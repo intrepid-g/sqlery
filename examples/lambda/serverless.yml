@@ -1,0 +1,67 @@
+service: sqlery-worker
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.13
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+
+  environment:
+    DJANGO_SETTINGS_MODULE: myproject.settings
+    DATABASE_URL: ${env:DATABASE_URL}
+    SECRET_KEY: ${env:SECRET_KEY}
+
+  iam:
+    role:
+      statements:
+        # Allow Lambda to invoke itself for recursive worker spawning
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+          Resource: !GetAtt SqleryWorkerLambdaFunction.Arn
+
+        # Allow Lambda to manage EventBridge rules
+        - Effect: Allow
+          Action:
+            - events:PutRule
+            - events:PutTargets
+            - events:RemoveTargets
+            - events:DeleteRule
+            - events:DisableRule
+            - events:EnableRule
+            - events:DescribeRule
+          Resource: '*'
+
+functions:
+  worker:
+    handler: sqlery.lambda_handler.handler
+    timeout: 900  # 15 minutes (adjust based on your longest job)
+    memorySize: 1024  # Adjust based on your job requirements
+
+    # Optional: Schedule periodic polling for jobs
+    events:
+      - schedule:
+          rate: rate(5 minutes)
+          enabled: true
+          input:
+            action: poll_and_process
+
+    # VPC configuration (if your database is in VPC)
+    # vpc:
+    #   securityGroupIds:
+    #     - sg-xxxxx
+    #   subnetIds:
+    #     - subnet-xxxxx
+    #     - subnet-yyyyy
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: true
+    slim: true
+    strip: false
+    layer: true

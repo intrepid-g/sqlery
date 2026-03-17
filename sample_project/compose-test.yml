@@ -1,0 +1,63 @@
+services:
+  # PostgreSQL database for testing
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: sqlery_test
+      POSTGRES_USER: sqlery
+      POSTGRES_PASSWORD: sqlery_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sqlery"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # SQLite mode - Django web server
+  web-sqlite:
+    build:
+      context: ..
+      dockerfile: sample_project/Dockerfile
+    command: python manage.py runserver 0.0.0.0:8855
+    volumes:
+      - sqlite_data:/app/data
+    ports:
+      - "8855:8855"
+    environment:
+      - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=mysite.settings
+      - SQLITE_PATH=/app/data/db.sqlite3
+      - USE_SQLITE=1
+      - DJANGO_ALLOW_REMOTE=1
+    stdin_open: true
+    tty: true
+
+  # PostgreSQL mode - Django web server
+  web-postgres:
+    build:
+      context: ..
+      dockerfile: sample_project/Dockerfile
+    command: python manage.py runserver 0.0.0.0:8856
+    ports:
+      - "8856:8856"
+    environment:
+      - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=mysite.settings
+      - USE_POSTGRES=1
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=sqlery_test
+      - POSTGRES_USER=sqlery
+      - POSTGRES_PASSWORD=sqlery_password
+      - DJANGO_ALLOW_REMOTE=1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+volumes:
+  sqlite_data:
+  postgres_data:
