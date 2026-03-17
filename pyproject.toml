@@ -1,0 +1,144 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlery"
+version = "0.13.0"
+description = "Job queue + cron scheduling - works standalone or with Django"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Sqlery Contributors"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 6.0",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    # Core dependencies (always required)
+    "croniter>=2.0.0",
+    "uuid6>=2024.1.0",
+]
+
+[project.optional-dependencies]
+# PostgreSQL support (optional - not needed for SQLite)
+postgres = ["psycopg>=3.1"]
+
+# CLI dependencies (typer + rich without full standalone)
+cli = ["typer>=0.9.0", "rich>=13.0.0"]
+
+# Django mode dependencies
+django = [
+    "django>=4.2",
+]
+
+# Standalone mode dependencies
+standalone = [
+    "sqlmodel>=0.0.14",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "jinja2>=3.1.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "alembic>=1.12.0",
+]
+
+# Additional features
+tasks = ["django-tasks>=0.1.0"]
+http = ["httpx>=0.24.0"]
+eventbridge = ["boto3>=1.34.0"]
+
+# Combined extras
+all-django = [
+    "django>=4.2",
+    "django-tasks>=0.1.0",
+    "psycopg>=3.1.0",
+    "httpx>=0.24.0",
+    "boto3>=1.34.0",
+]
+all-standalone = [
+    "psycopg>=3.1.0",
+    "sqlmodel>=0.0.14",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "jinja2>=3.1.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "alembic>=1.12.0",
+    "httpx>=0.24.0",
+    "boto3>=1.34.0",
+]
+all = [
+    "django>=4.2",
+    "django-tasks>=0.1.0",
+    "psycopg>=3.1.0",
+    "sqlmodel>=0.0.14",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "jinja2>=3.1.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "alembic>=1.12.0",
+    "httpx>=0.24.0",
+    "boto3>=1.34.0",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.4.0",
+    "pytest-django>=4.5.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.2.0",
+    "hypothesis>=6.92.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "httpx>=0.24.0",
+    "django>=4.2",
+    "sqlmodel>=0.0.14",
+    "fastapi>=0.104.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/intrepid-g/sqlery"
+Repository = "https://github.com/intrepid-g/sqlery"
+
+[project.scripts]
+sqlery = "sqlery.core.cli:main"
+sqlery-worker = "sqlery.fastapi_sqlery.cli:worker_main"
+sqlery-web = "sqlery.fastapi_sqlery.cli:web_main"
+sqlery-daemon = "sqlery.core.cli:daemon_main"
+sqlery-jobs = "sqlery.core.cli:jobs_main"
+sqlery-cleanup = "sqlery.core.cli:cleanup_main"
+sqlery-migrate = "sqlery.core.cli:migrate_main"
+sqlery-tasks = "sqlery.core.cli:tasks_main"
+sqlery-queues = "sqlery.core.cli:queues_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlery"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
