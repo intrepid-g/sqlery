@@ -1,0 +1,116 @@
+name: sqlery-stress
+
+x-build: &build
+  context: ..
+  dockerfile: stress_test/Dockerfile
+
+x-sqlery-env: &sqlery-env
+  DATABASE_URL: postgresql+psycopg://stress:stress@postgres/stress
+  SQLERY_DATABASE_URL: postgresql+psycopg://stress:stress@postgres/stress
+  PYTHONPATH: /app
+
+x-rq-env: &rq-env
+  REDIS_URL: redis://redis:6379
+  PYTHONPATH: /app
+
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: [sqlery]
+    environment:
+      POSTGRES_USER: stress
+      POSTGRES_PASSWORD: stress
+      POSTGRES_DB: stress
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stress"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    profiles: [rq]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  # ── Sqlery stack ──────────────────────────────────────────────────────────
+  # No separate setup service — initialize() calls create_all() on first connect,
+  # so workers and producer create tables themselves with a retry loop.
+
+  sqlery-worker:
+    build: *build
+    profiles: [sqlery]
+    command: python sqlery_app/worker.py
+    environment:
+      <<: *sqlery-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sqlery-producer:
+    build: *build
+    profiles: [sqlery]
+    command: python sqlery_app/producer.py
+    environment:
+      <<: *sqlery-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sqlery-reporter:
+    build: *build
+    profiles: [sqlery]
+    command: python sqlery_app/reporter.py
+    environment:
+      <<: *sqlery-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    # depends_on sqlery-producer removed: in Compose v5, --exit-code-from implies
+    # --abort-on-container-exit, so when producer exits compose tears down postgres
+    # before reporter can connect. Reporter starts with workers instead and polls
+    # until all jobs are done.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── RQ stack ──────────────────────────────────────────────────────────────
+
+  rq-worker:
+    build: *build
+    profiles: [rq]
+    command: rq worker stress --url redis://redis:6379
+    environment:
+      <<: *rq-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  rq-producer:
+    build: *build
+    profiles: [rq]
+    command: python rq_app/producer.py
+    environment:
+      <<: *rq-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  rq-reporter:
+    build: *build
+    profiles: [rq]
+    command: python rq_app/reporter.py
+    environment:
+      <<: *rq-env
+      TOTAL_JOBS: ${TOTAL_JOBS:-500}
+    depends_on:
+      rq-producer:
+        condition: service_completed_successfully
