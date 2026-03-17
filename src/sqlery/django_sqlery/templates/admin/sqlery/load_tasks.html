@@ -1,0 +1,35 @@
+{% extends "admin/base_site.html" %}
+{% block title %}Load Scheduled Tasks{% endblock %}
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; <a href="{% url 'sqlery:unified_view' %}">SQLery</a>
+    &rsaquo; <span>Load Tasks</span>
+</div>
+{% endblock %}
+{% block content %}
+<div id="content-main" style="max-width: 600px;">
+    <h2>Load Scheduled Tasks from Fixture</h2>
+    <p>Upload a JSON fixture file exported via <strong>Dump Tasks</strong> or
+    <code>manage.py sqlery_export --django-fixture</code>.</p>
+
+    {% if messages %}
+    <ul class="messagelist">
+        {% for message in messages %}
+        <li class="{{ message.tags }}">{{ message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <form method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="form-row" style="margin-bottom: 1rem;">
+            <label for="fixture_file" style="display:block; margin-bottom:0.5rem; font-weight:bold;">
+                Fixture file (.json)
+            </label>
+            <input type="file" name="fixture_file" id="fixture_file" accept=".json" required>
+        </div>
+        <input type="submit" value="Load" class="default" style="padding:0.5rem 2rem;">
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,231 @@
+{% extends "admin/change_form.html" %}
+
+{% block after_field_sets %}
+{{ block.super }}
+{% if original and original.status == "running" %}
+<div style="margin: 1rem 0; padding: 1rem; border: 2px solid #dc3545; border-radius: 4px; background: var(--darkened-bg, #f8f9fa);">
+    <form method="post" onsubmit="return confirm('Stop this running job?') && confirm('Are you sure? This will kill the job and cannot be undone.');">
+        {% csrf_token %}
+        <button type="submit" name="_stop_job" style="background: #dc3545; color: white; border: none; padding: 0.5rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 0.95rem; font-weight: bold;">
+            Stop Running Job
+        </button>
+        <span style="margin-left: 1rem; color: var(--body-quiet-color, #666);">
+            This will terminate the worker process and mark the job as failed.
+        </span>
+    </form>
+</div>
+{% endif %}
+{% if original and original.status == "queued" and original.scheduled_at and original.scheduled_at > now %}
+<div style="margin: 1rem 0; padding: 1rem; border: 2px solid #f0ad4e; border-radius: 4px; background: var(--darkened-bg, #f8f9fa);">
+    <form method="post" style="display: inline;">
+        {% csrf_token %}
+        <button type="submit" name="_enqueue_now" style="background: #f0ad4e; color: white; border: none; padding: 0.5rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 0.95rem; font-weight: bold;">
+            Enqueue Now
+        </button>
+        <span style="margin-left: 1rem; color: var(--body-quiet-color, #666);">
+            Clear the schedule and make this job immediately eligible for worker pickup.
+        </span>
+    </form>
+</div>
+{% endif %}
+{% if original and original.status == "failed" %}
+<div style="margin: 1rem 0; padding: 1rem; border: 2px solid #f0ad4e; border-radius: 4px; background: var(--darkened-bg, #f8f9fa);">
+    <form method="post" style="display: inline;">
+        {% csrf_token %}
+        <button type="submit" name="_retry_job" style="background: #f0ad4e; color: white; border: none; padding: 0.5rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 0.95rem; font-weight: bold;">
+            Retry Job
+        </button>
+        <span style="margin-left: 1rem; color: var(--body-quiet-color, #666);">
+            Re-queue this job — execution history is preserved.
+        </span>
+    </form>
+</div>
+{% endif %}
+
+{% if original %}
+<div style="margin: 1rem 0;">
+    <button type="button" id="copy-job-btn" onclick="copyJobDetails()" style="background: var(--primary, #417690); color: white; border: none; padding: 0.5rem 1.25rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem;">
+        Copy Job Details
+    </button>
+    <span id="copy-job-msg" style="margin-left: 0.75rem; color: var(--body-quiet-color, #666); font-size: 0.85rem; display: none;"></span>
+</div>
+
+<script>
+// --- Timezone toggle for Timing fieldset ---
+(function() {
+    const TS = {};
+    {% with ts=job_timestamps %}{% if ts.created_at %}TS.created_at = '{{ ts.created_at }}';{% endif %}
+    {% if ts.scheduled_at %}TS.scheduled_at = '{{ ts.scheduled_at }}';{% endif %}
+    {% if ts.started_at %}TS.started_at = '{{ ts.started_at }}';{% endif %}
+    {% if ts.finished_at %}TS.finished_at = '{{ ts.finished_at }}';{% endif %}{% endwith %}
+
+    const FIELD_NAMES = ['created_at', 'scheduled_at', 'started_at', 'finished_at'];
+
+    function formatDt(isoStr, useLocal) {
+        if (!isoStr) return null;
+        const d = new Date(isoStr);
+        if (isNaN(d)) return null;
+        const opts = {
+            year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false,
+            timeZoneName: 'short',
+        };
+        if (!useLocal) opts.timeZone = 'UTC';
+        return d.toLocaleString(undefined, opts);
+    }
+
+    function findFieldCell(fieldName) {
+        // Django admin renders readonly fields as <div class="readonly">
+        // inside a <td> next to a <td class="..."> with a label
+        const label = document.querySelector('.field-' + fieldName + ' .readonly');
+        return label;
+    }
+
+    function applyTimezone(useLocal) {
+        for (const name of FIELD_NAMES) {
+            const iso = TS[name];
+            if (!iso) continue;
+            const el = findFieldCell(name);
+            if (!el) continue;
+            const formatted = formatDt(iso, useLocal);
+            if (formatted) el.textContent = formatted;
+        }
+    }
+
+    function injectToggle() {
+        // Find the Timing fieldset header
+        const fieldsets = document.querySelectorAll('fieldset');
+        let timingFieldset = null;
+        for (const fs of fieldsets) {
+            const h2 = fs.querySelector('h2');
+            if (h2 && h2.textContent.trim() === 'Timing') {
+                timingFieldset = fs;
+                break;
+            }
+        }
+        if (!timingFieldset) return;
+
+        const h2 = timingFieldset.querySelector('h2');
+
+        const toggle = document.createElement('span');
+        toggle.style.cssText = 'float: right; font-size: 0.8rem; font-weight: normal;';
+        toggle.innerHTML = `
+            <label style="cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 0.35rem;">
+                <span id="tz-label-local" style="opacity: 1;">Local</span>
+                <input type="checkbox" id="tz-toggle" style="cursor: pointer;">
+                <span id="tz-label-utc" style="opacity: 0.5;">UTC</span>
+            </label>
+        `;
+        h2.appendChild(toggle);
+
+        const checkbox = document.getElementById('tz-toggle');
+        const labelLocal = document.getElementById('tz-label-local');
+        const labelUtc = document.getElementById('tz-label-utc');
+
+        // Default to local time
+        applyTimezone(true);
+
+        checkbox.addEventListener('change', function() {
+            const useLocal = !this.checked;
+            applyTimezone(useLocal);
+            labelLocal.style.opacity = useLocal ? '1' : '0.5';
+            labelLocal.style.fontWeight = useLocal ? 'bold' : 'normal';
+            labelUtc.style.opacity = useLocal ? '0.5' : '1';
+            labelUtc.style.fontWeight = useLocal ? 'normal' : 'bold';
+            try { localStorage.setItem('sqlery_tz', useLocal ? 'local' : 'utc'); } catch(e) {}
+        });
+
+        // Restore preference
+        try {
+            const pref = localStorage.getItem('sqlery_tz');
+            if (pref === 'utc') {
+                checkbox.checked = true;
+                checkbox.dispatchEvent(new Event('change'));
+            }
+        } catch(e) {}
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', injectToggle);
+    } else {
+        injectToggle();
+    }
+})();
+
+function copyJobDetails() {
+    const lines = [];
+    lines.push(`Job #{{ original.id }} — {{ original.get_status_display }}`);
+    lines.push(`Task: {{ original.task_path }}`);
+    {% if original.scheduled_task %}
+    lines.push(`Scheduled Task: {{ original.scheduled_task.name }}`);
+    {% endif %}
+    {% if original.job_name %}
+    lines.push(`Job Name: {{ original.job_name }}`);
+    {% endif %}
+    lines.push(`Queue: {{ original.queue_name }}`);
+    lines.push(`Priority: {{ original.priority }}`);
+
+    {% if original.kwargs %}
+    try {
+        const kwargs = JSON.parse('{{ original.kwargs|escapejs }}');
+        const args = kwargs._args || [];
+        const kw = Object.fromEntries(Object.entries(kwargs).filter(([k]) => k !== '_args'));
+        if (args.length) lines.push(`Args: ${JSON.stringify(args)}`);
+        if (Object.keys(kw).length) lines.push(`Kwargs: ${JSON.stringify(kw, null, 2)}`);
+    } catch(e) {
+        lines.push(`Kwargs: {{ original.kwargs|escapejs }}`);
+    }
+    {% endif %}
+
+    {% if original.worker %}
+    lines.push(`Worker: {{ original.worker.id }} (PID {{ original.worker.pid }}, Node {{ original.worker.node_id }})`);
+    {% elif original.worker_pid %}
+    lines.push(`Worker PID: {{ original.worker_pid }}`);
+    {% endif %}
+
+    lines.push('');
+    lines.push(`Created: {{ original.created_at|date:"Y-m-d H:i:s e" }}`);
+    {% if original.started_at %}
+    lines.push(`Started: {{ original.started_at|date:"Y-m-d H:i:s e" }}`);
+    {% endif %}
+    {% if original.finished_at %}
+    lines.push(`Finished: {{ original.finished_at|date:"Y-m-d H:i:s e" }}`);
+    {% endif %}
+    {% if original.duration_seconds %}
+    lines.push(`Duration: {{ original.duration_seconds }}s`);
+    {% endif %}
+
+    {% if original.error %}
+    lines.push('');
+    lines.push(`Error: {{ original.error|escapejs }}`);
+    {% endif %}
+    {% if original.traceback %}
+    lines.push('');
+    lines.push(`Traceback:`);
+    lines.push(`{{ original.traceback|escapejs }}`);
+    {% endif %}
+
+    const text = lines.join('\n');
+    navigator.clipboard.writeText(text).then(() => {
+        const msg = document.getElementById('copy-job-msg');
+        msg.textContent = 'Copied!';
+        msg.style.display = 'inline';
+        setTimeout(() => { msg.style.display = 'none'; }, 2000);
+    }).catch(() => {
+        // Fallback for older browsers
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        const msg = document.getElementById('copy-job-msg');
+        msg.textContent = 'Copied!';
+        msg.style.display = 'inline';
+        setTimeout(() => { msg.style.display = 'none'; }, 2000);
+    });
+}
+</script>
+{% endif %}
+{% endblock %}

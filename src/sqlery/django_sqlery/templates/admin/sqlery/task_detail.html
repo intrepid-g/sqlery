@@ -1,0 +1,644 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block title %}Task: {{ task_name }}{% endblock %}
+
+{% block extrahead %}
+<style>
+/* Task Header */
+.task-header {
+    background: var(--body-bg, #f8f9fa);
+    padding: 1.5rem;
+    border-radius: 4px;
+    margin-bottom: 2rem;
+    border-left: 4px solid var(--primary, #417690);
+    border: 1px solid var(--border-color, #ddd);
+}
+
+.task-info {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.info-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.info-label {
+    font-weight: 600;
+    color: var(--body-quiet-color, #666);
+    font-size: 0.9rem;
+}
+
+.info-value {
+    font-size: 1.1rem;
+    margin-top: 0.25rem;
+    color: var(--body-fg, #333);
+}
+
+/* Latest Run Highlight */
+.latest-run {
+    background: var(--darkened-bg, #f8f9fa);
+    border: 2px solid var(--primary, #417690);
+    padding: 1.5rem;
+    border-radius: 4px;
+    margin: 1.5rem 0;
+}
+
+.latest-run h3 {
+    margin: 0 0 1rem 0;
+    color: var(--body-fg, #333);
+}
+
+.latest-run strong {
+    color: var(--body-fg, #333);
+}
+
+.latest-run span {
+    color: var(--body-fg, #333);
+}
+
+/* Statistics */
+.stats-section {
+    background: var(--body-bg, white);
+    padding: 1.5rem;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    margin-bottom: 2rem;
+    border: 1px solid var(--border-color, #ddd);
+}
+
+.stats-grid {
+    display: flex;
+    gap: 2rem;
+    flex-wrap: wrap;
+}
+
+.stat-item {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.stat-item strong {
+    font-size: 1.2rem;
+    color: #417690;
+}
+
+/* Jobs Table */
+.jobs-section {
+    background: var(--body-bg, white);
+    padding: 1.5rem;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    border: 1px solid var(--border-color, #ddd);
+}
+
+.jobs-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1rem;
+}
+
+.jobs-table th {
+    background: var(--primary, #417690);
+    color: var(--primary-fg, white);
+    padding: 0.75rem;
+    text-align: left;
+    font-weight: 600;
+}
+
+.jobs-table td {
+    padding: 0.75rem;
+    border-bottom: 1px solid var(--border-color, #ddd);
+    color: var(--body-fg, #333);
+}
+
+.jobs-table tbody tr {
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.jobs-table tbody tr:hover {
+    background: var(--darkened-bg, #f5f5f5);
+}
+
+/* Job Details Expandable */
+.job-details-row {
+    display: none;
+}
+
+.job-details-row.expanded {
+    display: table-row;
+}
+
+.job-details {
+    background: var(--darkened-bg, #f8f9fa);
+    padding: 1rem;
+}
+
+.job-details h4 {
+    margin: 0 0 0.5rem 0;
+    color: var(--body-fg, #333);
+}
+
+.job-details pre {
+    background: var(--body-bg, #fff);
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    max-height: 300px;
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+    border: 1px solid var(--border-color, #ddd);
+    color: var(--body-fg, #333);
+}
+
+/* Status Colors */
+.status-queued { color: #007bff; font-weight: 600; }
+.status-running { color: #ffc107; font-weight: 600; }
+.status-success { color: #28a745; font-weight: 600; }
+.status-failed { color: #dc3545; font-weight: 600; }
+
+/* Buttons */
+.btn {
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background-color 0.2s;
+    text-decoration: none;
+    display: inline-block;
+}
+
+.btn-primary {
+    background: var(--primary, #417690);
+    color: var(--primary-fg, white);
+}
+
+.btn-primary:hover {
+    background: var(--primary-hover, #356578);
+}
+
+.btn-secondary {
+    background: var(--close-button-bg, #6c757d);
+    color: white;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+}
+
+/* Filter Controls */
+.filter-controls {
+    margin: 1rem 0;
+    padding: 1rem;
+    background: var(--darkened-bg, #f8f9fa);
+    border-radius: 4px;
+    border: 1px solid var(--border-color, #ddd);
+}
+
+.filter-controls label {
+    font-weight: 600;
+    margin-right: 0.5rem;
+    color: var(--body-fg, #333);
+}
+
+.filter-controls select {
+    padding: 0.5rem;
+    border: 1px solid var(--border-color, #ddd);
+    border-radius: 4px;
+    background: var(--body-bg, white);
+    color: var(--body-fg, #333);
+}
+
+/* Load More */
+.load-more {
+    text-align: center;
+    margin: 1.5rem 0;
+}
+
+/* Empty State */
+.empty-state {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--body-quiet-color, #999);
+}
+
+code {
+    background: var(--darkened-bg, #f4f4f4);
+    padding: 0.2rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.9em;
+    color: var(--body-fg, #333);
+}
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; <a href="{% url 'sqlery:unified_view' %}">SQLery</a>
+    &rsaquo; <span>{{ task_name }}</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <!-- Task Details -->
+    <div class="task-header">
+        <div class="task-info">
+            <div class="info-item">
+                <span class="info-label">Task Path</span>
+                <span class="info-value"><code id="task-path">Loading...</code></span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Cron Expression</span>
+                <span class="info-value"><code id="task-cron">Loading...</code></span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Queue</span>
+                <span class="info-value" id="task-queue">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Priority</span>
+                <span class="info-value" id="task-priority">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="task-status">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Next Run</span>
+                <span class="info-value" id="task-next-run">Loading...</span>
+            </div>
+        </div>
+
+        <div style="margin-top: 1.5rem;">
+            <a href="{% url 'admin:sqlery_scheduledtask_change' task_id %}" class="btn btn-secondary">Edit Task</a>
+            <button onclick="enqueueTask()" class="btn btn-primary">Enqueue Now</button>
+            <button onclick="toggleTask()" class="btn btn-secondary" id="toggle-btn">Loading...</button>
+        </div>
+    </div>
+
+    <!-- Latest Run Highlight -->
+    <div class="latest-run" id="latest-run" style="display: none;">
+        <h3>Latest Run</h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+            <div>
+                <strong>Status:</strong> <span id="latest-status" class="status-queued">-</span>
+            </div>
+            <div>
+                <strong>Created:</strong> <span id="latest-created">-</span>
+            </div>
+            <div>
+                <strong>Started:</strong> <span id="latest-started">-</span>
+            </div>
+            <div>
+                <strong>Duration:</strong> <span id="latest-duration">-</span>
+            </div>
+        </div>
+        <div style="margin-top: 1rem;" id="latest-output-section" style="display: none;">
+            <strong>Output:</strong>
+            <pre id="latest-output" style="max-height: 150px;"></pre>
+        </div>
+        <div style="margin-top: 1rem;" id="latest-error-section" style="display: none;">
+            <strong>Error:</strong>
+            <pre id="latest-error" style="max-height: 150px;"></pre>
+        </div>
+    </div>
+
+    <!-- Job Statistics -->
+    <div class="stats-section module">
+        <h2>Statistics</h2>
+        <div class="stats-grid">
+            <div class="stat-item">Total: <strong id="stat-total">0</strong></div>
+            <div class="stat-item">Queued: <strong id="stat-queued" style="color: #007bff;">0</strong></div>
+            <div class="stat-item">Running: <strong id="stat-running" style="color: #ffc107;">0</strong></div>
+            <div class="stat-item">Success: <strong id="stat-success" style="color: #28a745;">0</strong></div>
+            <div class="stat-item">Failed: <strong id="stat-failed" style="color: #dc3545;">0</strong></div>
+        </div>
+    </div>
+
+    <!-- All Job Runs -->
+    <div class="jobs-section module">
+        <h2>All Job Runs</h2>
+
+        <div class="filter-controls">
+            <label for="status-filter">Filter by status:</label>
+            <select id="status-filter" onchange="loadJobs(false)">
+                <option value="">All</option>
+                <option value="queued">Queued</option>
+                <option value="running">Running</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+            </select>
+        </div>
+
+        <table class="jobs-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th>Started</th>
+                    <th>Finished</th>
+                    <th>Duration</th>
+                    <th>Retries</th>
+                </tr>
+            </thead>
+            <tbody id="jobs-tbody">
+                <tr>
+                    <td colspan="7" style="text-align: center; padding: 2rem;">
+                        <div class="empty-state">Loading jobs...</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="load-more" id="load-more-container" style="display: none;">
+            <button id="load-more-btn" onclick="loadMoreJobs()" class="btn btn-secondary">Load More</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const TASK_ID = {{ task_id }};
+const URLS = {
+    taskDetail: '{% url "sqlery:api_task_detail" task_id=task_id %}',
+    taskJobs: '{% url "sqlery:api_task_jobs" task_id=task_id %}',
+    taskAction: '{% url "sqlery:api_task_action" task_id=task_id %}',
+};
+let currentPage = 1;
+let taskEnabled = false;
+let expandedRows = new Set();
+
+// Format datetime
+function formatDateTime(isoString) {
+    if (!isoString) return '-';
+    try {
+        const date = new Date(isoString);
+        return date.toLocaleString();
+    } catch (e) {
+        return isoString;
+    }
+}
+
+// Load task details
+async function loadTaskDetails() {
+    try {
+        const response = await fetch(URLS.taskDetail);
+        if (!response.ok) throw new Error('Failed to fetch task details');
+
+        const data = await response.json();
+
+        document.getElementById('task-path').textContent = data.task_path;
+        document.getElementById('task-cron').textContent = data.cron_expression || 'Not scheduled';
+        document.getElementById('task-queue').textContent = data.queue_name;
+        document.getElementById('task-priority').textContent = data.priority;
+        document.getElementById('task-status').textContent = data.enabled ? 'Enabled' : 'Disabled';
+        document.getElementById('task-next-run').textContent = formatDateTime(data.next_run_at);
+
+        taskEnabled = data.enabled;
+        document.getElementById('toggle-btn').textContent = taskEnabled ? 'Disable Task' : 'Enable Task';
+
+        // Update stats
+        document.getElementById('stat-total').textContent = data.stats.total;
+        document.getElementById('stat-queued').textContent = data.stats.queued;
+        document.getElementById('stat-running').textContent = data.stats.running;
+        document.getElementById('stat-success').textContent = data.stats.success;
+        document.getElementById('stat-failed').textContent = data.stats.failed;
+
+        // Latest job
+        if (data.latest_job) {
+            const latestRun = document.getElementById('latest-run');
+            latestRun.style.display = 'block';
+
+            const statusSpan = document.getElementById('latest-status');
+            statusSpan.textContent = data.latest_job.status;
+            statusSpan.className = `status-${data.latest_job.status}`;
+
+            document.getElementById('latest-created').textContent = formatDateTime(data.latest_job.created_at);
+            document.getElementById('latest-started').textContent = formatDateTime(data.latest_job.started_at);
+            document.getElementById('latest-duration').textContent = data.latest_job.duration_seconds
+                ? `${data.latest_job.duration_seconds}s`
+                : '-';
+
+            // Show output or error
+            if (data.latest_job.output) {
+                document.getElementById('latest-output-section').style.display = 'block';
+                document.getElementById('latest-output').textContent = data.latest_job.output;
+            }
+            if (data.latest_job.error) {
+                document.getElementById('latest-error-section').style.display = 'block';
+                document.getElementById('latest-error').textContent = data.latest_job.error;
+            }
+        }
+    } catch (error) {
+        console.error('Failed to load task details:', error);
+        // Silently retry after 3 seconds instead of blocking with an alert
+        setTimeout(loadTaskDetails, 3000);
+    }
+}
+
+// Load jobs
+async function loadJobs(append = false) {
+    if (!append) {
+        currentPage = 1;
+        expandedRows.clear();
+    }
+
+    const statusFilter = document.getElementById('status-filter').value;
+    const url = `${URLS.taskJobs}?page=${currentPage}&limit=20${statusFilter ? '&status=' + statusFilter : ''}`;
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Failed to fetch jobs');
+
+        const data = await response.json();
+        const tbody = document.getElementById('jobs-tbody');
+
+        if (!data.jobs || data.jobs.length === 0) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="7" style="text-align: center; padding: 2rem;">
+                        <div class="empty-state">No jobs found.</div>
+                    </td>
+                </tr>
+            `;
+            document.getElementById('load-more-container').style.display = 'none';
+            return;
+        }
+
+        const html = data.jobs.map(job => `
+            <tr onclick="toggleJobDetails(${job.id})">
+                <td>${job.id}</td>
+                <td class="status-${job.status}">${job.status}</td>
+                <td>${formatDateTime(job.created_at)}</td>
+                <td>${formatDateTime(job.started_at)}</td>
+                <td>${formatDateTime(job.finished_at)}</td>
+                <td>${job.duration_seconds ? job.duration_seconds + 's' : '-'}</td>
+                <td>${job.retry_count}${job.max_retries > 0 ? ' / ' + job.max_retries : ''}</td>
+            </tr>
+            <tr id="details-row-${job.id}" class="job-details-row">
+                <td colspan="7">
+                    <div class="job-details">
+                        ${job.output ? `<div><h4>Output:</h4><pre>${escapeHtml(job.output)}</pre></div>` : ''}
+                        ${job.error ? `<div><h4>Error:</h4><pre>${escapeHtml(job.error)}</pre></div>` : ''}
+                        ${job.traceback ? `<div><h4>Traceback:</h4><pre>${escapeHtml(job.traceback)}</pre></div>` : ''}
+                        ${!job.output && !job.error && !job.traceback ? '<div>No output or errors</div>' : ''}
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+
+        if (append) {
+            tbody.innerHTML += html;
+        } else {
+            tbody.innerHTML = html;
+        }
+
+        // Show/hide load more button
+        const loadMoreContainer = document.getElementById('load-more-container');
+        if (currentPage < data.total_pages) {
+            loadMoreContainer.style.display = 'block';
+        } else {
+            loadMoreContainer.style.display = 'none';
+        }
+
+        // Re-expand previously expanded rows
+        expandedRows.forEach(jobId => {
+            const row = document.getElementById(`details-row-${jobId}`);
+            if (row) row.classList.add('expanded');
+        });
+    } catch (error) {
+        console.error('Failed to load jobs:', error);
+        const tbody = document.getElementById('jobs-tbody');
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="7" style="text-align: center; padding: 2rem; color: #d32f2f;">
+                    ⚠️ Failed to load jobs. Please refresh the page.
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function loadMoreJobs() {
+    currentPage++;
+    loadJobs(true);
+}
+
+function toggleJobDetails(jobId) {
+    const row = document.getElementById(`details-row-${jobId}`);
+    if (!row) return;
+
+    row.classList.toggle('expanded');
+
+    if (row.classList.contains('expanded')) {
+        expandedRows.add(jobId);
+    } else {
+        expandedRows.delete(jobId);
+    }
+}
+
+async function enqueueTask() {
+    try {
+        const response = await fetch(URLS.taskAction, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCookie('csrftoken')
+            },
+            body: JSON.stringify({action: 'enqueue'})
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            alert(`✓ Task enqueued successfully! Job ID: ${data.job_id}`);
+            loadTaskDetails();
+            loadJobs(false);
+        } else {
+            // Show the specific error message from the API
+            alert(`⚠️ ${data.error || 'Failed to enqueue task'}`);
+        }
+    } catch (error) {
+        console.error('Failed to enqueue task:', error);
+        alert('✗ Failed to enqueue task. Please try again.');
+    }
+}
+
+async function toggleTask() {
+    const action = taskEnabled ? 'disable' : 'enable';
+
+    try {
+        const response = await fetch(URLS.taskAction, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCookie('csrftoken')
+            },
+            body: JSON.stringify({action})
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            // Update UI immediately without waiting for refresh
+            taskEnabled = !taskEnabled;
+            document.getElementById('toggle-btn').textContent = taskEnabled ? 'Disable Task' : 'Enable Task';
+            document.getElementById('task-status').textContent = taskEnabled ? 'Enabled' : 'Disabled';
+            // Also refresh from server
+            loadTaskDetails();
+        } else {
+            alert(`Failed to ${action} task: ${data.error || 'Unknown error'}`);
+        }
+    } catch (error) {
+        console.error('Failed to toggle task:', error);
+        alert('Failed to toggle task status');
+    }
+}
+
+// Get CSRF token
+function getCookie(name) {
+    let cookieValue = null;
+    if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+        }
+    }
+    return cookieValue;
+}
+
+// HTML escape
+function escapeHtml(unsafe) {
+    if (unsafe === null || unsafe === undefined) return '';
+    return String(unsafe)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+// Auto-refresh every 5 seconds
+setInterval(() => {
+    loadTaskDetails();
+    loadJobs(false);
+}, 5000);
+
+// Initial load
+loadTaskDetails();
+loadJobs(false);
+</script>
+{% endblock %}
