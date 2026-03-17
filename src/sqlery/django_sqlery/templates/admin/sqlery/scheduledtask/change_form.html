@@ -1,0 +1,212 @@
+{% extends "admin/change_form.html" %}
+{% load static %}
+
+{% block submit_buttons_bottom %}
+{{ block.super }}
+{% if original %}
+<div class="submit-row">
+    <input type="submit" value="Enqueue Now" name="_enqueue_now" class="default" style="background-color: #417690; margin-left: 10px;">
+</div>
+{% endif %}
+{% endblock %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    .job-runs-section {
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 20px;
+        margin-top: 20px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    }
+
+    .job-runs-section h2 {
+        margin: 0 0 15px 0;
+        font-size: 18px;
+    }
+
+    .job-runs-section table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+
+    .job-runs-section th {
+        text-align: left;
+        padding: 12px;
+        background: #f8f9fa;
+        border-bottom: 2px solid #ddd;
+        font-weight: 600;
+        font-size: 13px;
+    }
+
+    .job-runs-section td {
+        padding: 12px;
+        border-bottom: 1px solid #eee;
+        font-size: 13px;
+    }
+
+    .job-runs-section tr:hover {
+        background: #f8f9fa;
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+
+    .status-badge.queued { background: #d1ecf1; color: #0c5460; }
+    .status-badge.running { background: #fff3cd; color: #856404; }
+    .status-badge.success { background: #d4edda; color: #155724; }
+    .status-badge.failed { background: #f8d7da; color: #721c24; }
+
+    .job-link {
+        color: #417690;
+        text-decoration: none;
+        font-weight: 500;
+    }
+
+    .job-link:hover {
+        text-decoration: underline;
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 40px;
+        color: #999;
+    }
+
+    .job-output {
+        max-width: 300px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .scrollable-table {
+        max-height: 500px;
+        overflow-y: auto;
+    }
+
+    .scrollable-table::-webkit-scrollbar {
+        width: 8px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 4px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-thumb {
+        background: #888;
+        border-radius: 4px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-thumb:hover {
+        background: #555;
+    }
+</style>
+{% endblock %}
+
+{% block after_field_sets %}
+    {% if original %}
+        <div class="job-runs-section">
+            <h2>📋 Job Runs for this Scheduled Task</h2>
+            <div class="scrollable-table">
+                {% if original.jobs.all %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Status</th>
+                                <th>Queue</th>
+                                <th>Priority</th>
+                                <th>Created</th>
+                                <th>Started</th>
+                                <th>Finished</th>
+                                <th>Duration</th>
+                                <th>Retry</th>
+                                <th>Output/Error</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for job in original.jobs.all|dictsortreversed:"created_at" %}
+                                <tr>
+                                    <td>
+                                        <a href="{% url 'admin:sqlery_queuedjob_change' job.id %}" class="job-link">
+                                            #{{ job.id }}
+                                        </a>
+                                    </td>
+                                    <td>
+                                        {% if job.status == 'queued' %}
+                                            <span class="status-badge queued">Queued</span>
+                                        {% elif job.status == 'running' %}
+                                            <span class="status-badge running">Running</span>
+                                        {% elif job.status == 'success' %}
+                                            <span class="status-badge success">Success</span>
+                                        {% elif job.status == 'failed' %}
+                                            <span class="status-badge failed">Failed</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ job.queue_name }}</td>
+                                    <td>{{ job.priority }}</td>
+                                    <td>
+                                        {% if job.created_at %}
+                                            {{ job.created_at|date:"Y-m-d H:i:s" }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if job.started_at %}
+                                            {{ job.started_at|date:"Y-m-d H:i:s" }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if job.finished_at %}
+                                            {{ job.finished_at|date:"Y-m-d H:i:s" }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if job.duration_seconds %}
+                                            {{ job.duration_seconds|floatformat:2 }}s
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if job.max_retries > 0 %}
+                                            {{ job.retry_count }}/{{ job.max_retries }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                    <td class="job-output">
+                                        {% if job.error %}
+                                            <span style="color: #dc3545;" title="{{ job.error }}">{{ job.error|truncatechars:50 }}</span>
+                                        {% elif job.output %}
+                                            <span title="{{ job.output }}">{{ job.output|truncatechars:50 }}</span>
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <div class="empty-state">No job runs yet for this scheduled task</div>
+                {% endif %}
+            </div>
+        </div>
+    {% endif %}
+{% endblock %}

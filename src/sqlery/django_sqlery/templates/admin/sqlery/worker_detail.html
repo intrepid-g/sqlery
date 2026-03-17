@@ -1,0 +1,309 @@
+{% extends "admin/base_site.html" %}
+{% block title %}Worker Detail{% endblock %}
+{% block extrahead %}
+<style>
+    .worker-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 1.5rem;
+    }
+    .worker-meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 1rem;
+        margin-bottom: 2rem;
+    }
+    .meta-card {
+        background: var(--darkened-bg, #f5f5f5);
+        padding: 1rem;
+        border-radius: 4px;
+        border: 1px solid var(--border-color, #ddd);
+    }
+    .meta-label {
+        font-size: 0.8rem;
+        color: var(--body-quiet-color, #666);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 0.25rem;
+    }
+    .meta-value {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--body-fg, #333);
+        word-break: break-all;
+    }
+    .current-job-card {
+        background: var(--body-bg, #fff);
+        border: 2px solid #f39c12;
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 2rem;
+    }
+    .current-job-card h3 {
+        margin: 0 0 0.75rem 0;
+        color: #f39c12;
+    }
+    .current-job-card .job-info {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 0.75rem;
+    }
+    .stats-row {
+        display: flex;
+        gap: 1.5rem;
+        margin-bottom: 2rem;
+        flex-wrap: wrap;
+    }
+    .stat-pill {
+        padding: 0.5rem 1rem;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .stat-pill.success { background: rgba(39,174,96,0.15); color: #27ae60; }
+    .stat-pill.failed { background: rgba(231,76,60,0.15); color: #e74c3c; }
+    .stat-pill.total { background: rgba(52,152,219,0.15); color: #3498db; }
+    .stat-pill.avg { background: rgba(155,89,182,0.15); color: #9b59b6; }
+
+    .jobs-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .jobs-table th {
+        background: var(--primary, #417690);
+        color: var(--primary-fg, white);
+        padding: 0.6rem 0.75rem;
+        text-align: left;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .jobs-table td {
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--border-color, #ddd);
+        color: var(--body-fg, #333);
+        font-size: 0.85rem;
+    }
+    .jobs-table tbody tr:hover {
+        background: var(--darkened-bg, #f5f5f5);
+        cursor: pointer;
+    }
+    code {
+        background: var(--darkened-bg, #f4f4f4);
+        padding: 0.15rem 0.3rem;
+        border-radius: 3px;
+        font-size: 0.85em;
+        color: var(--body-fg, #333);
+    }
+    .status-badge {
+        padding: 0.2rem 0.5rem;
+        border-radius: 3px;
+        font-weight: 600;
+        font-size: 0.8rem;
+        color: white;
+    }
+    .status-idle { background: #27ae60; }
+    .status-busy { background: #f39c12; }
+    .status-dead { background: #e74c3c; }
+    .section-title {
+        margin: 0 0 1rem 0;
+        color: var(--body-fg, #333);
+    }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; <a href="{% url 'sqlery:unified_view' %}">SQLery</a>
+    &rsaquo; <span>Worker {{ worker_id|truncatechars:12 }}</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <div id="worker-loading" style="text-align:center; padding:3rem; color:var(--body-quiet-color,#999);">Loading worker details...</div>
+    <div id="worker-content" style="display:none;">
+        <!-- Worker metadata -->
+        <div class="worker-meta" id="worker-meta"></div>
+
+        <!-- Current job -->
+        <div id="current-job-section"></div>
+
+        <!-- Stats -->
+        <div id="stats-section"></div>
+
+        <!-- Job history -->
+        <h2 class="section-title">Job History</h2>
+        <table class="jobs-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Task</th>
+                    <th>Queue</th>
+                    <th>Status</th>
+                    <th>Started</th>
+                    <th>Duration</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody id="jobs-tbody"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    const WORKER_ID = '{{ worker_id }}';
+    const API_URL = `{% url "sqlery:api_worker_detail" worker_id=worker_id %}`;
+    const JOB_URL_TEMPLATE = `{% url 'admin:sqlery_queuedjob_change' 0 %}`;
+
+    function jobUrl(id) {
+        return JOB_URL_TEMPLATE.replace('/0/', `/${id}/`);
+    }
+
+    function escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatDateTime(iso) {
+        if (!iso) return '-';
+        return new Date(iso).toLocaleString();
+    }
+
+    function formatDuration(secs) {
+        if (secs == null) return '-';
+        secs = Math.round(secs);
+        if (secs >= 3600) return Math.floor(secs/3600) + 'h ' + Math.floor((secs%3600)/60) + 'm';
+        if (secs >= 60) return Math.floor(secs/60) + 'm ' + (secs%60) + 's';
+        return secs + 's';
+    }
+
+    async function loadWorker() {
+        try {
+            const resp = await fetch(API_URL);
+            if (!resp.ok) throw new Error('Failed to fetch');
+            const w = await resp.json();
+
+            document.getElementById('worker-loading').style.display = 'none';
+            document.getElementById('worker-content').style.display = 'block';
+
+            // Metadata cards
+            const statusClass = `status-${w.status}`;
+            document.getElementById('worker-meta').innerHTML = `
+                <div class="meta-card">
+                    <div class="meta-label">Worker ID</div>
+                    <div class="meta-value"><code>${escapeHtml(w.id)}</code></div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Node</div>
+                    <div class="meta-value">${escapeHtml(w.node_id)}</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">PID</div>
+                    <div class="meta-value">${w.pid}</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Status</div>
+                    <div class="meta-value"><span class="status-badge ${statusClass}">${w.status}</span></div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Started</div>
+                    <div class="meta-value">${formatDateTime(w.started_at)}</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Last Heartbeat</div>
+                    <div class="meta-value">${formatDateTime(w.last_heartbeat)}${w.heartbeat_age != null ? ` <small>(${Math.round(w.heartbeat_age)}s ago)</small>` : ''}</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Jobs Processed</div>
+                    <div class="meta-value">${w.jobs_processed}</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Queues</div>
+                    <div class="meta-value">${(w.queues && w.queues.length) ? w.queues.map(q => `<code>${escapeHtml(q)}</code>`).join(' ') : '<em>all</em>'}</div>
+                </div>
+            `;
+
+            // Current job
+            const cjSection = document.getElementById('current-job-section');
+            if (w.current_job) {
+                const cj = w.current_job;
+                const name = cj.task_name || cj.task_path.split('.').pop();
+                cjSection.innerHTML = `
+                    <div class="current-job-card">
+                        <h3>Currently Executing</h3>
+                        <div class="job-info">
+                            <div>
+                                <div class="meta-label">Job</div>
+                                <div><a href="${jobUrl(cj.id)}">#${cj.id} - <strong>${escapeHtml(name)}</strong></a></div>
+                            </div>
+                            <div>
+                                <div class="meta-label">Task Path</div>
+                                <div><code>${escapeHtml(cj.task_path)}</code></div>
+                            </div>
+                            <div>
+                                <div class="meta-label">Queue</div>
+                                <div>${escapeHtml(cj.queue_name)}</div>
+                            </div>
+                            <div>
+                                <div class="meta-label">Elapsed</div>
+                                <div><strong>${formatDuration(cj.elapsed_seconds)}</strong></div>
+                            </div>
+                            <div>
+                                <div class="meta-label">Started</div>
+                                <div>${formatDateTime(cj.started_at)}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } else {
+                cjSection.innerHTML = '';
+            }
+
+            // Stats
+            const stats = w.job_stats || {};
+            const avgDur = stats.avg_duration != null ? formatDuration(stats.avg_duration) : '-';
+            document.getElementById('stats-section').innerHTML = `
+                <div class="stats-row">
+                    <span class="stat-pill total">${stats.total || 0} total jobs</span>
+                    <span class="stat-pill success">${stats.success || 0} success</span>
+                    <span class="stat-pill failed">${stats.failed || 0} failed</span>
+                    <span class="stat-pill avg">avg ${avgDur}</span>
+                </div>
+            `;
+
+            // Job history
+            const tbody = document.getElementById('jobs-tbody');
+            const jobs = w.jobs_history || [];
+            if (jobs.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:2rem; color:var(--body-quiet-color,#999);">No job history</td></tr>`;
+            } else {
+                const statusColors = { running: '#f39c12', queued: '#3498db', success: '#27ae60', failed: '#e74c3c' };
+                tbody.innerHTML = jobs.map(j => {
+                    const name = j.task_name || j.task_path.split('.').pop();
+                    const sc = statusColors[j.status] || '#666';
+                    const err = j.error ? escapeHtml(j.error).substring(0, 80) : '-';
+                    return `
+                        <tr onclick="window.location='${jobUrl(j.id)}'">
+                            <td>#${j.id}</td>
+                            <td title="${escapeHtml(j.task_path)}"><strong>${escapeHtml(name)}</strong></td>
+                            <td>${escapeHtml(j.queue_name)}</td>
+                            <td><span style="color:${sc};font-weight:bold;">${j.status}</span></td>
+                            <td>${formatDateTime(j.started_at)}</td>
+                            <td>${formatDuration(j.duration_seconds)}</td>
+                            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(j.error || '')}">${err}</td>
+                        </tr>`;
+                }).join('');
+            }
+        } catch (error) {
+            console.error('Failed to load worker:', error);
+            document.getElementById('worker-loading').innerHTML = `<span style="color:#e74c3c;">Failed to load worker details.</span>`;
+        }
+    }
+
+    loadWorker();
+    // Auto-refresh every 5 seconds
+    setInterval(loadWorker, 5000);
+</script>
+{% endblock %}

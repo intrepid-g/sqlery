@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - django-sqlery{% endblock %}
+
+{% block content %}
+<div x-data="{ autoRefresh: true }" x-init="
+    setInterval(() => {
+        if (autoRefresh) {
+            fetch('/api/stats')
+                .then(res => res.json())
+                .then(data => {
+                    // Update stats dynamically
+                    console.log('Stats updated', data);
+                    location.reload(); // Simple refresh for now
+                });
+        }
+    }, 3000);
+">
+    <!-- Page Header -->
+    <div class="md:flex md:items-center md:justify-between mb-6">
+        <div class="flex-1 min-w-0">
+            <h1 class="text-2xl font-bold leading-7 text-gray-900 sm:text-3xl sm:truncate">
+                Dashboard
+            </h1>
+        </div>
+        <div class="mt-4 flex md:mt-0 md:ml-4">
+            <label class="inline-flex items-center">
+                <input type="checkbox" x-model="autoRefresh" class="form-checkbox h-5 w-5 text-blue-600">
+                <span class="ml-2 text-sm text-gray-700">Auto-refresh (3s)</span>
+            </label>
+        </div>
+    </div>
+
+    <!-- Statistics Cards -->
+    <div class="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4 mb-8">
+        <!-- Total Jobs -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Total Jobs
+                </dt>
+                <dd class="mt-1 text-3xl font-semibold text-gray-900">
+                    {{ stats.total_jobs }}
+                </dd>
+            </div>
+        </div>
+
+        <!-- Queued Jobs -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Queued
+                </dt>
+                <dd class="mt-1 text-3xl font-semibold text-yellow-600">
+                    {{ queue_stats.queued }}
+                </dd>
+            </div>
+        </div>
+
+        <!-- Running Jobs -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Running
+                </dt>
+                <dd class="mt-1 text-3xl font-semibold text-blue-600">
+                    {{ queue_stats.running }}
+                </dd>
+            </div>
+        </div>
+
+        <!-- Active Workers -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Active Workers
+                </dt>
+                <dd class="mt-1 text-3xl font-semibold text-green-600">
+                    {{ workers|length }}
+                </dd>
+            </div>
+        </div>
+    </div>
+
+    <!-- Additional Stats Grid -->
+    <div class="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 mb-8">
+        <!-- Success Rate -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Successful
+                </dt>
+                <dd class="mt-1 text-2xl font-semibold text-green-600">
+                    {{ queue_stats.success }}
+                </dd>
+            </div>
+        </div>
+
+        <!-- Failed Jobs -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Failed
+                </dt>
+                <dd class="mt-1 text-2xl font-semibold text-red-600">
+                    {{ queue_stats.failed }}
+                </dd>
+            </div>
+        </div>
+
+        <!-- Scheduled Tasks -->
+        <div class="bg-white overflow-hidden shadow rounded-lg">
+            <div class="px-4 py-5 sm:p-6">
+                <dt class="text-sm font-medium text-gray-500 truncate">
+                    Scheduled Tasks
+                </dt>
+                <dd class="mt-1 text-2xl font-semibold text-purple-600">
+                    {{ stats.enabled_scheduled_tasks }} / {{ stats.total_scheduled_tasks }}
+                    <span class="text-sm text-gray-500">enabled</span>
+                </dd>
+            </div>
+        </div>
+    </div>
+
+    <!-- Running Jobs Table -->
+    <div class="bg-white shadow rounded-lg mb-8">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Currently Running Jobs</h2>
+        </div>
+        <div class="overflow-hidden">
+            {% if recent_jobs %}
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            ID
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Task
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Queue
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Started
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Duration
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {% for job in recent_jobs %}
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
+                            <a href="/jobs/{{ job.id }}">#{{ job.id }}</a>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            {{ job.task_path.split('.')[-1] }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {{ job.queue_name }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {% if job.started_at %}
+                                {{ job.started_at.strftime('%H:%M:%S') }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            <div class="flex items-center">
+                                <div class="animate-pulse h-2 w-2 bg-blue-500 rounded-full mr-2"></div>
+                                Running...
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="px-6 py-12 text-center text-gray-500">
+                No jobs currently running
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Active Workers -->
+    <div class="bg-white shadow rounded-lg">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Active Workers</h2>
+        </div>
+        <div class="overflow-hidden">
+            {% if workers %}
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Worker ID
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Node
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Status
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Jobs Processed
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Last Heartbeat
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {% for worker in workers %}
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900">
+                            {{ str(worker.id)[:8] }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {{ worker.node_id }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                {% if worker.status == 'idle' %}bg-green-100 text-green-800
+                                {% elif worker.status == 'busy' %}bg-blue-100 text-blue-800
+                                {% else %}bg-gray-100 text-gray-800{% endif %}">
+                                {{ worker.status }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {{ worker.jobs_processed }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {% if worker.last_heartbeat %}
+                                {{ worker.last_heartbeat.strftime('%H:%M:%S') }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="px-6 py-12 text-center text-gray-500">
+                No active workers
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

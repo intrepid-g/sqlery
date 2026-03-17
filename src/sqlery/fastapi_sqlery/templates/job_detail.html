@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+
+{% block title %}Job #{{ job.id }} - django-sqlery{% endblock %}
+
+{% block content %}
+<div>
+    <!-- Page Header -->
+    <div class="md:flex md:items-center md:justify-between mb-6">
+        <div class="flex-1 min-w-0">
+            <h1 class="text-2xl font-bold leading-7 text-gray-900 sm:text-3xl sm:truncate">
+                Job #{{ job.id }}
+            </h1>
+            <p class="mt-1 text-sm text-gray-500">
+                {{ job.task_path }}
+            </p>
+        </div>
+        <div class="mt-4 flex md:mt-0 md:ml-4">
+            <span class="px-3 py-2 inline-flex text-sm leading-5 font-semibold rounded-md
+                {% if job.status == 'queued' %}bg-yellow-100 text-yellow-800
+                {% elif job.status == 'running' %}bg-blue-100 text-blue-800
+                {% elif job.status == 'success' %}bg-green-100 text-green-800
+                {% elif job.status == 'failed' %}bg-red-100 text-red-800
+                {% else %}bg-gray-100 text-gray-800{% endif %}">
+                {{ job.status.upper() }}
+            </span>
+        </div>
+    </div>
+
+    <!-- Job Details Grid -->
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2 mb-6">
+        <!-- Basic Info -->
+        <div class="bg-white shadow rounded-lg overflow-hidden">
+            <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+                <h2 class="text-lg font-medium text-gray-900">Basic Information</h2>
+            </div>
+            <div class="px-4 py-5 sm:p-6">
+                <dl class="grid grid-cols-1 gap-x-4 gap-y-6 sm:grid-cols-2">
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Queue</dt>
+                        <dd class="mt-1 text-sm text-gray-900">{{ job.queue_name }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Priority</dt>
+                        <dd class="mt-1 text-sm text-gray-900">{{ job.priority }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Created</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.created_at %}
+                                {{ job.created_at.strftime('%Y-%m-%d %H:%M:%S') }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Started</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.started_at %}
+                                {{ job.started_at.strftime('%Y-%m-%d %H:%M:%S') }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Finished</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.finished_at %}
+                                {{ job.finished_at.strftime('%Y-%m-%d %H:%M:%S') }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Duration</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.duration_seconds %}
+                                {{ "%.2f"|format(job.duration_seconds) }}s
+                            {% else %}
+                                -
+                            {% endif %}
+                        </dd>
+                    </div>
+                </dl>
+            </div>
+        </div>
+
+        <!-- Retry Info -->
+        <div class="bg-white shadow rounded-lg overflow-hidden">
+            <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+                <h2 class="text-lg font-medium text-gray-900">Retry Configuration</h2>
+            </div>
+            <div class="px-4 py-5 sm:p-6">
+                <dl class="grid grid-cols-1 gap-x-4 gap-y-6 sm:grid-cols-2">
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Retry Count</dt>
+                        <dd class="mt-1 text-sm text-gray-900">{{ job.retry_count }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Max Retries</dt>
+                        <dd class="mt-1 text-sm text-gray-900">{{ job.max_retries }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Retry Backoff</dt>
+                        <dd class="mt-1 text-sm text-gray-900">{{ job.retry_backoff }}s</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Allow Parallel</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.allow_parallel %}
+                                <span class="text-green-600">Yes</span>
+                            {% else %}
+                                <span class="text-gray-600">No</span>
+                            {% endif %}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Timeout</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.timeout_seconds %}
+                                {{ job.timeout_seconds }}s
+                            {% else %}
+                                No timeout
+                            {% endif %}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Worker PID</dt>
+                        <dd class="mt-1 text-sm text-gray-900">
+                            {% if job.worker_pid %}
+                                {{ job.worker_pid }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </dd>
+                    </div>
+                </dl>
+            </div>
+        </div>
+    </div>
+
+    <!-- Arguments -->
+    <div class="bg-white shadow rounded-lg overflow-hidden mb-6">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Arguments</h2>
+        </div>
+        <div class="px-4 py-5 sm:p-6">
+            <pre class="bg-gray-50 rounded p-4 overflow-x-auto"><code>{{ job.kwargs|tojson(indent=2) }}</code></pre>
+        </div>
+    </div>
+
+    <!-- Output / Error -->
+    {% if job.status == 'success' and job.output %}
+    <div class="bg-white shadow rounded-lg overflow-hidden mb-6">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Output</h2>
+        </div>
+        <div class="px-4 py-5 sm:p-6">
+            <pre class="bg-gray-50 rounded p-4 overflow-x-auto text-sm">{{ job.output }}</pre>
+        </div>
+    </div>
+    {% endif %}
+
+    {% if job.status == 'failed' %}
+    <div class="bg-white shadow rounded-lg overflow-hidden mb-6">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Error</h2>
+        </div>
+        <div class="px-4 py-5 sm:p-6">
+            <div class="mb-4">
+                <h3 class="text-sm font-medium text-gray-700 mb-2">Error Message:</h3>
+                <pre class="bg-red-50 rounded p-4 overflow-x-auto text-sm text-red-900">{{ job.error }}</pre>
+            </div>
+            {% if job.traceback %}
+            <div>
+                <h3 class="text-sm font-medium text-gray-700 mb-2">Traceback:</h3>
+                <pre class="bg-gray-50 rounded p-4 overflow-x-auto text-xs text-gray-700">{{ job.traceback }}</pre>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Execution History -->
+    {% if job.runs %}
+    <div class="bg-white shadow rounded-lg overflow-hidden">
+        <div class="px-4 py-5 sm:px-6 border-b border-gray-200">
+            <h2 class="text-lg font-medium text-gray-900">Execution History</h2>
+        </div>
+        <div class="overflow-hidden">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Attempt
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Status
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Started
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Duration
+                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Result
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {% for run in job.runs %}
+                    <tr>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                            #{{ run.attempt_number + 1 }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                {% if run.status == 'success' %}bg-green-100 text-green-800
+                                {% else %}bg-red-100 text-red-800{% endif %}">
+                                {{ run.status }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {% if run.started_at %}
+                                {{ run.started_at }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {% if run.duration %}
+                                {{ "%.2f"|format(run.duration) }}s
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                        <td class="px-6 py-4 text-sm text-gray-500">
+                            {% if run.status == 'success' %}
+                                {{ run.output[:100] }}{% if run.output|length > 100 %}...{% endif %}
+                            {% else %}
+                                {{ run.error[:100] }}{% if run.error|length > 100 %}...{% endif %}
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

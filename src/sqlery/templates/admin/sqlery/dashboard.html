@@ -1,0 +1,632 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block title %}Sqlery Dashboard{% endblock %}
+
+{% block extrastyle %}
+<style>
+    .dashboard-container {
+        padding: 20px;
+        max-width: 1400px;
+        margin: 0 auto;
+    }
+
+    .dashboard-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 30px;
+    }
+
+    .dashboard-header h1 {
+        margin: 0;
+        font-size: 28px;
+    }
+
+    .refresh-indicator {
+        font-size: 12px;
+        color: #666;
+    }
+
+    .refresh-indicator.error {
+        color: #dc3545;
+    }
+
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 20px;
+        margin-bottom: 30px;
+    }
+
+    .stat-card {
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 20px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .stat-card h3 {
+        margin: 0 0 15px 0;
+        font-size: 14px;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+        font-size: 36px;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+
+    .stat-value.queued { color: #17a2b8; }
+    .stat-value.running { color: #ffc107; }
+    .stat-value.success { color: #28a745; }
+    .stat-value.failed { color: #dc3545; }
+    .stat-value.enabled { color: #28a745; }
+    .stat-value.due { color: #ff6b6b; }
+
+    .stat-detail {
+        font-size: 14px;
+        color: #666;
+        margin: 5px 0;
+    }
+
+    .queue-table, .scheduled-tasks-table, .recent-jobs-table {
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 30px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .queue-table h2, .scheduled-tasks-table h2, .recent-jobs-table h2 {
+        margin: 0 0 15px 0;
+        font-size: 18px;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+
+    th {
+        text-align: left;
+        padding: 12px;
+        background: #f8f9fa;
+        border-bottom: 2px solid #ddd;
+        font-weight: 600;
+        font-size: 13px;
+    }
+
+    td {
+        padding: 12px;
+        border-bottom: 1px solid #eee;
+        font-size: 13px;
+    }
+
+    tr:hover {
+        background: #f8f9fa;
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+
+    .status-badge.queued { background: #d1ecf1; color: #0c5460; }
+    .status-badge.running { background: #fff3cd; color: #856404; }
+    .status-badge.success { background: #d4edda; color: #155724; }
+    .status-badge.failed { background: #f8d7da; color: #721c24; }
+    .status-badge.enabled { background: #d4edda; color: #155724; }
+    .status-badge.disabled { background: #e2e3e5; color: #383d41; }
+
+    .empty-state {
+        text-align: center;
+        padding: 40px;
+        color: #999;
+    }
+
+    .loading {
+        text-align: center;
+        padding: 40px;
+        color: #666;
+    }
+
+    .error-message {
+        background: #f8d7da;
+        border: 1px solid #f5c6cb;
+        color: #721c24;
+        padding: 15px;
+        border-radius: 4px;
+        margin-bottom: 20px;
+    }
+
+    .job-link {
+        color: #417690;
+        text-decoration: none;
+        font-weight: 500;
+    }
+
+    .job-link:hover {
+        text-decoration: underline;
+    }
+
+    .task-path-small {
+        font-size: 11px;
+        color: #999;
+        display: block;
+        margin-top: 2px;
+    }
+
+    .scrollable-table {
+        max-height: 600px;
+        overflow-y: auto;
+    }
+
+    .scrollable-table::-webkit-scrollbar {
+        width: 8px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 4px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-thumb {
+        background: #888;
+        border-radius: 4px;
+    }
+
+    .scrollable-table::-webkit-scrollbar-thumb:hover {
+        background: #555;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard-container">
+    <div class="dashboard-header">
+        <h1>📊 Sqlery Dashboard</h1>
+        <div class="refresh-indicator" id="refreshIndicator">
+            Loading...
+        </div>
+    </div>
+
+    <div id="errorContainer"></div>
+
+    <!-- Stats Cards -->
+    <div id="statsGrid" class="stats-grid">
+        <!-- Stats cards will be inserted here -->
+    </div>
+
+    <!-- Worker Status (Multi-Worker Mode Only) -->
+    <div class="queue-table" id="workerStatusContainer" style="display: none;">
+        <h2>👷 Worker Pool Status</h2>
+        <div id="workerStatusTable">
+            <div class="loading">Loading worker status...</div>
+        </div>
+    </div>
+
+    <!-- Active Queues -->
+    <div class="queue-table" id="queueTableContainer">
+        <h2>📦 Active Queues</h2>
+        <div id="queueTable">
+            <div class="loading">Loading queue data...</div>
+        </div>
+    </div>
+
+    <!-- Scheduled Tasks -->
+    <div class="scheduled-tasks-table" id="scheduledTasksContainer">
+        <h2>⏰ Scheduled Tasks</h2>
+        <div id="scheduledTasksTable">
+            <div class="loading">Loading scheduled tasks...</div>
+        </div>
+    </div>
+
+    <!-- Recent Jobs (Scrollable) -->
+    <div class="recent-jobs-table" id="recentJobsContainer">
+        <h2>📋 Recent Job Runs (Last 50)</h2>
+        <div class="scrollable-table" id="recentJobsTable">
+            <div class="loading">Loading recent jobs...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    'use strict';
+
+    const REFRESH_INTERVAL = 3000; // 3 seconds
+    const API_URL = '{% url "sqlery:dashboard_stats" %}';
+    let refreshTimer = null;
+
+    /**
+     * Fetch dashboard data from API
+     */
+    async function fetchDashboardData() {
+        try {
+            const response = await fetch(API_URL, {
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            console.error('Failed to fetch dashboard data:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update stats cards
+     */
+    function updateStatsCards(data) {
+        const statsHtml = `
+            <div class="stat-card">
+                <h3>Queued Jobs</h3>
+                <div class="stat-value queued">${data.job_counts.queued}</div>
+                <div class="stat-detail">Total: ${data.job_counts.total}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Running Jobs</h3>
+                <div class="stat-value running">${data.job_counts.running}</div>
+                <div class="stat-detail">Active workers</div>
+            </div>
+            <div class="stat-card">
+                <h3>Success (Total)</h3>
+                <div class="stat-value success">${data.job_counts.success}</div>
+                <div class="stat-detail">Last hour: ${data.recent_activity.recent_success}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Failed (Total)</h3>
+                <div class="stat-value failed">${data.job_counts.failed}</div>
+                <div class="stat-detail">Last hour: ${data.recent_activity.recent_failed}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Scheduled Tasks</h3>
+                <div class="stat-value enabled">${data.scheduled_tasks.enabled_count}</div>
+                <div class="stat-detail">
+                    Total: ${data.scheduled_tasks.total} |
+                    <span class="stat-value due" style="font-size: 14px;">Due: ${data.scheduled_tasks.due_count}</span>
+                </div>
+            </div>
+        `;
+        document.getElementById('statsGrid').innerHTML = statsHtml;
+    }
+
+    /**
+     * Update queue table
+     */
+    function updateQueueTable(queues) {
+        const container = document.getElementById('queueTable');
+
+        if (queues.length === 0) {
+            container.innerHTML = '<div class="empty-state">No active queues</div>';
+            return;
+        }
+
+        const tableHtml = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>Queue Name</th>
+                        <th>Queued</th>
+                        <th>Running</th>
+                        <th>Total Active</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${queues.map(queue => `
+                        <tr>
+                            <td><strong>${escapeHtml(queue.queue_name)}</strong></td>
+                            <td><span class="status-badge queued">${queue.queued}</span></td>
+                            <td><span class="status-badge running">${queue.running}</span></td>
+                            <td>${queue.queued + queue.running}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+        container.innerHTML = tableHtml;
+    }
+
+    /**
+     * Update scheduled tasks table
+     */
+    function updateScheduledTasksTable(tasks) {
+        const container = document.getElementById('scheduledTasksTable');
+
+        if (tasks.length === 0) {
+            container.innerHTML = '<div class="empty-state">No scheduled tasks</div>';
+            return;
+        }
+
+        const tableHtml = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Cron</th>
+                        <th>Queue</th>
+                        <th>Priority</th>
+                        <th>Status</th>
+                        <th>Next Run</th>
+                        <th>Last Run</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tasks.map(task => `
+                        <tr>
+                            <td>
+                                <a href="/admin/sqlery/scheduledtask/${task.id}/change/" class="job-link">
+                                    ${escapeHtml(task.name)}
+                                </a>
+                                <span class="task-path-small">${escapeHtml(task.task_path)}</span>
+                            </td>
+                            <td><code>${escapeHtml(task.cron_expression)}</code></td>
+                            <td>${escapeHtml(task.queue_name)}</td>
+                            <td>${task.priority}</td>
+                            <td><span class="status-badge ${task.enabled ? 'enabled' : 'disabled'}">${task.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                            <td>${formatDateTime(task.next_run_at)}</td>
+                            <td>${formatDateTime(task.last_run_at)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+        container.innerHTML = tableHtml;
+    }
+
+    /**
+     * Update worker status table (multi-worker mode)
+     */
+    function updateWorkerStatus(data) {
+        const container = document.getElementById('workerStatusContainer');
+        const tableContainer = document.getElementById('workerStatusTable');
+
+        // Hide section if not in multi-worker mode
+        if (!data.multi_worker_enabled) {
+            container.style.display = 'none';
+            return;
+        }
+
+        // Show section
+        container.style.display = 'block';
+
+        const stats = data.worker_stats;
+        const workers = data.workers_list || [];
+
+        if (!stats) {
+            tableContainer.innerHTML = '<div class="empty-state">Worker statistics unavailable</div>';
+            return;
+        }
+
+        // Worker summary
+        const summaryHtml = `
+            <div style="margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px;">
+                <strong>Active Workers:</strong> ${stats.active} / ${stats.max_workers} &nbsp;|&nbsp;
+                <strong>Idle:</strong> <span style="color: #28a745;">${stats.idle}</span> &nbsp;|&nbsp;
+                <strong>Busy:</strong> <span style="color: #ffc107;">${stats.busy}</span> &nbsp;|&nbsp;
+                <strong>Dead:</strong> <span style="color: #dc3545;">${stats.dead}</span>
+            </div>
+        `;
+
+        // Workers table
+        let workersTableHtml = '';
+        if (workers.length === 0) {
+            workersTableHtml = '<div class="empty-state">No active workers</div>';
+        } else {
+            workersTableHtml = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Worker ID</th>
+                            <th>Node</th>
+                            <th>PID</th>
+                            <th>Status</th>
+                            <th>Current Job</th>
+                            <th>Jobs Processed</th>
+                            <th>Started</th>
+                            <th>Last Heartbeat</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${workers.map(worker => `
+                            <tr>
+                                <td><code>${worker.id.substring(0, 8)}</code></td>
+                                <td>${escapeHtml(worker.node_id)}</td>
+                                <td>${worker.pid}</td>
+                                <td><span class="status-badge ${worker.status}">${worker.status}</span></td>
+                                <td>
+                                    ${worker.current_job_id
+                                        ? `<a href="/admin/sqlery/queuedjob/${worker.current_job_id}/change/" class="job-link">#${worker.current_job_id}</a>`
+                                        : '-'}
+                                </td>
+                                <td>${worker.jobs_processed}</td>
+                                <td>${formatDateTime(worker.started_at)}</td>
+                                <td>${formatDateTime(worker.last_heartbeat)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        tableContainer.innerHTML = summaryHtml + workersTableHtml;
+    }
+
+    /**
+     * Update recent jobs table
+     */
+    function updateRecentJobsTable(jobs) {
+        const container = document.getElementById('recentJobsTable');
+
+        if (jobs.length === 0) {
+            container.innerHTML = '<div class="empty-state">No recent jobs</div>';
+            return;
+        }
+
+        const tableHtml = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Task</th>
+                        <th>Queue</th>
+                        <th>Priority</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Duration</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${jobs.map(job => `
+                        <tr>
+                            <td>
+                                <a href="/admin/sqlery/queuedjob/${job.id}/change/" class="job-link">
+                                    #${job.id}
+                                </a>
+                            </td>
+                            <td>
+                                <a href="/admin/sqlery/queuedjob/${job.id}/change/" class="job-link">
+                                    ${escapeHtml(job.task_path.split('.').pop())}
+                                </a>
+                                <span class="task-path-small">${escapeHtml(job.task_path)}</span>
+                            </td>
+                            <td>${escapeHtml(job.queue_name)}</td>
+                            <td>${job.priority}</td>
+                            <td><span class="status-badge ${job.status}">${job.status}</span></td>
+                            <td>${formatDateTime(job.created_at)}</td>
+                            <td>${job.duration_seconds ? job.duration_seconds.toFixed(2) + 's' : '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+        container.innerHTML = tableHtml;
+    }
+
+    /**
+     * Update refresh indicator
+     */
+    function updateRefreshIndicator(status, message) {
+        const indicator = document.getElementById('refreshIndicator');
+        indicator.textContent = message;
+        indicator.className = 'refresh-indicator ' + (status === 'error' ? 'error' : '');
+    }
+
+    /**
+     * Show error message
+     */
+    function showError(error) {
+        const container = document.getElementById('errorContainer');
+        container.innerHTML = `
+            <div class="error-message">
+                <strong>Error:</strong> ${escapeHtml(error.message)}
+            </div>
+        `;
+        updateRefreshIndicator('error', 'Failed to refresh');
+    }
+
+    /**
+     * Clear error message
+     */
+    function clearError() {
+        document.getElementById('errorContainer').innerHTML = '';
+    }
+
+    /**
+     * Refresh dashboard
+     */
+    async function refreshDashboard() {
+        try {
+            const data = await fetchDashboardData();
+
+            // Update all sections
+            updateStatsCards(data);
+            updateWorkerStatus(data);
+            updateQueueTable(data.queue_stats);
+            updateScheduledTasksTable(data.scheduled_tasks_list || []);
+            updateRecentJobsTable(data.recent_jobs);
+
+            // Update refresh indicator
+            const now = new Date();
+            updateRefreshIndicator('success', `Last updated: ${now.toLocaleTimeString()}`);
+
+            // Clear any errors
+            clearError();
+
+        } catch (error) {
+            showError(error);
+        }
+    }
+
+    /**
+     * Start auto-refresh
+     */
+    function startAutoRefresh() {
+        // Initial load
+        refreshDashboard();
+
+        // Set up interval
+        refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL);
+    }
+
+    /**
+     * Stop auto-refresh (cleanup)
+     */
+    function stopAutoRefresh() {
+        if (refreshTimer) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+        }
+    }
+
+    /**
+     * Utility: Escape HTML to prevent XSS
+     */
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    /**
+     * Utility: Format datetime
+     */
+    function formatDateTime(isoString) {
+        if (!isoString) return '-';
+        try {
+            const date = new Date(isoString);
+            return date.toLocaleString();
+        } catch {
+            return isoString;
+        }
+    }
+
+    // Initialize dashboard when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startAutoRefresh);
+    } else {
+        startAutoRefresh();
+    }
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', stopAutoRefresh);
+})();
+</script>
+{% endblock %}

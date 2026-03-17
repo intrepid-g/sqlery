@@ -1,0 +1,393 @@
+{% extends "admin/change_list.html" %}
+{% load static %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    .dashboard-stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-bottom: 25px;
+    }
+
+    .stat-card {
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 15px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    }
+
+    .stat-card h3 {
+        margin: 0 0 10px 0;
+        font-size: 12px;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+        font-size: 28px;
+        font-weight: bold;
+        margin-bottom: 5px;
+    }
+
+    .stat-value.queued { color: #17a2b8; }
+    .stat-value.running { color: #ffc107; }
+    .stat-value.success { color: #28a745; }
+    .stat-value.failed { color: #dc3545; }
+    .stat-value.enabled { color: #28a745; }
+    .stat-value.due { color: #ff6b6b; }
+
+    .stat-detail {
+        font-size: 12px;
+        color: #666;
+        margin: 3px 0;
+    }
+
+    .refresh-indicator {
+        font-size: 11px;
+        color: #666;
+        text-align: right;
+        margin-bottom: 10px;
+    }
+
+    .refresh-indicator.error {
+        color: #dc3545;
+    }
+
+    .scheduled-tasks-section {
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 15px;
+        margin-bottom: 25px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    }
+
+    .scheduled-tasks-section h2 {
+        margin: 0 0 15px 0;
+        font-size: 16px;
+    }
+
+    .scheduled-tasks-section table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+
+    .scheduled-tasks-section th {
+        text-align: left;
+        padding: 10px;
+        background: #f8f9fa;
+        border-bottom: 2px solid #ddd;
+        font-weight: 600;
+        font-size: 12px;
+    }
+
+    .scheduled-tasks-section td {
+        padding: 10px;
+        border-bottom: 1px solid #eee;
+        font-size: 12px;
+    }
+
+    .scheduled-tasks-section tr:hover {
+        background: #f8f9fa;
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 3px 6px;
+        border-radius: 3px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+
+    .status-badge.enabled { background: #d4edda; color: #155724; }
+    .status-badge.disabled { background: #e2e3e5; color: #383d41; }
+
+    .task-link {
+        color: #417690;
+        text-decoration: none;
+        font-weight: 500;
+    }
+
+    .task-link:hover {
+        text-decoration: underline;
+    }
+
+    .task-path-small {
+        font-size: 10px;
+        color: #999;
+        display: block;
+        margin-top: 2px;
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 30px;
+        color: #999;
+    }
+
+    .loading {
+        text-align: center;
+        padding: 30px;
+        color: #666;
+    }
+</style>
+{% endblock %}
+
+{% block content_title %}
+    {% if app_label == 'sqlery' %}
+        <div style="margin-bottom: 25px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <div>
+                    <h1 style="margin: 0 0 5px 0; font-size: 24px;">📊 Sqlery</h1>
+                    <p style="margin: 0; color: #666;">Real-time job queue monitoring and management</p>
+                </div>
+                <div class="refresh-indicator" id="refreshIndicator">
+                    Loading...
+                </div>
+            </div>
+
+            <!-- Dashboard Stats -->
+            <div id="dashboardStats" class="dashboard-stats-grid">
+                <!-- Stats cards will be inserted here -->
+                <div class="loading">Loading dashboard stats...</div>
+            </div>
+
+            <!-- Scheduled Tasks Section -->
+            <div class="scheduled-tasks-section">
+                <h2>⏰ Scheduled Tasks</h2>
+                <div id="scheduledTasksTable">
+                    <div class="loading">Loading scheduled tasks...</div>
+                </div>
+            </div>
+        </div>
+    {% endif %}
+    <h2>📋 Recent Job Runs</h2>
+{% endblock %}
+
+{% block footer %}
+{{ block.super }}
+{% if app_label == 'sqlery' %}
+<script>
+(function() {
+    'use strict';
+
+    const REFRESH_INTERVAL = 3000; // 3 seconds
+    const API_URL = '{% url "sqlery:dashboard_stats" %}';
+    let refreshTimer = null;
+
+    /**
+     * Fetch dashboard data from API
+     */
+    async function fetchDashboardData() {
+        try {
+            const response = await fetch(API_URL, {
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            console.error('Failed to fetch dashboard data:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update dashboard stats
+     */
+    function updateDashboardStats(data) {
+        // Build workers card if multi-worker mode is enabled
+        let workersCard = '';
+        if (data.multi_worker_enabled && data.worker_stats) {
+            const ws = data.worker_stats;
+            workersCard = `
+                <div class="stat-card">
+                    <h3>Workers</h3>
+                    <div class="stat-value running">${ws.active}/${ws.max_workers}</div>
+                    <div class="stat-detail">
+                        Idle: ${ws.idle} | Busy: ${ws.busy}
+                        ${ws.dead > 0 ? ` | <span style="color: #dc3545;">Dead: ${ws.dead}</span>` : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        const statsHtml = `
+            <div class="stat-card">
+                <h3>Queued Jobs</h3>
+                <div class="stat-value queued">${data.job_counts.queued}</div>
+                <div class="stat-detail">Total: ${data.job_counts.total}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Running Jobs</h3>
+                <div class="stat-value running">${data.job_counts.running}</div>
+                <div class="stat-detail">Active workers</div>
+            </div>
+            ${workersCard}
+            <div class="stat-card">
+                <h3>Success (Total)</h3>
+                <div class="stat-value success">${data.job_counts.success}</div>
+                <div class="stat-detail">Last hour: ${data.recent_activity.recent_success}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Failed (Total)</h3>
+                <div class="stat-value failed">${data.job_counts.failed}</div>
+                <div class="stat-detail">Last hour: ${data.recent_activity.recent_failed}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Scheduled Tasks</h3>
+                <div class="stat-value enabled">${data.scheduled_tasks.enabled_count}</div>
+                <div class="stat-detail">
+                    Total: ${data.scheduled_tasks.total} |
+                    <span class="stat-value due" style="font-size: 12px;">Due: ${data.scheduled_tasks.due_count}</span>
+                </div>
+            </div>
+        `;
+        document.getElementById('dashboardStats').innerHTML = statsHtml;
+    }
+
+    /**
+     * Update scheduled tasks table
+     */
+    function updateScheduledTasksTable(tasks) {
+        const container = document.getElementById('scheduledTasksTable');
+
+        if (tasks.length === 0) {
+            container.innerHTML = '<div class="empty-state">No scheduled tasks</div>';
+            return;
+        }
+
+        const tableHtml = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Cron</th>
+                        <th>Queue</th>
+                        <th>Priority</th>
+                        <th>Status</th>
+                        <th>Next Run</th>
+                        <th>Last Run</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tasks.map(task => `
+                        <tr>
+                            <td>
+                                <a href="/admin/sqlery/scheduledtask/${task.id}/change/" class="task-link">
+                                    ${escapeHtml(task.name)}
+                                </a>
+                                <span class="task-path-small">${escapeHtml(task.task_path)}</span>
+                            </td>
+                            <td><code style="font-size: 11px;">${escapeHtml(task.cron_expression)}</code></td>
+                            <td>${escapeHtml(task.queue_name)}</td>
+                            <td>${task.priority}</td>
+                            <td><span class="status-badge ${task.enabled ? 'enabled' : 'disabled'}">${task.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                            <td>${formatDateTime(task.next_run_at)}</td>
+                            <td>${formatDateTime(task.last_run_at)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+        container.innerHTML = tableHtml;
+    }
+
+    /**
+     * Update refresh indicator
+     */
+    function updateRefreshIndicator(status, message) {
+        const indicator = document.getElementById('refreshIndicator');
+        if (indicator) {
+            indicator.textContent = message;
+            indicator.className = 'refresh-indicator ' + (status === 'error' ? 'error' : '');
+        }
+    }
+
+    /**
+     * Refresh dashboard
+     */
+    async function refreshDashboard() {
+        try {
+            const data = await fetchDashboardData();
+
+            // Update all sections
+            updateDashboardStats(data);
+            updateScheduledTasksTable(data.scheduled_tasks_list || []);
+
+            // Update refresh indicator
+            const now = new Date();
+            updateRefreshIndicator('success', `Last updated: ${now.toLocaleTimeString()}`);
+
+        } catch (error) {
+            updateRefreshIndicator('error', 'Failed to refresh');
+        }
+    }
+
+    /**
+     * Start auto-refresh
+     */
+    function startAutoRefresh() {
+        // Initial load
+        refreshDashboard();
+
+        // Set up interval
+        refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL);
+    }
+
+    /**
+     * Stop auto-refresh (cleanup)
+     */
+    function stopAutoRefresh() {
+        if (refreshTimer) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+        }
+    }
+
+    /**
+     * Utility: Escape HTML to prevent XSS
+     */
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    /**
+     * Utility: Format datetime
+     */
+    function formatDateTime(isoString) {
+        if (!isoString) return '-';
+        try {
+            const date = new Date(isoString);
+            return date.toLocaleString();
+        } catch {
+            return isoString;
+        }
+    }
+
+    // Initialize dashboard when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startAutoRefresh);
+    } else {
+        startAutoRefresh();
+    }
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', stopAutoRefresh);
+})();
+</script>
+{% endif %}
+{% endblock %}

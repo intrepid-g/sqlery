@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Workers - django-sqlery{% endblock %}
+
+{% block content %}
+<div>
+    <h1 class="text-2xl font-bold mb-6">Workers</h1>
+
+    <div class="bg-white shadow rounded-lg">
+        {% if workers %}
+        <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Node</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">PID</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Queues</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Jobs Processed</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Heartbeat</th>
+                </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200">
+                {% for worker in workers %}
+                <tr>
+                    <td class="px-6 py-4 text-sm font-mono text-gray-900">{{ str(worker.id)[:8] }}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">{{ worker.node_id }}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">{{ worker.pid }}</td>
+                    <td class="px-6 py-4">
+                        <span class="px-2 py-1 text-xs rounded
+                            {% if worker.status == 'idle' %}bg-green-100 text-green-800
+                            {% elif worker.status == 'busy' %}bg-blue-100 text-blue-800
+                            {% else %}bg-gray-100 text-gray-800{% endif %}">
+                            {{ worker.status }}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-500">{{ worker.queues|join(', ') }}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">{{ worker.jobs_processed }}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">
+                        {% if worker.last_heartbeat %}{{ worker.last_heartbeat.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}-{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="px-6 py-12 text-center text-gray-500">No workers found</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
