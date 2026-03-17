@@ -1,0 +1,6 @@
+# Lambda deployment requirements
+Django>=4.2
+sqlery[eventbridge]
+dj-database-url
+psycopg2-binary
+boto3>=1.34.0

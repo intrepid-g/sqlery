@@ -1,0 +1,28 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: sample_project/Dockerfile
+    command: python manage.py runserver 0.0.0.0:8855
+    volumes:
+      - .:/app
+      - ../src:/src  # Mount source for development
+      - sqlite_data:/app/data  # Persist SQLite database
+    ports:
+      - "8855:8855"
+    environment:
+      - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=mysite.settings
+      - PYTHONPATH=/app/../src
+      - SQLITE_PATH=/app/data/db.sqlite3
+    stdin_open: true
+    tty: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8855/admin/').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  sqlite_data:
