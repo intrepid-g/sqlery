@@ -9,8 +9,20 @@ def create_daemon_lease_if_missing(apps, schema_editor):
     therefore still exists from 0020 and this migration is a no-op.
     """
     connection = schema_editor.connection
-    table_names = connection.introspection.table_names()
-    if 'sqlery_daemon_lease' not in table_names:
+    # Use cursor directly to avoid introspection cache returning stale results
+    # during a migration run (table_names() may miss tables created earlier
+    # in the same migrate session on SQLite in-memory databases).
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlery_daemon_lease'"
+            if connection.vendor == 'sqlite'
+            else "SELECT 1 FROM information_schema.tables WHERE table_name='sqlery_daemon_lease'"
+        )
+        table_exists = cursor.fetchone() is not None
+    except Exception:
+        table_exists = 'sqlery_daemon_lease' in connection.introspection.table_names()
+    if not table_exists:
         schema_editor.create_model(apps.get_model('sqlery', 'DaemonLease'))
 
 
