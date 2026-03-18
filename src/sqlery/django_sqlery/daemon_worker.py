@@ -37,6 +37,8 @@ if 'DJANGO_SETTINGS_MODULE' not in os.environ:
 import django
 django.setup()
 
+from django.conf import settings as django_settings
+from sqlery.core.log_config import configure_logging
 from sqlery.django_sqlery.executor import TaskExecutor
 from sqlery.django_sqlery.settings import get_setting
 from sqlery.django_sqlery.worker_registry import cleanup_dead_workers
@@ -58,8 +60,7 @@ def signal_handler(signum, frame):
 
 def get_pid_file_path() -> Path:
     """Get path to PID file."""
-    from django.conf import settings
-    pid_dir = Path(settings.BASE_DIR) / 'tmp'
+    pid_dir = Path(django_settings.BASE_DIR) / 'tmp'
     pid_dir.mkdir(exist_ok=True)
     return pid_dir / 'sqlery_daemon.pid'
 
@@ -84,8 +85,7 @@ def remove_pid_file():
 
 def write_heartbeat():
     """Write heartbeat timestamp for monitoring."""
-    from django.conf import settings
-    heartbeat_file = Path(settings.BASE_DIR) / 'tmp' / 'sqlery_daemon.heartbeat'
+    heartbeat_file = Path(django_settings.BASE_DIR) / 'tmp' / 'sqlery_daemon.heartbeat'
     try:
         with open(heartbeat_file, 'w') as f:
             f.write(str(int(time.time())))
@@ -167,13 +167,14 @@ def run_daemon():
 
 
 if __name__ == '__main__':
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+    # # Old: always log to stdout (captured by parent's raw file → grows forever)
+    # logging.basicConfig(
+    #     level=logging.INFO,
+    #     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    #     handlers=[
+    #         logging.StreamHandler(sys.stdout)
+    #     ]
+    # )
 
+    configure_logging('sqlery_daemon.log', debug_stream=sys.stdout)
     run_daemon()

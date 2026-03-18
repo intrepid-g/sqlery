@@ -8,17 +8,16 @@ The worker runs persistently, polling for jobs until terminated by the daemon.
 
 import sys
 import os
-import logging
 
 
 def main():
     """Main entry point for worker runner."""
-    # Configure logging to stdout
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        handlers=[logging.StreamHandler(sys.stderr)],
-    )
+    # # Old: always log to stderr (captured by parent's raw file → grows forever)
+    # logging.basicConfig(
+    #     level=logging.INFO,
+    #     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    #     handlers=[logging.StreamHandler(sys.stderr)],
+    # )
 
     # Check if Django settings module is set in environment
     # If so, initialize Django BEFORE any sqlery imports
@@ -30,6 +29,11 @@ def main():
         # Setup Django
         import django
         django.setup()
+
+    # Configure logging after Django setup so compat layer works
+    # (sqlery imports trigger sqlery/__init__.py which needs Django first)
+    from sqlery.core.log_config import configure_logging
+    configure_logging(f'sqlery_worker_{os.getpid()}.log')
 
     # Import and run worker (mode detection will happen correctly now)
     from sqlery.core.worker import WorkerProcess
