@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 
+from .log_config import is_debug_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,15 +186,26 @@ class DaemonManager:
             # Use core daemon runner
             daemon_script_path = Path(__file__).parent / 'daemon_runner.py'
 
-        # Get log file path
-        log_file_path = self.pid_dir / 'sqlery_daemon.log'
-
-        # Open log file for daemon output
-        try:
-            log_file = open(log_file_path, 'a')
-        except Exception as e:
-            logger.warning(f"Failed to open log file {log_file_path}: {e}")
+        # Debug mode: redirect stdout/stderr to raw log file (grows forever).
+        # Normal mode: subprocess configures its own RotatingFileHandler; parent
+        # sends stdout/stderr to DEVNULL since the child manages its own logging.
+        if is_debug_mode():
+            log_file_path = self.pid_dir / 'sqlery_daemon.log'
+            try:
+                log_file = open(log_file_path, 'a')
+            except Exception as e:
+                logger.warning(f"Failed to open log file {log_file_path}: {e}")
+                log_file = subprocess.DEVNULL
+        else:
             log_file = subprocess.DEVNULL
+
+        # # Old: always redirect to raw log file (grows forever)
+        # log_file_path = self.pid_dir / 'sqlery_daemon.log'
+        # try:
+        #     log_file = open(log_file_path, 'a')
+        # except Exception as e:
+        #     logger.warning(f"Failed to open log file {log_file_path}: {e}")
+        #     log_file = subprocess.DEVNULL
 
         # Spawn subprocess
         try:

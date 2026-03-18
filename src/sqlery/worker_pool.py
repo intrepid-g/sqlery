@@ -5,6 +5,7 @@ import sys
 import subprocess
 from pathlib import Path
 
+from sqlery.core.log_config import is_debug_mode
 from sqlery.django_sqlery.worker_registry import (
     cleanup_dead_workers,
     count_active_workers,
@@ -21,12 +22,23 @@ def spawn_worker():
     Returns:
         subprocess.Popen instance of the spawned worker
     """
-    # Create log file for worker output (for debugging)
-    from django.conf import settings
-    log_dir = Path(settings.BASE_DIR) / 'tmp'
-    log_dir.mkdir(exist_ok=True)
-    worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
-    worker_log_file = open(worker_log, 'a')
+    # Debug mode: redirect to raw log file (grows forever).
+    # Normal mode: subprocess configures its own RotatingFileHandler.
+    if is_debug_mode():
+        from django.conf import settings
+        log_dir = Path(settings.BASE_DIR) / 'tmp'
+        log_dir.mkdir(exist_ok=True)
+        worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
+        worker_log_file = open(worker_log, 'a')
+    else:
+        worker_log_file = subprocess.DEVNULL
+
+    # # Old: always redirect to raw log file (grows forever)
+    # from django.conf import settings
+    # log_dir = Path(settings.BASE_DIR) / 'tmp'
+    # log_dir.mkdir(exist_ok=True)
+    # worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
+    # worker_log_file = open(worker_log, 'a')
 
     # Run worker as module to preserve package structure for relative imports
     # Use -m to run as module: python -m sqlery.worker_process
