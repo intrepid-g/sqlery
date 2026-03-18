@@ -13,6 +13,8 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from .log_config import is_debug_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,14 +77,28 @@ class WorkerPoolManager:
         Returns:
             subprocess.Popen instance of the spawned worker
         """
-        log_dir = self._get_log_dir()
-        worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
-
-        try:
-            worker_log_file = open(worker_log, 'a')
-        except Exception as e:
-            logger.warning(f"Failed to open log file {worker_log}: {e}")
+        # Debug mode: redirect stdout to raw log file (grows forever).
+        # Normal mode: subprocess configures its own RotatingFileHandler; parent
+        # sends stdout to DEVNULL since the child manages its own logging.
+        if is_debug_mode():
+            log_dir = self._get_log_dir()
+            worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
+            try:
+                worker_log_file = open(worker_log, 'a')
+            except Exception as e:
+                logger.warning(f"Failed to open log file {worker_log}: {e}")
+                worker_log_file = subprocess.DEVNULL
+        else:
             worker_log_file = subprocess.DEVNULL
+
+        # # Old: always redirect to raw log file (grows forever)
+        # log_dir = self._get_log_dir()
+        # worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
+        # try:
+        #     worker_log_file = open(worker_log, 'a')
+        # except Exception as e:
+        #     logger.warning(f"Failed to open log file {worker_log}: {e}")
+        #     worker_log_file = subprocess.DEVNULL
 
         # Spawn worker subprocess using core worker module
         # The worker will run jobs from the specified queues
