@@ -223,7 +223,7 @@ class CleanupManager:
             status__in=['failed', 'archived'],
             failure_ttl__isnull=False,
             finished_at__isnull=False,
-        )
+        ).exclude(failure_ttl=-1)  # -1 means keep forever
 
         for job in failed_jobs:
             if job.finished_at + timedelta(seconds=job.failure_ttl) < now:
