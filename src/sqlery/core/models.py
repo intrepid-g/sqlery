@@ -107,7 +107,7 @@ class QueuedJob(SQLModel, table=True):
     # TTL (time-to-live)
     ttl: int | None = Field(default=None, description="Max seconds job can stay queued before expiring")
     result_ttl: int | None = Field(default=None, description="Seconds to keep successful job result")
-    failure_ttl: int | None = Field(default=None, description="Seconds to keep failed job result")
+    failure_ttl: int | None = Field(default=None, description="Seconds to keep failed job result (-1 = forever)")
 
     # Optimistic locking
     version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
