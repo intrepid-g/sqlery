@@ -527,7 +527,7 @@ class QueuedJob(models.Model):
     failure_ttl = models.IntegerField(
         null=True,
         blank=True,
-        help_text="Seconds to keep failed job data (None = use global)",
+        help_text="Seconds to keep failed job data (-1 = forever, None = use global)",
     )
 
     # Optional reference to scheduled task
