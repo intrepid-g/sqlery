@@ -2,7 +2,13 @@
 
 import logging
 
+from .executor import TaskExecutor
 from .subprocess_executor import get_execution_strategy, run_scheduler_subprocess, run_worker_subprocess
+
+try:
+    from django_tasks import task
+except ImportError:
+    task = None
 
 logger = logging.getLogger(__name__)
 
@@ -75,42 +81,48 @@ def _process_queue_subprocess(queue_name: str | None = None):
 
 def _enqueue_django_tasks():
     """Enqueue jobs for due tasks via django-tasks."""
-    try:
-        from django_tasks import task
-
-        @task()
-        def enqueue_due_tasks():
-            from .executor import TaskExecutor
-
-            executor = TaskExecutor()
-            return executor.run_due_tasks()
-
-        enqueue_due_tasks()
-        logger.info("Triggered scheduler via django-tasks")
-
-    except ImportError:
+    if task is None:
         logger.warning("django-tasks not available, falling back to synchronous")
         _enqueue_synchronously()
+        return
+
+    # try:
+    #     from django_tasks import task  # moved to top-level
+    # except ImportError:
+    #     ...
+
+    @task()
+    def enqueue_due_tasks():
+        # from .executor import TaskExecutor  # moved to top-level
+
+        executor = TaskExecutor()
+        return executor.run_due_tasks()
+
+    enqueue_due_tasks()
+    logger.info("Triggered scheduler via django-tasks")
 
 
 def _process_queue_django_tasks(queue_name: str | None = None):
     """Process queue via django-tasks."""
-    try:
-        from django_tasks import task
-
-        @task()
-        def process_queue():
-            from .executor import TaskExecutor
-
-            executor = TaskExecutor()
-            return executor.run_queue_workers(queue_name=queue_name, once=True)
-
-        process_queue()
-        logger.info("Triggered worker via django-tasks")
-
-    except ImportError:
+    if task is None:
         logger.warning("django-tasks not available, falling back to synchronous")
         _process_queue_synchronously(queue_name)
+        return
+
+    # try:
+    #     from django_tasks import task  # moved to top-level
+    # except ImportError:
+    #     ...
+
+    @task()
+    def process_queue():
+        # from .executor import TaskExecutor  # moved to top-level
+
+        executor = TaskExecutor()
+        return executor.run_queue_workers(queue_name=queue_name, once=True)
+
+    process_queue()
+    logger.info("Triggered worker via django-tasks")
 
 
 # ===== Synchronous/Thread Mode =====
@@ -118,7 +130,7 @@ def _process_queue_django_tasks(queue_name: str | None = None):
 
 def _enqueue_synchronously():
     """Enqueue jobs for due tasks synchronously (blocking)."""
-    from .executor import TaskExecutor
+    # from .executor import TaskExecutor  # moved to top-level
 
     executor = TaskExecutor()
     executor.run_due_tasks()
@@ -127,7 +139,7 @@ def _enqueue_synchronously():
 
 def _process_queue_synchronously(queue_name: str | None = None):
     """Process queue synchronously (blocking)."""
-    from .executor import TaskExecutor
+    # from .executor import TaskExecutor  # moved to top-level
 
     executor = TaskExecutor()
     executor.run_queue_workers(queue_name=queue_name)

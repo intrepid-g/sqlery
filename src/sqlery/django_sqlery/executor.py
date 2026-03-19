@@ -2,14 +2,24 @@
 
 import contextvars
 import logging
+import os
+import signal
+import subprocess
+import sys
+import time
 import traceback as tb
+from datetime import timedelta
+
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from .db_compat import atomic_claim_job_queryset
+from .models import ScheduledTask, QueuedJob
+from .subprocess_executor import get_manage_py_path
+from .utils import import_task, calculate_next_run
 
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
-from django.db import transaction
-from django.utils import timezone
-from .models import ScheduledTask, QueuedJob
-from .utils import import_task, calculate_next_run
-from .db_compat import atomic_claim_job_queryset
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +167,7 @@ class TaskExecutor:
                     task.cron_expression, base_time=timezone.now()
                 )
             elif task.schedule_type == "interval":
-                from datetime import timedelta
+                # from datetime import timedelta  # moved to top-level
                 task.next_run_at = timezone.now() + timedelta(
                     seconds=task.get_interval_seconds()
                 )
@@ -193,7 +203,7 @@ class TaskExecutor:
             Requires Postgres for SKIP LOCKED support. On other databases,
             falls back to SELECT FOR UPDATE which may block instead of skip.
         """
-        from django.db.models import Q
+        # from django.db.models import Q  # moved to top-level
 
         now = timezone.now()
 
@@ -273,7 +283,7 @@ class TaskExecutor:
         try:
             # Set up timeout if specified
             if job.timeout_seconds:
-                import signal
+                # import signal  # moved to top-level
 
                 def timeout_handler(signum, frame):
                     raise TimeoutError(
@@ -366,7 +376,7 @@ class TaskExecutor:
         Returns:
             QueuedJob: The new retry job
         """
-        from datetime import timedelta
+        # from datetime import timedelta  # moved to top-level
 
         # Calculate retry delay
         delay_seconds = failed_job.calculate_retry_delay()
@@ -482,7 +492,7 @@ class TaskExecutor:
         Args:
             queue_name (str, optional): Only check specific queue
         """
-        from datetime import timedelta
+        # from datetime import timedelta  # moved to top-level
 
         now = timezone.now()
 
@@ -559,9 +569,9 @@ class TaskExecutor:
             str|None: "SIGTERM" if killed gracefully, "SIGKILL" if force-killed,
                      None if process already dead or error
         """
-        import os
-        import signal
-        import time
+        # import os  # moved to top-level
+        # import signal  # moved to top-level
+        # import time  # moved to top-level
 
         try:
             # Check if process exists
@@ -647,10 +657,10 @@ class TaskExecutor:
         Args:
             queue_name (str, optional): Queue name to pass to next worker
         """
-        import subprocess
-        import sys
-        import os
-        from .subprocess_executor import get_manage_py_path
+        # import subprocess  # moved to top-level
+        # import sys  # moved to top-level
+        # import os  # moved to top-level
+        # from .subprocess_executor import get_manage_py_path  # moved to top-level
 
         try:
             manage_py = get_manage_py_path()

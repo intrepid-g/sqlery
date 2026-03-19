@@ -10,6 +10,11 @@ from abc import ABC, abstractmethod
 from typing import Any
 from datetime import datetime
 
+try:
+    from django.conf import settings as _django_settings
+except ImportError:
+    _django_settings = None
+
 
 # Global backend instance (initialized once)
 _backend = None
@@ -678,9 +683,9 @@ def _detect_mode() -> str:
     # Check if Django is configured and available
     if 'django' in sys.modules:
         try:
-            from django.conf import settings
+            # from django.conf import settings  # moved to top-level
             # Check if Django settings are configured
-            if settings.configured:
+            if _django_settings is not None and _django_settings.configured:
                 return 'django'
         except ImportError:
             pass
@@ -699,11 +704,11 @@ def _initialize_backend():
 
     if mode == 'django':
         # from .django_sqlery.backend import DjangoBackend  # Wrong: looks in compat/django_sqlery/
-        from sqlery.django_sqlery.backend import DjangoBackend
+        from sqlery.django_sqlery.backend import DjangoBackend  # Inline to avoid circular import: compat -> backend -> compat
         _backend = DjangoBackend()
     else:
         # from .fastapi_sqlery.backend import SQLAlchemyBackend  # Wrong: looks in compat/fastapi_sqlery/
-        from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+        from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend  # Inline to avoid circular import: compat -> backend -> compat
         _backend = SQLAlchemyBackend()
 
     return _backend
@@ -720,11 +725,11 @@ def _initialize_config():
 
     if mode == 'django':
         # from .django_sqlery.config import DjangoConfig  # Wrong: looks in compat/django_sqlery/
-        from sqlery.django_sqlery.config import DjangoConfig
+        from sqlery.django_sqlery.config import DjangoConfig  # Inline to avoid circular import: compat -> backend -> compat
         _config = DjangoConfig()
     else:
         # from .fastapi_sqlery.config import StandaloneConfig  # Wrong: looks in compat/fastapi_sqlery/
-        from sqlery.fastapi_sqlery.config import StandaloneConfig
+        from sqlery.fastapi_sqlery.config import StandaloneConfig  # Inline to avoid circular import: compat -> backend -> compat
         _config = StandaloneConfig()
 
     return _config

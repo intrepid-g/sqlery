@@ -38,8 +38,13 @@ import django
 django.setup()
 
 from django.conf import settings as django_settings
+from django.utils import timezone
+
 from sqlery.core.log_config import configure_logging
+from sqlery.django_sqlery.deadlines import enforce_deadlines, rebuild_deadlines
 from sqlery.django_sqlery.executor import TaskExecutor
+from sqlery.django_sqlery.intervention import do_manual_intervention
+from sqlery.django_sqlery.models import DaemonCommand
 from sqlery.django_sqlery.settings import get_setting
 from sqlery.django_sqlery.worker_registry import cleanup_dead_workers
 from sqlery.worker_pool import ensure_worker_pool, stop_all_workers, get_worker_pool_status
@@ -93,6 +98,53 @@ def write_heartbeat():
         logger.error(f"Failed to write heartbeat: {e}")
 
 
+def _process_pending_commands():
+    """Read and execute pending daemon commands from DB.
+
+    Commands are written by the API (e.g., manual intervention button)
+    and picked up here each daemon cycle.
+    """
+    # from django.utils import timezone as tz  # moved to top-level
+
+    # try:
+    #     from .models import DaemonCommand  # moved to top-level
+    # except Exception:
+    #     return  # Model not yet migrated
+
+    pending = DaemonCommand.objects.filter(status='pending').order_by('created_at')
+
+    for cmd in pending:
+        cmd.status = 'processing'
+        cmd.save(update_fields=['status'])
+
+        try:
+            if cmd.command == 'manual_intervention':
+                # from .intervention import do_manual_intervention  # moved to top-level
+                result = do_manual_intervention(cmd.payload)
+            elif cmd.command == 'restart_workers':
+                stopped = stop_all_workers()
+                pool_status = ensure_worker_pool()
+                result = {'stopped': stopped, 'spawned': pool_status.get('spawned', 0)}
+            elif cmd.command == 'cleanup_now':
+                dead_count = cleanup_dead_workers()
+                result = {'dead_workers_cleaned': dead_count}
+            elif cmd.command == 'enforce_deadlines':
+                enforced = enforce_deadlines()
+                result = {'enforced': enforced}
+            else:
+                result = {'error': f'Unknown command: {cmd.command}'}
+
+            cmd.status = 'completed'
+            cmd.result = result
+        except Exception as e:
+            logger.error(f"Command {cmd.command} failed: {e}", exc_info=True)
+            cmd.status = 'failed'
+            cmd.result = {'error': str(e)}
+
+        cmd.processed_at = timezone.now()
+        cmd.save(update_fields=['status', 'result', 'processed_at'])
+
+
 def run_daemon():
     """Main daemon loop - manages worker pool and runs scheduler.
 
@@ -116,6 +168,11 @@ def run_daemon():
     executor = TaskExecutor()
 
     try:
+        # Rebuild deadline files from DB (in case /tmp was cleared)
+        rebuilt = rebuild_deadlines()
+        if rebuilt:
+            logger.info(f"Rebuilt {rebuilt} deadline file(s) from DB on startup")
+
         # Initial worker pool setup
         pool_status = ensure_worker_pool()
         logger.info(f"Worker pool initialized: {pool_status['spawned']} workers spawned")
@@ -131,6 +188,14 @@ def run_daemon():
                 dead_count = cleanup_dead_workers()
                 if dead_count > 0:
                     logger.info(f"Cleaned up {dead_count} dead workers")
+
+                # Enforce job deadlines (non-blocking two-phase kill)
+                enforced = enforce_deadlines()
+                if enforced > 0:
+                    logger.info(f"Enforced {enforced} overdue deadline(s)")
+
+                # Process daemon commands from DB (manual intervention, etc.)
+                _process_pending_commands()
 
                 # Ensure worker pool is healthy
                 pool_status = ensure_worker_pool()

@@ -9,6 +9,9 @@ import logging
 import re
 import time
 
+from django.db import OperationalError, connection, connections
+from django.db.utils import DatabaseError
+
 logger = logging.getLogger(__name__)
 
 # Transient error patterns that are safe to retry
@@ -47,8 +50,8 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            from django.db import OperationalError
-            from django.db.utils import DatabaseError
+            # from django.db import OperationalError  # moved to top-level
+            # from django.db.utils import DatabaseError  # moved to top-level
 
             last_exc = None
             for attempt in range(max_retries + 1):
@@ -71,7 +74,7 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
 
                     # Force reconnect before retry
                     try:
-                        from django.db import connections
+                        # from django.db import connections  # moved to top-level
                         connections.close_all()
                     except Exception:
                         pass
@@ -99,7 +102,7 @@ def configure_connection_resilience(for_job_child: bool = False):
 
     Values come from DJANGO_SQL_JOBS settings with sensible defaults.
     """
-    from django.db import connection
+    # from django.db import connection  # moved to top-level
 
     try:
         vendor = connection.vendor

@@ -5,9 +5,18 @@ Provides database-agnostic operations that work across both backends:
 - boto3 RDS Data API support for serverless PostgreSQL
 """
 
-from django.db import connection, transaction
-from django.utils import timezone
 import logging
+
+from django.db import connection, transaction
+from django.db.models import F
+from django.utils import timezone
+
+from .settings import get_setting
+
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +90,8 @@ def atomic_claim_job_sqlite(job, worker):
     Returns:
         bool: True if claimed successfully, False if version conflict or already claimed
     """
-    from .models import QueuedJob
-    from django.db.models import F
+    from .models import QueuedJob  # circular: models.py imports db_compat
+    # from django.db.models import F  # moved to top-level
 
     # Remember the version we read from the SELECT
     expected_version = job.version
@@ -122,8 +131,8 @@ def atomic_claim_job_postgres(job, worker):
     Returns:
         bool: True if claimed successfully, False if version conflict (should not happen)
     """
-    from django.db.models import F
-    from .models import QueuedJob
+    # from django.db.models import F  # moved to top-level
+    from .models import QueuedJob  # circular: models.py imports db_compat
 
     expected_version = job.version
 
@@ -177,8 +186,12 @@ def get_boto3_rds_client():
         boto3 client or None if not configured
     """
     try:
-        import boto3
-        from .settings import get_setting
+        # import boto3  # moved to top-level (optional)
+        # from .settings import get_setting  # moved to top-level
+
+        if boto3 is None:
+            logger.warning("boto3 not installed, RDS Data API not available")
+            return None
 
         cluster_arn = get_setting('RDS_DATA_API_CLUSTER_ARN')
         secret_arn = get_setting('RDS_DATA_API_SECRET_ARN')
@@ -188,9 +201,6 @@ def get_boto3_rds_client():
             return None
 
         return boto3.client('rds-data')
-    except ImportError:
-        logger.warning("boto3 not installed, RDS Data API not available")
-        return None
     except Exception as e:
         logger.error(f"Failed to initialize boto3 RDS client: {e}")
         return None
@@ -213,7 +223,7 @@ def execute_rds_data_api_query(sql, parameters=None):
     if not client:
         raise RuntimeError("RDS Data API not configured")
 
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     cluster_arn = get_setting('RDS_DATA_API_CLUSTER_ARN')
     secret_arn = get_setting('RDS_DATA_API_SECRET_ARN')
@@ -236,5 +246,5 @@ def is_using_rds_data_api():
     Returns:
         bool: True if RDS Data API is configured and enabled
     """
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
     return get_setting('USE_RDS_DATA_API', False) and get_boto3_rds_client() is not None

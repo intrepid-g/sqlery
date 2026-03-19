@@ -1,7 +1,10 @@
 """Django-agnostic scheduled task management."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from ..compat import get_backend
+from ..crontab import next_cron_occurrence
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,7 @@ class Scheduler:
             backend: DatabaseBackend instance (auto-detected if not provided)
         """
         if backend is None:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
         self.backend = backend
 
@@ -105,7 +108,7 @@ class Scheduler:
             next_run = self.calculate_next_run(task.cron_expression)
             self.backend.update_scheduled_task_next_run(task.id, next_run)
         elif schedule_type == 'interval':
-            from datetime import timedelta
+            # from datetime import timedelta  # moved to top-level
             interval = getattr(task, 'get_interval_seconds', lambda: 0)()
             if interval > 0:
                 next_run = datetime.now(timezone.utc) + timedelta(seconds=interval)
@@ -134,7 +137,7 @@ class Scheduler:
         Returns:
             Next run datetime (UTC)
         """
-        from ..crontab import next_cron_occurrence
+        # from ..crontab import next_cron_occurrence  # moved to top-level
 
         if base_time is None:
             base_time = datetime.now(timezone.utc)

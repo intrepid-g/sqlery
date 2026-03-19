@@ -4,13 +4,16 @@ This backend uses SQLModel/SQLAlchemy for all database operations.
 """
 
 import os
+import socket
 from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
+
+from sqlalchemy import and_, or_, text
 from sqlmodel import Session, select, func, delete
-from sqlalchemy import and_, or_
 
 from ..compat import DatabaseBackend
 from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker
+from .database import get_session
 
 
 class SQLAlchemyBackend(DatabaseBackend):
@@ -21,7 +24,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
     def __init__(self):
         """Initialize SQLAlchemy backend."""
-        from .database import get_session
+        # from .database import get_session  # moved to top-level
 
         self._get_session = get_session
 
@@ -257,7 +260,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
     def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None, jobs_processed: int | None = None):
         """Update or create worker heartbeat."""
-        import socket
+        # import socket  # moved to top-level
 
         with self._get_session() as session:
             worker = session.get(Worker, worker_id)
@@ -305,7 +308,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             if dry_run:
                 # Count without deleting
-                from sqlmodel import select, func
+                # from sqlmodel import select, func  # moved to top-level
                 count_stmt = select(func.count(QueuedJob.id))
                 if status:
                     count_stmt = count_stmt.where(QueuedJob.status == status)
@@ -356,7 +359,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             if dry_run:
                 # Count without deleting — convert delete to count query
-                from sqlmodel import func
+                # from sqlmodel import func  # moved to top-level
                 count_stmt = select(func.count(QueuedJob.id))
                 if status:
                     count_stmt = count_stmt.where(QueuedJob.status == status)
@@ -412,7 +415,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
     def vacuum_database(self) -> dict:
         """Run database vacuum/optimize (PostgreSQL VACUUM)."""
-        from sqlalchemy import text
+        # from sqlalchemy import text  # moved to top-level
 
         try:
             with self._get_session() as session:

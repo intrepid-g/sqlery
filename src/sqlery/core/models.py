@@ -4,7 +4,8 @@ These models are automatically generated from the unified schemas
 to ensure consistency with Django models.
 """
 
-from datetime import datetime, UTC
+import os
+from datetime import datetime, timedelta, UTC
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 # Needed for SQLModel forward-reference string annotations in Relationship() — union syntax ("X | None")
 # is not supported by SQLAlchemy's string resolver, so Optional["X"] must be used instead.
@@ -152,7 +153,7 @@ class QueuedJob(SQLModel, table=True):
 
     def mark_running(self):
         """Mark job as running and record worker PID."""
-        import os
+        # import os  # moved to top-level
         self.status = "running"
         self.started_at = datetime.now(UTC)
         self.worker_pid = os.getpid()
@@ -301,6 +302,6 @@ class Worker(SQLModel, table=True):
         """Check if worker is alive based on heartbeat."""
         if self.status == "dead":
             return False
-        from datetime import timedelta
+        # from datetime import timedelta  # moved to top-level
         threshold = datetime.now(UTC) - timedelta(seconds=timeout_seconds)
         return self.last_heartbeat >= threshold

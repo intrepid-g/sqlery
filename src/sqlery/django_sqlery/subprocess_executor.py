@@ -1,10 +1,19 @@
 """Subprocess execution wrappers to prevent memory leaks."""
 
+import logging
+import os
 import subprocess
 import sys
-import os
-import logging
 from typing import Literal
+
+from django.conf import settings
+
+from .settings import get_setting
+
+try:
+    import django_tasks
+except ImportError:
+    django_tasks = None
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +31,7 @@ def get_manage_py_path() -> str:
         RuntimeError: If BASE_DIR is not configured or manage.py not found
     """
     try:
-        from django.conf import settings
+        # from django.conf import settings  # moved to top-level
 
         # Get Django project root
         if not hasattr(settings, 'BASE_DIR'):
@@ -151,7 +160,7 @@ def should_use_subprocess() -> bool:
     Returns:
         True if subprocess mode should be used
     """
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     execution_mode = get_setting("EXECUTION_MODE", "auto")
 
@@ -163,10 +172,12 @@ def should_use_subprocess() -> bool:
         return False
     elif execution_mode == "auto":
         # Auto mode: prefer django-tasks if available, otherwise subprocess
-        try:
-            import django_tasks
+        # try:
+        #     import django_tasks  # moved to top-level (optional)
+        # except ImportError:
+        if django_tasks is not None:
             return False  # Use django-tasks
-        except ImportError:
+        else:
             return True  # Fallback to subprocess
     else:
         logger.warning(f"Unknown EXECUTION_MODE: {execution_mode}, using auto")
@@ -179,7 +190,7 @@ def get_execution_strategy() -> Literal["subprocess", "django-tasks", "thread"]:
     Returns:
         One of: 'subprocess', 'django-tasks', 'thread'
     """
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     execution_mode = get_setting("EXECUTION_MODE", "auto")
 
@@ -189,22 +200,26 @@ def get_execution_strategy() -> Literal["subprocess", "django-tasks", "thread"]:
         return "thread"
     elif execution_mode == "django-tasks":
         # Check if django-tasks is available
-        try:
-            import django_tasks
+        # try:
+        #     import django_tasks  # moved to top-level (optional)
+        # except ImportError:
+        if django_tasks is not None:
             return "django-tasks"
-        except ImportError:
+        else:
             logger.warning("EXECUTION_MODE is 'django-tasks' but not installed, falling back to subprocess")
             return "subprocess"
     elif execution_mode == "auto":
         # Auto mode: prefer django-tasks if available, otherwise subprocess
-        try:
-            import django_tasks
+        # try:
+        #     import django_tasks  # moved to top-level (optional)
+        # except ImportError:
+        if django_tasks is not None:
             use_django_tasks = get_setting("USE_DJANGO_TASKS", True)
             if use_django_tasks:
                 return "django-tasks"
             else:
                 return "subprocess"
-        except ImportError:
+        else:
             return "subprocess"
     else:
         logger.warning(f"Unknown EXECUTION_MODE: {execution_mode}, using subprocess")

@@ -29,6 +29,11 @@ from logging.handlers import RotatingFileHandler
 
 from sqlery.compat import get_config, is_django_mode
 
+try:
+    from django.conf import settings as django_settings
+except ImportError:
+    django_settings = None
+
 LOG_FORMAT = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 LOG_BACKUP_COUNT = 3
@@ -45,8 +50,8 @@ def get_log_dir() -> Path:
     Must be called after Django setup if in Django mode.
     """
     if is_django_mode():
-        from django.conf import settings
-        log_dir = Path(settings.BASE_DIR) / 'tmp'
+        # from django.conf import settings  # moved to top-level (try/except)
+        log_dir = Path(django_settings.BASE_DIR) / 'tmp'
     else:
         log_dir = Path(get_config('LOG_DIR', '/tmp/sqlery'))
     log_dir.mkdir(exist_ok=True, parents=True)

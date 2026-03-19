@@ -1,20 +1,28 @@
 """Atomic job claiming logic for multi-worker architecture."""
 
-from django.db import transaction, models
+import logging
+import os
+import socket
+from datetime import timedelta
+
+from django.db import connection, models, transaction
+from django.db.models import F
 from django.utils import timezone
 
+from sqlery.core.db_resilience import retry_on_db_error
+from sqlery.core.registry import track_job_start, track_job_finish
+from sqlery.core.utils import parse_rate_limit
+
+from .db_compat import atomic_claim_job_queryset, atomic_claim_job, is_sqlite
 from .models import QueuedJob, Worker, TagLock
 from .settings import get_setting
 # from .registries import track_job_start, track_job_finish  # Promoted to core
-from sqlery.core.registry import track_job_start, track_job_finish
-from .db_compat import atomic_claim_job_queryset, atomic_claim_job, is_sqlite
-from sqlery.core.db_resilience import retry_on_db_error
 
 
 def get_node_id():
     """Get the node identifier (hostname or NODE_ID env var)."""
-    import socket
-    import os
+    # import socket  # moved to top-level
+    # import os  # moved to top-level
     return os.environ.get("NODE_ID", socket.gethostname())
 
 
@@ -32,7 +40,7 @@ def ensure_tag_locks_exist(tags):
     if not tags:
         return
 
-    from .models import TagLock
+    # from .models import TagLock  # moved to top-level
 
     # Check which tags already exist (single query)
     existing = set(
@@ -54,7 +62,7 @@ def ensure_all_configured_tags():
     This should be called on worker startup to populate the TagLock
     table with all tags from TAG_RATE_LIMITS and TAG_CONCURRENCY_LIMITS.
     """
-    from .models import TagLock
+    # from .models import TagLock  # moved to top-level
 
     all_tags = set()
 
@@ -132,8 +140,8 @@ def check_tag_rate_limits(job):
         return True  # No limits configured
 
     # from .rate_limit_utils import parse_rate_limit  # Was broken: no such file in django_sqlery
-    from sqlery.core.utils import parse_rate_limit
-    import logging
+    # from sqlery.core.utils import parse_rate_limit  # moved to top-level
+    # import logging  # moved to top-level
 
     logger = logging.getLogger(__name__)
 
@@ -187,7 +195,7 @@ def check_job_dependencies(job):
     if not job.dependencies:
         return True  # No dependencies = can run immediately
 
-    import logging
+    # import logging  # moved to top-level
     logger = logging.getLogger(__name__)
 
     # Check dependency status
@@ -290,8 +298,8 @@ def expire_ttl_jobs():
     Jobs with a ttl value that have been queued longer than ttl seconds
     are marked as failed with termination_reason='expired'.
     """
-    from datetime import timedelta
-    import logging
+    # from datetime import timedelta  # moved to top-level
+    # import logging  # moved to top-level
 
     logger = logging.getLogger(__name__)
     now = timezone.now()
@@ -329,7 +337,7 @@ def claim_next_job_with_queue_priority(worker, queues: list[str] | None = None):
     Returns:
         QueuedJob instance if claimed, None if no jobs available
     """
-    from django.db import connection, models
+    # from django.db import connection, models  # moved to top-level
 
     if queues is None:
         queues = get_setting("WORKER_QUEUES", ["default"])
@@ -462,7 +470,7 @@ def release_job(worker, job, status, **kwargs):
         status: Final status ('success' or 'failed')
         **kwargs: Additional fields to update (output, error, traceback, etc.)
     """
-    from django.db.models import F
+    # from django.db.models import F  # moved to top-level
 
     with transaction.atomic():
         # Prepare update fields
@@ -495,7 +503,7 @@ def release_job(worker, job, status, **kwargs):
         if rows_updated == 0:
             # Job was modified by another process — most likely displaced by a newer
             # named job (force_stop incremented the version and deleted the row).
-            import logging
+            # import logging  # moved to top-level
             logger = logging.getLogger(__name__)
             logger.warning(
                 f"Job {job.id} version conflict in release_job - another process modified it"

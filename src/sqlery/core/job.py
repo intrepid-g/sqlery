@@ -4,6 +4,8 @@ from typing import Callable, Any
 from datetime import datetime
 from functools import update_wrapper
 
+from .job_queue import enqueue as core_enqueue, enqueue_at as core_enqueue_at
+
 
 class JobWrapper:
     """Wrapper for functions decorated with @job.
@@ -92,7 +94,7 @@ class JobWrapper:
             ...     to_email='user@example.com'
             ... )
         """
-        from .job_queue import enqueue as core_enqueue
+        # from .job_queue import enqueue as core_enqueue  # moved to top-level
 
         return core_enqueue(
             self.task_path,
@@ -180,7 +182,7 @@ class JobWrapper:
             ...     to_email='user@example.com'
             ... )
         """
-        from .job_queue import enqueue_at as core_enqueue_at
+        # from .job_queue import enqueue_at as core_enqueue_at  # moved to top-level
 
         return core_enqueue_at(
             self.task_path,

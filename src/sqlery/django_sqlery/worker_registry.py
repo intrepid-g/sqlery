@@ -1,10 +1,12 @@
 """Worker registration and lifecycle management."""
 
+import logging
 import os
 import signal
+
 from django.utils import timezone
 
-from .models import Worker
+from .models import QueuedJob, Worker
 from .settings import get_setting
 from .worker_claiming import get_node_id
 
@@ -110,7 +112,7 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
 
     # Clean up ghost "running" jobs — jobs stuck in running status with no
     # active worker pointing at them (e.g. from a previous crash / force-stop).
-    from .models import QueuedJob
+    # from .models import QueuedJob  # moved to top-level
     active_worker_job_ids = set(
         Worker.objects.filter(status__in=["idle", "busy"])
         .exclude(current_job__isnull=True)
@@ -121,8 +123,8 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
     )
     ghost_count = ghost_running.count()
     if ghost_count:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
+        # import logging as _logging  # moved to top-level
+        logging.getLogger(__name__).warning(
             f"Marking {ghost_count} ghost running job(s) as failed (no active worker)"
         )
         ghost_running.update(

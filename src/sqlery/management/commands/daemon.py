@@ -1,11 +1,15 @@
 """Management command for controlling the daemon worker."""
 
 from django.core.management.base import BaseCommand
+
 from sqlery.daemon_manager import (
     get_daemon_status,
     stop_daemon,
     cleanup_stale_pid,
 )
+from sqlery.daemon_middleware import DaemonMiddleware
+from sqlery.settings import get_setting
+from sqlery.worker_pool import get_worker_pool_status
 
 
 class Command(BaseCommand):
@@ -36,8 +40,8 @@ class Command(BaseCommand):
 
     def show_status(self):
         """Show daemon status."""
-        from sqlery.worker_pool import get_worker_pool_status
-        from sqlery.settings import get_setting
+        # from sqlery.worker_pool import get_worker_pool_status  # moved to top-level
+        # from sqlery.settings import get_setting  # moved to top-level
 
         status = get_daemon_status()
 
@@ -127,7 +131,7 @@ class Command(BaseCommand):
         self.stdout.write("Starting daemon...")
 
         try:
-            from sqlery.daemon_middleware import DaemonMiddleware
+            # from sqlery.daemon_middleware import DaemonMiddleware  # moved to top-level
 
             middleware = DaemonMiddleware(lambda r: r)
             middleware.spawn_daemon()

@@ -1,11 +1,12 @@
 """Database cleanup and retention management."""
 
 from datetime import timedelta
-from django.db import transaction
+
+from django.db import connection, transaction
 from django.db.models import Count, Sum
 from django.utils import timezone
 
-from .models import QueuedJob, JobRegistry
+from .models import DaemonCommand, QueuedJob, JobRegistry
 from .settings import get_setting
 
 
@@ -151,7 +152,7 @@ class CleanupManager:
         Returns:
             dict with database statistics
         """
-        from django.db import connection
+        # from django.db import connection  # moved to top-level
 
         stats = {}
 
@@ -258,6 +259,22 @@ class CleanupManager:
                 'result': per_job_result,
             })
 
+        # Cleanup old daemon commands (processed commands older than 24h)
+        try:
+            stale_commands = DaemonCommand.objects.filter(
+                created_at__lt=timezone.now() - timedelta(hours=24)
+            ).exclude(status='pending')
+            cmd_count = stale_commands.count()
+            if not dry_run:
+                stale_commands.delete()
+            if cmd_count > 0:
+                results['actions'].append({
+                    'action': 'cleanup_daemon_commands',
+                    'result': {'deleted' if not dry_run else 'would_delete': cmd_count},
+                })
+        except Exception:
+            pass  # DaemonCommand table may not exist yet
+
         # Cleanup jobs by age
         for status in ['success', 'failed', 'archived']:
             max_age_key = f'{status}_max_age_days'
@@ -313,7 +330,7 @@ class CleanupManager:
         Returns:
             dict with vacuum results
         """
-        from django.db import connection
+        # from django.db import connection  # moved to top-level
 
         if connection.vendor != 'postgresql':
             return {

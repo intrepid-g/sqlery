@@ -1,11 +1,15 @@
 """Worker pool management for spawning and monitoring workers."""
 
 import os
+import signal
 import sys
 import subprocess
 from pathlib import Path
 
+from django.conf import settings as django_settings
+
 from sqlery.core.log_config import is_debug_mode
+from sqlery.django_sqlery.models import Worker
 from sqlery.django_sqlery.worker_registry import (
     cleanup_dead_workers,
     count_active_workers,
@@ -25,8 +29,8 @@ def spawn_worker():
     # Debug mode: redirect to raw log file (grows forever).
     # Normal mode: subprocess configures its own RotatingFileHandler.
     if is_debug_mode():
-        from django.conf import settings
-        log_dir = Path(settings.BASE_DIR) / 'tmp'
+        # from django.conf import settings  # moved to top-level
+        log_dir = Path(django_settings.BASE_DIR) / 'tmp'
         log_dir.mkdir(exist_ok=True)
         worker_log = log_dir / f'sqlery_worker_{os.getpid()}.log'
         worker_log_file = open(worker_log, 'a')
@@ -101,8 +105,8 @@ def stop_all_workers(node_id=None, force=False):
     Returns:
         int: Number of workers stopped
     """
-    import signal
-    from .models import Worker
+    # import signal  # moved to top-level
+    # from .models import Worker  # moved to top-level
 
     if node_id is None:
         node_id = get_node_id()
@@ -142,7 +146,7 @@ def get_worker_pool_status(node_id=None):
     Returns:
         dict: Worker pool status information
     """
-    from .models import Worker
+    # from .models import Worker  # moved to top-level
 
     if node_id is None:
         node_id = get_node_id()

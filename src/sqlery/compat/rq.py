@@ -20,6 +20,9 @@ import warnings
 from datetime import timedelta, datetime, UTC
 from typing import Any, Callable
 
+from sqlery.core.utils import import_task
+from sqlery.django_sqlery.models import Worker as _Worker
+
 warnings.warn(
     "sqlery.compat.rq is deprecated and will be removed in v3.2.0. "
     "Use sqlery.django_sqlery.queue.Queue and sqlery.cancel_job directly.",
@@ -372,7 +375,7 @@ def requeue_if_jobs_pending(
     q = _make_django_queue(current_job.queue_name)
 
     # from sqlery.django_sqlery.utils import import_task  # Promoted to core
-    from sqlery.core.utils import import_task
+    # from sqlery.core.utils import import_task  # moved to top-level
     func = import_task(current_job.task_path)
 
     enqueue_kwargs: dict[str, Any] = {
@@ -453,7 +456,7 @@ class Worker:
     @classmethod
     def all(cls, connection=None):
         """Return all active sqlery workers (connection kwarg ignored)."""
-        from sqlery.django_sqlery.models import Worker as _Worker
+        # from sqlery.django_sqlery.models import Worker as _Worker  # moved to top-level
 
         return list(_Worker.objects.filter(status__in=["idle", "busy"]))
 

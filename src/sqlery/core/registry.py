@@ -3,6 +3,8 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
+from ..compat import get_backend, get_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +25,7 @@ class RegistryManager:
             backend: DatabaseBackend instance (auto-detected if not provided)
         """
         if backend is None:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
 
         self.backend = backend
@@ -134,7 +136,7 @@ class RegistryManager:
         Returns:
             Number of entries deleted
         """
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
 
         if max_age_days is None:
             retention = get_config('REGISTRY_RETENTION', {})

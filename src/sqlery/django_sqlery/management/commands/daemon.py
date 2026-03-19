@@ -5,6 +5,8 @@ Updated in v0.11.0 to use core.daemon.DaemonManager.
 
 from django.core.management.base import BaseCommand
 from sqlery.core.daemon import DaemonManager
+from sqlery.core.worker_pool import WorkerPoolManager
+from sqlery.django_sqlery.settings import get_setting
 
 
 class Command(BaseCommand):
@@ -45,7 +47,7 @@ class Command(BaseCommand):
 
     def show_status(self):
         """Show daemon status."""
-        from sqlery.django_sqlery.settings import get_setting
+        # from sqlery.django_sqlery.settings import get_setting  # moved to top-level
 
         daemon = DaemonManager()
         status = daemon.status()
@@ -87,7 +89,7 @@ class Command(BaseCommand):
 
         self.stdout.write("\n=== Worker Pool Status ===\n")
         try:
-            from sqlery.core.worker_pool import WorkerPoolManager
+            # from sqlery.core.worker_pool import WorkerPoolManager  # moved to top-level
 
             pool = WorkerPoolManager(max_workers, queues)
             pool_status = pool.get_status()
