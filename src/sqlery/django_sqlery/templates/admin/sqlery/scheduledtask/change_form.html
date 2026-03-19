@@ -82,7 +82,7 @@
     }
 
     .job-output {
-        max-width: 300px;
+        max-width: 600px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -192,9 +192,9 @@
                                     </td>
                                     <td class="job-output">
                                         {% if job.error %}
-                                            <span style="color: #dc3545;" title="{{ job.error }}">{{ job.error|truncatechars:50 }}</span>
+                                            <span style="color: #dc3545;" title="{{ job.error }}">{{ job.error|truncatechars:200 }}</span>
                                         {% elif job.output %}
-                                            <span title="{{ job.output }}">{{ job.output|truncatechars:50 }}</span>
+                                            <span title="{{ job.output }}">{{ job.output|truncatechars:200 }}</span>
                                         {% else %}
                                             -
                                         {% endif %}
