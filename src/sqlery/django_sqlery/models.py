@@ -797,8 +797,8 @@ class QueuedJob(models.Model):
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "status": status,
             "duration": self.duration_seconds,
-            "output": output[:1000] if output else "",  # Limit to 1000 chars
-            "error": error[:1000] if error else "",  # Limit to 1000 chars
+            "output": output[:2000] if output else "",  # Limit to 2000 chars
+            "error": error[:2000] if error else "",  # Limit to 2000 chars
         }
 
         # Initialize runs list if needed

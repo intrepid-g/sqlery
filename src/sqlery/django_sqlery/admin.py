@@ -520,7 +520,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
 
             # Display output or error
             message = error if error else output
-            message = message[:100] + "..." if len(message) > 100 else message
+            message = message[:500] + "..." if len(message) > 500 else message
 
             html_parts.append(
                 f'<tr>'
@@ -529,7 +529,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 f'<td style="padding: 8px; border: 1px solid #ddd; font-size: 11px;">{finished}</td>'
                 f'<td style="padding: 8px; border: 1px solid #ddd; text-align: right;">{duration:.2f}s</td>'
                 f'<td style="padding: 8px; border: 1px solid #ddd; color: {status_color}; font-weight: bold;">{status}</td>'
-                f'<td style="padding: 8px; border: 1px solid #ddd; font-size: 11px; max-width: 300px; overflow: hidden; text-overflow: ellipsis;">{message}</td>'
+                f'<td style="padding: 8px; border: 1px solid #ddd; font-size: 11px; max-width: 600px; overflow: hidden; text-overflow: ellipsis;">{message}</td>'
                 f'</tr>'
             )
 
