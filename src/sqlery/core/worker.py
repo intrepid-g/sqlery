@@ -222,8 +222,9 @@ class JobExecutor:
         """Close inherited DB connections after fork."""
         try:
             # from django.db import connections  # moved to top-level (try/except)
-            connections.close_all()
-        except ImportError:
+            if connections is not None:
+                connections.close_all()
+        except Exception:
             pass
 
     def _import_task(self, task_path: str):
@@ -473,7 +474,8 @@ class WorkerProcess:
                 try:
                     # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
                     # from django.db import close_old_connections  # moved to top-level (try/except)
-                    close_old_connections()
+                    if close_old_connections is not None:
+                        close_old_connections()
 
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
@@ -606,7 +608,8 @@ class WorkerProcess:
 
         # Also prune stale connections (parent may wait a long time for child)
         # from django.db import close_old_connections  # moved to top-level (try/except)
-        close_old_connections()
+        if close_old_connections is not None:
+            close_old_connections()
 
         # Update heartbeat with child info
         self._heartbeat('busy', job_id=job.id)
