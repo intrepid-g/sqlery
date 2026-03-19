@@ -850,6 +850,44 @@ def api_clear_jobs(request):
 
 @csrf_exempt
 @staff_required_json
+def api_archive_scheduled_jobs(request):
+    """POST /admin/api/sqlery/jobs/archive-scheduled/
+
+    Archive one or more scheduled (future-dated) queued jobs by setting
+    their status to 'archived'.
+
+    Request Body (JSON):
+        {"job_ids": [1, 2, 3]}
+
+    Returns:
+        JSON with count of archived jobs
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    try:
+        body = json.loads(request.body)
+        job_ids = body.get('job_ids', [])
+
+        if not job_ids:
+            return JsonResponse({'error': 'job_ids is required and must be non-empty'}, status=400)
+
+        updated = QueuedJob.objects.filter(
+            id__in=job_ids,
+            status='queued',
+        ).update(status='archived')
+
+        return JsonResponse({'success': True, 'archived': updated})
+
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    except Exception as e:
+        logger.error(f"Archive scheduled jobs failed: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@csrf_exempt
+@staff_required_json
 def api_vacuum(request):
     """POST /admin/api/sqlery/vacuum/
 

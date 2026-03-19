@@ -269,6 +269,7 @@ Task Queue Management{% endblock %} {% block extrahead %}
         clearJobsUrl: '{% url "sqlery:api_clear_jobs" %}',
         stopJobUrl: '{% url "sqlery:api_stop_job" job_id=0 %}',
         enqueueJobNowUrl: '{% url "sqlery:api_enqueue_job_now" job_id=0 %}',
+        archiveScheduledJobsUrl: '{% url "sqlery:api_archive_scheduled_jobs" %}',
         queuedJobChangeUrl: '{% url "admin:sqlery_queuedjob_change" 0 %}',
         queuedJobChangelistUrl: '{% url "admin:sqlery_queuedjob_changelist" %}',
         scheduledTaskAddUrl: '{% url "admin:sqlery_scheduledtask_add" %}',

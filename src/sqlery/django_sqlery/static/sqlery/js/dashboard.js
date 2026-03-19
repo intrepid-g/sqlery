@@ -720,13 +720,22 @@ function renderStatTable(type, jobs) {
             </table>`;
     } else if (type === 'scheduled') {
         container.innerHTML = `
+            <div class="scheduled-bulk-bar" id="scheduled-bulk-bar" style="display:none; padding:0.4rem 0.6rem; background:#f0f0f0; border-radius:4px; margin-bottom:0.4rem; font-size:0.8rem; align-items:center; gap:0.5rem;">
+                <span id="scheduled-bulk-count">0 selected</span>
+                <button onclick="event.stopPropagation();archiveSelectedScheduledJobs()" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:#6c757d;color:white;border:none;border-radius:3px;cursor:pointer;">Archive Selected</button>
+                <button onclick="event.stopPropagation();clearScheduledSelection()" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:#aaa;color:white;border:none;border-radius:3px;cursor:pointer;">Clear</button>
+            </div>
             <table>
-                <thead><tr><th>ID</th><th>Task</th><th>Queue</th><th>Pri</th><th>Scheduled For</th><th>Actions</th></tr></thead>
+                <thead><tr>
+                    <th style="width:30px"><input type="checkbox" onclick="event.stopPropagation();toggleAllScheduledCheckboxes(this)" title="Select all"></th>
+                    <th>ID</th><th>Task</th><th>Queue</th><th>Pri</th><th>Scheduled For</th><th>Actions</th>
+                </tr></thead>
                 <tbody>
                     ${jobs.map(j => {
                         const name = j.task_name || j.task_path.split('.').pop();
                         const enqueueBtn = `<button onclick="event.stopPropagation();enqueueJobNow(${j.id},'${escapeHtml(name)}')" style="font-size:0.7rem;padding:0.15rem 0.4rem;background:#f0ad4e;color:white;border:none;border-radius:3px;cursor:pointer;">Enqueue Now</button>`;
                         return `<tr onclick="window.location='${jobUrl(j.id)}'">
+                            <td onclick="event.stopPropagation()"><input type="checkbox" class="scheduled-job-cb" value="${j.id}" onclick="updateScheduledBulkBar()"></td>
                             <td>#${j.id}</td>
                             <td title="${escapeHtml(j.task_path)}"><strong>${escapeHtml(name)}</strong></td>
                             <td>${escapeHtml(j.queue_name)}</td>
@@ -1166,6 +1175,52 @@ async function removeQueuedJob(jobId, jobName) {
         }
     } catch (e) {
         showToast('Failed to remove job', e.message, 'error');
+    }
+}
+
+// --- Scheduled jobs bulk selection helpers ---
+
+function toggleAllScheduledCheckboxes(selectAllCb) {
+    document.querySelectorAll('.scheduled-job-cb').forEach(cb => {
+        cb.checked = selectAllCb.checked;
+    });
+    updateScheduledBulkBar();
+}
+
+function updateScheduledBulkBar() {
+    const checked = document.querySelectorAll('.scheduled-job-cb:checked');
+    const bar = document.getElementById('scheduled-bulk-bar');
+    const count = document.getElementById('scheduled-bulk-count');
+    if (bar) bar.style.display = checked.length > 0 ? 'flex' : 'none';
+    if (count) count.textContent = `${checked.length} selected`;
+}
+
+function clearScheduledSelection() {
+    document.querySelectorAll('.scheduled-job-cb').forEach(cb => { cb.checked = false; });
+    const selectAll = document.querySelector('#stat-table-scheduled input[type="checkbox"]:not(.scheduled-job-cb)');
+    if (selectAll) selectAll.checked = false;
+    updateScheduledBulkBar();
+}
+
+async function archiveSelectedScheduledJobs() {
+    const ids = Array.from(document.querySelectorAll('.scheduled-job-cb:checked')).map(cb => Number(cb.value));
+    if (ids.length === 0) return;
+    if (!confirm(`Archive ${ids.length} scheduled job(s)?`)) return;
+    try {
+        const resp = await fetch(DASHBOARD_CONFIG.archiveScheduledJobsUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+            body: JSON.stringify({ job_ids: ids }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast(`Archived ${data.archived} scheduled job(s)`, '', 'success');
+            refreshAll();
+        } else {
+            showToast('Failed to archive jobs', data.error || '', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to archive jobs', e.message, 'error');
     }
 }
 
