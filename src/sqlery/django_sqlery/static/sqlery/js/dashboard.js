@@ -184,6 +184,7 @@ function updateHealthPanel(warnings) {
                     <span style="flex:1;font-size:0.9rem;">${escapeHtml(w.msg)}</span>
                     ${w.action ? `<button
                         onclick="executeHealthAction(${JSON.stringify(w.action).replace(/"/g, '&quot;')})"
+                        ${w.action.kind === 'manual_intervention' ? 'data-intervention-btn' : ''}
                         style="white-space:nowrap;padding:0.25rem 0.75rem;background:#e67e22;color:white;border:none;border-radius:3px;cursor:pointer;font-size:0.85rem;">
                         ${escapeHtml(w.action.label)}
                     </button>` : '<span style="font-size:0.8rem;color:#999;white-space:nowrap;">Manual intervention required</span>'}
@@ -208,6 +209,41 @@ async function executeHealthAction(action) {
         for (const wid of (action.worker_ids || [])) {
             await workerAction(wid, 'unpause');
         }
+    } else if (action.kind === 'manual_intervention') {
+        await triggerIntervention();
+    }
+}
+
+async function triggerIntervention() {
+    // Find and disable all intervention buttons
+    const btns = document.querySelectorAll('[data-intervention-btn]');
+    btns.forEach(b => { b.disabled = true; b.textContent = 'Working...'; });
+
+    try {
+        const resp = await fetch('/admin/api/sqlery/intervene/', {
+            method: 'POST',
+            headers: {'X-CSRFToken': getCsrfToken()},
+        });
+        const data = await resp.json();
+
+        if (data.status === 'completed') {
+            const actions = data.result?.actions_taken || [];
+            const msg = actions.length > 0
+                ? `Intervention complete: ${actions.join(', ')}`
+                : 'Intervention complete: no issues found';
+            if (data.note) addFeedEvent('info', data.note, new Date());
+            addFeedEvent('info', msg, new Date());
+        } else if (data.status === 'rejected') {
+            addFeedEvent('info', data.message || 'System is healthy — no intervention needed', new Date());
+        } else if (data.status === 'pending') {
+            addFeedEvent('info', 'Intervention queued — waiting for daemon to process...', new Date());
+        } else if (data.status === 'failed') {
+            addFeedEvent('warning', `Intervention failed: ${data.result?.error || 'Unknown error'}`, new Date());
+        }
+    } catch (e) {
+        addFeedEvent('warning', `Intervention request failed: ${e.message}`, new Date());
+    } finally {
+        btns.forEach(b => { b.disabled = false; b.textContent = 'Fix Now'; });
     }
 }
 

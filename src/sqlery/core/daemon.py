@@ -1,15 +1,37 @@
 """Django-agnostic daemon process management."""
 
 import os
+import socket
+import subprocess
 import sys
 import time
 import signal
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 
+from ..compat import get_backend, get_config, is_django_mode
+from .cleanup import CleanupManager
 from .log_config import is_debug_mode
+from .scheduler import Scheduler
+from .worker_pool import WorkerPoolManager
+from sqlery.core.db_resilience import configure_connection_resilience
+
+try:
+    from django.conf import settings as django_settings
+except ImportError:
+    django_settings = None
+
+try:
+    from django.utils import timezone as django_timezone
+except ImportError:
+    django_timezone = None
+
+try:
+    from ..django_sqlery.models import QueuedJob
+except Exception:
+    QueuedJob = None
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +67,11 @@ class DaemonManager:
 
     def _get_default_pid_dir(self) -> Path:
         """Get default PID directory based on mode."""
-        from ..compat import is_django_mode
+        # from ..compat import is_django_mode  # moved to top-level
 
         if is_django_mode():
-            from django.conf import settings
-            return Path(settings.BASE_DIR) / 'tmp'
+            # from django.conf import settings  # moved to top-level (try/except as django_settings)
+            return Path(django_settings.BASE_DIR) / 'tmp'
         else:
             return Path('/tmp/sqlery')
 

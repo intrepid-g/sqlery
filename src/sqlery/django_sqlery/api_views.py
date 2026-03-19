@@ -2,13 +2,24 @@
 
 import json
 import logging
-from datetime import timedelta
-from django.http import JsonResponse
+import os
+import signal
+import time
+import uuid
+from datetime import datetime, timedelta, timezone as dt_timezone
+from pathlib import Path
+
+from django.conf import settings as django_settings
 from django.core.paginator import Paginator
-from django.db.models import Count, Max, Min, Q
+from django.db.models import Avg, Count, Max, Min, Q
+from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-from .models import ScheduledTask, QueuedJob
+
+from ..compat import get_backend
+from .intervention import diagnose_system_health, do_manual_intervention_direct
+from .models import DaemonCommand, QueuedJob, ScheduledTask, Worker
+from .utils import enqueue_task
 from .views import staff_required_json, _compute_health_warnings, _get_health_warnings, _job_display_name
 
 logger = logging.getLogger(__name__)
@@ -30,8 +41,8 @@ def api_scheduled_tasks_list(request):
             queued_jobs=Count('jobs', filter=Q(jobs__status='queued'))
         ).order_by('-enabled', 'name')
 
-        from django.utils import timezone as _tz
-        _now = _tz.now()
+        # from django.utils import timezone as _tz  # moved to top-level
+        _now = timezone.now()
 
         data = []
         for t in tasks:
@@ -239,7 +250,7 @@ def api_task_action(request, task_id):
 
         if action == 'enqueue':
             # Enqueue task immediately - allow multiple jobs
-            from .utils import enqueue_task
+            # from .utils import enqueue_task  # moved to top-level
             job = enqueue_task(task)
             return JsonResponse({'success': True, 'job_id': job.id})
 
@@ -300,8 +311,8 @@ def api_stop_job(request, job_id):
         return JsonResponse({'error': f'Job is not running (status: {job.status})'}, status=400)
 
     try:
-        import os
-        import signal
+        # import os  # moved to top-level
+        # import signal  # moved to top-level
 
         # # Old: found worker and killed worker_pid (which is the parent).
         # # This killed the parent worker, not the forked child.
@@ -382,11 +393,11 @@ def api_worker_action(request, worker_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-    from .models import Worker
-    import uuid as uuid_mod
+    # from .models import Worker  # moved to top-level
+    # import uuid as uuid_mod  # moved to top-level
 
     try:
-        worker = Worker.objects.get(id=uuid_mod.UUID(worker_id))
+        worker = Worker.objects.get(id=uuid.UUID(worker_id))
     except (ValueError, Worker.DoesNotExist):
         return JsonResponse({'error': 'Worker not found'}, status=404)
 
@@ -414,15 +425,15 @@ def api_worker_action(request, worker_id):
         elif action == 'restart':
             # Send SIGTERM to the worker process — the daemon will detect the dead PID
             # within DAEMON_CHECK_INTERVAL seconds and spawn a replacement automatically.
-            import os
-            import signal as _signal
+            # import os  # moved to top-level
+            # import signal as _signal  # moved to top-level
 
             if not worker.pid:
                 return JsonResponse({'error': 'Worker has no PID'}, status=400)
 
             sent = False
             try:
-                os.kill(worker.pid, _signal.SIGTERM)
+                os.kill(worker.pid, signal.SIGTERM)
                 sent = True
             except ProcessLookupError:
                 pass  # already gone — daemon will clean it up and spawn a new one
@@ -505,11 +516,11 @@ def api_worker_detail(request, worker_id):
 
     Get detailed worker info including current job and recent job history.
     """
-    from .models import Worker
-    import uuid as uuid_mod
+    # from .models import Worker  # moved to top-level
+    # import uuid as uuid_mod  # moved to top-level
 
     try:
-        worker_uuid = uuid_mod.UUID(worker_id)
+        worker_uuid = uuid.UUID(worker_id)
         worker = Worker.objects.select_related('current_job', 'current_job__scheduled_task').get(id=worker_uuid)
     except (ValueError, Worker.DoesNotExist):
         return JsonResponse({'error': 'Worker not found'}, status=404)
@@ -551,8 +562,8 @@ def api_worker_detail(request, worker_id):
 
     # Upcoming (queued) jobs for this worker's queues
     worker_queues = worker.queues or []
-    from django.utils import timezone as _tz
-    _now = _tz.now()
+    # from django.utils import timezone as _tz  # moved to top-level
+    _now = timezone.now()
     if worker_queues:
         upcoming_qs = QueuedJob.objects.filter(
             status='queued', queue_name__in=worker_queues
@@ -572,7 +583,7 @@ def api_worker_detail(request, worker_id):
     } for j in upcoming_qs.select_related('scheduled_task').order_by('-priority', 'created_at')[:20]]
 
     # Stats — use worker FK to find all jobs this worker has processed
-    from django.db.models import Avg
+    # from django.db.models import Avg  # moved to top-level
     worker_jobs_qs = QueuedJob.objects.filter(worker=worker)
     job_stats = worker_jobs_qs.aggregate(
         total=Count('id'),
@@ -714,11 +725,11 @@ def api_activity_feed(request):
         now = timezone.now()
         since_str = request.GET.get('since')
         if since_str:
-            from datetime import datetime as dt
-            since = dt.fromisoformat(since_str)
+            # from datetime import datetime as dt  # moved to top-level
+            since = datetime.fromisoformat(since_str)
             if since.tzinfo is None:
-                from datetime import timezone as _tz
-                since = since.replace(tzinfo=_tz.utc)
+                # from datetime import timezone as _tz  # moved to top-level
+                since = since.replace(tzinfo=dt_timezone.utc)
         else:
             since = now - timedelta(minutes=5)
 
@@ -851,10 +862,119 @@ def api_vacuum(request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
     try:
-        from ..compat import get_backend
+        # from ..compat import get_backend  # moved to top-level
         backend = get_backend()
         result = backend.vacuum_database()
         return JsonResponse({'success': True, 'result': result})
     except Exception as e:
         logger.error(f"Vacuum failed: {e}")
         return JsonResponse({'error': str(e)}, status=500)
+
+
+@csrf_exempt
+@staff_required_json
+def api_manual_intervention(request):
+    """POST /admin/api/sqlery/intervene/
+
+    Trigger manual intervention via the daemon command queue.
+
+    Creates a DaemonCommand(command='manual_intervention') and waits
+    up to 15 seconds for the daemon to process it. If the daemon is
+    alive, it will pick up the command on its next cycle (<=10s).
+
+    If the daemon appears down, falls back to direct DB-only intervention.
+
+    Returns:
+        200: {"status": "completed", "result": {...}}
+        202: {"status": "pending", "message": "..."}
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    # ── Gate: refuse to intervene if system is healthy ─────────
+    #
+    # diagnose_system_health() is a read-only check that returns a
+    # list of detected problems. If empty, the system is working
+    # correctly and intervention would only cause harm (killing
+    # healthy workers, failing running jobs, etc.).
+    #
+    # check_os=False because this runs in the web server process,
+    # which may be in a different container/PID namespace than the
+    # workers. PID checks would be meaningless. DB-only checks
+    # (stale heartbeats, ghost jobs, queue counts) are sufficient
+    # to gate the request — the daemon will do the OS-level checks
+    # when it processes the command.
+    # from .intervention import diagnose_system_health  # moved to top-level
+    problems = diagnose_system_health(check_os=False)
+    if not problems:
+        return JsonResponse({
+            'status': 'rejected',
+            'message': 'System appears healthy — no intervention needed',
+            'checks_passed': [
+                'All busy worker heartbeats are fresh (<120s)',
+                'Daemon lease is not expired',
+                'No ghost running jobs',
+                'No queued jobs without workers',
+                'No running jobs past their timeout',
+            ],
+        }, status=409)
+
+    # Check if there's already a pending intervention
+    existing = DaemonCommand.objects.filter(
+        command='manual_intervention',
+        status='pending',
+    ).first()
+    if existing:
+        return JsonResponse({
+            'status': 'pending',
+            'message': 'Intervention already queued',
+            'command_id': existing.id,
+        }, status=202)
+
+    # Create the command (include diagnosis so daemon doesn't re-check)
+    cmd = DaemonCommand.objects.create(
+        command='manual_intervention',
+        payload={
+            'triggered_by': 'dashboard',
+            'triggered_at': timezone.now().isoformat(),
+        },
+    )
+
+    # Wait for daemon to pick it up (up to 15 seconds, polling every 1s)
+    for _ in range(15):
+        time.sleep(1)
+        cmd.refresh_from_db()
+        if cmd.status in ('completed', 'failed'):
+            return JsonResponse({
+                'status': cmd.status,
+                'result': cmd.result,
+                'processed_at': cmd.processed_at.isoformat() if cmd.processed_at else None,
+            })
+
+    # Daemon didn't pick it up — check if it's alive via heartbeat file
+    # from django.conf import settings as django_settings  # moved to top-level
+    heartbeat_file = Path(django_settings.BASE_DIR) / 'tmp' / 'sqlery_daemon.heartbeat'
+    daemon_alive = False
+    if heartbeat_file.exists():
+        try:
+            ts = float(heartbeat_file.read_text().strip())
+            daemon_alive = (time.time() - ts) < 60
+        except (ValueError, OSError):
+            pass
+
+    if not daemon_alive:
+        # Daemon is down — do a direct intervention (fallback)
+        cmd.delete()
+        # from .intervention import do_manual_intervention_direct  # moved to top-level
+        result = do_manual_intervention_direct()
+        return JsonResponse({
+            'status': 'completed',
+            'result': result,
+            'note': 'Daemon appears down — intervention ran directly from API',
+        })
+
+    return JsonResponse({
+        'status': 'pending',
+        'message': 'Command queued but daemon has not processed it yet',
+        'command_id': cmd.id,
+    }, status=202)

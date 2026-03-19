@@ -4,11 +4,15 @@ This module provides CLI entry points for standalone mode, wrapping the
 core CLI with additional standalone-specific commands.
 """
 
+import uvicorn
+
 import typer
 from rich.console import Console
 
-# Import the core CLI app
+from ..compat import is_django_mode
 from ..core.cli import app
+from ..core.worker import Worker
+from .app import app as fastapi_app
 
 console = Console()
 
@@ -23,8 +27,8 @@ def worker_command(
     max_jobs: int = typer.Option(0, "--max-jobs", "-m", help="Max jobs to process (0=unlimited)"),
 ):
     """Run a standalone worker process."""
-    from ..compat import is_django_mode
-    from ..core.worker import Worker
+    # from ..compat import is_django_mode  # moved to top-level
+    # from ..core.worker import Worker  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py worker' in Django mode[/red]")
@@ -51,7 +55,7 @@ def web_command(
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
 ):
     """Run the web UI server."""
-    from ..compat import is_django_mode
+    # from ..compat import is_django_mode  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py runserver' in Django mode[/red]")
@@ -60,8 +64,8 @@ def web_command(
     console.print(f"[bold blue]Starting web UI on {host}:{port}[/bold blue]")
 
     try:
-        import uvicorn
-        from .app import app as fastapi_app
+        # import uvicorn  # moved to top-level
+        # from .app import app as fastapi_app  # moved to top-level
 
         uvicorn.run(
             fastapi_app,

@@ -63,6 +63,10 @@ coverage.xml
 *.sqlite3
 *.sqlite3-journal
 
+# Internal docs (local-only, not published)
+docs/internal/
+docs/archive/
+
 # Development artifacts
 .last-response
 .gitignoreo

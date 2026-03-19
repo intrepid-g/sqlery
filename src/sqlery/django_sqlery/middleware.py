@@ -1,7 +1,13 @@
 """Middleware for triggering scheduled tasks and queue workers on requests."""
 
-from django.core.cache import cache
 import logging
+
+from django.core.cache import cache
+
+from sqlery.triggers import trigger_due_tasks
+from sqlery.triggers import trigger_queue_workers
+
+from .settings import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +33,8 @@ class ScheduledTaskMiddleware:
 
     def maybe_trigger_scheduler(self):
         """Check for due scheduled tasks and enqueue jobs (throttled)."""
-        from .settings import get_setting
-        from sqlery.triggers import trigger_due_tasks
+        # from .settings import get_setting  # moved to top-level
+        # from sqlery.triggers import trigger_due_tasks  # moved to top-level
 
         # Check if enabled
         if not get_setting("ENABLE_MIDDLEWARE_TRIGGER", True):
@@ -52,8 +58,8 @@ class ScheduledTaskMiddleware:
 
     def maybe_trigger_workers(self):
         """Process queued jobs (throttled)."""
-        from .settings import get_setting
-        from sqlery.triggers import trigger_queue_workers
+        # from .settings import get_setting  # moved to top-level
+        # from sqlery.triggers import trigger_queue_workers  # moved to top-level
 
         # Check if enabled
         if not get_setting("ENABLE_MIDDLEWARE_TRIGGER", True):

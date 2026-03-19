@@ -1,12 +1,22 @@
 """Webhook delivery for job completion notifications."""
 
-import logging
-import hmac
 import hashlib
+import hmac
 import json
+import logging
 import uuid as _uuid
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
+
+from django.db.models import F
+
+from .models import QueuedJob
+from .settings import get_setting
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +84,7 @@ def send_webhook(job, event='success'):
         logger.debug(f"Skipping webhook for job {job.id} - event '{event}' not in {job.webhook_events}")
         return True
 
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     # Build webhook payload
     payload = {
@@ -110,9 +120,11 @@ def send_webhook(job, event='success'):
     # Send webhook
     timeout = get_setting('WEBHOOK_TIMEOUT', 10)  # 10 second default timeout
 
-    try:
-        import requests
-    except ImportError:
+    # try:
+    #     import requests  # moved to top-level
+    # except ImportError:
+    #     ...
+    if requests is None:
         logger.error(
             "Cannot send webhook: requests library not installed. "
             "Install with: pip install sqlery[webhooks]"
@@ -212,8 +224,8 @@ def retry_failed_webhooks():
     Returns:
         dict: Statistics about retry attempts
     """
-    from .models import QueuedJob
-    from django.db.models import F
+    # from .models import QueuedJob  # moved to top-level
+    # from django.db.models import F  # moved to top-level
 
     # Find jobs with pending webhooks that haven't exceeded max retries
     jobs_to_retry = QueuedJob.objects.filter(

@@ -2,22 +2,28 @@
 
 import asyncio
 import functools
-import os
 import logging
+import os
+import sys
 import tempfile
 from datetime import timedelta
 from io import StringIO
+
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
+from django.core.cache import caches
 from django.core.management import call_command
+from django.db.models import Count, Q, Sum
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+
+from .models import QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .signature import verify_signature
-from .models import QueuedJob
+from .subprocess_executor import get_manage_py_path
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +184,7 @@ def _compute_health_warnings(
     Called by both the stats endpoint (for the health panel, polled every 3s)
     and the feed endpoint (for feed items on initial load).
     """
-    from .models import Worker
+    # from .models import Worker  # moved to top-level
     warnings_list = []
     ts = now.isoformat()
 
@@ -219,9 +225,9 @@ def _compute_health_warnings(
                     'action': action,
                 })
 
-    from django.db.models import Q as _Q
+    # from django.db.models import Q as _Q  # moved to top-level
     # Only count due jobs (not future-scheduled) for health warnings
-    _due_filter = _Q(scheduled_at__isnull=True) | _Q(scheduled_at__lte=now)
+    _due_filter = Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
     # queued_count = QueuedJob.objects.filter(status='queued').count()
     # queued_count = QueuedJob.objects.filter(status='queued').filter(_due_filter).count()
     # running_count = QueuedJob.objects.filter(status='running').count()
@@ -240,7 +246,10 @@ def _compute_health_warnings(
             'type': 'warning',
             'msg': f'{queued_count} job(s) queued but no active workers — restart the worker daemon',
             'time': ts,
-            'action': None,
+            'action': {
+                'kind': 'manual_intervention',
+                'label': 'Fix Now',
+            },
         })
 
     # 3. Jobs queued, workers present but idle and nothing running
@@ -263,7 +272,10 @@ def _compute_health_warnings(
                 }
                 msg = f'{queued_count} job(s) waiting {wait} — all workers are paused'
             else:
-                action = None
+                action = {
+                    'kind': 'manual_intervention',
+                    'label': 'Fix Now',
+                }
                 msg = f'{queued_count} job(s) waiting {wait} — workers idle but not picking up (check daemon)'
             warnings_list.append({'type': 'warning', 'msg': msg, 'time': ts, 'action': action})
 
@@ -300,7 +312,7 @@ def _get_health_warnings(now, **kwargs) -> list[dict]:
     When called without precomputed data (e.g. from activity feed), uses a 2-second cache
     to avoid re-running the same queries that dashboard_stats just executed.
     """
-    from django.core.cache import caches
+    # from django.core.cache import caches  # moved to top-level
     # If no precomputed data passed, try cache first
     if not kwargs:
         cached = caches['default'].get('sqlery_health_warnings')
@@ -395,8 +407,8 @@ async def spawn_worker_subprocess():
     The subprocess runs: python /path/to/manage.py run_jobs --once
     Uses absolute path to manage.py to work regardless of CWD.
     """
-    import sys
-    from .subprocess_executor import get_manage_py_path
+    # import sys  # moved to top-level
+    # from .subprocess_executor import get_manage_py_path  # moved to top-level
 
     # Get absolute path to manage.py (prevents CWD issues)
     manage_py = get_manage_py_path()
@@ -427,7 +439,7 @@ async def health_check(request):
     Returns:
         200: Service is healthy
     """
-    from .models import QueuedJob
+    # from .models import QueuedJob  # moved to top-level
 
     # Check database connectivity
     try:
@@ -477,12 +489,12 @@ def dashboard_stats(request):
     Cached for 2 seconds (in-memory) to absorb concurrent polls.
     Rate-limited to 1 request per 5 seconds per session.
     """
-    from django.core.cache import caches
-    from django.db.models import Count, Q, Sum
-    from django.utils import timezone
-    from datetime import timedelta
-    from .models import ScheduledTask, QueuedJob, Worker
-    from .settings import get_setting
+    # from django.core.cache import caches  # moved to top-level
+    # from django.db.models import Count, Q, Sum  # moved to top-level
+    # from django.utils import timezone  # moved to top-level
+    # from datetime import timedelta  # moved to top-level
+    # from .models import ScheduledTask, QueuedJob, Worker  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     # --- Rate limit: 1 req / 5s per session ---
     session_key = request.session.session_key
@@ -891,9 +903,9 @@ def load_scheduled_tasks(request):
             messages.error(request, f"Load failed: {exc}")
         finally:
             if tmp:
-                import os as _os
+                # import os as _os  # moved to top-level
                 try:
-                    _os.unlink(tmp.name)
+                    os.unlink(tmp.name)
                 except OSError:
                     pass
 

@@ -5,10 +5,13 @@ Provides async job processing and execution logic.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
+import socket
 import importlib
 import json
 import logging
+import time
 import traceback as tb_module
 from typing import Any, Callable
 from datetime import datetime
@@ -16,6 +19,7 @@ from datetime import datetime
 # from .backends.base import AsyncStorageBackend
 AsyncStorageBackend = None
 from .async_queue import AsyncQueue
+from .decorators import JobFunction, AsyncJobFunction
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +169,7 @@ class AsyncWorker:
 
         # Unwrap decorated functions
         # If function is decorated with @job or @async_job, extract the original function
-        from .decorators import JobFunction, AsyncJobFunction
+        # from .decorators import JobFunction, AsyncJobFunction  # moved to top-level
         if isinstance(func, (JobFunction, AsyncJobFunction)):
             func = func.func
 
@@ -219,9 +223,9 @@ class AsyncWorker:
         Returns:
             Worker ID string
         """
-        import socket
-        import os
-        import time
+        # import socket  # moved to top-level
+        # import os  # moved to top-level
+        # import time  # moved to top-level
         hostname = socket.gethostname()
         pid = os.getpid()
         timestamp = int(time.time())

@@ -10,10 +10,22 @@ import socket
 import subprocess
 import signal
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from ..compat import get_backend, get_config, is_django_mode
 from .log_config import is_debug_mode
+
+try:
+    from django.conf import settings as django_settings
+except ImportError:
+    django_settings = None
+
+try:
+    from dateutil.parser import isoparse
+except ImportError:
+    isoparse = None
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +46,7 @@ class WorkerPoolManager:
             backend: Database backend (auto-detected if None)
         """
         if backend is None:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
 
         self.backend = backend
@@ -57,11 +69,11 @@ class WorkerPoolManager:
         Returns:
             Path to log directory
         """
-        from ..compat import get_config, is_django_mode
+        # from ..compat import get_config, is_django_mode  # moved to top-level
 
         if is_django_mode():
-            from django.conf import settings
-            log_dir = Path(settings.BASE_DIR) / 'tmp'
+            # from django.conf import settings  # moved to top-level (try/except as django_settings)
+            log_dir = Path(django_settings.BASE_DIR) / 'tmp'
         else:
             log_dir = Path(get_config('LOG_DIR', '/tmp/sqlery'))
 
@@ -161,7 +173,7 @@ class WorkerPoolManager:
         Returns:
             Number of workers cleaned up
         """
-        from datetime import datetime, timezone, timedelta
+        # from datetime import datetime, timezone, timedelta  # moved to top-level
 
         workers = self.backend.get_worker_heartbeats(active_only=False)
         now = datetime.now(timezone.utc)
@@ -484,7 +496,7 @@ class WorkerPoolManager:
         Returns:
             True if process was killed, False if already dead or error
         """
-        import time
+        # import time  # moved to top-level
 
         try:
             # Check if process exists
@@ -542,8 +554,8 @@ class WorkerPoolManager:
         above — e.g., a worker process that exists but is completely
         unresponsive to signals for an extended period.
         """
-        from datetime import datetime, timezone, timedelta
-        from ..compat import get_config
+        # from datetime import datetime, timezone, timedelta  # moved to top-level
+        # from ..compat import get_config  # moved to top-level
 
         now = datetime.now(timezone.utc)
         irregularities = {
@@ -572,7 +584,7 @@ class WorkerPoolManager:
             if hasattr(worker, 'last_heartbeat'):
                 last_heartbeat = worker.last_heartbeat
             elif isinstance(worker, dict):
-                from dateutil.parser import isoparse
+                # from dateutil.parser import isoparse  # moved to top-level (try/except)
                 last_heartbeat = isoparse(worker['last_heartbeat']) if worker.get('last_heartbeat') else None
             else:
                 continue

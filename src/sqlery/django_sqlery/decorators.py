@@ -7,6 +7,9 @@ import functools
 import inspect
 import logging
 from typing import Any, Callable
+
+from sqlery.compat import get_backend, get_config
+
 # from sqlery.async_queue import AsyncQueue
 try:
     from sqlery.async_queue import AsyncQueue
@@ -94,7 +97,7 @@ class JobFunction:
             # Override queue
             job = send_email.enqueue('user@example.com', 'Hello', 'World', queue='urgent')
         """
-        from sqlery.compat import get_backend, get_config
+        # from sqlery.compat import get_backend, get_config  # moved to top-level
 
         # Build task path
         task_path = f"{self.func.__module__}.{self.func.__qualname__}"
@@ -183,7 +186,7 @@ class JobFunction:
         Returns:
             Job instance from backend
         """
-        from sqlery.compat import get_backend, get_config
+        # from sqlery.compat import get_backend, get_config  # moved to top-level
 
         # Build task path
         task_path = f"{self.func.__module__}.{self.func.__qualname__}"

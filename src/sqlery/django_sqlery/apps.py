@@ -1,6 +1,9 @@
 import logging
 
 from django.apps import AppConfig
+from django.db.backends.signals import connection_created
+
+from sqlery.django_sqlery.settings import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +18,7 @@ def _configure_sqlite_connection(sender, connection, **kwargs):
     if connection.vendor != "sqlite":
         return
 
-    from sqlery.django_sqlery.settings import get_setting
+    # from sqlery.django_sqlery.settings import get_setting  # moved to top-level
 
     cursor = connection.cursor()
 
@@ -37,7 +40,7 @@ class DjangoSqleryConfig(AppConfig):
 
     def ready(self):
         """Register connection_created signal for SQLite resilience."""
-        from django.db.backends.signals import connection_created
+        # from django.db.backends.signals import connection_created  # moved to top-level
 
         connection_created.connect(_configure_sqlite_connection)
         logger.debug("SQLery: registered connection_created signal for SQLite resilience")

@@ -6,6 +6,9 @@ import os
 import logging
 from django.core.cache import cache
 
+from .subprocess_executor import get_manage_py_path
+from .settings import get_setting
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,7 +46,7 @@ class SubprocessTriggerMiddleware:
 
     def maybe_spawn_subprocess(self):
         """Check if it's time to spawn subprocess for job processing."""
-        from .settings import get_setting
+        # from .settings import get_setting  # moved to top-level
 
         # Check if enabled
         if not get_setting("ENABLE_MIDDLEWARE_TRIGGER", True):
@@ -81,7 +84,7 @@ class SubprocessTriggerMiddleware:
         Uses subprocess.Popen for fire-and-forget execution.
         Process runs detached to prevent zombies.
         """
-        from .subprocess_executor import get_manage_py_path
+        # from .subprocess_executor import get_manage_py_path  # moved to top-level
 
         # Get absolute path to manage.py (prevents CWD issues)
         manage_py = get_manage_py_path()

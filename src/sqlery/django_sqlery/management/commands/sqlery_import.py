@@ -7,6 +7,11 @@ import tempfile
 from datetime import datetime, timezone as dt_timezone
 from io import StringIO
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 
@@ -56,14 +61,13 @@ class Command(BaseCommand):
         # Parse input
         input_format = options["format"]
         if input_format == "yaml":
-            try:
-                import yaml
-                data = yaml.safe_load(raw)
-            except ImportError:
+            # import yaml  # moved to top-level (optional try/except)
+            if yaml is None:
                 self.stderr.write(
                     self.style.ERROR("PyYAML required for YAML: pip install pyyaml")
                 )
                 return
+            data = yaml.safe_load(raw)
         else:
             data = json.loads(raw)
 

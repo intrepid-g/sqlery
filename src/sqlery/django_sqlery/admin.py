@@ -1,10 +1,18 @@
 """Django admin configuration for sqlery."""
 
+import os
+import signal as sig
+from datetime import datetime
+
 from django.contrib import admin
-from django.utils.html import format_html
-from django.utils import timezone
+from django.shortcuts import redirect, render
 from django.urls import path, reverse
-from django.shortcuts import render, redirect
+from django.utils import timezone
+from django.utils.html import format_html
+
+from sqlery.core.cleanup import CleanupManager
+
+from .executor import TaskExecutor
 from .models import ScheduledTask, QueuedJob
 
 
@@ -146,7 +154,7 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
 
     def enqueue_now(self, request, queryset):
         """Admin action to enqueue jobs for tasks immediately."""
-        from .executor import TaskExecutor
+        # from .executor import TaskExecutor  # moved to top-level
 
         executor = TaskExecutor()
         count = 0
@@ -172,7 +180,7 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
 
     def run_cleanup_now(self, request, queryset):
         """Admin action to run database cleanup and vacuum immediately."""
-        from sqlery.core.cleanup import CleanupManager
+        # from sqlery.core.cleanup import CleanupManager  # moved to top-level
         result = CleanupManager().auto_cleanup()
         self.message_user(request, f"Cleanup complete: {result}")
 
@@ -181,7 +189,7 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
     def changelist_view(self, request, extra_context=None):
         """Redirect to unified SQLery dashboard instead of default changelist."""
         # Redirect to unified dashboard
-        from django.urls import reverse
+        # from django.urls import reverse  # moved to top-level
         return redirect(reverse('sqlery:unified_view'))
 
     def change_view(self, request, object_id, form_url='', extra_context=None):
@@ -190,7 +198,7 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
 
         # Handle "Enqueue Now" button click
         if request.method == 'POST' and '_enqueue_now' in request.POST:
-            from .executor import TaskExecutor
+            # from .executor import TaskExecutor  # moved to top-level
             task = self.get_object(request, object_id)
             if task and task.enabled:
                 executor = TaskExecutor()
@@ -304,15 +312,15 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 self.message_user(request, f"Job #{job.id} enqueued for immediate processing.")
             else:
                 self.message_user(request, "Job must be queued with a future schedule.", level='warning')
-            from django.shortcuts import redirect
+            # from django.shortcuts import redirect  # moved to top-level
             return redirect(request.path)
 
         # Handle stop button click
         if request.method == 'POST' and '_stop_job' in request.POST:
             job = self.get_object(request, object_id)
             if job and job.status == 'running':
-                import os
-                import signal as sig
+                # import os  # moved to top-level
+                # import signal as sig  # moved to top-level
                 # from .models import Worker
 
                 # # Old: killed the parent worker, not the forked child
@@ -360,7 +368,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 self.message_user(request, f"Job {job.id} stopped.")
             else:
                 self.message_user(request, "Job is not running.", level='warning')
-            from django.shortcuts import redirect
+            # from django.shortcuts import redirect  # moved to top-level
             return redirect(request.path)
 
         # Handle retry button click — re-queue the same job (keeps execution history)
@@ -382,7 +390,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 self.message_user(request, f"Job #{job.id} re-queued.")
             else:
                 self.message_user(request, "Only failed jobs can be retried.", level='warning')
-            from django.shortcuts import redirect
+            # from django.shortcuts import redirect  # moved to top-level
             return redirect(request.path)
 
         # Pass UTC ISO timestamps for JS timezone toggle
@@ -491,7 +499,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
             # Format datetime strings
             if started:
                 try:
-                    from datetime import datetime
+                    # from datetime import datetime  # moved to top-level
                     started_dt = datetime.fromisoformat(started.replace('Z', '+00:00'))
                     started = started_dt.strftime("%Y-%m-%d %H:%M:%S")
                 except:
@@ -570,7 +578,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
 
     def stop_running(self, request, queryset):
         """Stop running jobs by killing their worker processes."""
-        from .executor import TaskExecutor
+        # from .executor import TaskExecutor  # moved to top-level
 
         executor = TaskExecutor()
         killed_count = 0
