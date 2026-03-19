@@ -875,7 +875,7 @@ def initialize(
 
     # Initialize database (creates tables)
     # from .fastapi_sqlery.database import init_database  # Wrong: looks in compat/fastapi_sqlery/
-    from sqlery.fastapi_sqlery.database import init_database
+    from sqlery.fastapi_sqlery.database import init_database  # Inline to avoid circular import: compat -> backend -> compat
     # init_database(database_url or get_config('DATABASE_URL'))
     init_database(
         database_url or get_config('DATABASE_URL'),

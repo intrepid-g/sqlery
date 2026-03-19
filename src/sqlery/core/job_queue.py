@@ -257,7 +257,7 @@ def enqueue_at(
         >>> job.scheduled_at
         datetime.datetime(...)
     """
-    from ..compat import get_backend, get_config
+    # from ..compat import get_backend, get_config  # moved to top-level
 
     # Get defaults from config
     if queue is None:

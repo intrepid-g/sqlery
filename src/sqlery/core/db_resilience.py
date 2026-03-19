@@ -12,6 +12,11 @@ import time
 from django.db import OperationalError, connection, connections
 from django.db.utils import DatabaseError
 
+try:
+    from sqlery.django_sqlery.settings import get_setting
+except ImportError:
+    get_setting = None
+
 logger = logging.getLogger(__name__)
 
 # Transient error patterns that are safe to retry
@@ -111,9 +116,12 @@ def configure_connection_resilience(for_job_child: bool = False):
         return
 
     # Lazy import settings to avoid circular imports
-    try:
-        from sqlery.django_sqlery.settings import get_setting
-    except ImportError:
+    # try:  # moved to top-level (try/except)
+    #     from sqlery.django_sqlery.settings import get_setting
+    # except ImportError:
+    #     logger.debug("django_sqlery.settings not available, skipping resilience config")
+    #     return
+    if get_setting is None:
         logger.debug("django_sqlery.settings not available, skipping resilience config")
         return
 

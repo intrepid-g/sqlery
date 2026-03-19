@@ -167,7 +167,7 @@ class DaemonManager:
         # Get worker count if running
         worker_count = 0
         if running:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
             workers = backend.get_worker_heartbeats(active_only=True)
             worker_count = len(workers)
@@ -193,7 +193,7 @@ class DaemonManager:
         Returns:
             subprocess.Popen instance, or None if already running
         """
-        import subprocess
+        # import subprocess  # moved to top-level
 
         # Check if already running
         if self.is_running():
@@ -330,12 +330,12 @@ class DaemonManager:
         """
         # import fcntl  # Removed: replaced with DB-backed queue leases
 
-        from ..compat import get_config, get_backend
-        from .scheduler import Scheduler
-        from .worker_pool import WorkerPoolManager
+        # from ..compat import get_config, get_backend  # moved to top-level
+        # from .scheduler import Scheduler  # moved to top-level
+        # from .worker_pool import WorkerPoolManager  # moved to top-level
 
         # Configure DB resilience (WAL mode, busy_timeout, statement_timeout, etc.)
-        from sqlery.core.db_resilience import configure_connection_resilience
+        # from sqlery.core.db_resilience import configure_connection_resilience  # moved to top-level
         configure_connection_resilience()
 
         # Get configuration
@@ -466,7 +466,7 @@ class DaemonManager:
                 # Periodic auto-cleanup (every 6 hours)
                 if auto_cleanup and _should_run_cleanup(last_cleanup_at, interval_hours=6):
                     try:
-                        from .cleanup import CleanupManager
+                        # from .cleanup import CleanupManager  # moved to top-level
                         CleanupManager().auto_cleanup()
                         last_cleanup_at = datetime.now(timezone.utc)
                         logger.info("Periodic auto-cleanup completed")
@@ -538,14 +538,16 @@ class DaemonManager:
             queue_names: If provided, only check jobs in these queues.
                          None means check all queues.
         """
-        import os
+        # import os  # moved to top-level
 
-        try:
-            from ..django_sqlery.models import QueuedJob
-        except Exception:
+        # try:  # moved to top-level (try/except)
+        #     from ..django_sqlery.models import QueuedJob
+        # except Exception:
+        #     return
+        if QueuedJob is None:
             return
 
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
         # Heartbeat stale threshold: the daemon sends SIGUSR1 every cycle
         # (~DAEMON_CHECK_INTERVAL seconds). If the worker can't respond for
         # this many seconds, something is wrong.
@@ -554,7 +556,7 @@ class DaemonManager:
         # jitter between daemon cycles and worker signal handling.
         stale_threshold = alive_timeout * 3
 
-        import socket
+        # import socket  # moved to top-level
         current_node = os.environ.get("NODE_ID", socket.gethostname())
 
         running_jobs_qs = QueuedJob.objects.filter(status='running')
@@ -592,8 +594,8 @@ class DaemonManager:
 
             # Check 4: worker moved on to a different job or is idle (this job is abandoned)
             if not reason and job.worker and job.worker.current_job_id != job.id:
-                from django.utils import timezone
-                from datetime import timedelta
+                # from django.utils import timezone  # moved to top-level (try/except as django_timezone)
+                # from datetime import timedelta  # moved to top-level
                 if job.worker.current_job_id:
                     reason = (
                         f"Worker {job.worker.friendly_name} moved on to job "
@@ -602,8 +604,8 @@ class DaemonManager:
                 # Worker is idle (current_job_id=None) but job still running.
                 # Grace period: only flag if running longer than alive_timeout
                 # to avoid false positives during the brief claim→heartbeat window.
-                elif job.started_at and job.started_at < timezone.now() - timedelta(seconds=alive_timeout):
-                    age = int((timezone.now() - job.started_at).total_seconds())
+                elif job.started_at and job.started_at < django_timezone.now() - timedelta(seconds=alive_timeout):
+                    age = int((django_timezone.now() - job.started_at).total_seconds())
                     reason = (
                         f"Worker {job.worker.friendly_name} is idle but job has been "
                         f"running for {age}s — zombie"
@@ -611,10 +613,10 @@ class DaemonManager:
 
             # Check 5: assigned worker heartbeat is stale
             if not reason and job.worker:
-                from django.utils import timezone
-                from datetime import timedelta
-                if job.worker.last_heartbeat and job.worker.last_heartbeat < timezone.now() - timedelta(seconds=stale_threshold):
-                    age = int((timezone.now() - job.worker.last_heartbeat).total_seconds())
+                # from django.utils import timezone  # moved to top-level (try/except as django_timezone)
+                # from datetime import timedelta  # moved to top-level
+                if job.worker.last_heartbeat and job.worker.last_heartbeat < django_timezone.now() - timedelta(seconds=stale_threshold):
+                    age = int((django_timezone.now() - job.worker.last_heartbeat).total_seconds())
                     reason = (
                         f"Worker {job.worker.friendly_name} heartbeat stale "
                         f"({age}s old, threshold {stale_threshold}s)"
@@ -654,7 +656,7 @@ class DaemonManager:
             if not worker_row:
                 return
 
-            from ..django_sqlery.models import QueuedJob
+            # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
             orphaned = QueuedJob.objects.filter(worker=worker_row, status='running')
             count = 0
             for job in orphaned:
@@ -683,7 +685,7 @@ class DaemonManager:
         Args:
             backend: Database backend instance
         """
-        from datetime import datetime, timedelta, timezone
+        # from datetime import datetime, timedelta, timezone  # moved to top-level
 
         try:
             # Get all workers (not just from current node)
@@ -691,7 +693,7 @@ class DaemonManager:
             workers = backend.get_worker_heartbeats(active_only=False)
 
             # Use configured alive timeout (default 30s)
-            from ..compat import get_config
+            # from ..compat import get_config  # moved to top-level
             alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', 30)
             threshold = datetime.now(timezone.utc) - timedelta(seconds=alive_timeout)
             cleaned = 0
@@ -722,7 +724,7 @@ class DaemonManager:
                 if last_heartbeat and last_heartbeat < threshold:
                     # Fail any running jobs assigned to this worker
                     try:
-                        from ..django_sqlery.models import QueuedJob
+                        # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
                         orphaned_jobs = QueuedJob.objects.filter(
                             worker_id=worker_id,
                             status='running',
@@ -759,7 +761,7 @@ class DaemonManager:
             backend: Database backend instance
             max_age_seconds: How long to keep dead worker rows (default: 120s / 2 minutes)
         """
-        from datetime import datetime, timedelta, timezone
+        # from datetime import datetime, timedelta, timezone  # moved to top-level
 
         try:
             workers = backend.get_worker_heartbeats(active_only=False)
@@ -885,7 +887,7 @@ class DaemonManager:
         Returns:
             Hostname of the current machine
         """
-        import socket
+        # import socket  # moved to top-level
         return socket.gethostname()
 
     def stop(self, force: bool = False) -> bool:
