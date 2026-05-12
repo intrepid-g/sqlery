@@ -104,55 +104,55 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| UNIF-01 | — | Pending |
-| UNIF-02 | — | Pending |
-| UNIF-03 | — | Pending |
-| UNIF-04 | — | Pending |
-| UNIF-05 | — | Pending |
-| UNIF-06 | — | Pending |
-| DMOD-01 | — | Pending |
-| DMOD-02 | — | Pending |
-| DMOD-03 | — | Pending |
-| DMOD-04 | — | Pending |
-| DMOD-05 | — | Pending |
-| DMOD-06 | — | Pending |
-| SMOD-01 | — | Pending |
-| SMOD-02 | — | Pending |
-| SMOD-03 | — | Pending |
-| SMOD-04 | — | Pending |
-| SMOD-05 | — | Pending |
-| SMOD-06 | — | Pending |
-| ASYN-01 | — | Pending |
-| ASYN-02 | — | Pending |
-| ASYN-03 | — | Pending |
-| ASYN-04 | — | Pending |
-| ASYN-05 | — | Pending |
-| TEST-01 | — | Pending |
-| TEST-02 | — | Pending |
-| TEST-03 | — | Pending |
-| TEST-04 | — | Pending |
-| TEST-05 | — | Pending |
-| TEST-06 | — | Pending |
-| TEST-07 | — | Pending |
-| TEST-08 | — | Pending |
-| TEST-09 | — | Pending |
-| TEST-10 | — | Pending |
-| TEST-11 | — | Pending |
-| TEST-12 | — | Pending |
-| SEC-01 | — | Pending |
-| SEC-02 | — | Pending |
-| SEC-03 | — | Pending |
-| SEC-04 | — | Pending |
-| CLEAN-01 | — | Pending |
-| CLEAN-02 | — | Pending |
-| CLEAN-03 | — | Pending |
-| CLEAN-04 | — | Pending |
+| UNIF-01 | Phase 1 | Pending |
+| UNIF-02 | Phase 1 | Pending |
+| UNIF-03 | Phase 1 | Pending |
+| UNIF-04 | Phase 1 | Pending |
+| UNIF-05 | Phase 1 | Pending |
+| UNIF-06 | Phase 1 | Pending |
+| DMOD-01 | Phase 2 | Pending |
+| DMOD-02 | Phase 2 | Pending |
+| DMOD-03 | Phase 2 | Pending |
+| DMOD-04 | Phase 2 | Pending |
+| DMOD-05 | Phase 2 | Pending |
+| DMOD-06 | Phase 2 | Pending |
+| SMOD-01 | Phase 2 | Pending |
+| SMOD-02 | Phase 2 | Pending |
+| SMOD-03 | Phase 2 | Pending |
+| SMOD-04 | Phase 2 | Pending |
+| SMOD-05 | Phase 2 | Pending |
+| SMOD-06 | Phase 2 | Pending |
+| ASYN-01 | Phase 2 | Pending |
+| ASYN-02 | Phase 2 | Pending |
+| ASYN-03 | Phase 2 | Pending |
+| ASYN-04 | Phase 2 | Pending |
+| ASYN-05 | Phase 2 | Pending |
+| TEST-01 | Phase 3 | Pending |
+| TEST-02 | Phase 3 | Pending |
+| TEST-03 | Phase 3 | Pending |
+| TEST-04 | Phase 3 | Pending |
+| TEST-05 | Phase 3 | Pending |
+| TEST-06 | Phase 3 | Pending |
+| TEST-07 | Phase 3 | Pending |
+| TEST-08 | Phase 3 | Pending |
+| TEST-09 | Phase 3 | Pending |
+| TEST-10 | Phase 3 | Pending |
+| TEST-11 | Phase 3 | Pending |
+| TEST-12 | Phase 3 | Pending |
+| SEC-01 | Phase 4 | Pending |
+| SEC-02 | Phase 4 | Pending |
+| SEC-03 | Phase 4 | Pending |
+| SEC-04 | Phase 4 | Pending |
+| CLEAN-01 | Phase 4 | Pending |
+| CLEAN-02 | Phase 4 | Pending |
+| CLEAN-03 | Phase 4 | Pending |
+| CLEAN-04 | Phase 4 | Pending |
 
 **Coverage:**
-- v1 requirements: 40 total
-- Mapped to phases: 0
-- Unmapped: 40 ⚠️
+- v1 requirements: 43 total
+- Mapped to phases: 43
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-05-12*
-*Last updated: 2026-05-12 after initial definition*
+*Last updated: 2026-05-12 after roadmap creation*
