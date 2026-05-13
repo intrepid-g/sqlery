@@ -8,7 +8,7 @@ from django.utils import timezone
 
 from .models import QueuedJob, Worker
 from .settings import get_setting
-from .worker_claiming import get_node_id
+from sqlery.core.claiming import get_node_id
 
 
 def register_worker(queues=None):

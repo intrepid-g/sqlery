@@ -767,7 +767,6 @@ class WorkerProcess:
 
 # Backward compatibility aliases
 Worker = WorkerProcess
-TaskExecutor = JobExecutor  # Historic name from django_sqlery/executor.py
 
 __all__ = [
     "JobExecutor",
@@ -776,3 +775,23 @@ __all__ = [
     "Worker",
     "_current_job_var",
 ]
+
+
+def __getattr__(name):
+    """Lazy re-export of `TaskExecutor`.
+
+    `TaskExecutor` is the historic public name. In Django mode it resolves
+    to `sqlery.django_sqlery.executor.TaskExecutor` (a Django-coupled class
+    with scheduled-task helpers). In standalone mode (no Django installed)
+    it falls back to the framework-agnostic `JobExecutor` in this module.
+
+    This indirection lets callers do `from sqlery.core.worker import
+    TaskExecutor` without `core/worker.py` importing Django at module load.
+    """
+    if name == "TaskExecutor":
+        try:
+            from sqlery.django_sqlery.executor import TaskExecutor as _TE
+            return _TE
+        except ImportError:
+            return JobExecutor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

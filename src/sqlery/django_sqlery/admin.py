@@ -12,7 +12,7 @@ from django.utils.html import format_html
 
 from sqlery.core.cleanup import CleanupManager
 
-from .executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from .models import ScheduledTask, QueuedJob
 
 

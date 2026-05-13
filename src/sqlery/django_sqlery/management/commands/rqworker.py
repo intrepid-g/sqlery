@@ -21,7 +21,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from sqlery.core.daemon import DaemonManager
-from sqlery.django_sqlery.executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from sqlery.django_sqlery.settings import get_setting
 
 

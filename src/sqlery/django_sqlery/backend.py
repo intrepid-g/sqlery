@@ -19,7 +19,7 @@ from sqlery.core.db_resilience import retry_on_db_error
 from ..compat import DatabaseBackend
 from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
 from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
-from .worker_claiming import claim_next_job_with_queue_priority
+from sqlery.core.claiming import claim_next_job_with_queue_priority
 
 logger = logging.getLogger(__name__)
 
