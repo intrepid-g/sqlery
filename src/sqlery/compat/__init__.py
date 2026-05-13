@@ -832,6 +832,19 @@ def _initialize_config():
     return _config
 
 
+def _reset_backend():
+    """Reset the cached backend + config singletons.
+
+    Intended for tests that rebuild process-wide state between cases (e.g. the
+    `tests/integration/` matrix that switches integration modes per parametrize
+    cell). Not a public API — callers outside the test suite should not depend
+    on this function.
+    """
+    global _backend, _config
+    _backend = None
+    _config = None
+
+
 def get_backend() -> DatabaseBackend:
     """Get the active database backend.
 
