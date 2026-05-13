@@ -45,7 +45,15 @@ Plans:
   3. AsyncWorker uses a real async database backend (asyncpg for PostgreSQL, aiosqlite for SQLite) instead of the removed sync wrapper
   4. Async worker handles graceful shutdown via SIGTERM/SIGINT without losing in-progress jobs
   5. Lambda/serverless and HTTP trigger modes work in standalone without any Django dependency
-**Plans**: TBD
+**Plans**:
+  - 02-01: Bump Django floor to 5.2 LTS + CI matrix update (wave 1)
+  - 02-02: Add `shutting_down` job state + Django mig 0026 + Alembic 0014 (wave 1)
+  - 02-03: Define AsyncDatabaseBackend ABC in compat layer (wave 1)
+  - 02-04: DjangoAsyncBackend — native async ORM + raw `acursor()` claim (wave 2)
+  - 02-05: SQLAlchemyAsyncBackend — psycopg3-async / aiosqlite + WAL pragma (wave 2)
+  - 02-06: AsyncWorker rewrite + drain-with-deadline shutdown (wave 3)
+  - 02-07: Parametrized `(mode, integration, db)` E2E harness + existing-mode tests (wave 4)
+  - 02-08: Net-new modes — standalone subprocess/HTTP/Lambda, async E2E (wave 5)
 **UI hint**: no
 
 ### Phase 3: Testing & CI
