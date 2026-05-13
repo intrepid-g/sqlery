@@ -2,6 +2,10 @@
 
 Provides retry logic for transient DB errors and connection configuration
 for SQLite (WAL mode, busy_timeout) and PostgreSQL (statement_timeout, lock_timeout).
+
+Framework-agnostic: imports of Django and SQLAlchemy are guarded so this
+module can be imported in either mode (or with neither installed, for
+pure-import smoke tests).
 """
 
 import functools
@@ -9,15 +13,49 @@ import logging
 import re
 import time
 
-from django.db import OperationalError, connection, connections
-from django.db.utils import DatabaseError
-
-try:
-    from sqlery.django_sqlery.settings import get_setting
-except ImportError:
-    get_setting = None
-
 logger = logging.getLogger(__name__)
+
+# --- Guarded Django imports ---------------------------------------------------
+try:
+    from django.db import (
+        OperationalError as _django_OperationalError,
+        connection as _django_connection,
+        connections as _django_connections,
+    )
+    from django.db.utils import DatabaseError as _django_DatabaseError
+except ImportError:  # pragma: no cover - exercised by standalone-mode tests
+    _django_OperationalError = None
+    _django_DatabaseError = None
+    _django_connections = None
+    _django_connection = None
+
+# --- Guarded SQLAlchemy imports ----------------------------------------------
+try:
+    from sqlalchemy.exc import (
+        OperationalError as _sa_OperationalError,
+        DBAPIError as _sa_DBAPIError,
+    )
+except ImportError:  # pragma: no cover
+    _sa_OperationalError = None
+    _sa_DBAPIError = None
+
+# Tuple of exception classes that retry_on_db_error treats as retryable.
+# If neither Django nor SQLAlchemy is installed, fall back to (Exception,) so
+# tests can still exercise the retry path; warn at module load time.
+_RETRYABLE_EXC = tuple(
+    e for e in (
+        _django_OperationalError,
+        _django_DatabaseError,
+        _sa_OperationalError,
+        _sa_DBAPIError,
+    ) if e is not None
+)
+if not _RETRYABLE_EXC:
+    logger.warning(
+        "Neither django.db nor sqlalchemy.exc available; "
+        "retry_on_db_error will fall back to catching Exception."
+    )
+    _RETRYABLE_EXC = (Exception,)
 
 # Transient error patterns that are safe to retry
 _TRANSIENT_PATTERNS = [
@@ -41,12 +79,40 @@ def _is_transient_error(exc: Exception) -> bool:
     return any(pattern.search(msg) for pattern in _TRANSIENT_PATTERNS)
 
 
+def _reset_connections() -> None:
+    """Force reconnect for the active backend.
+
+    In Django mode this calls ``django.db.connections.close_all()``. In
+    standalone mode we attempt ``get_backend().reset_connections()`` if the
+    backend implements it; otherwise this is a no-op.
+    """
+    if _django_connections is not None:
+        try:
+            _django_connections.close_all()
+            return
+        except Exception:
+            pass
+
+    # Standalone mode: defer the import to avoid circulars at module load.
+    try:
+        from sqlery.compat import get_backend
+        backend = get_backend()
+        reset = getattr(backend, "reset_connections", None)
+        if callable(reset):
+            reset()
+        else:
+            logger.debug("Standalone backend has no reset_connections(); skipping reconnect.")
+    except Exception as exc:
+        logger.debug("Could not reset standalone backend connections: %s", exc)
+
+
 def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
     """Decorator that retries a function on transient database errors.
 
-    Catches OperationalError and DatabaseError, checks if the error is
-    transient, and retries with exponential backoff. Calls
-    connections.close_all() between retries to force reconnection.
+    Catches OperationalError / DBAPIError (Django and/or SQLAlchemy variants,
+    whichever are installed), checks if the error message matches a known
+    transient pattern, and retries with exponential backoff. Forces a
+    reconnect between retries.
 
     Args:
         max_retries: Maximum number of retry attempts (default 3).
@@ -55,14 +121,11 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            # from django.db import OperationalError  # moved to top-level
-            # from django.db.utils import DatabaseError  # moved to top-level
-
             last_exc = None
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
-                except (OperationalError, DatabaseError) as exc:
+                except _RETRYABLE_EXC as exc:
                     last_exc = exc
                     if attempt >= max_retries or not _is_transient_error(exc):
                         raise
@@ -79,8 +142,7 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
 
                     # Force reconnect before retry
                     try:
-                        # from django.db import connections  # moved to top-level
-                        connections.close_all()
+                        _reset_connections()
                     except Exception:
                         pass
 
@@ -91,6 +153,47 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
 
         return wrapper
     return decorator
+
+
+def _get_setting(name, default):
+    """Resolve a setting via the compat layer, falling back to the default.
+
+    Routes through ``sqlery.compat.get_config`` (function-local import to
+    avoid circular import at module load).
+    """
+    try:
+        from sqlery.compat import get_config
+        return get_config(name, default)
+    except Exception:
+        return default
+
+
+def _resolve_active_connection_and_vendor():
+    """Return (connection_or_None, vendor_or_None) for the active backend.
+
+    In Django mode returns the live ``django.db.connection`` (which has a
+    ``.vendor`` attribute and a ``.cursor()`` context manager). In standalone
+    mode attempts to read ``get_backend().vendor`` for vendor-only routing;
+    cursor-based configuration is skipped in standalone mode for now.
+    """
+    # Prefer Django connection if Django is installed and active.
+    if _django_connection is not None:
+        try:
+            from sqlery.compat import is_django_mode
+            if is_django_mode():
+                return _django_connection, _django_connection.vendor
+        except Exception:
+            # Fall through to standalone path
+            pass
+
+    # Standalone mode: try to read vendor from backend, no usable cursor here.
+    try:
+        from sqlery.compat import get_backend
+        backend = get_backend()
+        vendor = getattr(backend, "vendor", None)
+        return None, vendor
+    except Exception:
+        return None, None
 
 
 def configure_connection_resilience(for_job_child: bool = False):
@@ -105,30 +208,28 @@ def configure_connection_resilience(for_job_child: bool = False):
             user task queries are not killed by the DB. The job already has a
             SIGALRM-based timeout; statement_timeout would only interfere.
 
-    Values come from DJANGO_SQL_JOBS settings with sensible defaults.
+    Values come from settings via ``sqlery.compat.get_config`` with sensible
+    defaults. In standalone mode where no usable cursor handle is available
+    yet, this function logs a debug message and returns (no-op).
     """
-    # from django.db import connection  # moved to top-level
-
-    try:
-        vendor = connection.vendor
-    except Exception:
-        logger.warning("Could not determine DB vendor for resilience config")
+    connection, vendor = _resolve_active_connection_and_vendor()
+    if vendor is None:
+        logger.debug("Could not determine DB vendor for resilience config; skipping.")
         return
 
-    # Lazy import settings to avoid circular imports
-    # try:  # moved to top-level (try/except)
-    #     from sqlery.django_sqlery.settings import get_setting
-    # except ImportError:
-    #     logger.debug("django_sqlery.settings not available, skipping resilience config")
-    #     return
-    if get_setting is None:
-        logger.debug("django_sqlery.settings not available, skipping resilience config")
+    if connection is None:
+        # Standalone mode with vendor known but no cursor handle: nothing to do.
+        logger.debug(
+            "Standalone backend reported vendor=%s but no cursor available; "
+            "skipping resilience PRAGMA/SET.",
+            vendor,
+        )
         return
 
     if vendor == "sqlite":
-        _configure_sqlite(connection, get_setting)
+        _configure_sqlite(connection, _get_setting)
     elif vendor == "postgresql":
-        _configure_postgresql(connection, get_setting, apply_statement_timeout=not for_job_child)
+        _configure_postgresql(connection, _get_setting, apply_statement_timeout=not for_job_child)
 
 
 def _configure_sqlite(connection, get_setting):

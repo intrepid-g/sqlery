@@ -57,6 +57,11 @@ def pydantic_to_django_model(
     Returns:
         Django Model class
     """
+    if django_models is None:
+        raise RuntimeError(
+            "Django is required for pydantic_to_django_model; "
+            "install sqlery[django] or add django to your environment."
+        )
     # from django.db import models  # moved to top-level (try/except as django_models)
     models = django_models
 
@@ -123,6 +128,11 @@ def map_pydantic_to_django_field(name: str, p_field):
     Returns:
         Django Field instance
     """
+    if django_models is None:
+        raise RuntimeError(
+            "Django is required for map_pydantic_to_django_field; "
+            "install sqlery[django] or add django to your environment."
+        )
     # from django.db import models  # moved to top-level (try/except as django_models)
     models = django_models
 
