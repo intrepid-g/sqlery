@@ -64,7 +64,7 @@ from .eventbridge_trigger import (
     ensure_cron_eventbridge_rule,
     invoke_lambda_worker,
 )
-from .executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from .models import QueuedJob, ScheduledTask
 
 logger = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ to spawn multiple worker subprocesses.
 """
 
 from django.core.management.base import BaseCommand
-from sqlery.django_sqlery.executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 
 
 class Command(BaseCommand):

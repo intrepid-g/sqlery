@@ -28,7 +28,7 @@ from django.utils import timezone
 from datetime import timedelta
 
 from sqlery.django_sqlery.models import QueuedJob, Worker
-from sqlery.django_sqlery.executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from sqlery.core.worker import Worker as CoreWorker
 
 

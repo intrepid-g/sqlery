@@ -1,7 +1,7 @@
 """Management command to run scheduled tasks."""
 
 from django.core.management.base import BaseCommand
-from .executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from sqlery.django_sqlery.models import ScheduledTask
 
 

@@ -2,7 +2,7 @@
 
 import logging
 
-from .executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from .subprocess_executor import get_execution_strategy, run_scheduler_subprocess, run_worker_subprocess
 
 try:

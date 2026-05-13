@@ -28,7 +28,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from sqlery.core.worker import _current_job_var as _core_job_var
-from sqlery.django_sqlery.executor import _current_job_var as _django_job_var
+from sqlery.core.worker import _current_job_var as _django_job_var
 
 warnings.warn(
     "sqlery.compat.scheduler is deprecated and will be removed in v3.2.0. "

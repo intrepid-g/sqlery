@@ -15,8 +15,8 @@ django.setup()
 
 from django.utils import timezone
 
-from .executor import TaskExecutor
-from .worker_claiming import claim_next_job_with_queue_priority, release_job
+from sqlery.core.worker import TaskExecutor
+from sqlery.core.claiming import claim_next_job_with_queue_priority, release_job
 from .worker_registry import register_worker, unregister_worker, update_heartbeat
 from .settings import get_setting
 from .deadlines import write_deadline, clear_deadline

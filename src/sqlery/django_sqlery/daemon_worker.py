@@ -42,7 +42,7 @@ from django.utils import timezone
 
 from sqlery.core.log_config import configure_logging
 from sqlery.django_sqlery.deadlines import enforce_deadlines, rebuild_deadlines
-from sqlery.django_sqlery.executor import TaskExecutor
+from sqlery.core.worker import TaskExecutor
 from sqlery.django_sqlery.intervention import do_manual_intervention
 from sqlery.django_sqlery.models import DaemonCommand
 from sqlery.django_sqlery.settings import get_setting
