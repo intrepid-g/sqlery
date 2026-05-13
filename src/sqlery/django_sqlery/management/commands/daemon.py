@@ -30,20 +30,35 @@ class Command(BaseCommand):
             default=None,
             help='Number of worker subprocess processes to maintain (default: 1)',
         )
+        parser.add_argument(
+            '--once',
+            action='store_true',
+            default=False,
+            help=(
+                'Run a single daemon cycle and exit. Intended for testing / '
+                'one-shot integration harnesses. Only valid with action=start.'
+            ),
+        )
 
     def handle(self, *args, **options):
         action = options['action']
 
         max_workers = options.get('workers')
+        once = options.get('once', False)
 
         if action == 'start':
-            self.start_daemon(max_workers=max_workers)
+            self.start_daemon(max_workers=max_workers, once=once)
         elif action == 'status':
             self.show_status()
         elif action == 'stop':
             self.stop_daemon(force=options.get('force', False))
         elif action == 'restart':
             self.restart_daemon(force=options.get('force', False), max_workers=max_workers)
+
+        if action != 'start' and once:
+            self.stdout.write(self.style.WARNING(
+                "--once is ignored for actions other than 'start'."
+            ))
 
     def show_status(self):
         """Show daemon status."""
@@ -121,14 +136,21 @@ class Command(BaseCommand):
 
         self.stdout.write("")
 
-    def start_daemon(self, max_workers: int | None = None):
-        """Start the daemon in the foreground."""
+    def start_daemon(self, max_workers: int | None = None, once: bool = False):
+        """Start the daemon in the foreground.
+
+        Args:
+            max_workers: Override worker pool size.
+            once: If True, run a single daemon cycle and return (test harness).
+        """
         daemon = DaemonManager()
         if daemon.is_running():
             self.stdout.write(self.style.WARNING("Daemon is already running"))
             return
-        self.stdout.write(f"Starting daemon (workers={max_workers or 'default'})...")
-        daemon._run_daemon(max_workers=max_workers)
+        self.stdout.write(
+            f"Starting daemon (workers={max_workers or 'default'}, once={once})..."
+        )
+        daemon._run_daemon(max_workers=max_workers, once=once)
 
     def stop_daemon(self, force=False):
         """Stop the daemon."""

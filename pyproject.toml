@@ -134,6 +134,9 @@ packages = ["src/sqlery"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that hit serverful resources (e.g. Postgres); deselect with '-m \"not slow\"'",
+]
 
 [tool.black]
 line-length = 100
