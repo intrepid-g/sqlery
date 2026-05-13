@@ -42,7 +42,7 @@ cli = ["typer>=0.9.0", "rich>=13.0.0"]
 
 # Django mode dependencies
 django = [
-    "django>=4.2",
+    "django>=5.2",
 ]
 
 # Standalone mode dependencies
@@ -63,7 +63,7 @@ eventbridge = ["boto3>=1.34.0"]
 
 # Combined extras
 all-django = [
-    "django>=4.2",
+    "django>=5.2",
     "django-tasks>=0.1.0",
     "psycopg>=3.1.0",
     "httpx>=0.24.0",
@@ -82,7 +82,7 @@ all-standalone = [
     "boto3>=1.34.0",
 ]
 all = [
-    "django>=4.2",
+    "django>=5.2",
     "django-tasks>=0.1.0",
     "psycopg>=3.1.0",
     "sqlmodel>=0.0.14",
@@ -107,7 +107,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "httpx>=0.24.0",
-    "django>=4.2",
+    "django>=5.2",
     "sqlmodel>=0.0.14",
     "fastapi>=0.104.0",
 ]
