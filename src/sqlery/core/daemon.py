@@ -277,7 +277,7 @@ class DaemonManager:
         # Run daemon
         self._run_daemon()
 
-    def _run_daemon(self, max_workers: int | None = None):
+    def _run_daemon(self, max_workers: int | None = None, once: bool = False):
         """Main daemon loop - manages worker pool and scheduler.
 
         Runs continuously, performing these tasks each cycle:
@@ -290,6 +290,9 @@ class DaemonManager:
         Args:
             max_workers: Number of worker subprocess processes to maintain.
                 None falls back to config then default of 1.
+            once: If True, run a single cycle and exit. Intended for tests and
+                one-shot harnesses. Skips the inter-cycle sleep so the daemon
+                returns immediately after performing one round of work.
 
         Supports graceful shutdown on SIGTERM/SIGINT.
         """
@@ -437,6 +440,13 @@ class DaemonManager:
                         logger.info("Periodic auto-cleanup completed")
                     except Exception as e:
                         logger.error(f"Auto-cleanup error: {e}", exc_info=True)
+
+                # One-shot mode: exit after a single cycle (used by tests
+                # and integration harnesses via `--once`).
+                if once:
+                    logger.info("Daemon one-shot cycle complete; exiting.")
+                    shutdown_requested = True
+                    break
 
                 # Sleep until next cycle (with responsive shutdown checking)
                 elapsed = 0
