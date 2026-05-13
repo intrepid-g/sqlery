@@ -353,6 +353,7 @@ class QueuedJob(models.Model):
         ("success", "Success"),
         ("failed", "Failed"),
         ("archived", "Archived"),
+        ("shutting_down", "Shutting Down"),
     ]
 
     # Task definition
@@ -382,7 +383,7 @@ class QueuedJob(models.Model):
 
     # Status
     status = models.CharField(
-        max_length=10, choices=STATUS_CHOICES, default="queued", db_index=True
+        max_length=20, choices=STATUS_CHOICES, default="queued", db_index=True
     )
     version = models.IntegerField(
         default=0,
