@@ -70,3 +70,59 @@ jobs:
         PYTHONPATH: .
       run: |
         uv run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing
+
+  standalone-no-django:
+    # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
+    # submodules import in a fresh venv where `django` is NOT installed.
+    # See .planning/phases/01-core-unification/01-CONTEXT.md.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "latest"
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install package WITHOUT django (standalone extra only)
+      run: |
+        uv venv
+        # Use the [standalone] extra explicitly; do NOT use `uv sync` which
+        # would resolve the dev/all-deps environment and pull django in.
+        uv pip install ".[standalone]"
+
+    - name: Assert django is NOT installed (T-01-04 mitigation)
+      run: |
+        # If django is importable, the env is contaminated and the
+        # following import success would be a false positive. Fail loudly.
+        if uv run python -c "import django" 2>/dev/null; then
+          echo "FAIL: django is installed in the standalone venv (T-01-04)"
+          uv pip list | grep -i django || true
+          exit 1
+        else
+          echo "django absent OK"
+        fi
+
+    - name: Import all sqlery.core submodules without django
+      run: |
+        uv run python -c "
+        import sqlery.core
+        import sqlery.core.claiming
+        import sqlery.core.worker
+        import sqlery.core.daemon
+        import sqlery.core.db_resilience
+        import sqlery.core.log_config
+        import sqlery.core.model_utils
+        import sqlery.core.daemon_runner
+        import sqlery.core.worker_runner
+        import sqlery.core.scheduler_tasks
+        import sqlery.core.utils
+        import sqlery.core.worker_pool
+        print('all-core-imports-ok')
+        "
