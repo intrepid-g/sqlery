@@ -4,8 +4,14 @@ import json
 import sys
 from io import StringIO
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
+from django.core.serializers.json import DjangoJSONEncoder
 
 from sqlery.django_sqlery.models import ScheduledTask
 
@@ -86,16 +92,15 @@ class Command(BaseCommand):
 
         output_format = options["output"]
         if output_format == "yaml":
-            try:
-                import yaml
-                content = yaml.dump(data, default_flow_style=False)
-            except ImportError:
+            # import yaml  # moved to top-level (optional try/except)
+            if yaml is None:
                 self.stderr.write(
                     self.style.ERROR("PyYAML required for YAML: pip install pyyaml")
                 )
                 return
+            content = yaml.dump(data, default_flow_style=False)
         else:
-            from django.core.serializers.json import DjangoJSONEncoder
+            # from django.core.serializers.json import DjangoJSONEncoder  # moved to top-level
             content = json.dumps(data, indent=2, cls=DjangoJSONEncoder)
 
         if options["filename"]:

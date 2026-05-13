@@ -3,11 +3,24 @@
 import contextvars
 import json
 import logging
+import re
+import socket
+import sys
 import traceback as tb
 import signal
 import os
 import time
 from datetime import datetime, timezone, timedelta
+
+from ..compat import get_backend, get_config
+from .utils import import_task
+from sqlery.core.db_resilience import configure_connection_resilience
+
+try:
+    from django.db import connections, close_old_connections
+except ImportError:
+    connections = None
+    close_old_connections = None
 
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
 
@@ -22,7 +35,7 @@ class JobExecutor:
 
     def __init__(self, backend=None):
         if backend is None:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
         self.backend = backend
 
@@ -43,7 +56,7 @@ class JobExecutor:
         try:
             # Apply global default timeout if not set on the job
             if not job.timeout_seconds:
-                from ..compat import get_config
+                # from ..compat import get_config  # moved to top-level
                 job.timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
             # Set up timeout
@@ -113,7 +126,7 @@ class JobExecutor:
             # Configure DB resilience for child's fresh connection.
             # for_job_child=True skips statement_timeout — user task queries can
             # legitimately take longer than the daemon/worker guard value.
-            from sqlery.core.db_resilience import configure_connection_resilience
+            # from sqlery.core.db_resilience import configure_connection_resilience  # moved to top-level
             configure_connection_resilience(for_job_child=True)
 
             # Reset signal handlers — child doesn't need heartbeat
@@ -126,7 +139,7 @@ class JobExecutor:
 
             # Apply timeout
             if not job.timeout_seconds:
-                from ..compat import get_config
+                # from ..compat import get_config  # moved to top-level
                 job.timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
             if job.timeout_seconds:
@@ -208,9 +221,10 @@ class JobExecutor:
     def _reset_db_connections(self):
         """Close inherited DB connections after fork."""
         try:
-            from django.db import connections
-            connections.close_all()
-        except ImportError:
+            # from django.db import connections  # moved to top-level (try/except)
+            if connections is not None:
+                connections.close_all()
+        except Exception:
             pass
 
     def _import_task(self, task_path: str):
@@ -221,7 +235,7 @@ class JobExecutor:
         #     return getattr(module, func_name)
         # except (ImportError, AttributeError, ValueError) as e:
         #     raise ImportError(f"Cannot import task '{task_path}': {e}")
-        from .utils import import_task
+        # from .utils import import_task  # moved to top-level
         return import_task(task_path)
 
     def _should_retry(self, job) -> bool:
@@ -244,7 +258,7 @@ class JobExecutor:
         retry_job_name = None
         original_name = getattr(failed_job, 'job_name', None)
         if original_name:
-            import re
+            # import re  # moved to top-level
             # base_name = re.sub(r':retry:\d+$', '', original_name)
             base_name = re.sub(r':retry:\d+', '', original_name)
             retry_job_name = f"{base_name}:retry:{retry_count + 1}"
@@ -387,7 +401,7 @@ class WorkerProcess:
 
     def __init__(self, queues: list[str] | None = None, backend=None):
         if backend is None:
-            from ..compat import get_backend
+            # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
 
         self.backend = backend
@@ -401,23 +415,23 @@ class WorkerProcess:
         self._heartbeat_due = False
         self._last_loop_time = time.monotonic()
 
-        import socket
+        # import socket  # moved to top-level
         self.node_id = os.environ.get("NODE_ID", socket.gethostname())
         self.pid = os.getpid()
         self.worker_id = f"worker_{self.node_id}_{self.pid}"
 
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
         self.poll_interval = get_config('WORKER_POLL_INTERVAL', 5)
         self.heartbeat_interval = get_config('WORKER_HEARTBEAT_INTERVAL', 5)
 
     def run(self):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
-        import sys
+        # import sys  # moved to top-level
 
         logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
 
         # Configure DB resilience (WAL mode, busy_timeout, statement_timeout, etc.)
-        from sqlery.core.db_resilience import configure_connection_resilience
+        # from sqlery.core.db_resilience import configure_connection_resilience  # moved to top-level
         configure_connection_resilience()
 
         # Signal handlers for graceful shutdown
@@ -459,8 +473,9 @@ class WorkerProcess:
             while not self.shutdown_requested:
                 try:
                     # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
-                    from django.db import close_old_connections
-                    close_old_connections()
+                    # from django.db import close_old_connections  # moved to top-level (try/except)
+                    if close_old_connections is not None:
+                        close_old_connections()
 
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
@@ -552,7 +567,7 @@ class WorkerProcess:
         reads final result from DB (no pipe IPC).
         Returns dict with 'success', 'output'/'error'/'traceback'.
         """
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
         timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
         # # Pipe removed — child writes results directly to DB (like RQ)
@@ -592,8 +607,9 @@ class WorkerProcess:
         self.executor._reset_db_connections()
 
         # Also prune stale connections (parent may wait a long time for child)
-        from django.db import close_old_connections
-        close_old_connections()
+        # from django.db import close_old_connections  # moved to top-level (try/except)
+        if close_old_connections is not None:
+            close_old_connections()
 
         # Update heartbeat with child info
         self._heartbeat('busy', job_id=job.id)

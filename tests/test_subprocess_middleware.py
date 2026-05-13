@@ -274,3 +274,250 @@ class TestSubprocessTriggerMiddleware:
                 assert "/absolute/path/to/manage.py" in args
                 # Verify get_manage_py_path was called
                 mock_path.assert_called_once()
+
+
+@pytest.mark.django_db
+class TestSubprocessTriggerLifecycle:
+    """Integration tests for the full middleware → command → executor lifecycle.
+
+    Instead of mocking Popen entirely, these tests replace it with
+    a synchronous call_command('run_jobs') to exercise the real executor
+    path while keeping tests deterministic.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        """Clear cache before each test."""
+        cache.clear()
+
+    def _make_middleware(self, settings):
+        """Configure settings and return a wired-up middleware."""
+        settings.DJANGO_SQL_JOBS = {
+            "TRIGGER_MODE": "subprocess",
+            "ENABLE_MIDDLEWARE_TRIGGER": True,
+            "CHECK_INTERVAL_SECONDS": 60,
+        }
+        get_response = MagicMock(return_value=MagicMock(status_code=200))
+        return SubprocessTriggerMiddleware(get_response)
+
+    def test_full_lifecycle_queued_to_success(self, settings):
+        """End-to-end: middleware triggers subprocess → run_jobs → job succeeds."""
+        from django.core.management import call_command
+        from sqlery.models import QueuedJob
+
+        middleware = self._make_middleware(settings)
+
+        # Create a queued job pointing at a real task function
+        job = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            queue_name="default",
+            status="queued",
+        )
+
+        # Replace Popen with synchronous call_command to simulate the subprocess
+        def fake_popen(cmd, **kwargs):
+            call_command("run_jobs")
+            return MagicMock()
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+                middleware(request)
+
+        # Verify job transitioned to success
+        job.refresh_from_db()
+        assert job.status == "success"
+        assert job.output == "Success"
+        assert job.started_at is not None
+        assert job.finished_at is not None
+
+    def test_full_lifecycle_failing_job(self, settings):
+        """End-to-end: middleware triggers subprocess → run_jobs → job fails."""
+        from django.core.management import call_command
+        from sqlery.models import QueuedJob
+
+        middleware = self._make_middleware(settings)
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_executor.failing_task",
+            queue_name="default",
+            status="queued",
+        )
+
+        def fake_popen(cmd, **kwargs):
+            call_command("run_jobs")
+            return MagicMock()
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+                middleware(request)
+
+        job.refresh_from_db()
+        assert job.status == "failed"
+        assert "Task failed" in job.error
+        assert job.started_at is not None
+        assert job.finished_at is not None
+
+    def test_full_lifecycle_processes_one_job_only(self, settings):
+        """Subprocess invocation processes exactly one job, leaving others queued."""
+        from django.core.management import call_command
+        from sqlery.models import QueuedJob
+
+        middleware = self._make_middleware(settings)
+
+        # Create two queued jobs
+        job1 = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            queue_name="default",
+            status="queued",
+            priority=10,  # higher priority, processed first
+        )
+        job2 = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            queue_name="default",
+            status="queued",
+            priority=0,
+        )
+
+        popen_count = 0
+
+        def fake_popen(cmd, **kwargs):
+            nonlocal popen_count
+            popen_count += 1
+            # Only run the first call_command (the middleware trigger)
+            # Ignore any chained worker spawn from _spawn_next_worker
+            if popen_count == 1:
+                call_command("run_jobs")
+            return MagicMock()
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+                middleware(request)
+
+        job1.refresh_from_db()
+        job2.refresh_from_db()
+
+        # Higher-priority job processed, lower-priority job still queued
+        assert job1.status == "success"
+        assert job2.status == "queued"
+
+    def test_full_lifecycle_empty_queue(self, settings):
+        """Middleware triggers with no queued jobs — no crash, no side effects."""
+        from django.core.management import call_command
+        from sqlery.models import QueuedJob
+
+        middleware = self._make_middleware(settings)
+
+        def fake_popen(cmd, **kwargs):
+            call_command("run_jobs")
+            return MagicMock()
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+                response = middleware(request)
+
+        assert response is not None
+        assert QueuedJob.objects.count() == 0
+
+    def test_throttle_recovery_after_cache_expiry(self, settings):
+        """After cache key expires, the next request re-triggers subprocess spawn."""
+        settings.DJANGO_SQL_JOBS = {
+            "TRIGGER_MODE": "subprocess",
+            "ENABLE_MIDDLEWARE_TRIGGER": True,
+            "CHECK_INTERVAL_SECONDS": 60,
+        }
+
+        get_response = MagicMock(return_value=MagicMock())
+        middleware = SubprocessTriggerMiddleware(get_response)
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+
+                # First request — spawns
+                middleware(request)
+                assert mock_popen.call_count == 1
+
+                # Second request — throttled
+                middleware(request)
+                assert mock_popen.call_count == 1
+
+                # Expire the cache key (simulates CHECK_INTERVAL_SECONDS passing)
+                cache.delete("sqlery:last_subprocess_trigger")
+
+                # Third request — should spawn again
+                middleware(request)
+                assert mock_popen.call_count == 2
+
+    def test_throttle_recovery_spawns_for_new_job(self, settings):
+        """After throttle expires, a new job is picked up by the re-triggered subprocess."""
+        from django.core.management import call_command
+        from sqlery.models import QueuedJob
+
+        middleware = self._make_middleware(settings)
+
+        # First cycle: create and process job1
+        job1 = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            queue_name="default",
+            status="queued",
+        )
+
+        call_count = 0
+
+        def fake_popen(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            call_command("run_jobs")
+            return MagicMock()
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
+            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                factory = RequestFactory()
+                request = factory.get("/")
+
+                # First request processes job1
+                middleware(request)
+                assert call_count >= 1
+
+                job1.refresh_from_db()
+                assert job1.status == "success"
+
+                # Throttled — second request does nothing
+                job2 = QueuedJob.objects.create(
+                    task_path="tests.test_executor.dummy_task",
+                    queue_name="default",
+                    status="queued",
+                )
+                prev_count = call_count
+                middleware(request)
+                job2.refresh_from_db()
+                assert job2.status == "queued"  # not yet processed
+
+                # Expire throttle
+                cache.delete("sqlery:last_subprocess_trigger")
+
+                # Third request — picks up job2
+                middleware(request)
+                job2.refresh_from_db()
+                assert job2.status == "success"

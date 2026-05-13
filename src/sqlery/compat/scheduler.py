@@ -24,6 +24,12 @@ from datetime import timedelta
 from enum import Enum
 from typing import Any, Callable
 
+from django.db.models import Q
+from django.utils import timezone
+
+from sqlery.core.worker import _current_job_var as _core_job_var
+from sqlery.django_sqlery.executor import _current_job_var as _django_job_var
+
 warnings.warn(
     "sqlery.compat.scheduler is deprecated and will be removed in v3.2.0. "
     "Use sqlery.django_sqlery.queue.Queue, sqlery.django_sqlery.models, "
@@ -304,11 +310,11 @@ def get_current_job():
     ``.origin`` (queue name) work without modification.
     """
     # Check both the Django executor and core worker context vars
-    from sqlery.core.worker import _current_job_var as core_var
-    qj = core_var.get()
+    # from sqlery.core.worker import _current_job_var as core_var  # moved to top-level
+    qj = _core_job_var.get()
     if qj is None:
-        from sqlery.django_sqlery.executor import _current_job_var
-        qj = _current_job_var.get()
+        # from sqlery.django_sqlery.executor import _current_job_var  # moved to top-level
+        qj = _django_job_var.get()
     if qj is None:
         return None
     return _RQJobCompat(qj)
@@ -488,8 +494,8 @@ class Queue:
         Only returns ready-to-run jobs (not scheduled in the future),
         matching RQ's behavior where delayed jobs lived in a separate registry.
         """
-        from django.db.models import Q
-        from django.utils import timezone
+        # from django.db.models import Q  # moved to top-level
+        # from django.utils import timezone  # moved to top-level
         return list(
             QueuedJob.objects.filter(queue_name=self.name, status="queued")
             .filter(
@@ -536,7 +542,7 @@ class Queue:
 
         class _ScheduledRegistry:
             def get_job_ids(self) -> list[str]:
-                from django.utils import timezone
+                # from django.utils import timezone  # moved to top-level
                 return list(
                     QueuedJob.objects.filter(
                         queue_name=queue_name,

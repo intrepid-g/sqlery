@@ -9,6 +9,14 @@ import logging
 import re
 import time
 
+from django.db import OperationalError, connection, connections
+from django.db.utils import DatabaseError
+
+try:
+    from sqlery.django_sqlery.settings import get_setting
+except ImportError:
+    get_setting = None
+
 logger = logging.getLogger(__name__)
 
 # Transient error patterns that are safe to retry
@@ -47,8 +55,8 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            from django.db import OperationalError
-            from django.db.utils import DatabaseError
+            # from django.db import OperationalError  # moved to top-level
+            # from django.db.utils import DatabaseError  # moved to top-level
 
             last_exc = None
             for attempt in range(max_retries + 1):
@@ -71,7 +79,7 @@ def retry_on_db_error(max_retries: int = 3, backoff_base: float = 0.1):
 
                     # Force reconnect before retry
                     try:
-                        from django.db import connections
+                        # from django.db import connections  # moved to top-level
                         connections.close_all()
                     except Exception:
                         pass
@@ -99,7 +107,7 @@ def configure_connection_resilience(for_job_child: bool = False):
 
     Values come from DJANGO_SQL_JOBS settings with sensible defaults.
     """
-    from django.db import connection
+    # from django.db import connection  # moved to top-level
 
     try:
         vendor = connection.vendor
@@ -108,9 +116,12 @@ def configure_connection_resilience(for_job_child: bool = False):
         return
 
     # Lazy import settings to avoid circular imports
-    try:
-        from sqlery.django_sqlery.settings import get_setting
-    except ImportError:
+    # try:  # moved to top-level (try/except)
+    #     from sqlery.django_sqlery.settings import get_setting
+    # except ImportError:
+    #     logger.debug("django_sqlery.settings not available, skipping resilience config")
+    #     return
+    if get_setting is None:
         logger.debug("django_sqlery.settings not available, skipping resilience config")
         return
 

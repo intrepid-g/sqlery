@@ -14,6 +14,8 @@ import warnings
 from pathlib import Path
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 
+from sqlery.core.daemon import DaemonManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +37,7 @@ def get_pid_file_path() -> Path:
         Path to PID file in BASE_DIR/tmp/
     """
     _deprecation_warning('get_pid_file_path')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().pid_file
 
 
@@ -46,7 +48,7 @@ def get_heartbeat_file_path() -> Path:
         Path to heartbeat file in BASE_DIR/tmp/
     """
     _deprecation_warning('get_heartbeat_file_path')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().heartbeat_file
 
 
@@ -57,7 +59,7 @@ def read_pid_file() -> int | None:
         PID as integer, or None if file doesn't exist or is invalid
     """
     _deprecation_warning('read_pid_file')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().read_pid()
 
 
@@ -71,7 +73,7 @@ def is_process_running(pid: int) -> bool:
         True if process exists, False otherwise
     """
     _deprecation_warning('is_process_running')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().is_process_running(pid)
 
 
@@ -82,7 +84,7 @@ def is_daemon_running() -> bool:
         True if daemon process is active, False otherwise
     """
     _deprecation_warning('is_daemon_running')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().is_running()
 
 
@@ -97,7 +99,7 @@ def get_daemon_status() -> dict:
         - stale: bool (heartbeat is old)
     """
     _deprecation_warning('get_daemon_status')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().status()
 
 
@@ -111,7 +113,7 @@ def stop_daemon(force: bool = False) -> bool:
         True if daemon was stopped, False if not running
     """
     _deprecation_warning('stop_daemon')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().stop(force=force)
 
 
@@ -122,5 +124,5 @@ def cleanup_stale_pid() -> bool:
         True if cleaned up, False if daemon is still running
     """
     _deprecation_warning('cleanup_stale_pid')
-    from sqlery.core.daemon import DaemonManager
+    # from sqlery.core.daemon import DaemonManager  # moved to top-level
     return DaemonManager().cleanup_stale()

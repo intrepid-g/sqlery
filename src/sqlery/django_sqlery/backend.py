@@ -5,15 +5,21 @@ This backend wraps Django ORM operations to implement the DatabaseBackend interf
 
 import logging
 import os
+import socket
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
-from django.db import transaction
+
+from django.db import connection, IntegrityError, models as db_models, transaction
 from django.db.models import Q, Count
 from django.utils import timezone
 
-from ..compat import DatabaseBackend
-from .db_compat import atomic_claim_job_queryset, is_sqlite
 from sqlery.core.db_resilience import retry_on_db_error
+
+from ..compat import DatabaseBackend
+from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
+from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+from .worker_claiming import claim_next_job_with_queue_priority
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +33,7 @@ class DjangoBackend(DatabaseBackend):
     def __init__(self):
         """Initialize Django backend."""
         # Import models here to avoid circular imports
-        from .models import QueuedJob, ScheduledTask, JobRegistry, Worker
+        # from .models import QueuedJob, ScheduledTask, JobRegistry, Worker  # moved to top-level
 
         self.QueuedJob = QueuedJob
         self.ScheduledTask = ScheduledTask
@@ -147,7 +153,7 @@ class DjangoBackend(DatabaseBackend):
         #
         #     return job
 
-        from .worker_claiming import claim_next_job_with_queue_priority
+        # from .worker_claiming import claim_next_job_with_queue_priority  # moved to top-level
         worker_row = self._resolve_worker(worker_id)
         if not worker_row:
             return None
@@ -182,7 +188,7 @@ class DjangoBackend(DatabaseBackend):
 
     def _resolve_worker(self, worker_id: str):
         """Resolve a worker_id string to a Worker model instance."""
-        import uuid
+        # import uuid  # moved to top-level
 
         # Try UUID first
         try:
@@ -309,8 +315,8 @@ class DjangoBackend(DatabaseBackend):
     @retry_on_db_error()
     def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None, jobs_processed: int | None = None, total_busy_seconds: float | None = None):
         """Update or create worker heartbeat."""
-        import socket
-        import uuid
+        # import socket  # moved to top-level
+        # import uuid  # moved to top-level
 
         # Check if worker_id is a UUID (from cleanup_dead_workers)
         try:
@@ -392,7 +398,7 @@ class DjangoBackend(DatabaseBackend):
         Used by the daemon to keep workers alive without interfering with
         the worker's own state management (status, current_job).
         """
-        import uuid
+        # import uuid  # moved to top-level
 
         try:
             worker_uuid = uuid.UUID(str(worker_id))
@@ -476,7 +482,7 @@ class DjangoBackend(DatabaseBackend):
     @retry_on_db_error()
     def vacuum_database(self) -> dict:
         """Run database vacuum/optimize (PostgreSQL VACUUM)."""
-        from django.db import connection
+        # from django.db import connection  # moved to top-level
 
         with connection.cursor() as cursor:
             try:
@@ -666,7 +672,7 @@ class DjangoBackend(DatabaseBackend):
 
     def get_expired_ttl_jobs(self) -> list:
         """Get queued jobs whose TTL has expired."""
-        from datetime import timedelta
+        # from datetime import timedelta  # moved to top-level
 
         now = timezone.now()
         expired = []
@@ -677,8 +683,8 @@ class DjangoBackend(DatabaseBackend):
 
     def acquire_tag_locks(self, tags: list[str]) -> None:
         """Acquire exclusive locks on tag coordination rows."""
-        from .models import TagLock
-        from .db_compat import is_sqlite
+        # from .models import TagLock  # moved to top-level
+        # from .db_compat import is_sqlite  # moved to top-level
 
         # Ensure TagLock rows exist
         existing = set(TagLock.objects.filter(tag__in=tags).values_list('tag', flat=True))
@@ -702,7 +708,7 @@ class DjangoBackend(DatabaseBackend):
         limit: int = 1,
     ) -> list:
         """Get next claimable jobs ordered by queue priority, job priority, age."""
-        from django.db import models as db_models
+        # from django.db import models as db_models  # moved to top-level
 
         queryset = (
             self.QueuedJob.objects
@@ -739,7 +745,7 @@ class DjangoBackend(DatabaseBackend):
 
     def atomic_claim_job(self, job, worker) -> bool:
         """Atomically claim a specific job for a worker."""
-        from .db_compat import atomic_claim_job
+        # from .db_compat import atomic_claim_job  # moved to top-level
         return atomic_claim_job(job, worker)
 
     def claim_due_scheduled_task(self, task_id: int):
@@ -814,8 +820,8 @@ class DjangoBackend(DatabaseBackend):
         Returns the subset of queues successfully claimed. Expired leases are
         taken over atomically; live leases held by other daemons are skipped.
         """
-        from .models import DaemonLease
-        from django.db import IntegrityError
+        # from .models import DaemonLease  # moved to top-level
+        # from django.db import IntegrityError  # moved to top-level
 
         claimed = []
         for queue_name in queues:
@@ -833,9 +839,9 @@ class DjangoBackend(DatabaseBackend):
         lease_secs: int,
     ) -> bool:
         """Atomically claim a single queue lease. Returns True if claimed."""
-        from .models import DaemonLease
-        from django.db import IntegrityError
-        from datetime import timedelta
+        # from .models import DaemonLease  # moved to top-level
+        # from django.db import IntegrityError  # moved to top-level
+        # from datetime import timedelta  # moved to top-level
 
         now = timezone.now()
         expires = now + timedelta(seconds=lease_secs)
@@ -875,8 +881,8 @@ class DjangoBackend(DatabaseBackend):
         lease_secs: int,
     ) -> None:
         """Extend expires_at for all owned leases by lease_secs from now."""
-        from .models import DaemonLease
-        from datetime import timedelta
+        # from .models import DaemonLease  # moved to top-level
+        # from datetime import timedelta  # moved to top-level
 
         DaemonLease.objects.filter(
             queue_name__in=owned_queues,
@@ -889,7 +895,7 @@ class DjangoBackend(DatabaseBackend):
         daemon_id: str,
     ) -> None:
         """Delete lease rows for all owned queues on clean shutdown."""
-        from .models import DaemonLease
+        # from .models import DaemonLease  # moved to top-level
 
         DaemonLease.objects.filter(
             queue_name__in=owned_queues,

@@ -11,6 +11,11 @@ from datetime import datetime, date, time
 from pydantic import BaseModel, EmailStr, create_model
 from pydantic_core import PydanticUndefined
 
+try:
+    from django.db import models as django_models
+except ImportError:
+    django_models = None
+
 T = TypeVar('T', bound=BaseModel)
 FieldDefinition = tuple[Any, Any]
 
@@ -52,7 +57,8 @@ def pydantic_to_django_model(
     Returns:
         Django Model class
     """
-    from django.db import models
+    # from django.db import models  # moved to top-level (try/except as django_models)
+    models = django_models
 
     # Get Pydantic fields
     if hasattr(schema, "model_fields"):
@@ -117,7 +123,8 @@ def map_pydantic_to_django_field(name: str, p_field):
     Returns:
         Django Field instance
     """
-    from django.db import models
+    # from django.db import models  # moved to top-level (try/except as django_models)
+    models = django_models
 
     # Handle primary key
     if name == 'id':

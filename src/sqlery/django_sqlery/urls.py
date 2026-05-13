@@ -19,6 +19,8 @@ from .api_views import (
     api_vacuum,
     api_activity_feed,
     api_clear_jobs,
+    api_archive_scheduled_jobs,
+    api_manual_intervention,
 )
 
 app_name = "sqlery"
@@ -42,7 +44,9 @@ urlpatterns = [
     path("admin/api/sqlery/jobs/<int:job_id>/priority/", api_job_priority, name="api_job_priority"),
     path("admin/api/sqlery/queues/<str:queue_name>/jobs/", api_queue_jobs, name="api_queue_jobs"),
     path("admin/api/sqlery/jobs/clear/", api_clear_jobs, name="api_clear_jobs"),
+    path("admin/api/sqlery/jobs/archive-scheduled/", api_archive_scheduled_jobs, name="api_archive_scheduled_jobs"),
     path("admin/api/sqlery/vacuum/", api_vacuum, name="api_vacuum"),
+    path("admin/api/sqlery/intervene/", api_manual_intervention, name="api_intervene"),
     path("admin/api/sqlery/feed/", api_activity_feed, name="api_activity_feed"),
 
     # Fixture dump/load (smuggler-compatible)

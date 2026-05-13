@@ -1,5 +1,7 @@
 """Settings for sqlery."""
 
+import logging
+
 from django.conf import settings
 
 
@@ -193,7 +195,7 @@ def get_setting(name, default=None):
     Self-healing: If user config fails to load or is invalid, falls back to defaults.
     This ensures SQLery continues working even with misconfigured settings.
     """
-    import logging
+    # import logging  # moved to top-level
     logger = logging.getLogger(__name__)
 
     try:

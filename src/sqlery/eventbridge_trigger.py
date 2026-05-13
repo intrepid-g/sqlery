@@ -34,6 +34,15 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from django.utils import timezone
+
+from .settings import get_setting
+
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,8 +56,8 @@ def invoke_lambda_worker(job_id: int | None = None, queue_name: str | None = Non
     Returns:
         dict: Response from Lambda invocation
     """
-    import boto3
-    from .settings import get_setting
+    # import boto3  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     lambda_arn = get_setting("EVENTBRIDGE_LAMBDA_ARN")
     if not lambda_arn:
@@ -94,9 +103,9 @@ def schedule_eventbridge_event(job_id: int, run_at: datetime) -> dict[str, Any]:
     Returns:
         dict: Response with rule ARN and schedule expression
     """
-    import boto3
-    from django.utils import timezone
-    from .settings import get_setting
+    # import boto3  # moved to top-level
+    # from django.utils import timezone  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     lambda_arn = get_setting("EVENTBRIDGE_LAMBDA_ARN")
     if not lambda_arn:
@@ -186,8 +195,8 @@ def ensure_cron_eventbridge_rule(
     Returns:
         dict: Response with rule ARN
     """
-    import boto3
-    from .settings import get_setting
+    # import boto3  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     lambda_arn = get_setting("EVENTBRIDGE_LAMBDA_ARN")
     if not lambda_arn:
@@ -257,8 +266,8 @@ def delete_eventbridge_rule(rule_name: str) -> None:
     Args:
         rule_name: Name of the rule to delete
     """
-    import boto3
-    from .settings import get_setting
+    # import boto3  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     bus_name = get_setting("EVENTBRIDGE_BUS_NAME", "default")
     aws_region = get_setting("AWS_REGION", None)
@@ -290,8 +299,8 @@ def disable_cron_eventbridge_rule(task_id: int) -> None:
     Args:
         task_id: ScheduledTask ID
     """
-    import boto3
-    from .settings import get_setting
+    # import boto3  # moved to top-level
+    # from .settings import get_setting  # moved to top-level
 
     bus_name = get_setting("EVENTBRIDGE_BUS_NAME", "default")
     aws_region = get_setting("AWS_REGION", None)

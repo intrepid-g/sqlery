@@ -56,6 +56,17 @@ import logging
 import os
 import sys
 
+import django
+from django.db import transaction
+from django.utils import timezone
+
+from .eventbridge_trigger import (
+    ensure_cron_eventbridge_rule,
+    invoke_lambda_worker,
+)
+from .executor import TaskExecutor
+from .models import QueuedJob, ScheduledTask
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,10 +83,10 @@ def handler(event, context):
     # Initialize Django
     setup_django()
 
-    from .executor import TaskExecutor
-    from .eventbridge_trigger import ensure_cron_eventbridge_rule
-    from .models import QueuedJob, ScheduledTask
-    from django.utils import timezone
+    # from .executor import TaskExecutor  # moved to top-level
+    # from .eventbridge_trigger import ensure_cron_eventbridge_rule  # moved to top-level
+    # from .models import QueuedJob, ScheduledTask  # moved to top-level
+    # from django.utils import timezone  # moved to top-level
 
     logger.info(f"Lambda invoked with event: {json.dumps(event)}")
 
@@ -103,7 +114,7 @@ def setup_django():
     if not settings_module:
         raise ValueError("DJANGO_SETTINGS_MODULE environment variable must be set")
 
-    import django
+    # import django  # moved to top-level
 
     if not django.conf.settings.configured:
         django.setup()
@@ -119,9 +130,9 @@ def process_queue_action(event, context):
           "queue_name": "default"  # Optional
         }
     """
-    from .executor import TaskExecutor
-    from .models import QueuedJob
-    from .eventbridge_trigger import invoke_lambda_worker
+    # from .executor import TaskExecutor  # moved to top-level
+    # from .models import QueuedJob  # moved to top-level
+    # from .eventbridge_trigger import invoke_lambda_worker  # moved to top-level
 
     executor = TaskExecutor()
 
@@ -202,9 +213,9 @@ def run_scheduled_task_action(event, context):
           "priority": 10
         }
     """
-    from .models import ScheduledTask, QueuedJob
-    from .eventbridge_trigger import ensure_cron_eventbridge_rule, invoke_lambda_worker
-    from django.db import transaction
+    # from .models import ScheduledTask, QueuedJob  # moved to top-level
+    # from .eventbridge_trigger import ensure_cron_eventbridge_rule, invoke_lambda_worker  # moved to top-level
+    # from django.db import transaction  # moved to top-level
 
     task_id = event.get("task_id")
 
@@ -289,8 +300,8 @@ def poll_and_process_action(event, context):
           "action": "poll_and_process"
         }
     """
-    from .executor import TaskExecutor
-    from .eventbridge_trigger import invoke_lambda_worker
+    # from .executor import TaskExecutor  # moved to top-level
+    # from .eventbridge_trigger import invoke_lambda_worker  # moved to top-level
 
     executor = TaskExecutor()
 
@@ -306,7 +317,7 @@ def poll_and_process_action(event, context):
     logger.info(f"Processed {jobs_processed} queued jobs")
 
     # If there are more queued jobs, invoke another worker
-    from .models import QueuedJob
+    # from .models import QueuedJob  # moved to top-level
 
     more_jobs = QueuedJob.objects.filter(status="queued").exists()
 

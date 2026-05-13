@@ -10,6 +10,7 @@ All database operations are delegated to the DatabaseBackend ABC.
 import logging
 import os
 import socket
+from datetime import datetime, timezone
 
 from sqlery.core.utils import parse_rate_limit
 from sqlery.core.registry import track_job_start, track_job_finish
@@ -70,7 +71,7 @@ def check_tag_rate_limits(job, tag_rate_limits: dict, backend) -> bool:
     if not tag_rate_limits:
         return True
 
-    from datetime import datetime, timezone
+    # from datetime import datetime, timezone  # moved to top-level
 
     for tag in job.tags:
         rate_limit_str = tag_rate_limits.get(tag)

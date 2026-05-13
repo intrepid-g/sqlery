@@ -3,6 +3,8 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
+from ..compat import get_backend, get_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,11 +21,11 @@ class CleanupManager:
             backend: DatabaseBackend instance (auto-detected if not provided)
         """
         if backend is None:
-            from ..compat import get_backend, get_config
+            # from ..compat import get_backend, get_config  # moved to top-level
             backend = get_backend()
             self.retention_config = get_config('JOB_RETENTION', {})
         else:
-            from ..compat import get_config
+            # from ..compat import get_config  # moved to top-level
             self.retention_config = get_config('JOB_RETENTION', {})
 
         self.backend = backend
@@ -135,7 +137,7 @@ class CleanupManager:
         Returns:
             Dict with deletion stats
         """
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
 
         if max_age_days is None:
             registry_retention = get_config('REGISTRY_RETENTION', {})
@@ -187,7 +189,7 @@ class CleanupManager:
         Returns:
             Dict with cleanup results
         """
-        from ..compat import get_config
+        # from ..compat import get_config  # moved to top-level
 
         results = {
             'timestamp': datetime.now(timezone.utc).isoformat(),

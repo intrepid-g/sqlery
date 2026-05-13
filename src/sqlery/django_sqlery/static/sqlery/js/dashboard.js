@@ -184,6 +184,7 @@ function updateHealthPanel(warnings) {
                     <span style="flex:1;font-size:0.9rem;">${escapeHtml(w.msg)}</span>
                     ${w.action ? `<button
                         onclick="executeHealthAction(${JSON.stringify(w.action).replace(/"/g, '&quot;')})"
+                        ${w.action.kind === 'manual_intervention' ? 'data-intervention-btn' : ''}
                         style="white-space:nowrap;padding:0.25rem 0.75rem;background:#e67e22;color:white;border:none;border-radius:3px;cursor:pointer;font-size:0.85rem;">
                         ${escapeHtml(w.action.label)}
                     </button>` : '<span style="font-size:0.8rem;color:#999;white-space:nowrap;">Manual intervention required</span>'}
@@ -208,6 +209,41 @@ async function executeHealthAction(action) {
         for (const wid of (action.worker_ids || [])) {
             await workerAction(wid, 'unpause');
         }
+    } else if (action.kind === 'manual_intervention') {
+        await triggerIntervention();
+    }
+}
+
+async function triggerIntervention() {
+    // Find and disable all intervention buttons
+    const btns = document.querySelectorAll('[data-intervention-btn]');
+    btns.forEach(b => { b.disabled = true; b.textContent = 'Working...'; });
+
+    try {
+        const resp = await fetch('/admin/api/sqlery/intervene/', {
+            method: 'POST',
+            headers: {'X-CSRFToken': getCsrfToken()},
+        });
+        const data = await resp.json();
+
+        if (data.status === 'completed') {
+            const actions = data.result?.actions_taken || [];
+            const msg = actions.length > 0
+                ? `Intervention complete: ${actions.join(', ')}`
+                : 'Intervention complete: no issues found';
+            if (data.note) addFeedEvent('info', data.note, new Date());
+            addFeedEvent('info', msg, new Date());
+        } else if (data.status === 'rejected') {
+            addFeedEvent('info', data.message || 'System is healthy — no intervention needed', new Date());
+        } else if (data.status === 'pending') {
+            addFeedEvent('info', 'Intervention queued — waiting for daemon to process...', new Date());
+        } else if (data.status === 'failed') {
+            addFeedEvent('warning', `Intervention failed: ${data.result?.error || 'Unknown error'}`, new Date());
+        }
+    } catch (e) {
+        addFeedEvent('warning', `Intervention request failed: ${e.message}`, new Date());
+    } finally {
+        btns.forEach(b => { b.disabled = false; b.textContent = 'Fix Now'; });
     }
 }
 
@@ -684,13 +720,22 @@ function renderStatTable(type, jobs) {
             </table>`;
     } else if (type === 'scheduled') {
         container.innerHTML = `
+            <div class="scheduled-bulk-bar" id="scheduled-bulk-bar" style="display:none; padding:0.4rem 0.6rem; background:#f0f0f0; border-radius:4px; margin-bottom:0.4rem; font-size:0.8rem; align-items:center; gap:0.5rem;">
+                <span id="scheduled-bulk-count">0 selected</span>
+                <button onclick="event.stopPropagation();archiveSelectedScheduledJobs()" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:#6c757d;color:white;border:none;border-radius:3px;cursor:pointer;">Archive Selected</button>
+                <button onclick="event.stopPropagation();clearScheduledSelection()" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:#aaa;color:white;border:none;border-radius:3px;cursor:pointer;">Clear</button>
+            </div>
             <table>
-                <thead><tr><th>ID</th><th>Task</th><th>Queue</th><th>Pri</th><th>Scheduled For</th><th>Actions</th></tr></thead>
+                <thead><tr>
+                    <th style="width:30px"><input type="checkbox" onclick="event.stopPropagation();toggleAllScheduledCheckboxes(this)" title="Select all"></th>
+                    <th>ID</th><th>Task</th><th>Queue</th><th>Pri</th><th>Scheduled For</th><th>Actions</th>
+                </tr></thead>
                 <tbody>
                     ${jobs.map(j => {
                         const name = j.task_name || j.task_path.split('.').pop();
                         const enqueueBtn = `<button onclick="event.stopPropagation();enqueueJobNow(${j.id},'${escapeHtml(name)}')" style="font-size:0.7rem;padding:0.15rem 0.4rem;background:#f0ad4e;color:white;border:none;border-radius:3px;cursor:pointer;">Enqueue Now</button>`;
                         return `<tr onclick="window.location='${jobUrl(j.id)}'">
+                            <td onclick="event.stopPropagation()"><input type="checkbox" class="scheduled-job-cb" value="${j.id}" onclick="updateScheduledBulkBar()"></td>
                             <td>#${j.id}</td>
                             <td title="${escapeHtml(j.task_path)}"><strong>${escapeHtml(name)}</strong></td>
                             <td>${escapeHtml(j.queue_name)}</td>
@@ -1130,6 +1175,52 @@ async function removeQueuedJob(jobId, jobName) {
         }
     } catch (e) {
         showToast('Failed to remove job', e.message, 'error');
+    }
+}
+
+// --- Scheduled jobs bulk selection helpers ---
+
+function toggleAllScheduledCheckboxes(selectAllCb) {
+    document.querySelectorAll('.scheduled-job-cb').forEach(cb => {
+        cb.checked = selectAllCb.checked;
+    });
+    updateScheduledBulkBar();
+}
+
+function updateScheduledBulkBar() {
+    const checked = document.querySelectorAll('.scheduled-job-cb:checked');
+    const bar = document.getElementById('scheduled-bulk-bar');
+    const count = document.getElementById('scheduled-bulk-count');
+    if (bar) bar.style.display = checked.length > 0 ? 'flex' : 'none';
+    if (count) count.textContent = `${checked.length} selected`;
+}
+
+function clearScheduledSelection() {
+    document.querySelectorAll('.scheduled-job-cb').forEach(cb => { cb.checked = false; });
+    const selectAll = document.querySelector('#stat-table-scheduled input[type="checkbox"]:not(.scheduled-job-cb)');
+    if (selectAll) selectAll.checked = false;
+    updateScheduledBulkBar();
+}
+
+async function archiveSelectedScheduledJobs() {
+    const ids = Array.from(document.querySelectorAll('.scheduled-job-cb:checked')).map(cb => Number(cb.value));
+    if (ids.length === 0) return;
+    if (!confirm(`Archive ${ids.length} scheduled job(s)?`)) return;
+    try {
+        const resp = await fetch(DASHBOARD_CONFIG.archiveScheduledJobsUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+            body: JSON.stringify({ job_ids: ids }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast(`Archived ${data.archived} scheduled job(s)`, '', 'success');
+            refreshAll();
+        } else {
+            showToast('Failed to archive jobs', data.error || '', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to archive jobs', e.message, 'error');
     }
 }
 
