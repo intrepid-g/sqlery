@@ -1,194 +1,283 @@
 # Codebase Concerns
 
-**Analysis Date:** 2026-05-12
+**Analysis Date:** 2026-05-13
 
 ## Tech Debt
 
-**24 backward-compatibility stub files at package root:**
-- Issue: During a migration from flat `src/sqlery/` modules to `src/sqlery/django_sqlery/`, 24 stub files were left behind. Each contains `#CLEANUP` comments and re-exports from the new location. These stubs add confusion about where real code lives.
-- Files: `src/sqlery/admin.py`, `src/sqlery/apps.py`, `src/sqlery/cleanup.py`, `src/sqlery/daemon_manager.py`, `src/sqlery/daemon_worker.py`, `src/sqlery/dashboard_views.py`, `src/sqlery/db_compat.py`, `src/sqlery/executor.py`, `src/sqlery/http_trigger_middleware.py`, `src/sqlery/middleware.py`, `src/sqlery/views.py`, `src/sqlery/worker_claiming.py`, `src/sqlery/worker_process.py`, `src/sqlery/worker_registry.py`, `src/sqlery/registries.py`, `src/sqlery/settings.py`, `src/sqlery/urls.py`, `src/sqlery/daemon_middleware.py`, `src/sqlery/subprocess_middleware.py`, `src/sqlery/subprocess_executor.py`, `src/sqlery/models.py`, `src/sqlery/rate_limit_utils.py`, `src/sqlery/worker.py`, `src/sqlery/decorators.py`
-- Impact: Maintainers cannot tell at a glance which file to edit. New contributors import from wrong paths. Package size is inflated.
-- Fix approach: Replace stubs with deprecation warnings, add `__all__` to `__init__.py` for public API, then remove stubs after one release cycle.
+### Top-level `sqlery/*.py` shim files marked for cleanup
 
-**Duplicate claiming algorithms (core vs django_sqlery):**
-- Issue: `src/sqlery/core/claiming.py` (framework-agnostic, promoted from django_sqlery) duplicates `src/sqlery/django_sqlery/worker_claiming.py` (Django-specific, actively used). Both implement `get_node_id`, `check_tag_concurrency_limits`, `check_tag_rate_limits`, `check_job_dependencies`, `expire_ttl_jobs`, and `claim_next_job_with_queue_priority`. The Django version is the one actively called by `DjangoBackend.claim_job()` at `src/sqlery/django_sqlery/backend.py:150`. The core version is only imported by one file (`src/sqlery/worker_pool.py:14` for `get_node_id`).
-- Files: `src/sqlery/core/claiming.py`, `src/sqlery/django_sqlery/worker_claiming.py`
-- Impact: Bug fixes must be applied to both. The core version may drift out of sync since it is not the code path exercised by tests.
-- Fix approach: Make `django_sqlery/worker_claiming.py` delegate to `core/claiming.py` (passing Django ORM as backend), or delete the core version and keep the Django-specific one until standalone mode is mature enough to need its own.
+- Issue: 21 module files at `src/sqlery/` are header-stubs marked `# #CLEANUP: This file has been moved to src/sqlery/django_sqlery/` but remain on disk and on import paths.
+- Files (representative): `src/sqlery/daemon_manager.py`, `src/sqlery/daemon_worker.py`, `src/sqlery/models.py`, `src/sqlery/subprocess_middleware.py`, `src/sqlery/apps.py`, `src/sqlery/admin.py`, `src/sqlery/cleanup.py`, `src/sqlery/worker_process.py`, `src/sqlery/dashboard_views.py`, `src/sqlery/worker_claiming.py`, `src/sqlery/executor.py`, `src/sqlery/settings.py`, `src/sqlery/db_compat.py`, `src/sqlery/subprocess_executor.py`, `src/sqlery/daemon_middleware.py`, `src/sqlery/http_trigger_middleware.py`, `src/sqlery/urls.py`, `src/sqlery/registries.py`, `src/sqlery/views.py`, `src/sqlery/middleware.py`, `src/sqlery/worker_registry.py`.
+- Impact: Two import paths exist for the same symbol; doubles surface area for refactors, confuses IDE navigation, and prolongs deprecation cycle.
+- Fix approach: Confirm no external/user code imports these paths, then delete in one batch (or downgrade to a `__getattr__`-based lazy re-export module per package).
 
-**Duplicate execution logic (core/worker.py vs django_sqlery/executor.py):**
-- Issue: `src/sqlery/core/worker.py` (753 lines) and `src/sqlery/django_sqlery/executor.py` (675 lines) both implement job execution, retry logic, timeout handling, stale job cleanup, and concurrency checking. They use different patterns: the core version uses a backend abstraction; the Django version calls Django ORM directly. Both define `execute_job`, `_retry_job`, `_cleanup_stale_jobs`, `_kill_worker_process`, `can_execute_job`.
-- Files: `src/sqlery/core/worker.py`, `src/sqlery/django_sqlery/executor.py`
-- Impact: Maintenance burden doubles. Changes to retry logic, timeout behavior, or error handling must be replicated in both. Features like `parent_job_id` cascading and process group killing exist in core but not in the Django executor.
-- Fix approach: Route Django mode through the core `JobExecutor` via `DjangoBackend`. The Django executor should become a thin wrapper or be deprecated.
+### Dead async layer (`AsyncStorageBackend = None`)
 
-**Pervasive commented-out code:**
-- Issue: Large blocks of commented-out code throughout key files. `src/sqlery/core/worker.py` has ~130 lines of comments including old pipe IPC code, old kill-only-child code, old import logic. `src/sqlery/django_sqlery/executor.py` has ~71 comment lines. `src/sqlery/django_sqlery/models.py` has ~85 comment lines. `src/sqlery/django_sqlery/backend.py` has ~50 lines of commented-out old `claim_job` body.
-- Files: `src/sqlery/core/worker.py`, `src/sqlery/django_sqlery/executor.py`, `src/sqlery/django_sqlery/models.py`, `src/sqlery/django_sqlery/backend.py`, `src/sqlery/compat/__init__.py`
-- Impact: Obscures the actual implementation. Makes files appear larger than they are. The `# Old:` pattern appears as fossil comments throughout.
-- Fix approach: Delete all commented-out code in a dedicated cleanup commit. The git history preserves old implementations.
+- Issue: `AsyncStorageBackend` is set to `None` after the backends abstraction was removed in v0.13, but the `AsyncQueue` and async `Worker` classes still type-hint and reference it.
+- Files: `src/sqlery/async_queue.py:11-55`, `src/sqlery/async_worker.py:18-264`, `src/sqlery/django_sqlery/queue.py:17`, `src/sqlery/schema.py:7-8`, `src/sqlery/django_sqlery/decorators.py:367,451`.
+- Impact: Async worker / queue code paths can never be instantiated (defaults are `None`); ~600 lines of effectively-dead code that still gets imported.
+- Fix approach: Either delete `async_queue.py` / `async_worker.py` entirely or rebuild them on top of `DatabaseBackend`.
 
-**Django imports in the "framework-agnostic" core package:**
-- Issue: `src/sqlery/core/` is documented as "Django-agnostic" but 8 of its 16 modules import directly from Django. For example, `core/worker.py` imports `django.db.close_old_connections` and `django.db.connections`. `core/db_resilience.py` imports `django.db.OperationalError`. `core/daemon.py` imports `django.conf.settings` and `django.utils.timezone`. `core/worker_pool.py` imports `django.conf.settings`.
-- Files: `src/sqlery/core/worker.py:211,462,595`, `src/sqlery/core/db_resilience.py:50-51,74,102`, `src/sqlery/core/daemon.py:49,560,579`, `src/sqlery/core/worker_pool.py:61`, `src/sqlery/core/model_utils.py:55,120`, `src/sqlery/core/daemon_runner.py:21`, `src/sqlery/core/worker_runner.py:31`
-- Impact: Standalone mode cannot use `core/worker.py` or `core/db_resilience.py` without Django installed. The abstraction boundary between core and django_sqlery is broken.
-- Fix approach: Move all Django imports behind `try/except ImportError` blocks or route them through the compat layer. The `_reset_db_connections` method already has a try/except pattern that could be extended to `close_old_connections`.
+### Legacy daemon manager wrapper
 
-## Known Bugs
+- Issue: `src/sqlery/django_sqlery/daemon_manager.py` is marked `DEPRECATED in v0.11.0: Use sqlery.core.daemon.DaemonManager instead.` and emits a deprecation warning on import.
+- Files: `src/sqlery/django_sqlery/daemon_manager.py:3-25`.
+- Impact: Carries deprecation noise across all Django mode users; risk if any legacy management command still imports it.
+- Fix approach: Grep for callers, remove file, bump major version.
 
-**Missing webhooks module in django_sqlery:**
-- Symptoms: Any job with a `webhook_url` set will raise `ImportError: No module named 'sqlery.django_sqlery.webhooks'` when `mark_success()` or `mark_failed()` is called.
-- Files: `src/sqlery/django_sqlery/models.py:667`, `src/sqlery/django_sqlery/models.py:723`
-- Trigger: Enqueue a job with `webhook_url` set, let it complete (success or failure).
-- Workaround: The import is inside an `if self.webhook_url:` guard, so jobs without webhooks are unaffected. But for jobs with webhooks, the `mark_success`/`mark_failed` method will raise after already updating the DB status, which means the job status is updated but the webhook is never sent, and the error propagates to the worker.
-- Fix: Change `from .webhooks import send_webhook_with_retry` to `from sqlery.webhooks import send_webhook_with_retry` (the top-level module exists at `src/sqlery/webhooks.py`).
+### `compat.rq` and `compat.scheduler` slated for removal in v3.2.0
 
-**CI workflow triggers on `master` but default branch is `main`:**
-- Symptoms: GitHub Actions CI never runs on pushes or pull requests targeting the default branch.
-- Files: `.github/workflows/test.yml:6-8`
-- Trigger: Push to `main` or open a PR targeting `main`.
-- Workaround: None -- CI must be manually triggered or branch names changed.
-- Fix: Change `branches: [ master ]` to `branches: [ main ]` on both push and pull_request triggers.
+- Issue: Both modules emit `DeprecationWarning` with explicit version targets but are still ~1500 LOC combined.
+- Files: `src/sqlery/compat/rq.py:27`, `src/sqlery/compat/scheduler.py:34`.
+- Impact: Backward-compat shims for RQ and django-tasks-scheduler. Need an explicit removal plan; otherwise they will silently outlive the target version.
+- Fix approach: Set a removal commit gated on v3.2.0 changelog; add a CI check that fails if `version >= 3.2` and these modules still exist.
 
-**`AsyncWorker` references removed backend abstraction:**
-- Symptoms: `AsyncStorageBackend` is set to `None` at module level (`AsyncStorageBackend = None`). `AsyncWorker.__init__` accepts it as a type hint. Calling `await self.backend.claim_job(...)` will raise `AttributeError: 'NoneType' object has no attribute 'claim_job'` if no backend is explicitly provided.
-- Files: `src/sqlery/async_worker.py:17`, `src/sqlery/async_worker.py:95`
-- Trigger: Attempt to use `AsyncWorker` without passing an explicit backend object.
-- Workaround: Always pass an explicit backend. But the class is effectively unusable in standalone mode since no async backend implementation exists.
+### Date-marked dead-code comments (per project convention)
+
+The codebase intentionally preserves replaced code as `# # Old:` / `# Old:` comments per the user's [feedback_dead_code] memory. These should be tracked so they can be aged out:
+
+- `src/sqlery/worker_pool.py:40` and `src/sqlery/core/worker_pool.py:106` — old "always redirect to raw log file" logic.
+- `src/sqlery/core/worker.py:443,704,722` — old kill-only-child fork logic (now kills process group).
+- `src/sqlery/core/daemon.py:224,505,511,572,833` — old logging/lock/heartbeat/zombie-detection behavior, including a global `os.kill` zombie scan that was unsafe on multi-node setups.
+- `src/sqlery/core/worker_runner.py:15` — old "log to stderr" path.
+- `src/sqlery/core/scheduler.py:103` — old "always used cron" code that broke `interval` and `once` schedule types.
+- `src/sqlery/django_sqlery/daemon_worker.py:235` — old stdout-logging path.
+- `src/sqlery/django_sqlery/models.py:924` — old in-Python filtering that loaded all queued jobs into memory.
+- `src/sqlery/django_sqlery/admin.py:326`, `src/sqlery/django_sqlery/api_views.py:317`, `src/sqlery/django_sqlery/views.py:67` — old fork-unaware worker-kill / aggregation queries.
+- `src/sqlery/django_sqlery/migrations/0023_restore_daemonlease.py:37` — old unconditional `CreateModel` that crashed on existing tables.
+
+None of these blocks carry an explicit removal date; recommend adding a `# Remove after YYYY-MM-DD` comment so the tracking convention has a deadline.
+
+### `TODO` markers
+
+- `src/sqlery/core/log_config.py:8`: "TODO: Decide on the best default logging strategy for non-debug mode." — Only TODO in the codebase. Log configuration policy is unfinished.
+
+## Known Bugs / Limitations
+
+### SQLite cannot use `SELECT FOR UPDATE SKIP LOCKED`
+
+- Symptoms: Under multi-worker SQLite, claiming falls back to optimistic locking (`QueuedJob.version` CAS), which has higher contention and retry storms.
+- Files: `src/sqlery/django_sqlery/worker_claiming.py:229`, `src/sqlery/django_sqlery/db_compat.py:46`, `src/sqlery/compat/__init__.py:68,223,253`, `src/sqlery/django_sqlery/models.py:387,620-646`.
+- Trigger: 2+ workers on SQLite contending for the same queue.
+- Workaround: WAL mode + `busy_timeout=5000` are auto-applied (`src/sqlery/core/db_resilience.py:140-147`, `src/sqlery/django_sqlery/apps.py:23`). Documentation should explicitly recommend Postgres for multi-worker production.
+
+### Fork-safety pitfalls
+
+- Symptoms: DB connections inherited across `os.fork()` corrupt the parent's session if the child closes them; manifests as `psycopg` `OperationalError: connection already closed` or "consuming input failed".
+- Files: `src/sqlery/core/worker.py:563` (`_fork_and_execute`), `src/sqlery/core/worker.py:235` (commented-out task-loader fork path), `src/sqlery/core/worker_pool.py:118-131` (FD leak comment).
+- Trigger: Any unhandled exception during the fork window or any DB call inside a SIGUSR1 signal handler.
+- Workaround: `_reset_db_connections()` is called pre/post fork; signal handlers only flip a flag — never call DB. This contract is not asserted in code; one careless future edit will reintroduce the bug.
+
+### FD leak risk in worker pool
+
+- Symptoms: One file descriptor leaked per worker spawn under certain code paths.
+- Files: `src/sqlery/core/worker_pool.py:131` notes "Leaving it open leaks one FD per spawn."
+- Impact: Long-running daemons (weeks-long uptime) can exhaust file descriptors.
+
+### Circular import fragility
+
+- Files: `src/sqlery/__init__.py` (conditional Django decorator import), `src/sqlery/compat/__init__.py` (forced absolute imports).
+- Fragility: Comments note the compat layer uses absolute imports (`from sqlery.django_sqlery.backend`) instead of relative to avoid resolution in the wrong package. Any future contributor switching to relative imports will break standalone mode.
+- Fix approach: Add an import-time integration test that imports `sqlery` from both a Django and a non-Django environment.
 
 ## Security Considerations
 
-**Arbitrary code execution via `task_path`:**
-- Risk: The `task_path` field on `QueuedJob` is a string like `myapp.tasks.send_email`. It is imported and executed at `src/sqlery/core/utils.py:57-79` via `importlib.import_module()`. Any user or API client that can create jobs can execute any Python function accessible on the `PYTHONPATH`. This is by design for a task queue, but there is no allowlist or validation of task paths.
-- Files: `src/sqlery/core/utils.py:57-79`, `src/sqlery/fastapi_sqlery/app.py:342-360`, `src/sqlery/django_sqlery/api_views.py`
-- Current mitigation: Django API views require `is_staff` authentication. FastAPI standalone mode has NO authentication on any endpoint.
-- Recommendations: Add a `ALLOWED_TASK_MODULES` config option that restricts which Python modules can be imported. At minimum, add authentication middleware to the FastAPI standalone dashboard. Document the security model clearly.
+### Webhook delivery — SSRF risk
 
-**FastAPI standalone dashboard has zero authentication:**
-- Risk: The FastAPI app at `src/sqlery/fastapi_sqlery/app.py` exposes job creation, deletion, cancellation, database vacuum, and scheduled task management with no authentication. Any network-accessible deployment is fully open.
-- Files: `src/sqlery/fastapi_sqlery/app.py:15-19` (no auth middleware), `src/sqlery/fastapi_sqlery/app.py:342` (`POST /api/jobs` creates jobs)
-- Current mitigation: None. The Django mode uses `@staff_required_json` decorators properly.
-- Recommendations: Add API key or basic auth middleware as a minimum. Add a config option `DASHBOARD_AUTH_ENABLED` (default True) that gates access.
+- Risk: `send_webhook()` posts to a user-controlled `job.webhook_url` with no host allowlist, no scheme restriction, no private-IP filtering.
+- Files: `src/sqlery/webhooks.py:135-157`.
+- Current mitigation: HMAC-SHA256 signature header (`X-Sqlery-Signature`) if `WEBHOOK_SECRET` is set; 10s default timeout.
+- Recommendations:
+  - Validate `webhook_url` scheme is `https://` (or explicit allowlist).
+  - Block RFC 1918 / link-local / loopback hosts unless explicitly opted-in.
+  - Require `WEBHOOK_SECRET` in production (currently optional; if `None`, signature is silently skipped at `webhooks.py:108-110`).
 
-**Webhook SSRF (Server-Side Request Forgery):**
-- Risk: `src/sqlery/webhooks.py:123-128` sends HTTP POST requests to user-controlled `webhook_url` without any URL validation beyond Django's `URLField` format check. Internal network addresses (`http://169.254.169.254/`, `http://localhost:8080/admin`, `http://10.0.0.1/`) can be targeted.
-- Files: `src/sqlery/webhooks.py:123-128`, `src/sqlery/django_sqlery/models.py:421-425`
-- Current mitigation: Django `URLField` validates URL format only. No IP/host restrictions.
-- Recommendations: Add an allowlist or denylist for webhook domains/IPs. At minimum, block RFC1918 private ranges and link-local addresses. Consider using a dedicated webhook delivery service.
+### `requests` dependency missing from `pyproject.toml`
 
-**CSRF exemptions on internal endpoints:**
-- Risk: `src/sqlery/django_sqlery/views.py:332` (`internal_worker`) and `src/sqlery/django_sqlery/api_views.py` endpoints use `@csrf_exempt`. The `internal_worker` view validates HMAC signatures, but all `api_views.py` admin endpoints rely solely on `@staff_required_json` (session cookie) without CSRF protection.
-- Files: `src/sqlery/django_sqlery/api_views.py:209,281,375,453,475,607,807,840`
-- Current mitigation: `@staff_required_json` checks `is_staff`. HMAC on internal worker endpoint.
-- Recommendations: Either re-enable CSRF for admin API endpoints or use token-based auth (e.g., API keys) instead of session cookies. The JavaScript dashboard likely needs CSRF tokens in its fetch calls.
+- Risk: `src/sqlery/webhooks.py:17` does `import requests` (with try/except → `requests = None`), but `requests` is not listed in any `[project.optional-dependencies]` group. The error message at `webhooks.py:127` advises `pip install sqlery[webhooks]` — that extra does not exist in `pyproject.toml`.
+- Impact: Webhook delivery silently degrades to a logged error in every install path; users following the docs cannot resolve it.
+- Fix approach: Add `webhooks = ["requests>=2.31.0"]` (or migrate to the already-required `httpx`) and update the install hint.
+
+### Untrusted task path → arbitrary import
+
+- Risk: `getattr(module, function_name)` after `importlib.import_module(module_name)` runs whatever the enqueuer wrote into `task_path`.
+- Files: `src/sqlery/utils.py:63`, `src/sqlery/core/utils.py:72`, `src/sqlery/async_worker.py:160-166`.
+- Current mitigation: Enqueue API is in-process Python; assumption is the enqueuer is trusted. No allowlist of importable modules.
+- Recommendations: Document the trust boundary; consider an opt-in `ALLOWED_TASK_MODULES` setting for environments where the queue may receive untrusted writes (multi-tenant DB).
+
+### `kwargs` deserialization
+
+- Risk: Job kwargs are JSON-decoded (not pickled — good) but go straight into the function call. Functions that themselves `pickle.loads` user data are vulnerable.
+- Files: throughout `src/sqlery/core/worker.py`, `src/sqlery/django_sqlery/executor.py`.
+- Current mitigation: JSON-only serialization avoids the classic pickle RCE.
+
+### Lambda IAM — undocumented privilege requirements
+
+- Risk: `src/sqlery/lambda_handler.py` calls `invoke_lambda_worker()` to chain Lambda → Lambda invocations; `src/sqlery/eventbridge_trigger.py` creates EventBridge rules. Required IAM permissions (`lambda:InvokeFunction`, `events:PutRule`, `events:PutTargets`, `iam:PassRole`) are not documented in-tree.
+- Files: `src/sqlery/lambda_handler.py:65,159,193,273,326`, `src/sqlery/eventbridge_trigger.py:50-150`.
+- Recommendations: Add a minimal IAM policy template under `docs/lambda/`. Currently a deployer needs to read source to discover them.
+
+### Raw SQL in cleanup/VACUUM paths
+
+- Files: `src/sqlery/django_sqlery/cleanup.py:179,342`, `src/sqlery/django_sqlery/backend.py:487-497`, `src/sqlery/fastapi_sqlery/backend.py:422-425`, `src/sqlery/core/db_resilience.py:140-165`.
+- Risk: SQL strings are hardcoded table/PRAGMA names (no string interpolation of user input) — low risk. `f"SET statement_timeout = '{int(statement_timeout_ms)}'"` is wrapped in `int()`, but the f-string pattern is fragile.
+- Recommendation: Switch to parameterized values where supported; flag the f-string pattern in code review guidelines.
+
+### `subprocess.Popen` with `env=os.environ`
+
+- Files: `src/sqlery/django_sqlery/subprocess_middleware.py:94`, `src/sqlery/django_sqlery/executor.py:674`, `src/sqlery/core/daemon.py:234`, `src/sqlery/core/worker_pool.py:118`.
+- Risk: Inherits the full parent environment (intentional — needed for `DJANGO_SETTINGS_MODULE`), but means any env leak (logs, error reports) will surface secrets. `shell=True` is not used anywhere (good).
 
 ## Performance Bottlenecks
 
-**Polling-based job claiming:**
-- Problem: Workers poll the database for new jobs using `time.sleep(poll_interval)` (default 5 seconds). Under low-load conditions, this adds up to 5 seconds of latency to every job. Under high-load conditions, multiple workers hitting `SELECT FOR UPDATE SKIP LOCKED` creates contention.
-- Files: `src/sqlery/core/worker.py:474-477,492-495,529` (multiple sleep loops), `src/sqlery/django_sqlery/worker_process.py:111-112`
-- Cause: SQL databases do not natively support pub/sub notification for new row inserts. The architecture relies on periodic polling.
-- Improvement path: On PostgreSQL, use `LISTEN/NOTIFY` to wake workers immediately when jobs are enqueued. On SQLite, reduce poll interval for low-latency queues. Consider an HTTP trigger mode (already partially implemented) as an alternative to polling.
+### Scheduler / zombie scan queries without LIMIT
 
-**TTL expiry runs on every claim attempt:**
-- Problem: `expire_ttl_jobs()` is called at the top of every `claim_next_job_with_queue_priority()` call at `src/sqlery/django_sqlery/worker_claiming.py:339`. This queries all queued jobs with TTL set and checks each one individually in Python, running inside the same transaction as the claim.
-- Files: `src/sqlery/django_sqlery/worker_claiming.py:287-314,339`
-- Cause: TTL expiry is coupled to the claiming hot path instead of being a periodic background task.
-- Improvement path: Move TTL expiry to the daemon's periodic cleanup cycle (every N minutes) instead of running on every claim. Use a single `UPDATE ... WHERE created_at + ttl < now()` query instead of per-row Python iteration.
+- Files: `src/sqlery/core/scheduler.py`, `src/sqlery/core/daemon.py:526` (`_fail_zombie_running_jobs`).
+- Concern: Zombie scan iterates all running jobs on each daemon cycle; on large queues this is O(running_jobs). No incremental cursor.
 
-**Large model file (1196 lines):**
-- Problem: `src/sqlery/django_sqlery/models.py` is 1196 lines containing 5 model classes, business logic methods, signal handlers, and display helpers. The `QueuedJob` model alone spans 580+ lines with methods like `mark_success`, `mark_failed`, `check_dependencies_met`, `then`, `force_stop`, and webhook delivery.
-- Files: `src/sqlery/django_sqlery/models.py`
-- Cause: Active Record pattern -- model instances carry business logic that should live in service layers.
-- Improvement path: Extract business logic (mark_success, mark_failed, retry logic, webhook delivery) into a service module. Keep models as pure schema definitions.
+### VACUUM on every cleanup run
+
+- Files: `src/sqlery/django_sqlery/cleanup.py:342-344`, `src/sqlery/fastapi_sqlery/backend.py:422-425`.
+- Concern: `VACUUM ANALYZE` blocks autovacuum on Postgres; on SQLite, full `VACUUM` rewrites the database file. Should be opt-in or scheduled, not part of each cleanup cycle.
+
+### Optimistic locking retry storms (SQLite)
+
+- Files: `src/sqlery/django_sqlery/models.py:620-650`.
+- Concern: Under contention, `version=expected_version` CAS causes retry loops with no backoff. Workers can busy-loop hammering SQLite.
+
+## Reliability Concerns
+
+### Zombie / orphan job detection has a 5-signal heuristic
+
+- Files: `src/sqlery/core/daemon.py:526-572`.
+- Concern: Detection requires 5 conditions (PID gone, no worker, worker dead, worker moved on, heartbeat stale ≥ 3× `WORKER_ALIVE_TIMEOUT`). False negatives leave jobs `running` indefinitely.
+- Risk: A job that succeeded but failed to write its terminal state (DB drop at the wrong moment) appears identical to a zombie.
+
+### Heartbeat gaps under SIGUSR1 pressure
+
+- Files: `src/sqlery/core/daemon.py:505` ("Remove file-based heartbeat (deprecated but cleanup anyway)").
+- Concern: Heartbeats moved from file-based to DB-based via SIGUSR1. If the worker is mid-fork or in a long-running C extension, SIGUSR1 may be delayed > the 3×alive_timeout window, marking a live worker as zombie.
+- Mitigation: 3× safety factor; document tuning of `WORKER_ALIVE_TIMEOUT`.
+
+### Signal handler discipline is unenforced
+
+- Files: `src/sqlery/core/worker.py`, `src/sqlery/core/daemon.py`.
+- Concern: ARCHITECTURE notes "no DB calls in signal handlers to avoid corrupting psycopg connections" — this is a comment, not an enforced contract.
+- Recommendation: Add a lint rule or test that scans signal handlers for DB imports.
+
+### Two-layer timeout race
+
+- Files: `src/sqlery/core/worker.py:443,704,722`.
+- Concern: Child SIGALRM at `timeout`, parent safety SIGKILL at `timeout + 60s`. If parent clock skew > 60s vs child (containers with frozen clocks), parent may kill prematurely or never.
+
+### `version=0.13.0` in `pyproject.toml` vs deprecation targets at `v3.2.0`
+
+- Files: `pyproject.toml` (version 0.13.0), `src/sqlery/compat/rq.py:27`, `src/sqlery/compat/scheduler.py:34`.
+- Concern: Deprecation messages reference `v3.2.0` but project is at `0.13.0`. Mismatch indicates either an upcoming major version bump or stale deprecation messages. Users cannot tell which.
 
 ## Fragile Areas
 
-**Fork-based worker execution (core/worker.py):**
-- Files: `src/sqlery/core/worker.py:548-680`
-- Why fragile: The `_fork_and_execute` method uses `os.fork()`, `os.setpgrp()`, `os.killpg()`, `os.waitpid()`, and `os._exit()`. After fork, the child must close all inherited DB connections, reset signal handlers, and re-establish its own DB connection. Any failure in this sequence (e.g., DB connection pool corruption, signal handler inheritance) causes silent data loss or zombie processes. The parent waits in a polling loop (`time.sleep(0.5)`) checking `os.waitpid(WNOHANG)`.
-- Safe modification: Never change the fork sequence without testing both the parent timeout path and the child crash path. Always test with PostgreSQL (connection sharing after fork is the most common failure mode). The `_reset_db_connections` call at line 563 (before fork) is critical.
-- Test coverage: No dedicated fork tests exist. The chaos tests in `tests/chaos/test_worker_chaos.py` partially exercise this, but not the connection corruption scenario.
+### `src/sqlery/django_sqlery/models.py` (1248 lines)
 
-**Optimistic locking version field:**
-- Files: `src/sqlery/django_sqlery/models.py:377-380`, `src/sqlery/django_sqlery/db_compat.py:63-108`
-- Why fragile: The `version` field on `QueuedJob` is the sole mechanism for atomic claiming on SQLite. If any code path updates a job without incrementing the version field, it creates a silent race condition. The `ConcurrentModificationError` exception (raised when version conflicts occur) must be caught by all callers, but error handling is inconsistent -- `mark_success`, `mark_failed`, `mark_running` raise it, while `force_stop` at line 741 catches all exceptions silently.
-- Safe modification: Always use `F('version') + 1` in UPDATE queries. Never use `job.save()` without `update_fields` that includes version-related changes. Test with concurrent workers on SQLite.
-- Test coverage: `tests/test_version_locking.py` and `tests/test_atomic_claiming.py` cover the happy path.
+- Why fragile: Largest file in the project; combines model definitions, custom managers, optimistic locking, version increment logic, and historical migration helpers (`# Old:` blocks).
+- Safe modification: Add new fields via Django migrations only; never edit existing field defaults without a data migration. The `version` field is load-bearing for SQLite claiming.
+- Test coverage: `tests/test_models.py`, `tests/test_version_locking.py` — adequate but not exhaustive on edge cases.
 
-**Global backend singleton initialization (compat/__init__.py):**
-- Files: `src/sqlery/compat/__init__.py:691-709`
-- Why fragile: `_backend` and `_config` are module-level globals initialized lazily without any locking. In a multi-threaded environment (e.g., Django under ASGI with threads), two threads could simultaneously enter `_initialize_backend()`, see `_backend is None`, and both create new backend instances. The last write wins, potentially losing in-flight state from the first.
-- Safe modification: Add a threading lock around initialization, or initialize eagerly at app startup.
-- Test coverage: No concurrent initialization tests exist.
+### `src/sqlery/compat/__init__.py` (900 lines)
 
-**Daemon double-fork (core/daemon.py):**
-- Files: `src/sqlery/core/daemon.py:242-270`
-- Why fragile: Uses Unix double-fork to daemonize. Opens `/dev/null` for stdin/stdout/stderr redirection. PID file management at `/tmp/sqlery/sqlery_daemon.pid` has race conditions if multiple daemons start simultaneously. The heartbeat file mechanism at line 841 writes timestamps to a regular file, which can be corrupted by concurrent writes.
-- Safe modification: Test daemon start/stop sequences thoroughly. The PID file should use advisory file locking (`fcntl.flock`) to prevent races.
-- Test coverage: No daemon lifecycle tests exist.
+- Why fragile: Defines the ABC contract for both backends. Adding a method requires implementing it in `DjangoBackend` AND `SQLAlchemyBackend`, or both backends fall out of sync silently (ABC abstract methods are enforced, but new helpers are easy to add only in one place).
+- Safe modification: Always touch all three files together: `src/sqlery/compat/__init__.py`, `src/sqlery/django_sqlery/backend.py`, `src/sqlery/fastapi_sqlery/backend.py`.
+
+### `src/sqlery/core/worker.py` (769 lines) — fork orchestration
+
+- Why fragile: Fork-per-job semantics, signal forwarding, two-layer timeout, FD lifecycle. Three `# # Old: killed only the child` markers show this has been wrong before.
+- Test coverage: `tests/chaos/test_worker_chaos.py`, `tests/test_concurrency_and_timeout.py`.
+
+### `src/sqlery/core/daemon.py` (973 lines)
+
+- Why fragile: Owns lease acquisition, heartbeat, scheduler tick, zombie scan. Five `# # Old:` blocks document past bugs (global os.kill, file locks, daemon races writing status).
 
 ## Scaling Limits
 
-**SQLite concurrency ceiling:**
-- Current capacity: SQLite with WAL mode and `busy_timeout=5000ms` (configured at `src/sqlery/django_sqlery/apps.py:23-27` and `src/sqlery/core/db_resilience.py:131-137`) supports approximately 1-3 concurrent workers before contention becomes significant.
-- Limit: SQLite's write-lock serialization means only one writer at a time. Under high job throughput (>10 jobs/second), workers will frequently hit "database is locked" errors. The `retry_on_db_error` decorator at `src/sqlery/core/db_resilience.py:36` retries 3 times with exponential backoff, but this adds latency.
-- Scaling path: Migrate to PostgreSQL for production workloads. The codebase already supports it via `SELECT FOR UPDATE SKIP LOCKED`.
+### SQLite single-writer
 
-**No connection pooling for standalone mode workers:**
-- Current capacity: Each `SQLAlchemyBackend` instance creates sessions from a single global engine (`src/sqlery/fastapi_sqlery/database.py:21`). Worker processes spawned via fork inherit this engine, which can corrupt shared socket state.
-- Limit: In standalone mode with forked workers, PostgreSQL connection pool state is shared across forks, leading to "connection already closed" or "SSL connection closed unexpectedly" errors.
-- Scaling path: Use `NullPool` for forked workers or re-initialize the engine after fork (the Django side handles this via `_reset_db_connections`).
+- Current capacity: ~100 jobs/sec on commodity SSD with WAL mode.
+- Limit: One concurrent writer; `database is locked` errors above this.
+- Scaling path: Switch to Postgres (documented as production recommendation).
+
+### Worker pool size capped by `DJANGO_SQL_JOBS_MAX_WORKERS`
+
+- Files: `src/sqlery/core/worker_pool.py`.
+- Limit: No per-host CPU/memory checks; oversubscribing is possible.
 
 ## Dependencies at Risk
 
-**`requests` library used for webhooks without being a declared dependency:**
-- Risk: `src/sqlery/webhooks.py:113-115` imports `requests` inside a try/except, logging an error if missing. But `requests` is not listed in any `pyproject.toml` dependency group. Users will silently get broken webhooks unless they independently install `requests`.
-- Impact: Webhook delivery silently fails with an error log.
-- Migration plan: Either add `requests` to an optional dependency group (e.g., `webhooks = ["requests>=2.25.0"]`) or switch to `httpx` which is already a declared dependency under `[project.optional-dependencies] http`.
+### `requests` not declared
 
-**`AsyncStorageBackend` removed but `AsyncWorker` still references it:**
-- Risk: `src/sqlery/async_worker.py:16-17` sets `AsyncStorageBackend = None` with a comment "REMOVED in v0.13". The `AsyncWorker` class still uses this type in its constructor. The entire async worker path appears non-functional.
-- Impact: Anyone following documentation for async usage will hit runtime errors.
-- Migration plan: Either remove `AsyncWorker` entirely or implement an async backend that wraps `DatabaseBackend`.
+- Risk: Imported in `src/sqlery/webhooks.py:17` but absent from `pyproject.toml`. CLAUDE.md notes this explicitly.
+- Impact: Webhooks silently disabled on clean install.
+- Migration plan: Add to a new `webhooks` extra, or replace with `httpx` (already a dependency via the `http` extra).
+
+### `boto3` only in `eventbridge` extra
+
+- Files: `src/sqlery/eventbridge_trigger.py`, `src/sqlery/lambda_handler.py`.
+- Risk: Importing `lambda_handler` without the extra → `ImportError`. Lambda deployment instructions must mention the extra.
+
+### `django-tasks` is optional but referenced unconditionally
+
+- Files: `src/sqlery/django_sqlery/` integrations.
+- Risk: Need to verify all `django_tasks` imports are wrapped in try/except (per CONVENTIONS); worth a grep audit.
 
 ## Missing Critical Features
 
-**No rate limiting on API endpoints:**
-- Problem: The FastAPI and Django API endpoints have no rate limiting. A malicious or buggy client can flood the queue with jobs, exhaust database connections, or trigger thousands of webhook deliveries.
-- Blocks: Production deployment without additional reverse proxy rate limiting.
+### No CSRF/auth on FastAPI dashboard
 
-**No job result size limits:**
-- Problem: Job `output` and `error` fields are `TextField` (Django) / `Text` (SQLModel) with no size limits. A task returning a multi-megabyte string will be stored in full, bloating the database.
-- Files: `src/sqlery/django_sqlery/models.py:566-568`, `src/sqlery/core/models.py`
-- Blocks: Uncontrolled database growth from verbose task output.
+- Files: `src/sqlery/fastapi_sqlery/app.py`.
+- Problem: REST API for standalone mode has no documented auth layer.
+- Blocks: Production deployment behind a reverse proxy is the only safe option.
+
+### No rate limit on webhook retries
+
+- Files: `src/sqlery/webhooks.py:170+` (`send_webhook_with_retry`).
+- Problem: Retries could pile up on a slow/down receiver.
 
 ## Test Coverage Gaps
 
-**Standalone mode (FastAPI/SQLAlchemy backend) has no tests:**
-- What's not tested: The entire `src/sqlery/fastapi_sqlery/` package (backend, app, database, config, CLI) has zero test files. The `src/sqlery/core/` package (worker, daemon, claiming, worker_pool, scheduler, registry) also lacks dedicated tests. All existing tests use Django test infrastructure (pytest-django).
-- Files: `src/sqlery/fastapi_sqlery/backend.py` (888 lines), `src/sqlery/fastapi_sqlery/app.py` (581 lines), `src/sqlery/core/worker.py` (753 lines), `src/sqlery/core/daemon.py` (936 lines)
-- Risk: The standalone mode could be entirely broken without anyone knowing. The core worker (which uses fork) is untested.
-- Priority: High -- standalone mode is a primary use case.
+### Webhook delivery — no tests
 
-**Django cleanup, views, and admin have no tests:**
-- What's not tested: `src/sqlery/django_sqlery/cleanup.py` (337 lines, retention policies), `src/sqlery/django_sqlery/views.py` (902 lines, async views), `src/sqlery/django_sqlery/api_views.py` (860 lines, admin API), `src/sqlery/django_sqlery/admin.py` (623 lines), `src/sqlery/django_sqlery/backend.py` (897 lines, DjangoBackend implementation), `src/sqlery/django_sqlery/decorators.py` (492 lines), `src/sqlery/django_sqlery/worker_claiming.py` (523 lines)
-- Files: All of the above
-- Risk: Data retention bugs could silently delete jobs. API endpoints could return wrong data. The admin dashboard could crash.
-- Priority: Medium -- these are operational/administrative features.
+- What's not tested: `src/sqlery/webhooks.py` (HMAC signing, retry logic, error handling, SSRF surface).
+- Risk: Webhooks silently broken since `requests` not in deps; no test would catch it.
+- Priority: High.
 
-**Webhook delivery is untested:**
-- What's not tested: `src/sqlery/webhooks.py` (257 lines) -- HMAC signing, retry logic, HTTP delivery, error handling.
-- Files: `src/sqlery/webhooks.py`
-- Risk: Webhook signatures could be computed incorrectly, breaking verification on the receiving end. The retry mechanism (noted as incomplete in the code at line 188: "Note: Actual retry scheduling would happen via a separate mechanism") is never exercised.
-- Priority: Medium -- webhooks are an integration feature.
+### Lambda handler / EventBridge — no tests
 
-**No PostgreSQL-specific test coverage in CI:**
-- What's not tested: CI runs only 2 test files against PostgreSQL (`test_atomic_claiming.py` and `test_atomic_scheduler.py`). The bulk of tests run against SQLite only. PostgreSQL-specific features like `SELECT FOR UPDATE SKIP LOCKED`, `VACUUM ANALYZE`, connection pool behavior after fork, and `statement_timeout` are not tested.
-- Files: `.github/workflows/test.yml:61-66`
-- Risk: PostgreSQL regressions go undetected. The `retry_on_db_error` decorator handles PostgreSQL-specific errors that are never triggered in SQLite tests.
-- Priority: High -- PostgreSQL is the recommended production database.
+- What's not tested: `src/sqlery/lambda_handler.py`, `src/sqlery/eventbridge_trigger.py`.
+- Risk: Serverless mode could regress on any refactor.
+- Priority: High (medium if Lambda mode is non-critical).
+
+### Async worker / queue — no tests, no users
+
+- What's not tested: `src/sqlery/async_queue.py`, `src/sqlery/async_worker.py`.
+- Risk: Code is dead (`AsyncStorageBackend = None`); tests would fail. Decide: delete or rebuild.
+- Priority: Medium (cleanup task).
+
+### Standalone (FastAPI/SQLAlchemy) backend
+
+- What's not tested: `src/sqlery/fastapi_sqlery/backend.py` (891 lines). Most existing tests target Django mode.
+- Risk: One of the two declared "integration modes" is undertested.
+- Priority: High — this is the project's headline value proposition ("Every execution mode works reliably and is tested in CI across both Django and standalone").
+
+### `tests/integration/` is empty
+
+- Files: only `__init__.py` exists.
+- Risk: No end-to-end test of the standalone CLI → daemon → worker → DB flow.
+- Priority: High.
+
+### Lambda interactions exercised only indirectly
+
+- Files: `tests/chaos/test_worker_chaos.py`, `tests/chaos/test_property_based.py`.
+- Risk: Lambda + Postgres + fork interactions are not exercised.
 
 ---
 
-*Concerns audit: 2026-05-12*
+*Concerns audit: 2026-05-13*

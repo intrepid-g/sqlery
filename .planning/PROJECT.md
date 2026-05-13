@@ -34,7 +34,7 @@ Every execution mode works reliably and is tested in CI across both Django and s
 
 - [ ] Unify duplicate claiming algorithms (core/claiming.py vs django_sqlery/worker_claiming.py)
 - [ ] Unify duplicate execution logic (core/worker.py vs django_sqlery/executor.py)
-- [ ] Remove Django imports from framework-agnostic core package (8 of 16 core modules)
+- [ ] Remove Django imports from framework-agnostic core package (11 of ~18 core modules)
 - [ ] Rebuild AsyncWorker with real async backend (asyncpg/aiosqlite via compat layer)
 - [ ] Standalone mode parity: all 6 execution modes working in standalone (FastAPI/SQLAlchemy)
 - [ ] Full test coverage for every execution mode in both Django and standalone
@@ -47,7 +47,7 @@ Every execution mode works reliably and is tested in CI across both Django and s
 - [ ] Add FastAPI dashboard authentication (API key or basic auth)
 - [ ] SSRF protection for webhook URLs (block private/link-local ranges)
 - [ ] CSRF fixes for Django admin API endpoints
-- [ ] Remove 24 backward-compatibility stub files
+- [ ] Annotate 21 top-level backward-compat stub files in `src/sqlery/*.py` with a removal-date comment (per dead-code policy — do not delete outright)
 - [ ] Mark dead AsyncStorageBackend = None code for removal (comment with deletion date)
 - [ ] Mark commented-out code blocks for deletion with dates (don't delete outright — comment-and-date first)
 - [ ] All modes passing integration tests in GitHub Actions (SQLite + PostgreSQL)

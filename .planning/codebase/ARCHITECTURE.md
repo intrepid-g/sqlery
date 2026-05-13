@@ -1,118 +1,134 @@
+<!-- refreshed: 2026-05-13 -->
 # Architecture
 
-**Analysis Date:** 2026-05-12
+**Analysis Date:** 2026-05-13
 
 ## System Overview
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                     User Application                         │
-│  @job decorator, .enqueue(), .delay(), .enqueue_at()         │
-│  `src/sqlery/core/job.py`                                    │
-├──────────────────┬──────────────────┬───────────────────────┤
-│   Job Queue      │   Scheduler      │    CLI / Dashboard    │
-│ `core/job_queue` │ `core/scheduler` │ `core/cli`, `fastapi` │
-└────────┬─────────┴────────┬─────────┴──────────┬────────────┘
-         │                  │                     │
-         ▼                  ▼                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│             Compatibility / Backend Abstraction               │
-│  `src/sqlery/compat/__init__.py`                             │
-│  DatabaseBackend ABC, Config ABC, auto-detection             │
-├──────────────────────────┬──────────────────────────────────┤
-│    Django Backend         │    SQLAlchemy Backend            │
-│  `django_sqlery/backend`  │  `fastapi_sqlery/backend`       │
-│  Django ORM + migrations  │  SQLModel + Alembic             │
-└──────────────────────────┴──────────────────────────────────┘
-         │                           │
-         ▼                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Database (PostgreSQL or SQLite)                             │
-│  Tables: sqlery_queued_job, sqlery_scheduled_task,           │
-│          sqlery_worker, sqlery_registry                       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Public API Layer                            │
+│  @job decorator    enqueue()/enqueue_at()    Queue    Worker         │
+│  `src/sqlery/__init__.py`  `src/sqlery/core/job.py`                  │
+│                            `src/sqlery/core/job_queue.py`            │
+└─────────────────┬───────────────────────────────────┬───────────────┘
+                  │                                   │
+                  ▼                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Core Logic Layer (framework-agnostic)          │
+│  WorkerProcess   JobExecutor   DaemonManager   Scheduler             │
+│  Claiming algo   RegistryMgr   CleanupMgr      CLI (Typer)           │
+│  `src/sqlery/core/worker.py` `daemon.py` `scheduler.py`              │
+│  `claiming.py` `worker_pool.py` `registry.py` `cleanup.py` `cli.py`  │
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                Compat Layer (mode auto-detection)                    │
+│  DatabaseBackend ABC    Config ABC    get_backend()/get_config()     │
+│  initialize()           RQ shim       django-tasks-scheduler shim    │
+│  `src/sqlery/compat/__init__.py` `compat/rq.py` `compat/scheduler.py`│
+└─────────┬───────────────────────────────────────────────────┬───────┘
+          │                                                   │
+          ▼                                                   ▼
+┌────────────────────────────────────┐  ┌─────────────────────────────┐
+│  Django Integration                 │  │  Standalone Integration     │
+│  DjangoBackend / DjangoConfig       │  │  SQLAlchemyBackend          │
+│  Django ORM models + 25 migrations  │  │  StandaloneConfig           │
+│  Admin + dashboard + mgmt commands  │  │  SQLModel + 13 Alembic mig. │
+│  `src/sqlery/django_sqlery/`        │  │  FastAPI app + CLI          │
+│                                     │  │  `src/sqlery/fastapi_sqlery/`│
+└─────────────────────┬───────────────┘  └────────┬────────────────────┘
+                      │                            │
+                      ▼                            ▼
+              ┌──────────────────────────────────────────┐
+              │   PostgreSQL (prod) / SQLite (dev)       │
+              └──────────────────────────────────────────┘
 ```
 
 ## Component Responsibilities
 
 | Component | Responsibility | File |
 |-----------|----------------|------|
-| JobWrapper / @job | Decorator that wraps functions as enqueueable jobs | `src/sqlery/core/job.py` |
-| Queue / enqueue | Enqueue jobs for execution via the active backend | `src/sqlery/core/job_queue.py` |
-| DatabaseBackend ABC | Abstract interface for all DB operations (30+ methods) | `src/sqlery/compat/__init__.py` |
-| DjangoBackend | Django ORM implementation of DatabaseBackend | `src/sqlery/django_sqlery/backend.py` |
-| SQLAlchemyBackend | SQLModel/SQLAlchemy implementation of DatabaseBackend | `src/sqlery/fastapi_sqlery/backend.py` |
-| DjangoConfig | Reads config from Django settings.DJANGO_SQL_JOBS | `src/sqlery/django_sqlery/config.py` |
-| StandaloneConfig | In-memory config with env var loading | `src/sqlery/fastapi_sqlery/config.py` |
-| JobExecutor | Executes a single job with retry, timeout, crash recovery | `src/sqlery/core/worker.py` |
-| WorkerProcess | Persistent worker that polls, forks children, monitors | `src/sqlery/core/worker.py` |
+| JobWrapper / `@job` | Decorator that wraps functions as enqueueable jobs | `src/sqlery/core/job.py` |
+| Queue / enqueue | Enqueue jobs via the active backend | `src/sqlery/core/job_queue.py` |
+| DatabaseBackend ABC | Abstract interface for all DB operations | `src/sqlery/compat/__init__.py` |
+| DjangoBackend | Django ORM implementation of `DatabaseBackend` | `src/sqlery/django_sqlery/backend.py` |
+| SQLAlchemyBackend | SQLModel/SQLAlchemy implementation of `DatabaseBackend` | `src/sqlery/fastapi_sqlery/backend.py` |
+| DjangoConfig | Reads config from `settings.DJANGO_SQL_JOBS` | `src/sqlery/django_sqlery/config.py` |
+| StandaloneConfig | In-memory config + env-var loading | `src/sqlery/fastapi_sqlery/config.py` |
+| JobExecutor | Executes a single job (retry, timeout, crash recovery) | `src/sqlery/core/worker.py` |
+| WorkerProcess | Persistent worker: polls, forks children, monitors | `src/sqlery/core/worker.py` |
 | WorkerPoolManager | Manages pool of worker subprocesses | `src/sqlery/core/worker_pool.py` |
-| DaemonManager | Top-level daemon: scheduler, worker pool, heartbeats, leases | `src/sqlery/core/daemon.py` |
-| Scheduler | Finds due scheduled tasks, enqueues jobs | `src/sqlery/core/scheduler.py` |
+| DaemonManager | Top-level daemon: scheduler + pool + heartbeats + leases | `src/sqlery/core/daemon.py` |
+| Scheduler | Finds due `ScheduledTask`s and enqueues jobs | `src/sqlery/core/scheduler.py`, `src/sqlery/core/scheduler_tasks.py` |
 | Claiming Algorithm | Tag concurrency, rate limits, deps, atomic claim | `src/sqlery/core/claiming.py` |
-| RegistryManager | RQ-compatible job lifecycle tracking | `src/sqlery/core/registry.py` |
+| RegistryManager | RQ-compatible job lifecycle registries | `src/sqlery/core/registry.py` |
 | CleanupManager | Retention-based job/registry cleanup | `src/sqlery/core/cleanup.py` |
-| CLI | Typer-based CLI for standalone mode | `src/sqlery/core/cli.py` |
-| FastAPI Dashboard | Web UI + REST API for standalone mode | `src/sqlery/fastapi_sqlery/app.py` |
-| Django Admin | Django admin integration + custom dashboard | `src/sqlery/django_sqlery/admin.py` |
-| Lambda Handler | AWS Lambda entry point for serverless | `src/sqlery/lambda_handler.py` |
-| DB Resilience | Retry decorator, WAL/timeout config | `src/sqlery/core/db_resilience.py` |
+| CLI (Typer) | Standalone CLI entry points | `src/sqlery/core/cli.py` |
+| DB resilience | Retry decorator, WAL/timeout config | `src/sqlery/core/db_resilience.py` |
+| FastAPI dashboard | Web UI + REST API for standalone mode | `src/sqlery/fastapi_sqlery/app.py` |
+| Standalone CLI shim | `sqlery-worker` / `sqlery-web` entry points | `src/sqlery/fastapi_sqlery/cli.py` |
+| Engine / session | Global SQLAlchemy engine + session factory | `src/sqlery/fastapi_sqlery/database.py` |
+| Django admin/dashboard | Admin views + custom dashboard | `src/sqlery/django_sqlery/admin.py`, `src/sqlery/django_sqlery/dashboard_views.py` |
+| Django mgmt commands | `daemon`, `run_jobs`, `workers`, `cleanup_jobs`, … | `src/sqlery/django_sqlery/management/commands/` |
+| Lambda handler | AWS Lambda entry point (Django mode) | `src/sqlery/lambda_handler.py` |
+| RQ shim | Drop-in for `rq.Queue`, `Retry`, `get_current_job` | `src/sqlery/compat/rq.py` |
+| Scheduler shim | Drop-in for django-tasks-scheduler | `src/sqlery/compat/scheduler.py` |
 
 ## Pattern Overview
 
-**Overall:** Backend Abstraction / Strategy Pattern
-
-The library provides a single public API (enqueue, claim, schedule) that works identically in two modes: **Django mode** (Django ORM) and **Standalone mode** (SQLModel/SQLAlchemy + FastAPI). Mode is auto-detected at runtime by checking if Django is configured.
+**Overall:** Strategy pattern over a `DatabaseBackend` ABC, with mode auto-detection at process startup. Fork-per-job execution model inspired by RQ. Database is the single source of truth for queue state, scheduler state, worker heartbeats, and daemon leases.
 
 **Key Characteristics:**
 - Abstract `DatabaseBackend` ABC with 30+ methods defines the contract
 - `DjangoBackend` and `SQLAlchemyBackend` are the two concrete implementations
-- `get_backend()` returns the singleton for the current mode (lazy initialization)
-- All business logic (worker, scheduler, claiming) is framework-agnostic and delegates to the backend
-- Fork-per-job execution model (like RQ) for memory safety
-- Database-backed everything: job queue, scheduler, worker heartbeats, leases
+- `get_backend()` returns a process-local singleton (lazy initialisation in `src/sqlery/compat/__init__.py`)
+- All business logic in `src/sqlery/core/` is framework-agnostic and delegates to the backend
+- Fork-per-job for crash isolation and memory safety
+- Database-backed everything: queue, scheduler, worker heartbeats, leases
 
 ## Layers
 
-**Public API Layer:**
-- Purpose: User-facing functions and decorators for enqueueing jobs
+**Public API:**
+- Purpose: User-facing decorators and functions for enqueueing jobs
 - Location: `src/sqlery/__init__.py`, `src/sqlery/core/job.py`, `src/sqlery/core/job_queue.py`
-- Contains: `@job` decorator, `enqueue()`, `enqueue_at()`, `get_queue()`, `Queue` class
-- Depends on: Compat layer (get_backend, get_config)
+- Contains: `@job` decorator, `enqueue()`, `enqueue_at()`, `get_queue()`, `Queue`, `Worker` alias
+- Depends on: Compat layer (`get_backend`, `get_config`)
 - Used by: Application code
 
-**Core Logic Layer:**
-- Purpose: Framework-agnostic business logic for job processing
+**Core logic (framework-agnostic):**
+- Purpose: Business logic for job processing
 - Location: `src/sqlery/core/`
-- Contains: Worker, Scheduler, Claiming algorithm, Daemon, Registry, Cleanup, CLI, Utils
+- Contains: Worker, Scheduler, Claiming algorithm, Daemon, Registry, Cleanup, CLI, DB resilience, utils
 - Depends on: Compat layer (DatabaseBackend, Config)
-- Used by: CLI, Django management commands, FastAPI app, Lambda handler
+- Used by: CLI, Django mgmt commands, FastAPI app, Lambda handler
 
-**Compat / Backend Abstraction Layer:**
+**Compat:**
 - Purpose: Auto-detects mode and provides unified interfaces
 - Location: `src/sqlery/compat/__init__.py`
-- Contains: `DatabaseBackend` ABC, `Config` ABC, `get_backend()`, `get_config()`, `initialize()`
-- Depends on: Backend implementations (lazy import)
-- Used by: All core logic, public API
+- Contains: `DatabaseBackend` ABC, `Config` ABC, `get_backend()`, `get_config()`, `initialize()`, plus RQ and scheduler shims
+- Depends on: Backend implementations (lazy import to avoid circular Django app-loading)
+- Used by: All core logic and the public API
 
-**Django Integration Layer:**
-- Purpose: Django-specific models, admin, management commands, middleware
+**Django integration:**
+- Purpose: Django-specific models, admin, mgmt commands, middleware
 - Location: `src/sqlery/django_sqlery/`
-- Contains: Django models (24 migrations), DjangoBackend, admin site, dashboard views, management commands
-- Depends on: Django ORM, Core logic layer (via Compat)
+- Contains: ORM models, 25 migrations, `DjangoBackend`, admin site, dashboard, mgmt commands (`daemon.py`, `run_jobs.py`, `workers.py`, `cleanup_jobs.py`, `run_scheduled_tasks.py`, `rqworker.py`, `sqlery_import.py`, `sqlery_export.py`)
+- Depends on: Django ORM, core (via compat)
 - Used by: Django projects
 
-**Standalone Integration Layer:**
+**Standalone (FastAPI) integration:**
 - Purpose: SQLModel models, FastAPI dashboard, Alembic migrations
-- Location: `src/sqlery/fastapi_sqlery/`, `src/sqlery/core/models.py`
-- Contains: SQLModel models, SQLAlchemyBackend, FastAPI app, CLI, database session management
-- Depends on: SQLModel/SQLAlchemy, FastAPI, Core logic layer (via Compat)
+- Location: `src/sqlery/fastapi_sqlery/`, plus shared core models at `src/sqlery/core/models.py`
+- Contains: SQLModel models, `SQLAlchemyBackend`, FastAPI app, CLI shim, engine/session factory
+- Depends on: SQLModel/SQLAlchemy, FastAPI, core (via compat)
 - Used by: Non-Django Python projects
 
-**Compatibility / Migration Layer:**
+**Backward-compat shims:**
 - Purpose: Drop-in replacements for RQ and django-tasks-scheduler
 - Location: `src/sqlery/compat/rq.py`, `src/sqlery/compat/scheduler.py`
-- Contains: RQ-compatible Queue, Retry, get_current_job; scheduler-compatible Task, TaskType
+- Contains: RQ-compatible `Queue`, `Retry`, `get_current_job`; scheduler-compatible `Task`, `TaskType`
 - Depends on: Django integration layer
 - Used by: Projects migrating from RQ or django-tasks-scheduler
 
@@ -120,153 +136,153 @@ The library provides a single public API (enqueue, claim, schedule) that works i
 
 ### Primary Request Path: Enqueueing a Job
 
-1. User calls `my_task.enqueue(arg=value)` or `enqueue('myapp.tasks.my_task', arg=value)` (`src/sqlery/core/job.py:60`, `src/sqlery/core/job_queue.py:131`)
-2. `job_queue.enqueue()` calls `get_backend()` to get the active DatabaseBackend (`src/sqlery/compat/__init__.py:733`)
-3. Backend auto-detects Django vs standalone and returns `DjangoBackend` or `SQLAlchemyBackend` (`src/sqlery/compat/__init__.py:691`)
-4. `backend.create_job()` inserts a row into `sqlery_queued_job` with status='queued' (`src/sqlery/django_sqlery/backend.py:37` or `src/sqlery/fastapi_sqlery/backend.py:41`)
-5. Returns the created job object to the caller
+1. App calls `my_task.enqueue(...)` or `enqueue("module.path", kwargs)` (`src/sqlery/core/job.py`, `src/sqlery/core/job_queue.py`)
+2. `Queue` resolves the active backend via `get_backend()` (`src/sqlery/compat/__init__.py`)
+3. Backend serialises kwargs, inserts row into `sqlery_queued_job` (`src/sqlery/django_sqlery/backend.py:create_job` or `src/sqlery/fastapi_sqlery/backend.py:create_job`)
+4. Job ID returned to caller; transaction commits
 
 ### Primary Execution Path: Processing a Job
 
-1. **Daemon loop** polls every `DAEMON_CHECK_INTERVAL` seconds (`src/sqlery/core/daemon.py:362`)
-2. Daemon runs `Scheduler.run_due_tasks()` for owned queues (`src/sqlery/core/scheduler.py:26`)
-3. Daemon calls `WorkerPoolManager.ensure_workers()` to spawn worker subprocesses (`src/sqlery/core/worker_pool.py:266`)
-4. **Worker subprocess** starts via `worker_runner.py`, enters `WorkerProcess.run()` poll loop (`src/sqlery/core/worker_runner.py:14`, `src/sqlery/core/worker.py:413`)
-5. Worker calls `backend.claim_job(queues, worker_id)` using SELECT FOR UPDATE SKIP LOCKED (`src/sqlery/core/worker.py:468`)
-6. Claiming algorithm checks tag concurrency, rate limits, dependencies, then atomically claims (`src/sqlery/core/claiming.py:156`)
-7. Worker **forks** a child process via `_fork_and_execute()` (`src/sqlery/core/worker.py:548`)
-8. **Child process** calls `JobExecutor.execute_job_in_child()` (`src/sqlery/core/worker.py:100`)
-9. Child imports and calls the task function, writes result to DB, calls `os._exit()` (`src/sqlery/core/worker.py:141-169`)
-10. **Parent process** waits via `waitpid()`, reads final status from DB, loops back to step 5 (`src/sqlery/core/worker.py:610-680`)
+1. `DaemonManager` cycle runs the scheduler step then maintains the worker pool (`src/sqlery/core/daemon.py`)
+2. `WorkerPoolManager` spawns workers as subprocesses via `python -m sqlery.core.worker_runner` (`src/sqlery/core/worker_pool.py`, `src/sqlery/core/worker_runner.py`)
+3. `WorkerProcess.run()` polls; for each iteration it invokes the claiming algorithm (`src/sqlery/core/claiming.py`) which enforces tag concurrency, rate limits, dependencies, then atomically claims a job (Postgres: `SELECT FOR UPDATE SKIP LOCKED`; SQLite: version-CAS)
+4. Parent calls `_reset_db_connections()` then `os.fork()`; child calls `os.setpgrp()`, sets `SIGALRM` for `timeout_seconds`, executes the task callable (`src/sqlery/core/worker.py` `JobExecutor`)
+5. Child writes result/exception to DB and `_exit(0)`; parent `waitpid`s and marks job finished/failed with retry scheduling
+6. On timeout the parent sends `SIGTERM`/`SIGKILL` to the child's process group (safety net at `timeout + 60s`)
 
 ### Scheduled Task Path
 
-1. Admin creates `ScheduledTask` with cron expression, queue, priority
-2. Daemon's `Scheduler.run_due_tasks()` queries for tasks where `next_run_at <= now` (`src/sqlery/core/scheduler.py:43`)
-3. For each due task, scheduler checks for existing pending jobs (dedup) (`src/sqlery/core/scheduler.py:75`)
-4. Creates a `QueuedJob` linked to the `ScheduledTask` via `scheduled_task_id` (`src/sqlery/core/scheduler.py:86`)
-5. Updates `next_run_at` based on schedule type (cron, interval, once) (`src/sqlery/core/scheduler.py:103`)
-6. Job enters the normal execution path (claimed by a worker)
+1. `Scheduler.tick()` queries `ScheduledTask` rows whose `next_run <= now` (`src/sqlery/core/scheduler.py`, `src/sqlery/core/scheduler_tasks.py`)
+2. For each due task it computes the next cron occurrence via `croniter` and atomically updates `next_run` (optimistic check on previous `next_run`)
+3. A `QueuedJob` is created with `scheduled_task_id` set; idempotency prevents duplicate enqueues for the same tick
+4. Standard execution path takes over
 
 ### Serverless / Lambda Path
 
-1. EventBridge invokes `handler()` with action payload (`src/sqlery/lambda_handler.py:62`)
-2. Handler calls `setup_django()` to initialize Django in Lambda (`src/sqlery/lambda_handler.py:99`)
-3. For `process_queue`: finds and executes a job inline (`src/sqlery/lambda_handler.py:112`)
-4. For `run_scheduled_task`: enqueues job and invokes another Lambda worker (`src/sqlery/lambda_handler.py:193`)
-5. After processing, recursively invokes another Lambda if more jobs exist
+1. EventBridge triggers Lambda at the configured interval (`src/sqlery/eventbridge_trigger.py`)
+2. `lambda_handler(event, context)` (`src/sqlery/lambda_handler.py`) initialises Django, runs one scheduler tick and one bounded claim/execute cycle, then exits
+3. No persistent worker process — each invocation claims and executes a small batch
+4. State remains in the database between invocations
 
 **State Management:**
-- All state is in the database (PostgreSQL or SQLite). No in-memory queues.
-- Worker heartbeats are DB rows updated every daemon cycle via SIGUSR1 signals.
-- Queue ownership uses DB-backed leases (DaemonLease model) with TTL-based expiry.
-- Optimistic locking via `version` field on QueuedJob for SQLite (CAS pattern).
-- Postgres uses `SELECT FOR UPDATE SKIP LOCKED` for atomic claiming.
+- All state lives in the database (PostgreSQL or SQLite). No in-memory queues.
+- Worker heartbeats are DB rows refreshed via SIGUSR1 signals from the daemon.
+- Queue ownership uses DB-backed leases (`DaemonLease` model) with TTL-based expiry.
+- Optimistic locking via `version` field on `QueuedJob` (CAS) for SQLite.
+- Postgres claiming uses `SELECT FOR UPDATE SKIP LOCKED`.
 
 ## Key Abstractions
 
 **DatabaseBackend:**
-- Purpose: Unified interface for all database operations across Django/SQLAlchemy
+- Purpose: Unified interface for all DB operations across Django/SQLAlchemy
 - Examples: `src/sqlery/compat/__init__.py` (ABC), `src/sqlery/django_sqlery/backend.py`, `src/sqlery/fastapi_sqlery/backend.py`
-- Pattern: Strategy pattern with runtime auto-detection
+- Pattern: Strategy with runtime auto-detection (Django detected if `django.conf.settings` is configured)
 
-**JobWrapper / @job Decorator:**
-- Purpose: Turns any function into an enqueueable task with `.enqueue()`, `.delay()`, `.enqueue_at()` methods
-- Examples: `src/sqlery/core/job.py`
-- Pattern: Decorator pattern preserving callable semantics (direct call still works)
+**JobWrapper (`@job`):**
+- Purpose: Turns a function into an enqueueable task exposing `.enqueue()`, `.delay()`, `.enqueue_at()`
+- Examples: `src/sqlery/core/job.py`, `src/sqlery/django_sqlery/__init__.py` (Django variant with `async_job`)
+- Pattern: Decorator that preserves the original callable (direct call still executes synchronously)
 
 **Config:**
 - Purpose: Unified configuration interface across Django settings and standalone env vars
 - Examples: `src/sqlery/compat/__init__.py` (ABC), `src/sqlery/django_sqlery/config.py`, `src/sqlery/fastapi_sqlery/config.py`
-- Pattern: Strategy pattern; Django reads `settings.DJANGO_SQL_JOBS`, standalone uses in-memory dict + env vars
+- Pattern: Strategy; Django reads `settings.DJANGO_SQL_JOBS`, standalone uses in-memory dict overlaid with `SQLERY_*` env vars
 
-**Worker / Fork-per-Job Model:**
-- Purpose: Memory-safe job execution with crash isolation
+**Fork-per-job execution:**
+- Purpose: Memory-safe job execution with crash isolation (RQ-style)
 - Examples: `src/sqlery/core/worker.py`
-- Pattern: Parent claims jobs and forks children. Child executes one job, writes result to DB, exits. Parent never blocked by job execution. Like RQ's execution model.
+- Pattern: Parent claims a job and forks a child. Child runs one job, writes the result, exits. Parent is never blocked by job code; child crashes cannot poison the worker.
 
 ## Entry Points
 
-**Python Package (`import sqlery`):**
+**Python package:**
 - Location: `src/sqlery/__init__.py`
 - Triggers: `from sqlery import enqueue, Queue, Worker, job`
-- Responsibilities: Re-exports core API, conditionally imports Django decorators
+- Responsibilities: Re-exports core API; conditionally imports Django decorators and `AsyncQueue`
 
-**CLI (`sqlery` command):**
-- Location: `src/sqlery/core/cli.py`
-- Triggers: `pyproject.toml [project.scripts]` entries: `sqlery`, `sqlery-worker`, `sqlery-web`, `sqlery-daemon`, `sqlery-jobs`, `sqlery-cleanup`, `sqlery-migrate`, `sqlery-tasks`, `sqlery-queues`
-- Responsibilities: Typer-based CLI for standalone mode (daemon, workers, jobs, tasks, cleanup, migrations)
+**Standalone CLI (Typer):**
+- Location: `src/sqlery/core/cli.py` (+ thin shim at `src/sqlery/fastapi_sqlery/cli.py`)
+- Triggers: `pyproject.toml [project.scripts]`: `sqlery`, `sqlery-worker`, `sqlery-web`, `sqlery-daemon`, `sqlery-jobs`, `sqlery-cleanup`, `sqlery-migrate`, `sqlery-tasks`, `sqlery-queues`
+- Responsibilities: Daemon, workers, jobs, tasks, cleanup, Alembic migrations
 
-**Worker Runner:**
+**Worker runner subprocess:**
 - Location: `src/sqlery/core/worker_runner.py`
 - Triggers: Spawned by `WorkerPoolManager.spawn_worker()` as `python -m sqlery.core.worker_runner`
-- Responsibilities: Initializes Django if needed, creates `WorkerProcess`, runs poll loop
+- Responsibilities: Initialise Django if present, build a `WorkerProcess`, run the poll loop
 
-**FastAPI Dashboard:**
+**FastAPI app:**
 - Location: `src/sqlery/fastapi_sqlery/app.py`
 - Triggers: `sqlery-web` CLI or `uvicorn sqlery.fastapi_sqlery.app:app`
 - Responsibilities: Web UI dashboard + REST API for standalone mode
 
-**Django App:**
+**Django AppConfig:**
 - Location: `src/sqlery/django_sqlery/apps.py`
-- Triggers: Adding `'sqlery.django_sqlery'` to Django `INSTALLED_APPS`
-- Responsibilities: AppConfig with SQLite WAL mode signal, registers admin
+- Triggers: Adding `'sqlery.django_sqlery'` to `INSTALLED_APPS`
+- Responsibilities: Connects `connection_created` signal (enables SQLite WAL + `busy_timeout`), registers admin
 
-**Django Management Commands:**
-- Location: `src/sqlery/django_sqlery/management/commands/`
-- Triggers: `python manage.py daemon`, `python manage.py run_jobs`, `python manage.py workers`, etc.
+**Django management commands:**
+- Location: `src/sqlery/django_sqlery/management/commands/` (with a transitional copy at `src/sqlery/management/commands/`)
+- Triggers: `python manage.py daemon`, `run_jobs`, `workers`, `cleanup_jobs`, `run_scheduled_tasks`, `rqworker`, `sqlery_import`, `sqlery_export`
 - Responsibilities: Django-style CLI for daemon, workers, scheduler, cleanup, import/export
 
-**Lambda Handler:**
+**AWS Lambda:**
 - Location: `src/sqlery/lambda_handler.py`
-- Triggers: AWS Lambda invocation from EventBridge
-- Responsibilities: Serverless job processing (Django mode only)
+- Triggers: AWS Lambda invocation from EventBridge (`src/sqlery/eventbridge_trigger.py`)
+- Responsibilities: Serverless scheduler + claim/execute cycle (Django mode only)
 
 ## Architectural Constraints
 
-- **Threading:** Single-threaded event loop per worker. Workers fork child processes for job execution. No threading within workers. SIGUSR1 signal handler sets a flag (no DB calls in signal handlers to avoid corrupting psycopg connections).
-- **Global state:** Singleton `_backend` and `_config` in `src/sqlery/compat/__init__.py` (module-level, initialized once per process). Global `_engine` in `src/sqlery/fastapi_sqlery/database.py`.
-- **Circular imports:** Carefully managed with lazy imports. Django decorators imported conditionally in `__init__.py`. Compat layer uses absolute imports (`from sqlery.django_sqlery.backend`) instead of relative to avoid resolution in the wrong package.
-- **Fork safety:** DB connections must be closed before `os.fork()` and reopened in both parent and child. `_reset_db_connections()` calls `django.db.connections.close_all()`. Child process calls `os.setpgrp()` for process group isolation.
-- **SQLite limitations:** No `SELECT FOR UPDATE SKIP LOCKED` -- uses optimistic locking with version field (CAS). WAL mode enabled for concurrent reads. `busy_timeout` pragma set to 5000ms. Not recommended for production multi-worker setups.
-- **Signal handling:** SIGTERM/SIGINT for graceful shutdown (forwarded to child process groups via `os.killpg`). SIGUSR1 for heartbeat requests from daemon to workers. SIGALRM for job timeout in child processes.
+- **Threading:** Single-threaded event loop per worker. Workers fork child processes for execution; no threading inside the worker. SIGUSR1 handlers only set flags (no DB calls in signal handlers, to avoid corrupting psycopg connections).
+- **Global state:** Module-level singletons `_backend` and `_config` in `src/sqlery/compat/__init__.py` (initialised once per process). Global SQLAlchemy `_engine` in `src/sqlery/fastapi_sqlery/database.py`.
+- **Circular imports:** Carefully managed. Django decorators are imported conditionally in `src/sqlery/__init__.py`. The compat layer uses absolute imports (e.g. `from sqlery.django_sqlery.backend import ...`) to avoid relative resolution into the wrong package during Django app loading. RQ/scheduler shims are intentionally not imported eagerly.
+- **Fork safety:** DB connections must be closed before `os.fork()` and reopened in both parent and child. `_reset_db_connections()` calls `django.db.connections.close_all()` (Django) or disposes the SQLAlchemy engine (standalone). Child calls `os.setpgrp()` for process-group isolation.
+- **SQLite limitations:** No `SELECT FOR UPDATE SKIP LOCKED` — uses optimistic locking with `QueuedJob.version` (CAS). WAL mode enabled and `busy_timeout` pragma set to 5000 ms via `connection_created` signal. Not recommended for production multi-worker setups.
+- **Signal handling:** SIGTERM/SIGINT for graceful shutdown (forwarded to child process groups via `os.killpg`). SIGUSR1 for heartbeat requests from daemon to workers. SIGALRM in the child for job timeout.
+- **Backward compatibility:** Top-level stub modules (`src/sqlery/models.py`, `executor.py`, `decorators.py`, `utils.py`, plus the entire flat top-level layout — `worker.py`, `queue.py`, `daemon_manager.py`, etc.) re-export from new locations. Do not delete — comment-and-date per the project's dead-code policy.
 
 ## Anti-Patterns
 
 ### Importing Django models at module level in core code
 
-**What happens:** Core modules use lazy imports (`from ..django_sqlery.models import QueuedJob` inside methods) to avoid Django dependency at import time, but some places like `_fail_zombie_running_jobs` in `src/sqlery/core/daemon.py:509` directly import Django models.
-**Why it's wrong:** Breaks standalone mode if these code paths are reached without Django configured.
-**Do this instead:** Always delegate to `self.backend` methods. The backend abstracts away the ORM. See `src/sqlery/core/claiming.py` for the correct pattern.
+**What happens:** A module under `src/sqlery/core/` directly does `from sqlery.django_sqlery.models import QueuedJob`.
+**Why it's wrong:** Core must remain framework-agnostic. Direct imports break standalone mode and create circular imports during Django app loading.
+**Do this instead:** Go through `get_backend()` from `src/sqlery/compat/__init__.py`; backends return generic dict/dataclass-like job records.
 
 ### Duplicated model definitions
 
-**What happens:** Django models in `src/sqlery/django_sqlery/models.py` and SQLModel models in `src/sqlery/core/models.py` define the same tables independently.
-**Why it's wrong:** Schema drift between the two model sets requires manual synchronization.
-**Do this instead:** Reference `src/sqlery/core/model_schemas.py` for shared field definitions. Always update both models when changing schema.
+**What happens:** Adding a new field to `QueuedJob` in only one of `src/sqlery/django_sqlery/models.py` or `src/sqlery/core/models.py`.
+**Why it's wrong:** The two integration modes silently diverge; tests on one backend miss bugs on the other.
+**Do this instead:** Update both model files together, write a matching Django migration in `src/sqlery/django_sqlery/migrations/` and an Alembic revision in `alembic/versions/`, and reflect the field in the `DatabaseBackend` ABC.
+
+### DB calls inside signal handlers
+
+**What happens:** A SIGUSR1/SIGTERM handler updates worker state via the ORM.
+**Why it's wrong:** Signals can fire mid-transaction and corrupt psycopg connections.
+**Do this instead:** Set a flag in the handler and process it from the worker's main loop, as done in `src/sqlery/core/worker.py`.
 
 ## Error Handling
 
-**Strategy:** Multi-layer defense with graceful degradation
-
-**Patterns:**
-- **Job-level:** Try/except around task execution, mark job failed with error + traceback. Retry with exponential backoff if `max_retries > 0`.
-- **Worker-level:** Unhandled errors in main loop caught, DB connections reset, sleep, continue. Worker marks status='dead' on shutdown.
-- **Daemon-level:** Each daemon cycle step wrapped in try/except, errors logged but loop continues. Signal-based graceful shutdown.
-- **Fork-level:** Parent kills child process group on timeout (SIGTERM then SIGKILL). Two-layer timeout: child SIGALRM at `timeout`, parent safety net at `timeout + 60s`.
-- **DB-level:** `retry_on_db_error` decorator retries transient errors (deadlocks, connection drops, database locked) with exponential backoff. `configure_connection_resilience()` sets WAL mode, busy_timeout (SQLite), statement_timeout (Postgres).
-- **Zombie detection:** Daemon periodically scans for running jobs with dead workers (5 checks: PID gone, no worker, worker dead, worker moved on, heartbeat stale).
+- **Job-level:** Try/except around task execution; mark job failed with error + traceback; retry with exponential backoff when `max_retries > 0` (`src/sqlery/core/worker.py`).
+- **Worker-level:** Unhandled errors in the main loop are caught, DB connections reset, sleep, continue. On shutdown the worker marks `status='dead'`.
+- **Daemon-level:** Each daemon cycle step is wrapped in try/except; errors are logged and the loop continues. Signal-based graceful shutdown (`src/sqlery/core/daemon.py`).
+- **Fork-level:** Parent kills the child process group on timeout (SIGTERM then SIGKILL). Two-layer timeout: child SIGALRM at `timeout`, parent safety net at `timeout + 60s`.
+- **DB-level:** `retry_on_db_error` decorator retries transient errors (deadlocks, dropped connections, `database is locked`) with exponential backoff. `configure_connection_resilience()` sets WAL mode + `busy_timeout` (SQLite) and `statement_timeout` (Postgres). See `src/sqlery/core/db_resilience.py`.
+- **Zombie detection:** Daemon periodically scans for running jobs whose worker is dead/missing using a 5-check heuristic (PID gone, no worker row, worker dead, worker moved on, heartbeat stale) and re-queues or fails them.
 
 ## Cross-Cutting Concerns
 
-**Logging:** Standard `logging` module throughout. Each module creates `logger = logging.getLogger(__name__)`. Worker stderr goes to daemon's stderr (visible in container logs). Worker stdout goes to log files in `tmp/`.
+**Logging:** Module-level `logger = logging.getLogger(__name__)`; config helpers in `src/sqlery/core/log_config.py`. F-strings in log messages.
 
-**Validation:** Cron expressions validated via vendored crontabula in `src/sqlery/crontab.py`. Rate limits parsed and validated in `src/sqlery/core/utils.py`. Pydantic models validate API requests in FastAPI mode.
+**Validation:** Light. Public API validates `task_path` is importable; backends rely on DB constraints + JSON serialisation of `kwargs`/`meta`.
 
-**Authentication:** No built-in auth. Django mode relies on Django admin auth. FastAPI dashboard has no auth (intended for internal use). Lambda handler assumes IAM-based access.
+**Authentication:** Dashboard auth is delegated to host framework — Django admin uses Django auth (`is_staff`), FastAPI dashboard ships unauthenticated and expects the deployer to put it behind a reverse proxy.
 
-**Configuration:** Django mode reads `settings.DJANGO_SQL_JOBS` dict. Standalone mode reads env vars (`SQLERY_DATABASE_URL`, `SQLERY_POOL_SIZE`, etc.) and supports programmatic `initialize()`. Config keys documented in `src/sqlery/fastapi_sqlery/config.py:18-54`.
+**Configuration:** Single source via `Config` ABC. Django path: `settings.DJANGO_SQL_JOBS` dict with defaults in `src/sqlery/django_sqlery/settings.py`. Standalone path: `StandaloneConfig` in `src/sqlery/fastapi_sqlery/config.py` overlaid with `SQLERY_*` env vars; `sqlery.compat.initialize(...)` for programmatic init.
+
+**Webhooks:** Outgoing job-status webhooks signed via HMAC (`src/sqlery/webhooks.py`, `src/sqlery/signature.py`); migration `0010_webhooks.py` adds the schema.
+
+**Middleware (HTTP/subprocess/daemon trigger modes):** `src/sqlery/{http_trigger,subprocess,daemon}_middleware.py` and Django mirrors at `src/sqlery/django_sqlery/*_middleware.py`.
 
 ---
 
-*Architecture analysis: 2026-05-12*
+*Architecture analysis: 2026-05-13*

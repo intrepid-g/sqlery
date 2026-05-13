@@ -1,190 +1,190 @@
 # External Integrations
 
-**Analysis Date:** 2026-05-12
+**Analysis Date:** 2026-05-13
 
 ## APIs & External Services
 
-**AWS Lambda (optional - eventbridge trigger mode):**
-- Used for serverless job processing -- Lambda functions process jobs from the queue
-- SDK/Client: `boto3` >= 1.34.0 (optional extra `eventbridge`)
-- Implementation: `src/sqlery/eventbridge_trigger.py`
-  - `invoke_lambda_worker()` - Async Lambda invocation for immediate job processing
-  - `schedule_eventbridge_event()` - Delayed job scheduling via EventBridge rules
-  - `ensure_cron_eventbridge_rule()` - Cron task scheduling via EventBridge rules
-  - `delete_eventbridge_rule()` / `disable_cron_eventbridge_rule()` - Rule lifecycle management
-- Lambda handler: `src/sqlery/lambda_handler.py`
-  - Handler function: `sqlery.lambda_handler.handler`
-  - Actions: `process_queue`, `run_scheduled_task`, `poll_and_process`
-- Auth: AWS IAM credentials (boto3 default credential chain)
-- Config keys:
-  - `EVENTBRIDGE_LAMBDA_ARN` - ARN of the Lambda worker function (required)
-  - `EVENTBRIDGE_BUS_NAME` - EventBridge bus name (default: `"default"`)
-  - `AWS_REGION` - AWS region (optional, uses boto3 defaults)
-- Example deployment: `examples/lambda/serverless.yml`
+**AWS (serverless / EventBridge mode):**
+- AWS Lambda — serverless job execution
+  - Handler: `sqlery.lambda_handler.handler` (`src/sqlery/lambda_handler.py`)
+  - SDK: `boto3` >= 1.34.0 (optional extra `eventbridge`, guarded `try: import boto3`)
+  - Auth: standard AWS credential chain (env vars, instance role, etc.); no library-specific env var
+- AWS EventBridge — delayed / scheduled job dispatch via Lambda invocation
+  - Implementation: `src/sqlery/eventbridge_trigger.py`
+  - `invoke_lambda_worker(job_id, queue_name)` directly invokes Lambda
+  - Cron jobs schedule EventBridge rules for next execution
+  - Configured via `DJANGO_SQL_JOBS["TRIGGER_MODE"] = "eventbridge"` + `EVENTBRIDGE_LAMBDA_ARN`, `EVENTBRIDGE_BUS_NAME`, `AWS_REGION`
 
-**AWS EventBridge (optional - eventbridge trigger mode):**
-- Used for delayed job scheduling and cron-based task triggering
-- Accessed via `boto3.client("events")` in `src/sqlery/eventbridge_trigger.py`
-- Creates one-time rules for delayed jobs and recurring rules for cron tasks
-- Rule naming convention: `sqlery-job-{job_id}-{timestamp}` (delayed) and `sqlery-cron-task-{task_id}` (cron)
-
-**Webhook delivery (optional):**
-- Outgoing HTTP POST notifications on job completion
+**HTTP webhooks (outbound):**
 - Implementation: `src/sqlery/webhooks.py`
-  - `send_webhook()` - Single delivery attempt
-  - `send_webhook_with_retry()` - Delivery with exponential backoff
-  - `retry_failed_webhooks()` - Batch retry of failed deliveries
-- HTTP client: `requests` library (imported at runtime, not a declared dependency)
-- Security: HMAC-SHA256 signature via `X-Sqlery-Signature` header
-- Config keys:
-  - `WEBHOOK_SECRET` - Shared secret for HMAC signing
-  - `WEBHOOK_TIMEOUT` - HTTP timeout in seconds (default: 10)
+- Library: `requests` (NOT declared in `pyproject.toml`, guarded `try: import requests`)
+- Outbound notifications on job lifecycle events
+- Signed with HMAC-SHA256 — see `generate_webhook_signature(payload, secret)`
+- Custom JSON encoder `_SafeEncoder` handles UUID, datetime, Decimal, bytes, set/frozenset
 
-**HTTP trigger mode (optional - ASGI deployments):**
-- Internal HTTP endpoint for triggering job processing
-- Implementation stub: `src/sqlery/http_trigger_middleware.py` (migrated to `src/sqlery/django_sqlery/http_trigger_middleware.py`)
-- HTTP client: `httpx` >= 0.24.0 (optional extra `http`)
-- Config keys:
-  - `INTERNAL_BASE_URL` - e.g., `http://127.0.0.1:8000`
-  - `INTERNAL_SECRET` - Shared secret for HMAC signatures
-  - `SIGNATURE_MAX_AGE` - Signature validity in seconds (default: 5)
+**HTTP trigger (internal, ASGI deployments):**
+- Implementation: `src/sqlery/http_trigger_middleware.py`, `src/sqlery/django_sqlery/http_trigger_middleware.py`
+- Library: `httpx` >= 0.24.0 (optional extra `http`)
+- Triggers worker/scheduler runs by hitting a signed internal URL on the running ASGI app
+- Settings: `INTERNAL_BASE_URL`, `INTERNAL_SECRET`, `SIGNATURE_MAX_AGE` (default 5s)
+- Activated via `DJANGO_SQL_JOBS["TRIGGER_MODE"] = "http"`
 
 ## Data Storage
 
 **Databases:**
-- SQLite
-  - Connection: In-memory (`:memory:` for tests) or file path
-  - Client: Django ORM (Django mode) or SQLModel/SQLAlchemy (standalone mode)
-  - Config: `DATABASES["default"]` in Django settings; `SQLERY_DATABASE_URL` env var in standalone
-  - WAL mode and `busy_timeout` auto-configured in `src/sqlery/django_sqlery/apps.py`
-  - Optimistic locking via `version` field on `QueuedJob`
+- PostgreSQL (production) — via `psycopg` >= 3.1
+  - Standalone: `SQLERY_DATABASE_URL` env var
+  - Django: `DATABASES` setting (standard Django)
+- SQLite (dev / lightweight) — built into Python
+  - WAL mode + busy_timeout auto-configured
+  - Single-file storage
 
-- PostgreSQL 15+
-  - Connection: `SQLERY_DATABASE_URL` or `DATABASE_URL` env var (e.g., `postgresql://user:pass@host:5432/dbname`)
-  - Client: Django ORM with `psycopg` adapter (Django mode) or SQLModel/SQLAlchemy with `psycopg` (standalone)
-  - Connection pooling: SQLAlchemy `QueuePool` with `pool_pre_ping=True`
-  - Pool config: `SQLERY_POOL_SIZE` (default 5), `SQLERY_MAX_OVERFLOW` (default 10), `SQLERY_POOL_TIMEOUT` (default 30), `SQLERY_POOL_RECYCLE` (default 1800)
-  - Locking: `SELECT FOR UPDATE SKIP LOCKED` for atomic job claiming
-  - Configurable: `PG_STATEMENT_TIMEOUT_MS` (default 30000), `PG_LOCK_TIMEOUT_MS` (default 10000)
-
-**Schema migrations:**
-- Django mode: Django migrations in `src/sqlery/django_sqlery/migrations/` (24 migrations: 0001 through 0024)
-- Standalone mode: Alembic migrations in `alembic/versions/` (13 migrations)
-- Tables: `sqlery_queued_job`, `sqlery_scheduled_task`, `sqlery_worker`, `sqlery_registry`
+**ORM clients:**
+- Django ORM (Django mode) — `src/sqlery/django_sqlery/models.py`, `backend.py`
+- SQLModel / SQLAlchemy (standalone) — `src/sqlery/core/models.py`, `src/sqlery/fastapi_sqlery/backend.py`, `database.py`
 
 **File Storage:**
-- Not applicable (no file storage integration)
+- Local filesystem only (no S3 / GCS client)
 
 **Caching:**
-- None (database-backed queue, no external cache layer)
+- None — all state lives in the database (queue, scheduler, worker heartbeats, leases)
 
 ## Authentication & Identity
 
-**Auth Provider:**
-- No external auth provider
-- Django admin authentication used for Django mode dashboard access
-- Webhook authentication via HMAC-SHA256 signatures (`src/sqlery/webhooks.py`)
-- HTTP trigger mode uses HMAC signatures for internal endpoint security
+**Internal HTTP trigger:**
+- HMAC-SHA256 shared-secret signatures
+- Signature lifetime controlled by `SIGNATURE_MAX_AGE` (default 5s)
+- Implementation: `src/sqlery/signature.py`, `src/sqlery/django_sqlery/signature.py`
+
+**Webhook outbound:**
+- HMAC-SHA256 signatures generated in `src/sqlery/webhooks.py:generate_webhook_signature`
+
+**Web dashboard:**
+- Django: relies on Django admin auth (`src/sqlery/django_sqlery/admin.py`, `admin_site.py`)
+- Standalone (FastAPI): no built-in auth on dashboard endpoints — deployment responsibility
 
 ## Monitoring & Observability
 
 **Error Tracking:**
-- None (no external error tracking service)
-- Errors stored in `QueuedJob.error` and `QueuedJob.traceback` fields
+- None bundled — logging only
 
 **Logs:**
-- Standard Python `logging` module throughout
-- Logger per module: `logging.getLogger(__name__)`
-- No structured logging or external log aggregation configured
-- Rich terminal output for CLI commands (`src/sqlery/core/cli.py`)
+- Python `logging` initialized per-module (`logger = logging.getLogger(__name__)`)
+- Log helpers in `src/sqlery/core/log_config.py`
+- Levels follow project convention (DEBUG / INFO / WARNING / ERROR / EXCEPTION with f-string messages)
 
-**Health check:**
-- FastAPI `/health` endpoint in standalone mode (`src/sqlery/fastapi_sqlery/app.py`)
-- Worker heartbeat system: workers send periodic heartbeats stored in `sqlery_worker` table
-  - Configurable interval: `WORKER_HEARTBEAT_INTERVAL` (default 5s)
-  - Dead detection: `WORKER_ALIVE_TIMEOUT` (default 30s)
+**Job lifecycle:**
+- RQ-style registry manager (`src/sqlery/core/registry.py`) tracks finished/failed/started/canceled/scheduled/deferred jobs in DB
+- Worker heartbeats stored in DB rows (no external metrics backend)
 
 ## CI/CD & Deployment
 
 **Hosting:**
-- No specific hosting platform configured
-- Deployment targets documented:
-  - Bare metal / traditional server (Django mode with management commands)
-  - Docker (stress test `compose.yml` at `stress_test/compose.yml`)
-  - AWS Lambda (serverless mode via `src/sqlery/lambda_handler.py`)
+- Library — distributed via PyPI (`hatchling` build, `uv` publishing)
+- Application targets: bare metal, Docker, AWS Lambda (serverless mode), any ASGI host (for FastAPI dashboard)
 
 **CI Pipeline:**
-- GitHub Actions (`.github/workflows/test.yml`)
-- Matrix: Python 3.11, 3.12, 3.13 on ubuntu-latest
-- Services: PostgreSQL 15
-- Uses `uv` for dependency installation
-- Test stages:
-  1. Unit tests (`tests/` excluding `tests/chaos/`)
-  2. Chaos/property tests (`tests/chaos/`)
-  3. PostgreSQL-specific tests (`test_atomic_claiming.py`, `test_atomic_scheduler.py`)
-  4. Coverage report (`--cov=src/sqlery`)
+- GitHub Actions — `.github/workflows/test.yml`
+- Runs against Python 3.11–3.13 and both SQLite and PostgreSQL 15
+- Uses `uv` for environment setup
 
 ## Environment Configuration
 
-**Required env vars (standalone mode):**
-- `SQLERY_DATABASE_URL` - Database connection URL (PostgreSQL or SQLite)
+**Standalone mode env vars (read by `StandaloneConfig._load_from_env` in `src/sqlery/fastapi_sqlery/config.py`):**
+- `SQLERY_DATABASE_URL` — DB connection string
+- `SQLERY_POOL_SIZE`, `SQLERY_MAX_OVERFLOW`, `SQLERY_POOL_TIMEOUT`, `SQLERY_POOL_RECYCLE` — SQLAlchemy QueuePool tuning
+- `DJANGO_SQL_JOBS_MAX_WORKERS`, `DJANGO_SQL_JOBS_ENABLE_DAEMON`, `DJANGO_SQL_JOBS_CHECK_INTERVAL` — daemon/worker overrides
 
-**Required env vars (Django mode):**
-- `DJANGO_SETTINGS_MODULE` - Django settings module path
-- Standard Django database configuration in `DATABASES`
+**Django mode env vars:**
+- Standard Django (`DJANGO_SETTINGS_MODULE`, `DATABASE_URL` when used by host project)
+- `DJANGO_SETTINGS_MODULE` required by `sqlery.lambda_handler` to bootstrap Django in Lambda
 
-**Required env vars (Lambda mode):**
-- `DJANGO_SETTINGS_MODULE` - Django settings module
-- `DATABASE_URL` - Database connection URL
-- AWS credentials (via IAM role or env vars)
+**AWS env vars (for EventBridge / Lambda):**
+- Standard AWS SDK chain (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, etc.) — not read directly by sqlery
+- `DJANGO_SQL_JOBS["AWS_REGION"]` overrides for the EventBridge client if set
 
-**Optional env vars:**
-- `SQLERY_POOL_SIZE` - Connection pool size (default 5)
-- `SQLERY_MAX_OVERFLOW` - Max overflow connections (default 10)
-- `SQLERY_POOL_TIMEOUT` - Pool timeout seconds (default 30)
-- `SQLERY_POOL_RECYCLE` - Connection recycle seconds (default 1800)
-- `DJANGO_SQL_JOBS_MAX_WORKERS` - Worker count per node
-- `DJANGO_SQL_JOBS_ENABLE_DAEMON` - Enable/disable daemon
-- `DJANGO_SQL_JOBS_CHECK_INTERVAL` - Daemon check interval
-
-**Secrets location:**
-- Environment variables (no secrets file management built-in)
-- `.makefile-configs/` directory contains example `.env` files for various configurations:
-  - `default.env.example`, `eventbridge.env.example`, `http-trigger.env.example`, `multi-worker.env.example`, `queue-high.env.example`, `queue-low.env.example`
+**Secrets:**
+- `DJANGO_SQL_JOBS["INTERNAL_SECRET"]` — HMAC secret for internal HTTP trigger
+- Webhook secrets — passed per-webhook to `generate_webhook_signature`
+- No `.env` file convention enforced by the library
 
 ## Webhooks & Callbacks
 
-**Incoming:**
-- HTTP trigger endpoint (Django mode) - receives internal requests to trigger job processing
-  - Implementation: `src/sqlery/django_sqlery/http_trigger_middleware.py`
-  - HMAC-signed requests for security
-
 **Outgoing:**
-- Job completion webhooks (`src/sqlery/webhooks.py`)
-  - Events: `success`, `failure`
-  - Payload includes: job ID, task path, status, timing, output/error, tags
-  - HMAC-SHA256 signature in `X-Sqlery-Signature` header
-  - Configurable retry with exponential backoff
-  - Webhook URL and events configured per-job (`webhook_url`, `webhook_events` fields on Django `QueuedJob` model)
-  - Batch retry via `retry_failed_webhooks()` function
+- Job lifecycle webhooks dispatched from `src/sqlery/webhooks.py`
+- HMAC-SHA256 signed payload; JSON body via `_SafeEncoder`
+- Triggered on job completion / failure events
+
+**Incoming:**
+- Internal HTTP trigger endpoints (`src/sqlery/django_sqlery/urls.py`, `src/sqlery/django_sqlery/api_views.py`, `src/sqlery/django_sqlery/views.py`)
+- FastAPI REST API surface in `src/sqlery/fastapi_sqlery/app.py`
+- Both protected by signed-URL / shared-secret signature for the trigger endpoints; dashboard endpoints rely on host auth
+
+## Django Integration Surface
+
+- App: `'sqlery.django_sqlery'` added to `INSTALLED_APPS`
+- AppConfig: `src/sqlery/django_sqlery/apps.py` — registers SQLite WAL signal handler, admin
+- Models: 24+ migrations in `src/sqlery/django_sqlery/migrations/` (`QueuedJob`, `ScheduledTask`, `Worker`/`WorkerProcess`, `DaemonLease`, etc.)
+- Admin: `src/sqlery/django_sqlery/admin.py`, custom site in `admin_site.py`
+- Dashboard views: `src/sqlery/django_sqlery/dashboard_views.py`
+- Middleware: `src/sqlery/django_sqlery/middleware.py`, `daemon_middleware.py`, `http_trigger_middleware.py`, `subprocess_middleware.py`
+- Backend implementation: `src/sqlery/django_sqlery/backend.py` (implements `DatabaseBackend` ABC)
+- Management commands: `daemon`, `run_jobs`, `run_scheduled_tasks`, `cleanup_jobs`, `workers`, `rqworker`, `sqlery_export`, `sqlery_import`
+- Optional async execution via `django-tasks` (extra `tasks`); guarded import in `src/sqlery/triggers.py`
+
+## Standalone (SQLAlchemy + FastAPI) Surface
+
+- Package: `src/sqlery/fastapi_sqlery/`
+- Backend: `backend.py` (implements `DatabaseBackend` ABC against SQLModel)
+- DB session/engine: `database.py` — `init_database(database_url, **kwargs)`, `get_engine()`, `StaticPool` for SQLite, `QueuePool` for PostgreSQL
+- Web app: `app.py` — FastAPI dashboard + REST API
+- CLI: `cli.py` — `worker_main`, `web_main`
+- Config: `config.py` — `StandaloneConfig` with env-var loading
+- Models: shared `src/sqlery/core/models.py` (SQLModel definitions)
+- Migrations: Alembic (`alembic.ini`, `alembic/versions/`)
+- Programmatic bootstrap: `from sqlery.compat import initialize; initialize(database_url=..., max_workers=...)`
 
 ## Compatibility Layers
 
-**RQ (Redis Queue) compatibility:**
-- Drop-in replacement module: `src/sqlery/compat/rq.py`
-- Provides: `Queue`, `get_queue`, `Retry`, `get_current_job` matching RQ API
-- Status: Deprecated since v3.1.0, removal planned for v3.2.0
+**RQ (Redis Queue) drop-in:**
+- Module: `src/sqlery/compat/rq.py`
+- Provides `Retry`, `get_queue`, `get_current_job`, `Queue` aliases backed by `DjangoQueue` + `DjangoBackend`
+- Deprecated since v3.1.0, scheduled for removal in v3.2.0 (`DeprecationWarning` emitted on import)
+- Migration: change imports only — keeps RQ codebases drop-in compatible
 
-**django-tasks-scheduler compatibility:**
-- Drop-in replacement module: `src/sqlery/compat/scheduler.py`
-- Provides: `Task`, `TaskType`, `TaskArg`, `TaskKwarg`, `Queue`, `get_queue`, `get_all_workers`, `JobModel`, `JobStatus`
-- Status: Deprecated since v3.1.0, removal planned for v3.2.0
+**django-tasks-scheduler drop-in:**
+- Module: `src/sqlery/compat/scheduler.py`
+- Provides `Task`, `TaskType`, `TaskArg`, `TaskKwarg`, `get_scheduled_task`, `run_task`, `job`, `Queue`, `get_queue`, `get_all_workers`, `JobModel`, `JobStatus`
+- Same deprecation status as the RQ shim
 
-**django-tasks integration:**
-- Optional backend for async task execution
-- Extra: `tasks` (`django-tasks >= 0.1.0`)
-- Config: `USE_DJANGO_TASKS` setting (default True)
+**Internal compat (mode auto-detection):**
+- `src/sqlery/compat/__init__.py` — `DatabaseBackend` and `Config` ABCs, `get_backend()`, `get_config()`, `initialize()`
+- Detects Django via `from django.conf import settings as _django_settings` import, falls back to standalone
+- Singletons `_backend` and `_config` initialized once per process
+
+## Config Surfaces (summary)
+
+| Surface | Where | Loader |
+|---------|-------|--------|
+| Django settings dict | `settings.DJANGO_SQL_JOBS` | `get_setting()` in `src/sqlery/django_sqlery/settings.py` |
+| Env vars (standalone) | OS environment | `StandaloneConfig._load_from_env()` in `src/sqlery/fastapi_sqlery/config.py` |
+| Programmatic init | Python code | `sqlery.compat.initialize(...)` |
+| Alembic | `alembic.ini` | Alembic CLI / `sqlery-migrate` |
+| Pytest / Django test settings | `tests/settings.py` | `[tool.pytest.ini_options]` in `pyproject.toml` |
+
+## CLI ↔ External System Mapping
+
+| CLI Entry | External Surface |
+|-----------|------------------|
+| `sqlery-worker` | Reads jobs from DB (PG/SQLite); forks child processes |
+| `sqlery-web` | Boots Uvicorn ASGI server hosting FastAPI dashboard/API |
+| `sqlery-daemon` | Long-running daemon: scheduler + worker pool + DB leases |
+| `sqlery-migrate` | Invokes Alembic migrations against `SQLERY_DATABASE_URL` |
+| `sqlery-jobs` / `sqlery-tasks` / `sqlery-queues` | DB-only CRUD over standalone tables |
+| `sqlery-cleanup` | Applies retention policies, deletes old rows |
+| Django `manage.py daemon` / `run_jobs` / `workers` | Same as above but inside Django process |
+| `sqlery.lambda_handler.handler` | AWS Lambda invocation entry (EventBridge events or direct invocation) |
 
 ---
 
-*Integration audit: 2026-05-12*
+*Integration audit: 2026-05-13*
