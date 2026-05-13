@@ -193,11 +193,14 @@ class _DjangoHarness:
     # --- Mode dispatch -----------------------------------------------------
 
     def _drive_sync(self, job_id: int):
-        """Execute the job inline via the synchronous JobExecutor path."""
+        """Execute the job inline via the synchronous JobExecutor path.
+
+        ``JobExecutor.execute_job`` accepts jobs in either ``queued`` or
+        ``running`` status; for the sync path we leave the row as ``queued``
+        and let the executor drive it to ``success`` / ``failed`` directly.
+        """
         from sqlery.core.worker import JobExecutor
         job = self.backend.get_job_by_id(job_id)
-        # Claim transitions queued -> running so execute_job won't skip.
-        self.backend.mark_job_running(job.id, worker_id="test-sync-worker")
         JobExecutor(backend=self.backend).execute_job(job)
 
     def _drive_subprocess(self, job_id: int):
@@ -211,11 +214,10 @@ class _DjangoHarness:
         """
         # Mirror sync: the subprocess code path runs run_jobs --once which
         # claims+executes any queued job. We exercise the equivalent
-        # claim+execute pair through the public backend API.
+        # claim+execute pair through the public backend API. The executor
+        # itself transitions queued -> success/failed.
         from sqlery.core.worker import JobExecutor
         job = self.backend.get_job_by_id(job_id)
-        if job.status == "queued":
-            self.backend.mark_job_running(job.id, worker_id="test-subproc-worker")
         JobExecutor(backend=self.backend).execute_job(job)
 
     def _drive_http_trigger(self):
@@ -358,7 +360,6 @@ class _StandaloneHarness:
             "from sqlery.core.worker import JobExecutor;"
             f"b = get_backend();"
             f"job = b.get_job_by_id({job_id});"
-            f"b.mark_job_running({job_id}, worker_id='test-sa-sync');"
             "JobExecutor(backend=b).execute_job(job);"
         )
         _run_no_django(script)
