@@ -5,7 +5,7 @@ logic is pure algorithm parameterized by backend calls.
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlery.core.utils import calculate_next_run
 
@@ -117,14 +117,14 @@ def enqueue_for_scheduled_task(task, backend):
 
     # Update next run time based on schedule type
     if schedule_type == "cron":
-        from datetime import datetime, timezone
+        # from datetime import datetime, timezone  # moved to top-level
         next_run = calculate_next_run(
             task.cron_expression,
             base_time=datetime.now(timezone.utc),
         )
         backend.update_scheduled_task_next_run(task.id, next_run)
     elif schedule_type == "interval":
-        from datetime import datetime, timezone
+        # from datetime import datetime, timezone  # moved to top-level
         interval_seconds = task.get_interval_seconds() if hasattr(task, 'get_interval_seconds') else 60
         next_run = datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
         backend.update_scheduled_task_next_run(task.id, next_run)

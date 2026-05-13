@@ -3,10 +3,14 @@
 Updated in v0.11.0 to use core.worker_pool.WorkerPoolManager.
 """
 
+import os
+import signal
+
 from django.core.management.base import BaseCommand
 from sqlery.django_sqlery.models import Worker
 from sqlery.core.worker_pool import WorkerPoolManager
 from sqlery.django_sqlery.settings import get_setting
+from sqlery.compat import get_backend
 
 
 class Command(BaseCommand):
@@ -130,8 +134,8 @@ class Command(BaseCommand):
 
     def kill_worker(self, worker_id, force=False):
         """Kill a specific worker."""
-        import os
-        import signal
+        # import os  # moved to top-level
+        # import signal  # moved to top-level
 
         self.stdout.write(f"Killing worker {worker_id[:8]}...")
 
@@ -155,7 +159,7 @@ class Command(BaseCommand):
                 )
 
                 # Mark as dead in database
-                from sqlery.compat import get_backend
+                # from sqlery.compat import get_backend  # moved to top-level
                 backend = get_backend()
                 backend.update_worker_heartbeat(
                     worker_id=str(worker.id),

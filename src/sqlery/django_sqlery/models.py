@@ -5,14 +5,24 @@ to ensure schema consistency across Django and standalone modes.
 """
 
 import logging
+import os
 import uuid
+from datetime import timedelta
 
+from django.apps import apps
+from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
+from django.db.models import F
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from uuid6 import uuid7
+
+from .db_compat import is_sqlite
+from .friendly_name import uuid_to_friendly
+from .settings import get_setting
+from .utils import calculate_next_run, validate_cron_expression
 
 logger = logging.getLogger(__name__)
 
@@ -217,16 +227,16 @@ class ScheduledTask(models.Model):
 
     def _sync_eventbridge_rule(self):
         """Sync EventBridge cron rule when in eventbridge trigger mode."""
-        from .settings import get_setting
+        # from .settings import get_setting  # moved to top-level
 
         trigger_mode = get_setting("TRIGGER_MODE", "middleware")
 
         if trigger_mode != "eventbridge":
             return
 
-        import logging
+        # import logging  # moved to top-level
 
-        logger = logging.getLogger(__name__)
+        # logger = logging.getLogger(__name__)  # already defined at module level
 
         try:
             if self.enabled:
@@ -255,16 +265,16 @@ class ScheduledTask(models.Model):
 
     def _calculate_next_run(self):
         """Calculate next_run_at based on schedule_type."""
-        from datetime import timedelta
+        # from datetime import timedelta  # moved to top-level
 
-        from django.utils import timezone as tz
+        # from django.utils import timezone as tz  # moved to top-level
 
-        from .utils import calculate_next_run
+        # from .utils import calculate_next_run  # moved to top-level
 
         if self.schedule_type == "cron" and self.cron_expression:
             return calculate_next_run(self.cron_expression)
         elif self.schedule_type == "interval" and self.interval:
-            return tz.now() + timedelta(seconds=self.get_interval_seconds())
+            return timezone.now() + timedelta(seconds=self.get_interval_seconds())
         elif self.schedule_type == "once" and self.scheduled_time:
             return self.scheduled_time
         return None
@@ -297,7 +307,7 @@ class ScheduledTask(models.Model):
 
     def clean(self):
         """Validate schedule fields based on schedule_type."""
-        from django.core.exceptions import ValidationError
+        # from django.core.exceptions import ValidationError  # moved to top-level
 
         errors = {}
 
@@ -305,7 +315,7 @@ class ScheduledTask(models.Model):
             if not self.cron_expression:
                 errors["cron_expression"] = "Cron expression is required for cron schedule type."
             else:
-                from .utils import validate_cron_expression
+                # from .utils import validate_cron_expression  # moved to top-level
 
                 is_valid, error_msg = validate_cron_expression(self.cron_expression)
                 if not is_valid:
@@ -527,7 +537,7 @@ class QueuedJob(models.Model):
     failure_ttl = models.IntegerField(
         null=True,
         blank=True,
-        help_text="Seconds to keep failed job data (None = use global)",
+        help_text="Seconds to keep failed job data (-1 = forever, None = use global)",
     )
 
     # Optional reference to scheduled task
@@ -603,9 +613,9 @@ class QueuedJob(models.Model):
         Raises:
             ConcurrentModificationError: If job was modified by another process
         """
-        import os
+        # import os  # moved to top-level
 
-        from django.db.models import F
+        # from django.db.models import F  # moved to top-level
 
         expected_version = self.version
 
@@ -631,7 +641,7 @@ class QueuedJob(models.Model):
         Raises:
             ConcurrentModificationError: If job was modified by another process
         """
-        from django.db.models import F
+        # from django.db.models import F  # moved to top-level
 
         expected_version = self.version
         self.finished_at = timezone.now()
@@ -682,7 +692,7 @@ class QueuedJob(models.Model):
         Raises:
             ConcurrentModificationError: If job was modified by another process
         """
-        from django.db.models import F
+        # from django.db.models import F  # moved to top-level
 
         expected_version = self.version
         self.finished_at = timezone.now()
@@ -762,7 +772,7 @@ class QueuedJob(models.Model):
         if not self.worker_id:
             return
         try:
-            from django.apps import apps
+            # from django.apps import apps  # moved to top-level
 
             Worker = apps.get_model("sqlery", "Worker")
             Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
@@ -787,8 +797,8 @@ class QueuedJob(models.Model):
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "status": status,
             "duration": self.duration_seconds,
-            "output": output[:1000] if output else "",  # Limit to 1000 chars
-            "error": error[:1000] if error else "",  # Limit to 1000 chars
+            "output": output[:2000] if output else "",  # Limit to 2000 chars
+            "error": error[:2000] if error else "",  # Limit to 2000 chars
         }
 
         # Initialize runs list if needed
@@ -917,7 +927,7 @@ class QueuedJob(models.Model):
         #     job for job in queued_jobs
         #     if job.dependencies and self.id in job.dependencies
         # ]
-        from .db_compat import is_sqlite
+        # from .db_compat import is_sqlite  # moved to top-level
 
         if is_sqlite():
             # SQLite doesn't support JSON __contains — filter in Python
@@ -1087,7 +1097,7 @@ class Worker(models.Model):
 
     @property
     def friendly_name(self):
-        from .friendly_name import uuid_to_friendly
+        # from .friendly_name import uuid_to_friendly  # moved to top-level
 
         return uuid_to_friendly(self.id)
 
@@ -1100,6 +1110,48 @@ class Worker(models.Model):
             return False
         threshold = timezone.now() - timezone.timedelta(seconds=timeout_seconds)
         return self.last_heartbeat >= threshold
+
+
+class DaemonCommand(models.Model):
+    """Commands from frontend/API to the daemon process.
+
+    The daemon reads pending commands each cycle and executes them.
+    Commands are fire-and-forget from the frontend's perspective —
+    the frontend writes a row, the daemon picks it up.
+    """
+
+    COMMAND_CHOICES = [
+        ('manual_intervention', 'Manual Intervention'),
+        ('restart_workers', 'Restart Workers'),
+        ('cleanup_now', 'Cleanup Now'),
+        ('enforce_deadlines', 'Enforce Deadlines'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    command = models.CharField(max_length=100, choices=COMMAND_CHOICES)
+    payload = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    status = models.CharField(max_length=20, default='pending', choices=STATUS_CHOICES)
+    result = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    created_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sqlery_daemon_command"
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['status', 'created_at']),
+        ]
+        verbose_name = "Daemon Command"
+        verbose_name_plural = "Daemon Commands"
+
+    def __str__(self):
+        return f"DaemonCommand({self.command} [{self.status}])"
 
 
 class TagLock(models.Model):
@@ -1174,7 +1226,7 @@ def cleanup_eventbridge_rule(sender, instance, **kwargs):
 
     This only runs if TRIGGER_MODE='eventbridge', otherwise it's a no-op.
     """
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     trigger_mode = get_setting("TRIGGER_MODE", "middleware")
     if trigger_mode != "eventbridge":

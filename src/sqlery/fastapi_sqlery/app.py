@@ -3,13 +3,17 @@
 Provides web UI and REST API for job queue management.
 """
 
+import uvicorn
 from datetime import datetime, UTC
+from pathlib import Path
+
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
-from pathlib import Path
 from pydantic import BaseModel, Field
+
+from ..compat import get_backend, is_standalone_mode
 
 # Create FastAPI app
 app = FastAPI(
@@ -78,7 +82,7 @@ class UpdateScheduledTaskRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Main dashboard with overview statistics."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -112,7 +116,7 @@ async def jobs_list(
     per_page: int = 50,
 ):
     """List all jobs with optional filters."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -159,7 +163,7 @@ async def jobs_list(
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def job_detail(request: Request, job_id: int):
     """Job detail view."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     job = backend.get_job_by_id(job_id)
@@ -184,7 +188,7 @@ async def job_detail(request: Request, job_id: int):
 @app.get("/scheduled-tasks", response_class=HTMLResponse)
 async def scheduled_tasks_list(request: Request):
     """List all scheduled tasks."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     tasks = backend.get_scheduled_tasks()
@@ -202,7 +206,7 @@ async def scheduled_tasks_list(request: Request):
 @app.get("/workers", response_class=HTMLResponse)
 async def workers_list(request: Request):
     """List all workers."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     workers = backend.get_worker_heartbeats(active_only=False)
@@ -220,7 +224,7 @@ async def workers_list(request: Request):
 @app.get("/registries", response_class=HTMLResponse)
 async def registries_view(request: Request):
     """View job registries."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -248,7 +252,7 @@ async def registries_view(request: Request):
 @app.get("/api/stats")
 async def api_stats():
     """Get dashboard statistics (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     stats = backend.get_database_stats()
@@ -269,7 +273,7 @@ async def api_jobs_list(
     offset: int = 0,
 ):
     """Get jobs list (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -311,7 +315,7 @@ async def api_jobs_list(
 @app.get("/api/jobs/{job_id}")
 async def api_job_detail(job_id: int):
     """Get job details (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     job = backend.get_job_by_id(job_id)
@@ -342,7 +346,7 @@ async def api_job_detail(job_id: int):
 @app.post("/api/jobs", status_code=201)
 async def api_create_job(request: CreateJobRequest):
     """Create a new job (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -377,7 +381,7 @@ async def api_create_job(request: CreateJobRequest):
 @app.delete("/api/jobs/{job_id}")
 async def api_cancel_job(job_id: int):
     """Cancel a job (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     success = backend.cancel_job(job_id)
@@ -391,7 +395,7 @@ async def api_cancel_job(job_id: int):
 @app.get("/api/workers")
 async def api_workers_list(active_only: bool = True):
     """Get workers list (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     workers = backend.get_worker_heartbeats(active_only=active_only)
@@ -416,7 +420,7 @@ async def api_workers_list(active_only: bool = True):
 @app.get("/api/scheduled-tasks")
 async def api_scheduled_tasks_list():
     """Get scheduled tasks list (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     tasks = backend.get_scheduled_tasks()
@@ -443,7 +447,7 @@ async def api_scheduled_tasks_list():
 @app.post("/api/scheduled-tasks", status_code=201)
 async def api_create_scheduled_task(request: CreateScheduledTaskRequest):
     """Create a new scheduled task (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -476,7 +480,7 @@ async def api_create_scheduled_task(request: CreateScheduledTaskRequest):
 @app.get("/api/scheduled-tasks/{task_id}")
 async def api_scheduled_task_detail(task_id: int):
     """Get scheduled task details (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     task = backend.get_scheduled_task(task_id)
@@ -502,7 +506,7 @@ async def api_scheduled_task_detail(task_id: int):
 @app.patch("/api/scheduled-tasks/{task_id}")
 async def api_update_scheduled_task(task_id: int, request: UpdateScheduledTaskRequest):
     """Update a scheduled task (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
 
@@ -549,7 +553,7 @@ async def api_update_scheduled_task(task_id: int, request: UpdateScheduledTaskRe
 @app.delete("/api/scheduled-tasks/{task_id}")
 async def api_delete_scheduled_task(task_id: int):
     """Delete a scheduled task (JSON)."""
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     success = backend.delete_scheduled_task(task_id)
@@ -567,7 +571,7 @@ async def api_delete_scheduled_task(task_id: int):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    from ..compat import is_standalone_mode
+    # from ..compat import is_standalone_mode  # moved to top-level
 
     return {
         "status": "healthy",
@@ -577,5 +581,5 @@ async def health_check():
 
 
 if __name__ == "__main__":
-    import uvicorn
+    # import uvicorn  # moved to top-level
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -21,6 +21,11 @@ def main():
         import django
         django.setup()
 
+    # Configure logging after Django setup so compat layer works
+    # (sqlery imports trigger sqlery/__init__.py which needs Django first)
+    from sqlery.core.log_config import configure_logging
+    configure_logging('sqlery_daemon.log')
+
     # Import and run daemon (mode detection will happen correctly now)
     from sqlery.core.daemon import DaemonManager
 

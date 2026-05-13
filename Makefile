@@ -172,7 +172,8 @@ help: ## Show this help message
 	$(call print-help-section,Database,db|migrate)
 	$(call print-help-section,Single Worker,worker:)
 	$(call print-help-section,Multiple Workers,workers)
-	$(call print-help-section,Testing & Development,test|dev|demo|jobs)
+	$(call print-help-section,Test Suite,test)
+	$(call print-help-section,Development & Demo,dev|demo|jobs)
 	$(call print-help-section,Docker,docker)
 	$(call print-help-section,Cleanup & Utilities,clean|stop|logs|status)
 
@@ -426,10 +427,101 @@ dev-remote: ## Start Django development server accessible from network (0.0.0.0:
 shell: ## Open Django shell
 	@$(DJANGO_MANAGE) shell
 
+# =============================================================================
+# Test Suite
+# =============================================================================
+
 .PHONY: test
-test: ## Run tests
-	@echo "$(BLUE)→ Running tests...$(NC)"
-	@$(PYTHON_VENV) -m pytest tests/ -v
+test: ## Run all tests (excluding chaos)
+	@echo "$(BLUE)→ Running all tests...$(NC)"
+	@$(UV) run pytest tests/ --ignore=tests/chaos/ -v
+
+.PHONY: test-coverage
+test-coverage: ## Run tests with coverage report
+	@echo "$(BLUE)→ Running tests with coverage...$(NC)"
+	@$(UV) run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing -v
+
+# --- By component ---
+
+.PHONY: test-core
+test-core: ## Run core tests (models, queue, executor, claiming, scheduler)
+	@echo "$(BLUE)→ Running core tests...$(NC)"
+	@$(UV) run pytest tests/test_models.py tests/test_queue.py tests/test_executor.py tests/test_api.py tests/test_utils.py -v
+
+.PHONY: test-claiming
+test-claiming: ## Run atomic claiming and locking tests
+	@echo "$(BLUE)→ Running claiming tests...$(NC)"
+	@$(UV) run pytest tests/test_atomic_claiming.py tests/test_version_locking.py -v
+
+.PHONY: test-scheduler
+test-scheduler: ## Run scheduler and cron tests
+	@echo "$(BLUE)→ Running scheduler tests...$(NC)"
+	@$(UV) run pytest tests/test_atomic_scheduler.py tests/test_scheduler_compat.py -v
+
+.PHONY: test-concurrency
+test-concurrency: ## Run concurrency, timeout, and cleanup tests
+	@echo "$(BLUE)→ Running concurrency tests...$(NC)"
+	@$(UV) run pytest tests/test_concurrency_and_timeout.py -v
+
+# --- By framework ---
+
+.PHONY: test-django
+test-django: ## Run Django-specific tests (admin, middleware, triggers)
+	@echo "$(BLUE)→ Running Django tests...$(NC)"
+	@$(UV) run pytest tests/test_admin.py tests/test_middleware.py tests/test_triggers.py tests/test_http_trigger.py -v
+
+# --- By trigger mode ---
+# TRIGGER_MODE controls how sqlery discovers and processes jobs:
+#   middleware  - piggybacks on HTTP requests (default)
+#   subprocess - spawns subprocess per request (memory-safe)
+#   http       - signed HTTP POST to /_internal/worker (ASGI-friendly)
+#   daemon     - long-running background process with worker pool
+#   eventbridge - AWS Lambda via EventBridge
+#   disabled   - manual only (management commands)
+
+.PHONY: test-middleware-mode
+test-middleware-mode: ## Run middleware trigger mode tests
+	@echo "$(BLUE)→ Running middleware mode tests...$(NC)"
+	@$(UV) run pytest tests/test_middleware.py tests/test_triggers.py -v
+
+.PHONY: test-subprocess-mode
+test-subprocess-mode: ## Run subprocess trigger/execution mode tests
+	@echo "$(BLUE)→ Running subprocess mode tests...$(NC)"
+	@$(UV) run pytest tests/test_subprocess.py tests/test_subprocess_middleware.py -v
+
+.PHONY: test-http-mode
+test-http-mode: ## Run HTTP trigger mode tests (signed endpoints)
+	@echo "$(BLUE)→ Running HTTP trigger mode tests...$(NC)"
+	@$(UV) run pytest tests/test_http_trigger.py -v
+
+.PHONY: test-daemon-mode
+test-daemon-mode: ## Run daemon mode tests (chaos + worker lifecycle)
+	@echo "$(BLUE)→ Running daemon mode tests...$(NC)"
+	@$(UV) run pytest tests/chaos/ -v --timeout=60
+
+.PHONY: test-chaos
+test-chaos: ## Run chaos engineering tests (SIGKILL, hung workers, etc.)
+	@echo "$(BLUE)→ Running chaos tests...$(NC)"
+	@$(UV) run pytest tests/chaos/test_worker_chaos.py -v --timeout=60
+
+.PHONY: test-property
+test-property: ## Run property-based tests (Hypothesis)
+	@echo "$(BLUE)→ Running property-based tests...$(NC)"
+	@$(UV) run pytest tests/chaos/test_property_based.py -v --timeout=60
+
+# --- PostgreSQL-specific ---
+
+.PHONY: test-postgres
+test-postgres: ## Run PostgreSQL-specific tests (requires running PG)
+	@echo "$(BLUE)→ Running PostgreSQL-specific tests...$(NC)"
+	@$(UV) run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v --timeout=30
+
+# --- Quick ---
+
+.PHONY: test-quick
+test-quick: ## Run fast unit tests only (skip chaos, property, postgres)
+	@echo "$(BLUE)→ Running quick tests...$(NC)"
+	@$(UV) run pytest tests/ --ignore=tests/chaos/ -v -x --timeout=10
 
 .PHONY: demo-jobs
 demo-jobs: ## Enqueue demo jobs for testing

@@ -9,6 +9,9 @@ import traceback as tb
 
 from django.core.management.base import BaseCommand, CommandError
 
+from sqlery.core.utils import import_task
+from sqlery.django_sqlery.models import QueuedJob
+
 
 class Command(BaseCommand):
     help = "Inspect a job's full details or replay it locally to reproduce errors"
@@ -22,7 +25,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        from sqlery.django_sqlery.models import QueuedJob
+        # from sqlery.django_sqlery.models import QueuedJob  # moved to top-level
 
         job_id = options["job_id"]
 
@@ -124,7 +127,7 @@ class Command(BaseCommand):
         w(s.WARNING("\n--- Replaying task (diagnostic mode, job status will NOT be updated) ---\n"))
 
         # Import task
-        from sqlery.core.utils import import_task
+        # from sqlery.core.utils import import_task  # moved to top-level
 
         try:
             task_func = import_task(job.task_path)

@@ -1,14 +1,18 @@
 """Dashboard views for Sqlery admin."""
 
+import uuid
+
+from django.contrib import admin
 from django.contrib.admin.views.decorators import staff_member_required
 from django.shortcuts import render, get_object_or_404
+
 from .models import ScheduledTask, Worker
 
 
 @staff_member_required
 def dashboard_view(request):
     """Dashboard page view (requires staff permission)."""
-    from django.contrib import admin
+    # from django.contrib import admin  # moved to top-level
 
     context = {
         'title': 'Sqlery Dashboard',
@@ -30,7 +34,7 @@ def sqlery_unified_view(request):
 
     All data is fetched via JavaScript from API endpoints for easier iteration.
     """
-    from django.contrib import admin
+    # from django.contrib import admin  # moved to top-level
 
     context = {
         'title': 'SQLery - Task Queue Management',
@@ -56,7 +60,7 @@ def sqlery_task_detail_view(request, task_id):
 
     All job data is fetched via JavaScript from API endpoints.
     """
-    from django.contrib import admin
+    # from django.contrib import admin  # moved to top-level
 
     task = get_object_or_404(ScheduledTask, id=task_id)
 
@@ -74,8 +78,8 @@ def sqlery_task_detail_view(request, task_id):
 @staff_member_required
 def sqlery_worker_detail_view(request, worker_id):
     """Worker detail page - shows worker info and job history."""
-    import uuid
-    from django.contrib import admin
+    # import uuid  # moved to top-level
+    # from django.contrib import admin  # moved to top-level
 
     worker = get_object_or_404(Worker, id=uuid.UUID(worker_id))
 

@@ -17,9 +17,11 @@ Use ``python manage.py daemon`` or the SQLery worker API directly.
 
 import warnings
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from sqlery.core.daemon import DaemonManager
+from sqlery.django_sqlery.executor import TaskExecutor
 from sqlery.django_sqlery.settings import get_setting
 
 
@@ -80,7 +82,7 @@ class Command(BaseCommand):
     def _run_daemon(self, queues: list[str], max_workers: int | None = None):
         """Start the daemon loop in the foreground (like rqworker)."""
         # Override WORKER_QUEUES so the daemon picks up the CLI-specified queues
-        from django.conf import settings
+        # from django.conf import settings  # moved to top-level
 
         user_settings = getattr(settings, "DJANGO_SQL_JOBS", {})
         # original_queues = user_settings.get("WORKER_QUEUES")
@@ -93,7 +95,7 @@ class Command(BaseCommand):
 
     def _run_burst(self, queues: list[str]):
         """Process all pending jobs from the given queues, then exit."""
-        from sqlery.django_sqlery.executor import TaskExecutor
+        # from sqlery.django_sqlery.executor import TaskExecutor  # moved to top-level
 
         executor = TaskExecutor()
         total = 0

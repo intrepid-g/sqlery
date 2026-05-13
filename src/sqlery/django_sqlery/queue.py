@@ -6,8 +6,14 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Callable
 from datetime import datetime, timedelta, UTC
+from typing import Any, Callable
+
+from django.db.models import Max
+
+from .models import QueuedJob
+from .settings import get_setting
+
 # REMOVED in v0.13: backends abstraction layer was removed
 # from sqlery.backends.base import SyncStorageBackend
 SyncStorageBackend = None
@@ -42,7 +48,7 @@ class Queue:
         if default_timeout is not None:
             self.default_timeout = default_timeout
         else:
-            from .settings import get_setting
+            # from .settings import get_setting  # moved to top-level
             self.default_timeout = get_setting('DEFAULT_TIMEOUT_SECONDS')
 
     @classmethod
@@ -149,8 +155,8 @@ class Queue:
         # RQ compat: at_front=True sets priority to 1 above the current max in the queue
         priority = queue_options['priority']
         if queue_options.get('_rq_at_front'):
-            from .models import QueuedJob
-            from django.db.models import Max
+            # from .models import QueuedJob  # moved to top-level
+            # from django.db.models import Max  # moved to top-level
             max_priority = (
                 QueuedJob.objects
                 .filter(queue_name=queue_options['queue'], status='queued')
@@ -340,7 +346,7 @@ class Queue:
         Returns:
             QueuedJob instance or None if not found
         """
-        from .models import QueuedJob
+        # from .models import QueuedJob  # moved to top-level
 
         # Try job_name first (RQ string ID)
         if isinstance(job_id, str):

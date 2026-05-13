@@ -4,11 +4,21 @@ Provides command-line interface for standalone mode.
 Django mode uses Django management commands instead.
 """
 
+import os
+import signal
 import sys
+from datetime import datetime, timedelta, UTC
+
 import typer
 from rich.console import Console
 from rich.table import Table
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
+
+from ..compat import is_django_mode, get_backend, get_config, initialize as compat_initialize
+from ..crontab import parse_cron_string
+from ..triggers import trigger_due_tasks
+from .cleanup import CleanupManager
+from .daemon import DaemonManager
 
 app = typer.Typer(
     name="sqlery",
@@ -32,13 +42,13 @@ def daemon_start(
     detach: bool = typer.Option(True, "--detach/--no-detach", help="Run daemon in background"),
 ):
     """Start the job processing daemon."""
-    from ..compat import is_django_mode
+    # from ..compat import is_django_mode  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py daemon start' in Django mode[/red]")
         raise typer.Exit(1)
 
-    from .daemon import DaemonManager
+    # from .daemon import DaemonManager  # moved to top-level
 
     console.print("[bold blue]Starting sqlery daemon...[/bold blue]")
 
@@ -56,13 +66,13 @@ def daemon_start(
 @daemon_app.command("stop")
 def daemon_stop():
     """Stop the job processing daemon."""
-    from ..compat import is_django_mode
+    # from ..compat import is_django_mode  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py daemon stop' in Django mode[/red]")
         raise typer.Exit(1)
 
-    from .daemon import DaemonManager
+    # from .daemon import DaemonManager  # moved to top-level
 
     console.print("[bold blue]Stopping sqlery daemon...[/bold blue]")
 
@@ -78,13 +88,13 @@ def daemon_stop():
 @daemon_app.command("restart")
 def daemon_restart():
     """Restart the job processing daemon."""
-    from ..compat import is_django_mode
+    # from ..compat import is_django_mode  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py daemon restart' in Django mode[/red]")
         raise typer.Exit(1)
 
-    from .daemon import DaemonManager
+    # from .daemon import DaemonManager  # moved to top-level
 
     console.print("[bold blue]Restarting sqlery daemon...[/bold blue]")
 
@@ -100,13 +110,13 @@ def daemon_restart():
 @daemon_app.command("status")
 def daemon_status():
     """Check daemon status."""
-    from ..compat import is_django_mode
+    # from ..compat import is_django_mode  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py daemon status' in Django mode[/red]")
         raise typer.Exit(1)
 
-    from .daemon import DaemonManager
+    # from .daemon import DaemonManager  # moved to top-level
 
     daemon = DaemonManager()
     status = daemon.status()
@@ -133,7 +143,7 @@ def workers_list(
     active_only: bool = typer.Option(True, "--active-only/--all", help="Show only active workers"),
 ):
     """List all workers."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py workers list' in Django mode[/red]")
@@ -172,9 +182,9 @@ def workers_stop(
     worker_id: str | None = typer.Option(None, "--worker-id", "-w", help="Stop specific worker by ID"),
 ):
     """Stop all workers gracefully (or a specific worker by ID)."""
-    from ..compat import is_django_mode, get_backend
-    import signal
-    import os
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
+    # import signal  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py workers stop' in Django mode[/red]")
@@ -227,9 +237,9 @@ def workers_kill(
     force: bool = typer.Option(False, "--force", "-f", help="Confirm force kill"),
 ):
     """Force kill workers (SIGKILL). Use with caution!"""
-    from ..compat import is_django_mode, get_backend
-    import signal
-    import os
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
+    # import signal  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py workers kill' in Django mode[/red]")
@@ -287,8 +297,8 @@ def workers_cleanup(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted without deleting"),
 ):
     """Clean up stale worker records from database."""
-    from ..compat import is_django_mode, get_backend
-    from datetime import timedelta
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
+    # from datetime import timedelta  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py workers cleanup' in Django mode[/red]")
@@ -299,7 +309,7 @@ def workers_cleanup(
     # Get stale workers (no heartbeat in N hours)
     all_workers = backend.get_worker_heartbeats(active_only=False)
 
-    from datetime import datetime, UTC
+    # from datetime import datetime, UTC  # moved to top-level
     cutoff = datetime.now(UTC) - timedelta(hours=max_age_hours)
 
     stale_workers = [
@@ -350,8 +360,8 @@ def cleanup_auto(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted without deleting"),
 ):
     """Run automatic cleanup based on configuration."""
-    from ..compat import is_django_mode
-    from .cleanup import CleanupManager
+    # from ..compat import is_django_mode  # moved to top-level
+    # from .cleanup import CleanupManager  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py cleanup_jobs auto' in Django mode[/red]")
@@ -375,8 +385,8 @@ def cleanup_auto(
 @cleanup_app.command("stats")
 def cleanup_stats():
     """Show database statistics."""
-    from ..compat import is_django_mode
-    from .cleanup import CleanupManager
+    # from ..compat import is_django_mode  # moved to top-level
+    # from .cleanup import CleanupManager  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py cleanup_jobs stats' in Django mode[/red]")
@@ -400,8 +410,8 @@ def cleanup_stats():
 @cleanup_app.command("vacuum")
 def cleanup_vacuum():
     """Run database vacuum/optimize (PostgreSQL only)."""
-    from ..compat import is_django_mode
-    from .cleanup import CleanupManager
+    # from ..compat import is_django_mode  # moved to top-level
+    # from .cleanup import CleanupManager  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py cleanup_jobs vacuum' in Django mode[/red]")
@@ -434,7 +444,7 @@ def jobs_list(
     limit: int = typer.Option(10, "--limit", "-n", help="Number of jobs to show"),
 ):
     """List jobs."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to view jobs in Django mode[/red]")
@@ -493,7 +503,7 @@ def jobs_inspect(
     job_id: int = typer.Argument(..., help="Job ID to inspect"),
 ):
     """Show detailed information about a specific job."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to view jobs in Django mode[/red]")
@@ -546,7 +556,7 @@ def jobs_cancel(
     job_id: int = typer.Argument(..., help="Job ID to cancel"),
 ):
     """Cancel a queued job."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to manage jobs in Django mode[/red]")
@@ -572,7 +582,7 @@ def jobs_retry(
     limit: int | None = typer.Option(None, "--limit", "-n", help="Maximum number of jobs to retry"),
 ):
     """Retry failed jobs."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to manage jobs in Django mode[/red]")
@@ -605,7 +615,7 @@ def tasks_list(
     enabled_only: bool = typer.Option(False, "--enabled-only", help="Show only enabled tasks"),
 ):
     """List all scheduled tasks."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py run_scheduled_tasks' in Django mode[/red]")
@@ -662,7 +672,7 @@ def tasks_create(
     disabled: bool = typer.Option(False, "--disabled", help="Create task in disabled state"),
 ):
     """Create a new scheduled task."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to manage scheduled tasks in Django mode[/red]")
@@ -670,7 +680,7 @@ def tasks_create(
 
     # Validate cron expression
     try:
-        from ..crontab import parse_cron_string
+        # from ..crontab import parse_cron_string  # moved to top-level
         parse_cron_string(cron)
     except Exception as e:
         console.print(f"[red]Invalid cron expression '{cron}': {e}[/red]")
@@ -708,7 +718,7 @@ def tasks_update(
     enable: bool | None = typer.Option(None, "--enable/--disable", help="Enable or disable the task"),
 ):
     """Update a scheduled task."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to manage scheduled tasks in Django mode[/red]")
@@ -716,7 +726,7 @@ def tasks_update(
 
     if cron is not None:
         try:
-            from ..crontab import parse_cron_string
+            # from ..crontab import parse_cron_string  # moved to top-level
             parse_cron_string(cron)
         except Exception as e:
             console.print(f"[red]Invalid cron expression '{cron}': {e}[/red]")
@@ -750,7 +760,7 @@ def tasks_delete(
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
     """Delete a scheduled task."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to manage scheduled tasks in Django mode[/red]")
@@ -779,8 +789,8 @@ def tasks_run(
     task_name: str | None = typer.Option(None, "--name", "-n", help="Run specific task by name"),
 ):
     """Trigger due scheduled tasks (or a specific task by name)."""
-    from ..compat import is_django_mode, get_backend
-    from ..triggers import trigger_due_tasks
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
+    # from ..triggers import trigger_due_tasks  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py run_scheduled_tasks' in Django mode[/red]")
@@ -828,7 +838,7 @@ app.add_typer(queues_app, name="queues")
 @queues_app.command("list")
 def queues_list():
     """List all queues with job counts."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to view queues in Django mode[/red]")
@@ -885,7 +895,7 @@ def queues_stats(
     queue: str | None = typer.Option(None, "--queue", "-q", help="Show stats for specific queue"),
 ):
     """Show detailed queue statistics."""
-    from ..compat import is_django_mode, get_backend
+    # from ..compat import is_django_mode, get_backend  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django admin to view queue stats in Django mode[/red]")
@@ -924,8 +934,8 @@ def migrate_upgrade(
     revision: str = typer.Argument("head", help="Target revision (default: head)"),
 ):
     """Run database migrations (upgrade to target revision)."""
-    from ..compat import is_django_mode
-    import os
+    # from ..compat import is_django_mode  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django migrations in Django mode[/red]")
@@ -962,8 +972,8 @@ def migrate_downgrade(
     revision: str = typer.Argument("-1", help="Target revision (default: -1)"),
 ):
     """Rollback database migrations (downgrade to target revision)."""
-    from ..compat import is_django_mode
-    import os
+    # from ..compat import is_django_mode  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django migrations in Django mode[/red]")
@@ -998,8 +1008,8 @@ def migrate_downgrade(
 @migrate_app.command("current")
 def migrate_current():
     """Show current migration revision."""
-    from ..compat import is_django_mode
-    import os
+    # from ..compat import is_django_mode  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django migrations in Django mode[/red]")
@@ -1030,8 +1040,8 @@ def migrate_current():
 @migrate_app.command("history")
 def migrate_history():
     """Show migration history."""
-    from ..compat import is_django_mode
-    import os
+    # from ..compat import is_django_mode  # moved to top-level
+    # import os  # moved to top-level
 
     if is_django_mode():
         console.print("[red]Error: Use Django migrations in Django mode[/red]")
@@ -1072,7 +1082,8 @@ def initialize(
     pool_timeout: int = typer.Option(30, "--pool-timeout", help="Connection pool timeout in seconds"),
 ):
     """Initialize sqlery for standalone mode."""
-    from ..compat import is_django_mode, initialize
+    # from ..compat import is_django_mode, initialize  # moved to top-level (as compat_initialize)
+    initialize = compat_initialize
 
     if is_django_mode():
         console.print("[red]Error: Initialization not needed in Django mode[/red]")

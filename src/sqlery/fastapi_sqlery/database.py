@@ -4,8 +4,11 @@ Provides SQLAlchemy session management and database initialization.
 """
 
 from contextlib import contextmanager
+
+from sqlalchemy.pool import QueuePool, StaticPool
 from sqlmodel import Session, create_engine, SQLModel
-from sqlalchemy.pool import QueuePool
+
+from ..core import models as _models  # noqa: F401  # ensures SQLModel.metadata is populated
 
 # Global engine instance
 _engine = None
@@ -21,7 +24,7 @@ def init_database(database_url: str, **kwargs):
     global _engine
 
     if database_url.startswith('sqlite'):
-        from sqlalchemy.pool import StaticPool
+        # from sqlalchemy.pool import StaticPool  # moved to top-level
         _engine = create_engine(
             database_url,
             poolclass=StaticPool,
@@ -42,7 +45,7 @@ def init_database(database_url: str, **kwargs):
         )
 
     # Import models so SQLModel.metadata is populated before create_all
-    from ..core import models as _models  # noqa: F401
+    # from ..core import models as _models  # noqa: F401  # moved to top-level
 
     # Create all tables
     SQLModel.metadata.create_all(_engine)

@@ -7,6 +7,10 @@ All daemon logic is in sqlery.core - this is just a Django adapter.
 import logging
 from pathlib import Path
 
+from sqlery.core.daemon import DaemonManager
+
+from .settings import get_setting
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +49,7 @@ class DaemonMiddleware:
 
     def ensure_daemon_running(self):
         """Check if daemon is running, start if not."""
-        from .settings import get_setting
+        # from .settings import get_setting  # moved to top-level
 
         # Check TRIGGER_MODE
         trigger_mode = get_setting('TRIGGER_MODE', 'middleware')
@@ -53,7 +57,7 @@ class DaemonMiddleware:
             return
 
         # Use core DaemonManager
-        from sqlery.core.daemon import DaemonManager
+        # from sqlery.core.daemon import DaemonManager  # moved to top-level
 
         daemon = DaemonManager()
 

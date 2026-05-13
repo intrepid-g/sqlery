@@ -3,6 +3,7 @@
 Provides in-memory configuration for standalone mode.
 """
 
+import os
 from typing import Any
 
 from ..compat import Config
@@ -58,7 +59,7 @@ class StandaloneConfig(Config):
 
     def _load_from_env(self):
         """Load configuration from environment variables."""
-        import os
+        # import os  # moved to top-level
 
         # Map environment variables to config keys
         env_mappings = {

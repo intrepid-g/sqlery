@@ -2,9 +2,11 @@
 
 import logging
 import os
-import sys
 import signal
+import sys
 import time
+import traceback
+
 import django
 
 # Setup Django
@@ -17,6 +19,7 @@ from .executor import TaskExecutor
 from .worker_claiming import claim_next_job_with_queue_priority, release_job
 from .worker_registry import register_worker, unregister_worker, update_heartbeat
 from .settings import get_setting
+from .deadlines import write_deadline, clear_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,10 @@ def run_worker():
                 # print(f"Worker {worker.id.hex[:8]}: Processing job {job.id} [{job.task_path}]")
                 logger.info(f"Worker {worker.id.hex[:8]}: Processing job {job.id} [{job.task_path}]")
 
+                # Write deadline file so daemon can enforce timeout externally
+                worker_id_str = str(worker.id)
+                write_deadline(worker_id_str, job)
+
                 try:
                     result = executor.execute_job(job)
 
@@ -87,7 +94,7 @@ def run_worker():
                     logger.info(f"Worker {worker.id.hex[:8]}: Job {job.id} completed successfully")
 
                 except Exception as e:
-                    import traceback
+                    # import traceback  # moved to top-level
                     error_msg = str(e)
                     error_traceback = traceback.format_exc()
 
@@ -102,6 +109,10 @@ def run_worker():
 
                     # print(f"Worker {worker.id.hex[:8]}: Job {job.id} failed: {error_msg}")
                     logger.error(f"Worker {worker.id.hex[:8]}: Job {job.id} failed: {error_msg}")
+
+                finally:
+                    # Clear deadline file — job is done (success or failure)
+                    clear_deadline(worker_id_str)
 
                 # Update heartbeat after job completes
                 update_heartbeat(worker)

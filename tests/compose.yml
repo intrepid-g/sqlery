@@ -1,0 +1,11 @@
+name: sqlery-tests
+
+services:
+
+  test:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    environment:
+      DJANGO_SETTINGS_MODULE: tests.settings
+    command: ["pytest", "tests/", "-v", "--tb=short"]

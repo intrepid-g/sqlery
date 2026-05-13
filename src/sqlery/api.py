@@ -1,8 +1,15 @@
 """Public API for manual job enqueueing."""
 
+import logging
 from datetime import datetime
+
+from django.utils import timezone
+
+from .eventbridge_trigger import invoke_lambda_worker, schedule_eventbridge_event
 from .models import QueuedJob
 from .settings import get_setting
+
+logger = logging.getLogger(__name__)
 
 
 def enqueue(task_path, queue=None, priority=None, max_retries=None, retry_backoff=None,
@@ -172,7 +179,7 @@ def enqueue_at(task_path, run_at, queue=None, priority=None, max_retries=None, r
 
     # Ensure timezone-aware
     if run_at.tzinfo is None:
-        from django.utils import timezone
+        # from django.utils import timezone  # moved to top-level
         run_at = run_at.replace(tzinfo=timezone.utc)
 
     job = QueuedJob.objects.create(
@@ -202,7 +209,7 @@ def enqueue_at(task_path, run_at, queue=None, priority=None, max_retries=None, r
 
 def _trigger_worker_if_needed():
     """Trigger worker to process queue (if enabled)."""
-    from .settings import get_setting
+    # from .settings import get_setting  # moved to top-level
 
     trigger_mode = get_setting("TRIGGER_MODE", "middleware")
 
@@ -224,12 +231,12 @@ def _trigger_worker_if_needed():
 
 def _trigger_eventbridge_worker():
     """Invoke Lambda worker via EventBridge for immediate job processing."""
-    import logging
+    # import logging  # moved to top-level
 
-    logger = logging.getLogger(__name__)
+    # logger = logging.getLogger(__name__)  # moved to top-level
 
     try:
-        from .eventbridge_trigger import invoke_lambda_worker
+        # from .eventbridge_trigger import invoke_lambda_worker  # moved to top-level
 
         result = invoke_lambda_worker()
         logger.info(f"Triggered Lambda worker: {result}")
@@ -240,12 +247,12 @@ def _trigger_eventbridge_worker():
 
 def _schedule_eventbridge_delayed_job(job_id, run_at):
     """Schedule a delayed job execution via EventBridge."""
-    import logging
+    # import logging  # moved to top-level
 
-    logger = logging.getLogger(__name__)
+    # logger = logging.getLogger(__name__)  # moved to top-level
 
     try:
-        from .eventbridge_trigger import schedule_eventbridge_event
+        # from .eventbridge_trigger import schedule_eventbridge_event  # moved to top-level
 
         result = schedule_eventbridge_event(job_id, run_at)
         logger.info(f"Scheduled EventBridge delayed job {job_id}: {result}")

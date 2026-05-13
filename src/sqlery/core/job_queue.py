@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone as tz
 
+from ..compat import get_backend, get_config
+
 
 class Queue:
     """A queue for enqueueing jobs.
@@ -172,7 +174,7 @@ def enqueue(
         >>> job.status
         'queued'
     """
-    from ..compat import get_backend, get_config
+    # from ..compat import get_backend, get_config  # moved to top-level
 
     # Get defaults from config
     if queue is None:
@@ -255,7 +257,7 @@ def enqueue_at(
         >>> job.scheduled_at
         datetime.datetime(...)
     """
-    from ..compat import get_backend, get_config
+    # from ..compat import get_backend, get_config  # moved to top-level
 
     # Get defaults from config
     if queue is None:
@@ -297,7 +299,7 @@ def enqueue_at(
 
 def _trigger_worker_if_needed():
     """Trigger worker to process queue (if enabled)."""
-    from ..compat import get_config
+    # from ..compat import get_config  # moved to top-level
 
     # In traditional deployment with middleware, workers are already running
     # In serverless, this is a no-op (external scheduler triggers workers)
@@ -324,7 +326,7 @@ def claim_job(queues: list[str], worker_id: str):
     Returns:
         Job instance if found, None otherwise
     """
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     return backend.claim_job(queues, worker_id)
@@ -339,7 +341,7 @@ def get_queue_stats(queue_name: str | None = None) -> dict:
     Returns:
         Dict with queue statistics (counts by status)
     """
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     return backend.get_queue_stats(queue_name)
@@ -354,7 +356,7 @@ def cancel_job(job_id: int) -> bool:
     Returns:
         True if cancelled, False if not found or already running
     """
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     return backend.cancel_job(job_id)
@@ -370,7 +372,7 @@ def retry_failed_jobs(queue_name: str | None = None, max_jobs: int | None = None
     Returns:
         Number of jobs retried
     """
-    from ..compat import get_backend
+    # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
     return backend.retry_failed_jobs(queue_name, max_jobs)
