@@ -765,5 +765,14 @@ class WorkerProcess:
             logger.warning(f"Heartbeat failed: {e}")
 
 
-# Backward compatibility alias
+# Backward compatibility aliases
 Worker = WorkerProcess
+TaskExecutor = JobExecutor  # Historic name from django_sqlery/executor.py
+
+__all__ = [
+    "JobExecutor",
+    "TaskExecutor",
+    "WorkerProcess",
+    "Worker",
+    "_current_job_var",
+]

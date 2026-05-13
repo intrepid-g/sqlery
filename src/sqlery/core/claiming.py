@@ -15,7 +15,28 @@ from datetime import datetime, timezone
 from sqlery.core.utils import parse_rate_limit
 from sqlery.core.registry import track_job_start, track_job_finish
 
+# Optional Django imports — only needed by the legacy release_job() helper
+# which is preserved here for the django_sqlery worker_process.py runner.
+try:
+    from django.db import transaction as _django_transaction
+    from django.db.models import F as _django_F
+    from django.utils import timezone as _django_timezone
+except ImportError:
+    _django_transaction = None
+    _django_F = None
+    _django_timezone = None
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "get_node_id",
+    "check_tag_concurrency_limits",
+    "check_tag_rate_limits",
+    "check_job_dependencies",
+    "expire_ttl_jobs",
+    "claim_next_job_with_queue_priority",
+    "release_job",
+]
 
 
 def get_node_id():
@@ -247,3 +268,73 @@ def claim_next_job_with_queue_priority(
 
     # Exhausted max attempts
     return None
+
+
+def release_job(worker, job, status, **kwargs):
+    """Release a job after processing (legacy Django-mode helper).
+
+    Promoted verbatim from django_sqlery/worker_claiming.py so the Django
+    worker_process.py runner can keep using it via sqlery.core.claiming.
+    Requires Django to be installed; raises RuntimeError if Django is missing.
+
+    Args:
+        worker: Worker instance that processed the job
+        job: QueuedJob instance to release
+        status: Final status ('success' or 'failed')
+        **kwargs: Additional fields to update (output, error, traceback, etc.)
+    """
+    if _django_transaction is None or _django_F is None or _django_timezone is None:
+        raise RuntimeError(
+            "release_job() requires Django; install django to use this helper or "
+            "switch to DatabaseBackend.release_job(job_id) for framework-agnostic code."
+        )
+
+    # Lazy import to keep core import-clean when Django is absent.
+    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.settings import get_setting
+
+    with _django_transaction.atomic():
+        expected_version = job.version
+        finished_at = _django_timezone.now()
+        duration_seconds = None
+        if job.started_at:
+            duration_seconds = (finished_at - job.started_at).total_seconds()
+
+        update_fields = {
+            'status': status,
+            'worker': None,
+            'finished_at': finished_at,
+            'duration_seconds': duration_seconds,
+            'version': _django_F('version') + 1,
+        }
+
+        for key, value in kwargs.items():
+            if hasattr(job, key) and key != 'version':
+                update_fields[key] = value
+
+        rows_updated = QueuedJob.objects.filter(
+            id=job.id,
+            version=expected_version,
+        ).update(**update_fields)
+
+        if rows_updated == 0:
+            logger.warning(
+                f"Job {job.id} version conflict in release_job - another process modified it"
+            )
+
+        try:
+            job.refresh_from_db()
+        except QueuedJob.DoesNotExist:
+            worker.status = "idle"
+            worker.current_job = None
+            worker.jobs_processed += 1
+            worker.save(update_fields=["status", "current_job", "jobs_processed"])
+            return
+
+        if get_setting('ENABLE_REGISTRIES', True):
+            track_job_finish(job, status=status)
+
+        worker.status = "idle"
+        worker.current_job = None
+        worker.jobs_processed += 1
+        worker.save(update_fields=["status", "current_job", "jobs_processed"])
