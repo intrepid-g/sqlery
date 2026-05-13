@@ -30,9 +30,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. `core/daemon.py` and `core/db_resilience.py` function correctly when Django is not installed
 **Plans**: 3 plans
 Plans:
-- [ ] 01-01-PLAN.md — Guard Django imports across core/* (db_resilience, log_config, model_utils, *_runner)
-- [ ] 01-02-PLAN.md — Retire django_sqlery/{worker_claiming,executor}.py via dated stubs; update all callers
-- [ ] 01-03-PLAN.md — Pytest + CI verification that core imports without Django
+- [x] 01-01-PLAN.md — Guard Django imports across core/* (db_resilience, log_config, model_utils, *_runner)
+- [x] 01-02-PLAN.md — Retire django_sqlery/{worker_claiming,executor}.py via dated stubs; update all callers
+- [x] 01-03-PLAN.md — Pytest + CI verification that core imports without Django
 **UI hint**: no
 
 ### Phase 2: Execution Modes & Async Rebuild
