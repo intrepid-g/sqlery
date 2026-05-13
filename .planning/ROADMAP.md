@@ -28,7 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. `core/claiming.py` is the sole claiming implementation -- `django_sqlery/worker_claiming.py` delegates to it
   3. `core/worker.py` JobExecutor is the sole execution engine -- `django_sqlery/executor.py` delegates to it
   4. `core/daemon.py` and `core/db_resilience.py` function correctly when Django is not installed
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 01-01-PLAN.md — Guard Django imports across core/* (db_resilience, log_config, model_utils, *_runner)
+- [ ] 01-02-PLAN.md — Retire django_sqlery/{worker_claiming,executor}.py via dated stubs; update all callers
+- [ ] 01-03-PLAN.md — Pytest + CI verification that core imports without Django
 **UI hint**: no
 
 ### Phase 2: Execution Modes & Async Rebuild
@@ -77,7 +81,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Unification | 0/0 | Not started | - |
+| 1. Core Unification | 0/3 | Not started | - |
 | 2. Execution Modes & Async Rebuild | 0/0 | Not started | - |
 | 3. Testing & CI | 0/0 | Not started | - |
 | 4. Security & Cleanup | 0/0 | Not started | - |
