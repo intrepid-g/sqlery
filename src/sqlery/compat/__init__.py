@@ -655,6 +655,103 @@ class DatabaseBackend(ABC):
         pass
 
 
+class AsyncDatabaseBackend(ABC):
+    """Abstract async database backend interface.
+
+    Hot-path async analog of :class:`DatabaseBackend`. Only the methods the
+    AsyncWorker (ASYN-04) and serverless async paths actually await are
+    declared here -- daemon/scheduler internals remain on the sync ABC.
+
+    Method signatures mirror their sync counterparts (same args, awaitable
+    return). Concrete implementations live in DjangoAsyncBackend (ASYN-02)
+    and SQLAlchemyAsyncBackend (ASYN-03).
+    """
+
+    @abstractmethod
+    async def aclaim_job(self, queues: list[str], worker_id: str):
+        """Async analog of DatabaseBackend.claim_job."""
+        pass
+
+    @abstractmethod
+    async def amark_running(self, job_id, worker_id) -> None:
+        """Async analog of DatabaseBackend.update_worker_heartbeat (running)."""
+        pass
+
+    @abstractmethod
+    async def amark_success(self, job_id, result) -> None:
+        """Async analog of DatabaseBackend.mark_job_success."""
+        pass
+
+    @abstractmethod
+    async def amark_failed(
+        self, job_id, error: str, traceback: str | None = None
+    ) -> None:
+        """Async analog of DatabaseBackend.mark_job_failed."""
+        pass
+
+    @abstractmethod
+    async def amark_shutting_down(self, job_id) -> None:
+        """Mark a job as transitioning to shutting-down (ASYN-05 transient state)."""
+        pass
+
+    @abstractmethod
+    async def aget_status(self, job_id) -> str | None:
+        """Async fetch of a job's current status string. Returns None if missing."""
+        pass
+
+    @abstractmethod
+    async def aget_job(self, job_id):
+        """Async analog of DatabaseBackend.get_job_by_id."""
+        pass
+
+    @abstractmethod
+    async def aupdate_heartbeat(self, worker_id) -> None:
+        """Async analog of DatabaseBackend.refresh_worker_heartbeat."""
+        pass
+
+    @abstractmethod
+    async def aregister_worker(self, worker_id, metadata: dict) -> None:
+        """Async analog of DatabaseBackend.update_worker_heartbeat (register)."""
+        pass
+
+    @abstractmethod
+    async def aunregister_worker(self, worker_id) -> None:
+        """Async analog of DatabaseBackend.delete_worker_registration."""
+        pass
+
+    @abstractmethod
+    async def aclaim_lease(
+        self, queue_name: str, worker_id: str, ttl_seconds: int
+    ) -> bool:
+        """Async analog of DatabaseBackend.claim_queue_leases (single queue)."""
+        pass
+
+    @abstractmethod
+    async def arenew_lease(self, queue_name: str, worker_id: str) -> bool:
+        """Async analog of DatabaseBackend.renew_queue_leases (single queue)."""
+        pass
+
+    @abstractmethod
+    async def arelease_lease(self, queue_name: str, worker_id: str) -> None:
+        """Async analog of DatabaseBackend.release_queue_leases (single queue)."""
+        pass
+
+    @abstractmethod
+    async def aget_due_scheduled_tasks(self, now) -> list:
+        """Async analog of DatabaseBackend.get_due_scheduled_tasks."""
+        pass
+
+    @abstractmethod
+    async def aregistry_add(self, registry_name: str, job_id) -> None:
+        """Async analog of DatabaseBackend.add_job_to_registry."""
+        pass
+
+    @abstractmethod
+    async def aregistry_remove(self, registry_name: str, job_id) -> None:
+        """Async analog of DatabaseBackend.remove_job_from_registry."""
+        pass
+
+
 class Config(ABC):
     """Abstract configuration interface."""
 
@@ -889,6 +986,7 @@ def initialize(
 # Export main API
 __all__ = [
     'DatabaseBackend',
+    'AsyncDatabaseBackend',
     'Config',
     'get_backend',
     'get_config',
