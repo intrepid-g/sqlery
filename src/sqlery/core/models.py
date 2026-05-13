@@ -72,7 +72,7 @@ class QueuedJob(SQLModel, table=True):
     priority: int = Field(default=0, index=True, description="Priority (higher = sooner)")
 
     # Status
-    status: str = Field(default="queued", max_length=10, index=True, description="Job status (queued/running/success/failed/archived)")
+    status: str = Field(default="queued", max_length=20, index=True, description="Job status (queued/running/success/failed/archived/shutting_down)")
 
     # Retry chain linkage
     parent_job_id: int | None = Field(default=None, index=True, description="ID of the failed job this retry was created from (links retry chain)")
