@@ -17,9 +17,14 @@ def main():
         if os.getcwd() not in sys.path:
             sys.path.insert(0, os.getcwd())
 
-        # Setup Django
-        import django
-        django.setup()
+        # Setup Django — guarded so the runner is safely importable in
+        # standalone mode (Django bootstrap is a no-op when django is absent).
+        try:
+            import django  # type: ignore[import-not-found]
+            django.setup()
+        except ImportError:
+            # Django bootstrap — no-op in standalone mode
+            pass
 
     # Configure logging after Django setup so compat layer works
     # (sqlery imports trigger sqlery/__init__.py which needs Django first)
