@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.11.0] - Unreleased
 
+### Breaking
+
+- **BREAKING:** Django minimum version raised to 5.2 LTS. Users on Django 4.2 must upgrade before installing this release. Rationale: native async ORM features (`.aget`/`.acreate`/`.aupdate`, `connection.acursor()`) required for the async worker rebuild (Phase 2, ASYN-02).
+
 ### Added
 
 - Unified v0.11.0 architecture with core modules and admin (`e8a968c`)
