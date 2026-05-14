@@ -15,8 +15,8 @@ Key design points:
   ``backend.amark_shutting_down(job_id)``, THEN races the job task against an
   ``asyncio.sleep(deadline)`` timer (drain-with-deadline, decision C).
 - If the deadline wins, the job task is cancelled and marked ``failed`` with
-  the canonical error string ``shutdown_timeout: worker terminated before job
-  finished``; the standard failed-with-retries path requeues a fresh row when
+  the canonical error string :data:`SHUTDOWN_TIMEOUT_ERROR`; the standard
+  failed-with-retries path requeues a fresh row when
   ``max_retries > 0``.
 - The ``shutting_down`` state is write-once at the terminal boundary: once a
   ``finished`` / ``failed`` write lands, the row never reverts.
