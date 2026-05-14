@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Roadmap and state initialized
-last_updated: "2026-05-14T15:48:59.734Z"
-last_activity: 2026-05-13 -- Phase 02 execution started
+last_updated: "2026-05-14T17:40:49.602Z"
+last_activity: 2026-05-14 -- Phase 03 execution started
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 11
+  total_plans: 19
   completed_plans: 11
-  percent: 100
+  percent: 58
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-12)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integration modes, on both SQLite and PostgreSQL.
-**Current focus:** Phase 02 — execution-modes
+**Current focus:** Phase 03 — testing-ci
 
 ## Current Position
 
-Phase: 02 (execution-modes) — EXECUTING
+Phase: 03 (testing-ci) — EXECUTING
 Plan: 1 of 8
-Status: Executing Phase 02
-Last activity: 2026-05-13 -- Phase 02 execution started
+Status: Executing Phase 03
+Last activity: 2026-05-14 -- Phase 03 execution started
 
 Progress: [..........] 0%
 
