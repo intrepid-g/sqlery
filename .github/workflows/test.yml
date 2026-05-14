@@ -65,8 +65,21 @@ jobs:
       run: |
         uv run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v --timeout=30 || echo "PostgreSQL-specific tests completed"
 
-    - name: Check code coverage
+    - name: Run tests with coverage
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing
+        uv run pytest tests/ -m "not postgres" \
+          --ignore=tests/chaos/ \
+          --cov=src/sqlery \
+          --cov-report=term-missing \
+          --cov-report=html \
+          --cov-fail-under=13
+
+    - name: Upload coverage HTML
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-html-py${{ matrix.python-version }}
+        path: htmlcov/
+        retention-days: 14
