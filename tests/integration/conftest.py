@@ -41,6 +41,26 @@ Skip rules
 ----------
 The four cells deferred to Plan 02-08 are explicitly skipped (with the
 referencing message). Postgres rows are gated on ``SQLERY_TEST_PG_URL``.
+
+Marker semantics (plan 03-07, TEST-11)
+--------------------------------------
+``@pytest.mark.postgres``: the test (or test param) requires a real
+PostgreSQL service. Tests carrying this marker:
+
+  * Are skipped automatically when ``SQLERY_TEST_PG_URL`` is unset.
+  * Are EXCLUDED from the SQLite CI rails (those rails invoke
+    ``pytest -m "not postgres"``).
+  * Are INCLUDED in the dedicated Postgres CI rail
+    (``pytest -m postgres``).
+
+For matrix tests that need both engines, attach the marker to the
+``pytest.param('postgres', marks=[pytest.mark.postgres])`` row of the
+existing ``db`` axis — that way the SQLite cell remains unmarked (runs
+in the default rail) while the Postgres cell only runs in the PG rail.
+
+The ``db_engine`` fixture below is the lightweight, parametrize-on-call
+counterpart for unit suites that do NOT thread through the integration
+harness — e.g. ``tests/unit/test_sqlalchemy_backend_sync.py``'s PG mirror.
 """
 
 from __future__ import annotations
@@ -93,10 +113,23 @@ DEFERRED_TO_02_08: set = set()
 
 
 def pytest_collection_modifyitems(config, items):
-    """Apply skip markers to the deferred-to-02-08 cells in a uniform way."""
+    """Apply skip markers to the deferred-to-02-08 cells and gate PG rows.
+
+    In addition to the (mode, integration, db) skip rules used by the
+    Phase 02 matrix, this also gates ANY item carrying the ``postgres``
+    marker (introduced by plan 03-07) on ``SQLERY_TEST_PG_URL``. That
+    keeps PG-marked tests skipped (not errored) when the env var is
+    unset, regardless of whether they ride the integration harness.
+    """
     skip_02_08 = pytest.mark.skip(reason="covered by plan 02-08")
     skip_no_pg = pytest.mark.skip(reason="SQLERY_TEST_PG_URL not set; postgres cells skipped")
+    pg_url_set = _has_postgres_env()
     for item in items:
+        # Plan 03-07: any `@pytest.mark.postgres` test/param is skipped
+        # when the PG URL is not configured.
+        if not pg_url_set and "postgres" in item.keywords:
+            item.add_marker(skip_no_pg)
+
         params = getattr(item, "callspec", None)
         if params is None:
             continue
@@ -105,7 +138,7 @@ def pytest_collection_modifyitems(config, items):
         db = params.params.get("db")
         if (mode, integration) in DEFERRED_TO_02_08:
             item.add_marker(skip_02_08)
-        if db == "postgres" and not _has_postgres_env():
+        if db == "postgres" and not pg_url_set:
             item.add_marker(skip_no_pg)
 
 
@@ -542,6 +575,26 @@ def _build_harness(mode: str, integration: str, db: str):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def db_engine(request):
+    """Parametrize a test across both engines (plan 03-07, TEST-11).
+
+    Use this in unit-style suites that build their own engine — e.g. the
+    sync-SQLAlchemy backend tests in ``tests/unit/`` — to add a Postgres
+    mirror without weaving through the integration harness.
+
+    When ``SQLERY_TEST_PG_URL`` is unset, the ``postgres`` param skips
+    cleanly; the corresponding ``pytest.param`` row carries
+    ``marks=[pytest.mark.postgres]`` so the SQLite rail simply deselects
+    it via ``-m "not postgres"``.
+    """
+    if request.param == "postgres":
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("postgres engine requires SQLERY_TEST_PG_URL")
+        request.node.add_marker(pytest.mark.postgres)
+    return request.param
+
 
 @pytest.fixture
 def harness(request, reset_compat, db, transactional_db):
