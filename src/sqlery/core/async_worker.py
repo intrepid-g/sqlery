@@ -139,6 +139,7 @@ class AsyncWorker:
         self.shutdown_deadline_seconds = shutdown_deadline_seconds
 
         self._shutting_down: bool = False
+        self._shutdown_event: asyncio.Event | None = None
         # Map of job_id -> asyncio.Task for in-flight jobs (currently single-job).
         self._inflight: dict[Any, asyncio.Task] = {}
 
@@ -158,6 +159,7 @@ class AsyncWorker:
         - ``max_polls``: stop after this many poll iterations (claimed or
           empty).
         """
+        self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()
         jobs_done = 0
@@ -221,22 +223,37 @@ class AsyncWorker:
 
         self._inflight[job_id] = task
 
-        # If shutdown is signaled before this point, drain handles it.
-        if self._shutting_down:
+        # Race the job task against the shutdown event. If shutdown fires
+        # mid-flight, return immediately — drain_with_deadline takes over
+        # writing the terminal status.
+        shutdown_event = self._shutdown_event
+        if shutdown_event is None or self._shutting_down:
+            self._inflight.pop(job_id, None)
             return
 
+        shutdown_wait = asyncio.create_task(shutdown_event.wait())
         try:
-            result = await task
-        except asyncio.CancelledError:
-            # Drain path cancelled us; the deadline handler writes the row.
-            raise
-        except Exception as e:
-            tb = tb_module.format_exc()
-            await self._on_job_failed(job, error=str(e), traceback=tb)
-        else:
-            await self._on_job_success(job, result)
+            done, _ = await asyncio.wait(
+                {task, shutdown_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
+            if not shutdown_wait.done():
+                shutdown_wait.cancel()
+
+        if task in done:
+            # Job-wins normal path: write terminal status here.
+            try:
+                result = task.result()
+            except Exception as e:
+                tb = tb_module.format_exc()
+                await self._on_job_failed(job, error=str(e), traceback=tb)
+            else:
+                await self._on_job_success(job, result)
             self._inflight.pop(job_id, None)
+        else:
+            # Shutdown fired; leave task in self._inflight for drain handler.
+            return
 
     async def _on_job_success(self, job: Any, result: Any) -> None:
         await self.backend.amark_success(job.id, result)
@@ -330,6 +347,11 @@ class AsyncWorker:
             return
         logger.info(f"AsyncWorker {self.worker_id} entering shutdown")
         self._shutting_down = True
+        if self._shutdown_event is not None:
+            try:
+                self._shutdown_event.set()
+            except Exception:  # pragma: no cover
+                pass
 
     async def _drain_with_deadline(self) -> None:
         """Race in-flight job tasks against the shutdown deadline.
