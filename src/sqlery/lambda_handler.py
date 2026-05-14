@@ -83,23 +83,22 @@ def handler(event, context):
     # Initialize Django
     setup_django()
 
-    # from .executor import TaskExecutor  # moved to top-level
-    # from .eventbridge_trigger import ensure_cron_eventbridge_rule  # moved to top-level
-    # from .models import QueuedJob, ScheduledTask  # moved to top-level
-    # from django.utils import timezone  # moved to top-level
-
     logger.info(f"Lambda invoked with event: {json.dumps(event)}")
 
     action = event.get("action", "process_queue")
 
-    if action == "process_queue":
-        return process_queue_action(event, context)
+    # Plan 02-08 (DMOD-04): for the common queue-processing actions, delegate
+    # to the mode-agnostic helper so the Django and standalone Lambda twins
+    # share one claim+execute path. ``run_scheduled_task`` still uses the
+    # legacy Django-specific dispatcher (it touches Django-only models like
+    # ScheduledTask + EventBridge plumbing).
+    if action in ("process_queue", "poll_and_process"):
+        from sqlery.compat import get_backend
+        from sqlery.core.lambda_core import process_event
+        return process_event(event, get_backend())
 
     elif action == "run_scheduled_task":
         return run_scheduled_task_action(event, context)
-
-    elif action == "poll_and_process":
-        return poll_and_process_action(event, context)
 
     else:
         error_msg = f"Unknown action: {action}"
