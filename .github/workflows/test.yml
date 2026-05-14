@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   test:
@@ -52,13 +52,13 @@ jobs:
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/ -v --ignore=tests/chaos/ -x
+        uv run pytest tests/ -v --ignore=tests/chaos/ -x -m "not postgres"
 
     - name: Run chaos/property tests
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/chaos/ -v --timeout=60 || echo "Chaos tests completed (some may be skipped)"
+        uv run pytest tests/chaos/ -v --timeout=60 -m "not postgres" || echo "Chaos tests completed (some may be skipped)"
 
     - name: Run tests with PostgreSQL
       env:
@@ -67,11 +67,21 @@ jobs:
       run: |
         uv run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v --timeout=30 || echo "PostgreSQL-specific tests completed"
 
+    - name: Run @pytest.mark.postgres suite
+      env:
+        PYTHONPATH: .
+        SQLERY_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sqlery_test
+      # Exit code 5 (no tests collected) is tolerated until Plan 03-07 tags tests
+      # with @pytest.mark.postgres. Remove the `|| [ $rc -eq 5 ]` clause then.
+      run: |
+        bash -c 'uv run pytest -m postgres -v --tb=short; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 5 ]'
+
     - name: Check code coverage
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing
+        uv run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing -m "not postgres"
 
   standalone-no-django:
     # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
