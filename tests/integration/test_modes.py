@@ -13,9 +13,10 @@ Cells under test (SQLite, fast):
 - (sync, django)
 - (sync, standalone)
 
-The same six cells are parametrized against Postgres and marked ``slow``
-so they're skipped by default unless ``SQLERY_TEST_PG_URL`` is set and the
-caller opts in via ``-m slow``.
+The same six cells are parametrized against Postgres and marked
+``postgres`` (plan 03-07, TEST-11) so they ride the dedicated PG CI rail
+and are skipped on SQLite rails. The ``postgres`` rows also auto-skip
+when ``SQLERY_TEST_PG_URL`` is unset (see ``conftest.pytest_collection_modifyitems``).
 
 Requirements satisfied: DMOD-01 (daemon-django), DMOD-02 (subprocess-django),
 DMOD-03 (http-trigger-django), DMOD-05 (sync-django), SMOD-01
@@ -40,7 +41,7 @@ INTEGRATIONS = ["django", "standalone"]
     "db",
     [
         "sqlite",
-        pytest.param("postgres", marks=pytest.mark.slow),
+        pytest.param("postgres", marks=pytest.mark.postgres),
     ],
 )
 def test_mode_e2e(mode, integration, db, harness):
