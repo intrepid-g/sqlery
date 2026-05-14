@@ -88,7 +88,14 @@ Plans:
   3. Django admin API endpoints are protected against CSRF or use token-based auth
   4. Importing task modules is restricted to paths listed in `ALLOWED_TASK_MODULES` when configured
   5. All 24 backward-compatibility stub files and dead async code are annotated with deletion dates (not deleted outright)
-**Plans**: TBD
+**Plans**: 6 plans
+Plans:
+- [ ] 04-01-PLAN.md — CLEAN omnibus (CLEAN-01..04 + worker_process.py:71 arity fix) (wave 1)
+- [ ] 04-02-PLAN.md — SEC-04 ALLOWED_TASK_MODULES allowlist + production-env warning (wave 1)
+- [ ] 04-03-PLAN.md — SEC-01 dashboard auth (standalone/disabled/inherit three-mode middleware) (wave 2)
+- [ ] 04-04-PLAN.md — SEC-02 webhook SSRF denylist + DNS-rebinding-resistant validation (wave 2)
+- [ ] 04-05-PLAN.md — SEC-03 drop @csrf_exempt from 11 admin endpoints + regression test (wave 3)
+- [ ] 04-06-PLAN.md — docs/SECURITY.md (operator-facing security model) (wave 3)
 **UI hint**: no
 
 ## Progress
