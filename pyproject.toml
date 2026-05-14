@@ -140,6 +140,7 @@ packages = ["src/sqlery"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "slow: tests that hit serverful resources (e.g. Postgres); deselect with '-m \"not slow\"'",
     "postgres: requires a running PostgreSQL service (skipped on SQLite-only jobs)",
