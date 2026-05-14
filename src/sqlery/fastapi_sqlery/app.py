@@ -22,6 +22,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Mount the HTTP trigger router (SMOD-03). Pure-core handler lives in
+# sqlery.core.triggers; this adapter is a thin request/response wrapper.
+from .triggers import router as _trigger_router  # noqa: E402
+app.include_router(_trigger_router)
+
 # Get templates directory
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
