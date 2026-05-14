@@ -68,14 +68,14 @@ Plans:
   5. PostgreSQL-specific test suite runs in CI and covers all execution modes (not just 2 files)
 **Plans**: 8 plans
 Plans:
-- [ ] 03-01-PLAN.md — D-02-07-1 migration fix (0023 → no-op) + regression test (wave 1)
-- [ ] 03-02-PLAN.md — CI master→main + register `postgres` pytest marker + PG CI rail (wave 1)
-- [ ] 03-03-PLAN.md — Core unit tests (claiming/worker/daemon) + FakeBackend in tests/unit/ (wave 2)
-- [ ] 03-04-PLAN.md — Backend unit tests (sync SQLAlchemyBackend + DjangoBackend) (wave 2)
-- [ ] 03-05-PLAN.md — webhooks.py unit tests (HMAC/retry/HTTP-mocked) (wave 2)
-- [ ] 03-06-PLAN.md — Chaos rebuild: real-subprocess + Hypothesis; retire broken legacy file (wave 3)
-- [ ] 03-07-PLAN.md — Expand Postgres CI surface: tag tests + strict `pytest -m postgres` step (wave 3)
-- [ ] 03-08-PLAN.md — Coverage gate: `fail_under=70` in pyproject + CI + synthetic-fail verification (wave 3)
+- [x] 03-01-PLAN.md — D-02-07-1 migration fix (0023 → no-op) + regression test (wave 1)
+- [x] 03-02-PLAN.md — CI master→main + register `postgres` pytest marker + PG CI rail (wave 1)
+- [x] 03-03-PLAN.md — Core unit tests (claiming/worker/daemon) + FakeBackend in tests/unit/ (wave 2)
+- [x] 03-04-PLAN.md — Backend unit tests (sync SQLAlchemyBackend + DjangoBackend) (wave 2)
+- [x] 03-05-PLAN.md — webhooks.py unit tests (HMAC/retry/HTTP-mocked) (wave 2)
+- [x] 03-06-PLAN.md — Chaos rebuild: real-subprocess + Hypothesis; retire broken legacy file (wave 3)
+- [x] 03-07-PLAN.md — Expand Postgres CI surface: tag tests + strict `pytest -m postgres` step (wave 3)
+- [x] 03-08-PLAN.md — Coverage gate: `fail_under=70` in pyproject + CI + synthetic-fail verification (wave 3)
 **UI hint**: no
 
 ### Phase 4: Security & Cleanup
