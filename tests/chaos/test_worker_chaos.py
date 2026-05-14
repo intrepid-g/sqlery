@@ -1,3 +1,14 @@
+# #CLEANUP 2026-05-14: dead — superseded by test_subprocess_chaos.py and test_lease_zombie.py.
+# API drifted (TaskExecutor.claim_job removed; multiprocessing.Process + local-func pickling
+# broken under pytest — RESEARCH Pitfall #2). Preserved for historical reference per
+# CLAUDE.md feedback_dead_code policy. Remove no earlier than Phase 4 cleanup pass.
+import pytest
+
+pytest.skip(
+    "Legacy chaos suite; superseded by test_subprocess_chaos / test_lease_zombie",
+    allow_module_level=True,
+)
+
 """Chaos tests that deliberately kill workers and corrupt state.
 
 FAILING TESTS EXPLANATION:
