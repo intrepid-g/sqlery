@@ -2,7 +2,7 @@
 
 from django.urls import path
 from django.views.generic import RedirectView
-from .views import internal_worker, health_check, dashboard_stats, dump_scheduled_tasks, load_scheduled_tasks
+from .views import internal_worker, health_check, dashboard_stats, dump_scheduled_tasks, load_scheduled_tasks, trigger_view
 from .dashboard_views import dashboard_view, sqlery_unified_view, sqlery_task_detail_view, sqlery_worker_detail_view
 from .api_views import (
     api_scheduled_tasks_list,
@@ -29,6 +29,7 @@ urlpatterns = [
     # Internal endpoints
     path("_internal/worker", internal_worker, name="internal_worker"),
     path("_internal/health", health_check, name="health_check"),
+    path("_internal/trigger", trigger_view, name="trigger"),
 
     # API endpoints (all return JSON for API-first architecture)
     path("admin/api/sqlery/stats/", dashboard_stats, name="api_stats"),

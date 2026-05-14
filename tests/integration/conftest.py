@@ -87,11 +87,9 @@ def _has_postgres_env() -> bool:
 #   (lambda, *)              <-- 02-08 (DMOD-04 / SMOD-04)
 #   (async, *)               <-- 02-08 (DMOD-06 / SMOD-06)
 
-DEFERRED_TO_02_08 = {
-    ("subprocess", "standalone"),
-    ("http-trigger", "standalone"),
-    # ("lambda", *) and ("async", *) are not in our parametrize list at all.
-}
+DEFERRED_TO_02_08: set = set()
+# Plan 02-08 implements (subprocess, standalone) and (http-trigger, standalone).
+# Lambda + async cells live in their own dedicated test modules.
 
 
 def pytest_collection_modifyitems(config, items):
@@ -309,6 +307,10 @@ class _StandaloneHarness:
             self._drive_sync(job_id)
         elif self.mode == "daemon":
             self._drive_daemon_once()
+        elif self.mode == "subprocess":
+            self._drive_subprocess_standalone(job_id)
+        elif self.mode == "http-trigger":
+            self._drive_http_trigger_standalone(job_id)
         else:
             raise AssertionError(f"unknown mode for standalone harness: {self.mode}")
 
@@ -373,6 +375,50 @@ class _StandaloneHarness:
             "from sqlery.core.daemon import DaemonManager;"
             "DaemonManager()._run_daemon(max_workers=1, once=True);"
         )
+        _run_no_django(script, timeout=60)
+
+    def _drive_subprocess_standalone(self, job_id: int):
+        """Invoke ``spawn_subprocess_worker`` from inside a no-Django subprocess.
+
+        The outer subprocess (run via ``_run_no_django``) is the harness driver:
+        it imports ``sqlery.fastapi_sqlery.subprocess_executor`` with the Django
+        env scrubbed, then ``spawn_subprocess_worker`` spawns the actual worker
+        subprocess that claims and executes the job.
+        """
+        script = (
+            "from sqlery.compat import initialize;"
+            f"initialize(database_url={self.db_url!r}, enable_daemon=False);"
+            "from sqlery.fastapi_sqlery.subprocess_executor import spawn_subprocess_worker;"
+            f"rc = spawn_subprocess_worker({self.db_url!r}, queues=['default'], one_shot=True, timeout=45);"
+            "import sys; sys.exit(0 if rc == 0 else 1);"
+        )
+        _run_no_django(script, timeout=90)
+
+    def _drive_http_trigger_standalone(self, job_id: int):
+        """POST a signed envelope to FastAPI ``/trigger`` (in-process ASGI).
+
+        Runs in a no-Django subprocess so the standalone backend is the one
+        wired. Uses ``httpx.ASGITransport`` to call the app without binding a
+        real port.
+        """
+        script = "\n".join([
+            "import asyncio, json, os",
+            "os.environ['SQLERY_INTERNAL_SECRET'] = 'test-secret'",
+            "from sqlery.compat import initialize, set_config",
+            f"initialize(database_url={self.db_url!r}, enable_daemon=False)",
+            "set_config('INTERNAL_SECRET', 'test-secret')",
+            "from sqlery.core.signature import generate_signature",
+            "sig, ts = generate_signature('test-secret')",
+            "from sqlery.fastapi_sqlery.app import app",
+            "import httpx",
+            "async def _run():",
+            "    transport = httpx.ASGITransport(app=app)",
+            "    async with httpx.AsyncClient(transport=transport, base_url='http://test') as c:",
+            f"        body = json.dumps({{'action': 'process_queue', 'queue_name': 'default', 'job_id': {job_id}}})",
+            "        r = await c.post('/trigger', content=body, headers={'X-Signature': sig, 'X-Timestamp': ts, 'Content-Type': 'application/json'})",
+            "        print('STATUS', r.status_code, r.text)",
+            "asyncio.run(_run())",
+        ])
         _run_no_django(script, timeout=60)
 
     @property

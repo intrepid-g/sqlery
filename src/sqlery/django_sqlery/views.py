@@ -912,3 +912,41 @@ def load_scheduled_tasks(request):
         return redirect("sqlery:unified_view")
 
     return render(request, "admin/sqlery/load_tasks.html")
+
+
+
+# ============================================================================
+# Pure-core HTTP trigger adapter (SMOD-03 / CONTEXT D)
+# ============================================================================
+#
+# This view is the Django-side adapter that delegates to
+# sqlery.core.triggers.handle. The legacy `internal_worker` view above is
+# preserved unchanged for back-compat (it spawns a subprocess); the new
+# trigger_view is the path that matches the FastAPI router and the spec'd
+# envelope/result shape.
+
+@csrf_exempt
+@require_POST
+def trigger_view(request):
+    """Receive an HTTP trigger envelope and call core.triggers.handle.
+
+    Django side of the pure-core HTTP trigger (SMOD-03). Translates the
+    Django request into a TriggerEnvelope, calls handle(), translates the
+    TriggerResult to a JsonResponse.
+    """
+    import json as _json
+    from sqlery.core.triggers import TriggerEnvelope, handle as _handle
+
+    body = request.body or b""
+    headers = {k: v for k, v in request.headers.items()}
+    payload = {}
+    if body:
+        try:
+            payload = _json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning(f"Invalid trigger payload: {e}")
+            return JsonResponse({"error": "invalid JSON payload"}, status=400)
+
+    envelope = TriggerEnvelope(body=body, headers=headers, payload=payload)
+    result = _handle(envelope)
+    return JsonResponse(result.body, status=result.status_code)
