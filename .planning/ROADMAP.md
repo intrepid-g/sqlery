@@ -66,7 +66,16 @@ Plans:
   3. Edge case tests cover job timeout, worker crash recovery, retry logic, concurrent workers, zombie detection, and stale heartbeat cleanup
   4. Unit tests exist for core/claiming.py, core/worker.py, core/daemon.py, both backend implementations, and webhooks.py
   5. PostgreSQL-specific test suite runs in CI and covers all execution modes (not just 2 files)
-**Plans**: TBD
+**Plans**: 8 plans
+Plans:
+- [ ] 03-01-PLAN.md — D-02-07-1 migration fix (0023 → no-op) + regression test (wave 1)
+- [ ] 03-02-PLAN.md — CI master→main + register `postgres` pytest marker + PG CI rail (wave 1)
+- [ ] 03-03-PLAN.md — Core unit tests (claiming/worker/daemon) + FakeBackend in tests/unit/ (wave 2)
+- [ ] 03-04-PLAN.md — Backend unit tests (sync SQLAlchemyBackend + DjangoBackend) (wave 2)
+- [ ] 03-05-PLAN.md — webhooks.py unit tests (HMAC/retry/HTTP-mocked) (wave 2)
+- [ ] 03-06-PLAN.md — Chaos rebuild: real-subprocess + Hypothesis; retire broken legacy file (wave 3)
+- [ ] 03-07-PLAN.md — Expand Postgres CI surface: tag tests + strict `pytest -m postgres` step (wave 3)
+- [ ] 03-08-PLAN.md — Coverage gate: `fail_under=70` in pyproject + CI + synthetic-fail verification (wave 3)
 **UI hint**: no
 
 ### Phase 4: Security & Cleanup
@@ -91,5 +100,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 |-------|----------------|--------|-----------|
 | 1. Core Unification | 0/3 | Not started | - |
 | 2. Execution Modes & Async Rebuild | 0/0 | Not started | - |
-| 3. Testing & CI | 0/0 | Not started | - |
+| 3. Testing & CI | 0/8 | Not started | - |
 | 4. Security & Cleanup | 0/0 | Not started | - |
