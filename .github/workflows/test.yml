@@ -1,5 +1,11 @@
 name: Tests
 
+# CI matrix (plan 03-07, TEST-11):
+#   - Default rails (unit/chaos/coverage on the `test` job, plus the
+#     `standalone-no-django` job): run all tests EXCEPT `-m postgres`.
+#   - Postgres rail (the "Run @pytest.mark.postgres suite" step):
+#     runs ONLY `-m postgres` against the postgres:15 service container.
+#   - Together these cover the full mode × backend grid.
 on:
   push:
     branches: [ main ]
@@ -72,10 +78,9 @@ jobs:
         PYTHONPATH: .
         SQLERY_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sqlery_test
-      # Exit code 5 (no tests collected) is tolerated until Plan 03-07 tags tests
-      # with @pytest.mark.postgres. Remove the `|| [ $rc -eq 5 ]` clause then.
-      run: |
-        bash -c 'uv run pytest -m postgres -v --tb=short; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 5 ]'
+      # Plan 03-07: the exit-code-5 tolerance is removed. PG rail must
+      # collect > 0 tests; an empty collection now fails the job.
+      run: uv run pytest -m postgres -v --tb=short
 
     - name: Check code coverage
       env:
