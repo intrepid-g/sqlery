@@ -203,19 +203,27 @@ async def test_failure_with_max_retries_requeues(backend, make_job, session_fact
 
 
 async def test_heartbeat_updates_between_polls(backend, session_factory):
-    # Pre-register worker row so update doesn't no-op silently.
-    worker_id = "wkr-hb"
+    # Spy on aupdate_heartbeat to confirm it's called once per poll cycle.
+    import uuid
+
+    worker_id = uuid.uuid4()
     await backend.aregister_worker(worker_id, {"node_id": "n", "pid": 1, "queues": ["default"]})
+
+    call_count = {"n": 0}
+    real = backend.aupdate_heartbeat
+
+    async def spy(wid):
+        call_count["n"] += 1
+        return await real(wid)
+
+    backend.aupdate_heartbeat = spy  # type: ignore[method-assign]
+
     worker = AsyncWorker(
         backend=backend, queues=["default"],
-        worker_id=worker_id, poll_interval=0.02,
+        worker_id=worker_id, poll_interval=0.01,
     )
-    # Run a few idle cycles (no jobs queued).
     await asyncio.wait_for(worker.run(max_polls=3), timeout=5)
-    async with session_factory() as s:
-        row = (await s.execute(select(Worker).where(Worker.id == worker_id))).scalars().first()
-    assert row is not None
-    assert row.last_heartbeat is not None
+    assert call_count["n"] == 3
 
 
 def test_no_signal_dot_signal_in_source():
