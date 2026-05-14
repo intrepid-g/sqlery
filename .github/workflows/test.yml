@@ -82,11 +82,24 @@ jobs:
       # collect > 0 tests; an empty collection now fails the job.
       run: uv run pytest -m postgres -v --tb=short
 
-    - name: Check code coverage
+    - name: Run tests with coverage
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/ --ignore=tests/chaos/ --cov=src/sqlery --cov-report=term-missing -m "not postgres"
+        uv run pytest tests/ -m "not postgres" \
+          --ignore=tests/chaos/ \
+          --cov=src/sqlery \
+          --cov-report=term-missing \
+          --cov-report=html \
+          --cov-fail-under=13
+
+    - name: Upload coverage HTML
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-html-py${{ matrix.python-version }}
+        path: htmlcov/
+        retention-days: 14
 
   standalone-no-django:
     # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
