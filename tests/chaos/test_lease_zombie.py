@@ -293,6 +293,42 @@ class TestLeaseContention:
         assert len(winners) == 1, f"expected exactly one winner, got {winners}"
 
 
+# ---------------------------------------------------------------------------
+# Postgres mirror (plan 03-07, TEST-11)
+# ---------------------------------------------------------------------------
+# Lease contention is the most engine-sensitive of the three lease tests —
+# PG resolves it via row-level lock semantics, SQLite via busy_timeout +
+# optimistic locking. Mirror :class:`TestLeaseContention` against PG.
+
+
+@pytest.mark.postgres
+@pytest.mark.django_db(transaction=True)
+class TestLeaseContentionPostgres:
+    """Postgres mirror of :class:`TestLeaseContention`.
+
+    Auto-skipped on the SQLite CI rails (those filter ``-m "not postgres"``);
+    the PG rail runs this against ``DATABASE_URL`` (set to the PG service
+    in CI). The test asserts the same single-winner invariant.
+    """
+
+    def test_only_one_daemon_wins(self):
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("SQLERY_TEST_PG_URL not set; PG lease mirror skipped")
+
+        from sqlery.compat import get_backend
+
+        backend = get_backend()
+        if not _lease_supported(backend):
+            pytest.skip("active backend does not implement queue leases")
+
+        winners: list[str] = []
+        for daemon_id in ("pg1", "pg2", "pg3"):
+            claimed = _claim(backend, "pg-solo", daemon_id, lease_secs=30)
+            if "pg-solo" in (claimed or []):
+                winners.append(daemon_id)
+        assert len(winners) == 1, f"expected exactly one PG winner, got {winners}"
+
+
 @pytest.mark.django_db(transaction=True)
 class TestLeaseGracefulRelease:
     def test_release_allows_immediate_reacquire(self):
