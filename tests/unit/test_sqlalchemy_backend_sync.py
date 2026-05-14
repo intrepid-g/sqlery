@@ -685,3 +685,115 @@ class TestMiscMethods:
     def test_acquire_tag_locks_noop(self, sync_backend):
         # SQLAlchemyBackend.acquire_tag_locks is a no-op; just ensure it doesn't raise.
         assert sync_backend.acquire_tag_locks(["a", "b"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Postgres mirror (plan 03-07, TEST-11)
+# ---------------------------------------------------------------------------
+# MVCC and row-lock semantics differ from SQLite, so the most
+# engine-sensitive suites are mirrored against a real PG service. The
+# fixture builds a fresh engine against ``SQLERY_TEST_PG_URL`` and creates
+# the schema in-place; tables are dropped on teardown to keep the shared
+# test DB tidy across runs.
+
+
+@pytest.fixture
+def pg_sync_backend(monkeypatch):
+    """Per-test SQLAlchemyBackend bound to a real PG service.
+
+    Auto-skipped when ``SQLERY_TEST_PG_URL`` is unset. Uses a fresh
+    engine + ``SQLModel.metadata.create_all`` / ``drop_all`` so each test
+    starts from an empty schema (the shared PG service is OK because no
+    two PG-marked tests in this file run concurrently in CI).
+    """
+    pg_url = os.environ.get("SQLERY_TEST_PG_URL")
+    if not pg_url:
+        pytest.skip("SQLERY_TEST_PG_URL not set; PG mirror skipped")
+
+    from sqlalchemy import create_engine
+    from sqlmodel import SQLModel
+    from sqlery.fastapi_sqlery import database as db_mod
+    from sqlery.core import models as _core_models  # noqa: F401
+
+    engine = create_engine(pg_url, future=True)
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+    from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+    backend = SQLAlchemyBackend()
+    try:
+        yield backend
+    finally:
+        try:
+            SQLModel.metadata.drop_all(engine)
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.postgres
+class TestEnqueueAndClaimPostgres:
+    """PG mirror of :class:`TestEnqueueAndClaim` — exercises
+    ``SELECT FOR UPDATE SKIP LOCKED`` on the claim path."""
+
+    def test_create_job_persists_row(self, pg_sync_backend):
+        job = _create_basic_job(pg_sync_backend, queue_name="alpha")
+        assert job.id is not None
+        assert job.status == "queued"
+        assert job.queue_name == "alpha"
+
+    def test_claim_job_returns_queued_job(self, pg_sync_backend):
+        _create_basic_job(pg_sync_backend, queue_name="q1")
+        claimed = pg_sync_backend.claim_job(queues=["q1"], worker_id="w1")
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert claimed.queue_name == "q1"
+
+    def test_claim_job_returns_none_when_empty(self, pg_sync_backend):
+        assert pg_sync_backend.claim_job(queues=["empty"], worker_id="w1") is None
+
+    def test_claim_orders_by_priority(self, pg_sync_backend):
+        _create_basic_job(pg_sync_backend, priority=0)
+        high = _create_basic_job(pg_sync_backend, priority=10)
+        claimed = pg_sync_backend.claim_job(queues=["default"], worker_id="w1")
+        assert claimed.id == high.id
+
+
+@pytest.mark.postgres
+class TestLeaseLifecyclePostgres:
+    """PG mirror covering the lease claim/renew/release cycle.
+
+    PG row-level locking (``SELECT FOR UPDATE``) is the contention
+    primitive for the DaemonLease table; this asserts the lifecycle on
+    a real PG service.
+    """
+
+    def test_claim_renew_release_roundtrip(self, pg_sync_backend):
+        claimed = pg_sync_backend.claim_queue_leases(
+            queues=["pg-life-a", "pg-life-b"],
+            daemon_id="d1",
+            node_id="n1",
+            pid=1,
+            lease_secs=60,
+        )
+        assert set(claimed) == {"pg-life-a", "pg-life-b"}
+        # Renew must not raise.
+        pg_sync_backend.renew_queue_leases(
+            owned_queues=["pg-life-a", "pg-life-b"], daemon_id="d1", lease_secs=120,
+        )
+        pg_sync_backend.release_queue_leases(
+            owned_queues=["pg-life-a", "pg-life-b"], daemon_id="d1",
+        )
+
+    def test_lease_held_blocks_other_daemon(self, pg_sync_backend):
+        first = pg_sync_backend.claim_queue_leases(
+            queues=["pg-contended"], daemon_id="d1",
+            node_id="n1", pid=1, lease_secs=60,
+        )
+        assert first == ["pg-contended"]
+        # Second daemon must NOT win the same queue.
+        second = pg_sync_backend.claim_queue_leases(
+            queues=["pg-contended"], daemon_id="d2",
+            node_id="n2", pid=2, lease_secs=60,
+        )
+        assert second == []

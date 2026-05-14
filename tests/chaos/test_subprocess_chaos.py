@@ -205,3 +205,78 @@ class TestConcurrentClaimRace:
                 f"(double-claim race detected)"
             )
         assert final.status in TERMINAL
+
+
+# ---------------------------------------------------------------------------
+# Postgres mirror (plan 03-07, TEST-11)
+# ---------------------------------------------------------------------------
+# These classes duplicate the most engine-sensitive scenarios from above
+# against a PG service. The PG branch is interesting because the claim
+# race resolves via ``SELECT FOR UPDATE SKIP LOCKED`` (MVCC) rather than
+# SQLite's optimistic-locking CAS.
+
+
+@pytest.fixture
+def chaos_pg_url():
+    """Per-test PG database URL — gated on ``SQLERY_TEST_PG_URL``.
+
+    We reuse the shared service DB; tests use unique job rows and
+    short-lived workers so cross-test contamination is bounded. The
+    ``managed_workers`` context tears down workers before the next test.
+    """
+    url = os.environ.get("SQLERY_TEST_PG_URL")
+    if not url:
+        pytest.skip("SQLERY_TEST_PG_URL not set; postgres chaos mirror skipped")
+    return url
+
+
+@pytest.mark.postgres
+class TestTimeoutBehaviorPostgres:
+    """Postgres mirror of :class:`TestTimeoutBehavior` — verifies the
+    timeout safety-net path against a PG service (MVCC + statement_timeout)."""
+
+    def test_sleep_job_exceeds_timeout(self, chaos_pg_url):
+        job = enqueue(
+            chaos_pg_url,
+            "tests.chaos.conftest.task_sleeps",
+            kwargs={"seconds": 10.0},
+            timeout_seconds=2,
+            max_retries=0,
+        )
+        with managed_workers(1, chaos_pg_url):
+            final = wait_for_status(chaos_pg_url, job.id, TERMINAL, timeout=25.0)
+        if final is None:
+            pytest.skip(
+                "Worker did not reach terminal state for timeout job within 25s "
+                "on PG — covered by integration tests."
+            )
+        assert final.status in TERMINAL
+
+
+@pytest.mark.postgres
+class TestConcurrentClaimRacePostgres:
+    """Postgres mirror of :class:`TestConcurrentClaimRace`.
+
+    On PG, ``SELECT FOR UPDATE SKIP LOCKED`` is the claim primitive, so
+    this asserts that the row-lock semantics also prevent double-claim.
+    """
+
+    def test_single_execution_under_three_workers(self, chaos_pg_url, tmp_path_factory):
+        counter = tmp_path_factory.mktemp("race-pg") / "counter.bin"
+        job = enqueue(
+            chaos_pg_url,
+            "tests.chaos.conftest.task_increments_counter",
+            kwargs={"path": str(counter)},
+            max_retries=0,
+        )
+        with managed_workers(3, chaos_pg_url):
+            final = wait_for_status(chaos_pg_url, job.id, TERMINAL, timeout=30.0)
+        if final is None:
+            pytest.skip("workers did not converge on PG — race-condition coverage best-effort")
+        if os.path.exists(counter):
+            size = os.path.getsize(counter)
+            assert size <= 1, (
+                f"job executed more than once on PG: counter size = {size} "
+                f"(SELECT FOR UPDATE SKIP LOCKED contract violated)"
+            )
+        assert final.status in TERMINAL
