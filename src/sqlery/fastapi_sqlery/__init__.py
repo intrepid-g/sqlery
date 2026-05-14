@@ -20,12 +20,14 @@ try:
     from .app import create_app, app as default_app
     from .backend import FastAPIBackend
     from .cli import app as cli_app
+    from .async_backend import SQLAlchemyAsyncBackend
 
     __all__ = [
         'create_app',
         'default_app',
         'FastAPIBackend',
         'cli_app',
+        'SQLAlchemyAsyncBackend',
     ]
 
 # except ImportError as e:  # Too narrow — starlette raises AssertionError when jinja2 is missing
@@ -39,6 +41,13 @@ except Exception as e:
         ImportWarning
     )
     __all__ = []
+    # The async backend has no FastAPI dependency; expose it even when the
+    # FastAPI app stack failed to import (e.g. on minimal install).
+    try:
+        from .async_backend import SQLAlchemyAsyncBackend  # noqa: F401
+        __all__ = ['SQLAlchemyAsyncBackend']
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 # Version info
