@@ -157,7 +157,7 @@ class DjangoBackend(DatabaseBackend):
         worker_row = self._resolve_worker(worker_id)
         if not worker_row:
             return None
-        return claim_next_job_with_queue_priority(worker_row, queues=queues)
+        return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     @retry_on_db_error()
     def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
