@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from sqlery.core.worker import TaskExecutor
 from sqlery.core.claiming import claim_next_job_with_queue_priority, release_job
+from sqlery.compat import get_backend
 from .worker_registry import register_worker, unregister_worker, update_heartbeat
 from .settings import get_setting
 from .deadlines import write_deadline, clear_deadline
@@ -60,6 +61,12 @@ def run_worker():
     heartbeat_interval = get_setting("WORKER_HEARTBEAT_INTERVAL", 5)
     last_heartbeat = time.time()
 
+    # Resolve backend + queues once for the lifetime of this worker loop
+    # (Phase 04-01: fix arity bug — claim_next_job_with_queue_priority requires
+    # `(worker, backend, queues)` per src/sqlery/core/claiming.py:178).
+    backend = get_backend()
+    queues = get_setting("WORKER_QUEUES", ["default"])
+
     try:
         while not shutdown_requested:
             # Send heartbeat if interval elapsed
@@ -68,7 +75,7 @@ def run_worker():
                 last_heartbeat = time.time()
 
             # Try to claim a job
-            job = claim_next_job_with_queue_priority(worker)
+            job = claim_next_job_with_queue_priority(worker, backend, queues)
 
             if job:
                 # Execute the job
