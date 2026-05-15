@@ -103,6 +103,10 @@ asyncio.run(main())
 - [Migration from Celery](docs/migration-from-celery.md) - How to migrate
 - [Migration from RQ](docs/migration-from-rq.md) - How to migrate
 
+## 🔒 Security
+
+See [Security Guide (docs/SECURITY.md)](docs/SECURITY.md) for the full security model: dashboard authentication (three modes), webhook SSRF protection, `ALLOWED_TASK_MODULES` allowlist, Django CSRF audit, and the project's dead-code retention policy.
+
 ## 🎯 Use Cases
 
 Sqlery is ideal when you:
