@@ -142,3 +142,119 @@ class TestWorkerDispatchEnforcement:
         # Smoke test that the wiring import resolves.
         from sqlery.core import worker  # noqa: F401
         from sqlery.core.security import check_task_module_allowed  # noqa: F401
+
+    def test_executor_import_task_gates_before_importlib(self, monkeypatch):
+        """JobExecutor._import_task must raise TaskModuleNotAllowed BEFORE
+        importlib.import_module is called when the module is outside the
+        allowlist (verifies the gate placement, not just the primitive)."""
+        from sqlery.core import utils as core_utils
+        from sqlery.core.worker import JobExecutor
+
+        called = {"import_module": False}
+
+        def fail_if_called(*args, **kwargs):
+            called["import_module"] = True
+            raise AssertionError("importlib.import_module was reached")
+
+        monkeypatch.setattr(core_utils, "import_module", fail_if_called)
+        monkeypatch.setattr(
+            "sqlery.core.worker.get_config",
+            lambda key, default=None: ["myapp"] if key == "ALLOWED_TASK_MODULES" else default,
+        )
+
+        executor = JobExecutor.__new__(JobExecutor)  # skip __init__ (needs backend)
+        with pytest.raises(TaskModuleNotAllowed):
+            executor._import_task("other.tasks.do_thing")
+        assert called["import_module"] is False
+
+    def test_executor_import_task_passthrough_when_unset(self, monkeypatch):
+        """BC: when ALLOWED_TASK_MODULES is unset, dispatch falls through to
+        importlib (no TaskModuleNotAllowed raised)."""
+        from sqlery.core.worker import JobExecutor
+
+        monkeypatch.setattr(
+            "sqlery.core.worker.get_config",
+            lambda key, default=None: None if key == "ALLOWED_TASK_MODULES" else default,
+        )
+
+        executor = JobExecutor.__new__(JobExecutor)
+        # Use a stdlib module path so import succeeds — we're asserting the
+        # gate doesn't reject; the actual `os.path.join` is callable.
+        fn = executor._import_task("os.path.join")
+        assert callable(fn)
+
+
+class TestWarnOncePerWorkerRun:
+    """W3: production-env WARNING fires exactly once per WorkerProcess.run,
+    pinned BEFORE the fork loop — not per forked job."""
+
+    def test_warn_callsite_is_first_line_of_run(self):
+        """Static check: the warn_if_unconfigured call appears before any
+        loop / fork construct in WorkerProcess.run."""
+        import inspect
+        from sqlery.core.worker import WorkerProcess
+
+        src = inspect.getsource(WorkerProcess.run)
+        warn_idx = src.find("warn_if_unconfigured")
+        assert warn_idx != -1, "warn_if_unconfigured must be called in run()"
+        # Must appear before any 'while' loop and before any 'os.fork'.
+        while_idx = src.find("while ")
+        fork_idx = src.find("os.fork")
+        if while_idx != -1:
+            assert warn_idx < while_idx, "warn must precede the run loop"
+        if fork_idx != -1:
+            assert warn_idx < fork_idx, "warn must precede any fork"
+
+    def test_warn_fires_exactly_once_across_n_dispatches(self, caplog, monkeypatch):
+        """Simulate N forked job dispatches and assert the WARNING fires
+        exactly once — by calling warn_if_unconfigured once (as run() does)
+        and then invoking _import_task many times. The dispatch path must NOT
+        re-trigger the warning."""
+        from sqlery.core.worker import JobExecutor
+
+        monkeypatch.setenv("ENV", "production")
+        monkeypatch.setattr(
+            "sqlery.core.worker.get_config",
+            lambda key, default=None: None if key == "ALLOWED_TASK_MODULES" else default,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="sqlery.core.security"):
+            # Simulate WorkerProcess.run's first line:
+            warn_if_unconfigured(None)
+            # Simulate N forked dispatches:
+            executor = JobExecutor.__new__(JobExecutor)
+            for _ in range(10):
+                executor._import_task("os.path.join")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "ALLOWED_TASK_MODULES" in r.message
+        ]
+        assert len(warnings) == 1, (
+            f"Expected exactly 1 WARNING across run + 10 dispatches, got {len(warnings)}"
+        )
+
+
+class TestConfigWiring:
+    def test_django_defaults_has_key(self):
+        from sqlery.django_sqlery.settings import DEFAULTS
+        assert "ALLOWED_TASK_MODULES" in DEFAULTS
+        assert DEFAULTS["ALLOWED_TASK_MODULES"] is None
+
+    def test_standalone_config_default_none(self, monkeypatch):
+        monkeypatch.delenv("SQLERY_ALLOWED_TASK_MODULES", raising=False)
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+        cfg = StandaloneConfig()
+        assert cfg.get("ALLOWED_TASK_MODULES") is None
+
+    def test_standalone_config_loads_env_var(self, monkeypatch):
+        monkeypatch.setenv("SQLERY_ALLOWED_TASK_MODULES", "myapp, otherapp.tasks ,")
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+        cfg = StandaloneConfig()
+        assert cfg.get("ALLOWED_TASK_MODULES") == ["myapp", "otherapp.tasks"]
+
+    def test_standalone_config_empty_env_var_stays_none(self, monkeypatch):
+        monkeypatch.setenv("SQLERY_ALLOWED_TASK_MODULES", "   ,  ,")
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+        cfg = StandaloneConfig()
+        assert cfg.get("ALLOWED_TASK_MODULES") is None
