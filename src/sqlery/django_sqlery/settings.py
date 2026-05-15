@@ -89,6 +89,11 @@ DEFAULTS = {
     # Tag-based rate limits (throttling)
     "TAG_RATE_LIMITS": {},  # e.g., {"acme-api": "60/m", "stripe-api": "100/s", "slow-api": "1/10s"}
 
+    # Security: SEC-04 opt-in allowlist for task module imports.
+    # None / empty list = allow all (backward-compatible default).
+    # Configured = enforce prefix-with-dot-boundary match before importlib.
+    "ALLOWED_TASK_MODULES": None,
+
     # DB resilience settings
     "DB_RETRY_MAX_ATTEMPTS": 3,       # Retries on transient DB errors
     "DB_RETRY_BACKOFF_BASE": 0.1,     # Base seconds for exponential backoff
