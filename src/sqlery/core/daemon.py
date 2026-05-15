@@ -333,6 +333,7 @@ class DaemonManager:
         """
         # import fcntl  # Removed: replaced with DB-backed queue leases
 
+        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
         # from ..compat import get_config, get_backend  # moved to top-level
         # from .scheduler import Scheduler  # moved to top-level
         # from .worker_pool import WorkerPoolManager  # moved to top-level
@@ -550,6 +551,7 @@ class DaemonManager:
         """
         # import os  # moved to top-level
 
+        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
         # try:  # moved to top-level (try/except)
         #     from ..django_sqlery.models import QueuedJob
         # except Exception:
@@ -579,6 +581,7 @@ class DaemonManager:
             reason = None
 
             # Check 1: worker_pid doesn't exist on this machine
+            # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
             # # Old: checked os.kill for ALL jobs globally — incorrect on multi-node
             # if job.worker_pid:
             #     try:
@@ -846,6 +849,7 @@ class DaemonManager:
                 # current_status = getattr(worker, 'status', None) or (worker.get('status') if isinstance(worker, dict) else None)
                 # current_job_id = getattr(worker, 'current_job_id', None) or (worker.get('current_job_id') if isinstance(worker, dict) else None)
                 # backend.update_worker_heartbeat(
+                # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
                 #     worker_id=str(w_id),
                 #     status=current_status or 'busy',
                 #     current_job_id=current_job_id,

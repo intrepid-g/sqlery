@@ -43,6 +43,7 @@ from sqlery.core.utils import calculate_next_run, validate_cron_expression, impo
 #     Returns:
 #         tuple: (is_valid, error_message)
 #     """
+# #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
 #     try:
 #         parse_cron_string(cron_expression)
 #         return True, None
@@ -72,6 +73,7 @@ from sqlery.core.utils import calculate_next_run, validate_cron_expression, impo
 #         if not callable(task_func):
 #             raise ImportError(f"{task_path} is not callable")
 #
+# #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
 #         return task_func
 #     except (ValueError, ImportError, AttributeError) as e:
 #         raise ImportError(f"Cannot import task '{task_path}': {e}")
@@ -90,6 +92,7 @@ def enqueue_task(task):
 
     # Create queued job - allow multiple jobs for same task
     # job = QueuedJob.objects.create(
+    # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
     #     task_path=task.task_path,
     #     queue_name=task.queue_name,
     #     priority=task.priority,
