@@ -8,6 +8,8 @@ import uuid as _uuid
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
 
+from sqlery.security.ssrf import validate_webhook_url, WebhookURLBlocked
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +75,20 @@ def send_webhook(job, event='success'):
     if event not in job.webhook_events:
         logger.debug(f"Skipping webhook for job {job.id} - event '{event}' not in {job.webhook_events}")
         return True
+
+    # SSRF defense (SEC-02): block private/link-local/metadata/loopback targets
+    # BEFORE any further work — including the optional `requests` import — so a
+    # malicious URL cannot trigger DNS roundtrips beyond the validator's own
+    # resolution. WebhookURLBlocked is a ValueError subclass; we catch it here
+    # and return False so the caller (Django model mark_success/mark_failed)
+    # never sees an exception.
+    try:
+        validate_webhook_url(job.webhook_url)
+    except WebhookURLBlocked as e:
+        logger.warning(
+            f"Webhook blocked by SSRF policy for job {job.id}: {e}"
+        )
+        return False
 
     from .settings import get_setting
 
