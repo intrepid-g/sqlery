@@ -17,6 +17,7 @@ Examples:
 # Promoted to core — re-export for backward compatibility
 from sqlery.core.utils import parse_rate_limit, calculate_rate_limit_seconds, get_rate_limit_description
 
+# #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
 # import re
 # from datetime import timedelta
 # # from typing import tuple  # Not needed: tuple is a builtin (Python 3.9+)
@@ -53,6 +54,7 @@ from sqlery.core.utils import parse_rate_limit, calculate_rate_limit_seconds, ge
 #         )
 #
 #     # Convert to timedelta
+# #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
 #     if unit == "s":
 #         time_window = timedelta(seconds=multiplier)
 #     elif unit == "m":

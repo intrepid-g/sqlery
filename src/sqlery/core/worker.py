@@ -231,6 +231,7 @@ class JobExecutor:
         # # Duplicated logic — now delegates to core.utils.import_task
         # try:
         #     module_path, func_name = task_path.rsplit('.', 1)
+        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
         #     module = __import__(module_path, fromlist=[func_name])
         #     return getattr(module, func_name)
         # except (ImportError, AttributeError, ValueError) as e:
@@ -669,6 +670,7 @@ class WorkerProcess:
         #         result_data += chunk
         #     os.close(read_fd)
         #
+        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
         #     if result_data:
         #         return json.loads(result_data.decode())
         # except Exception as e:
