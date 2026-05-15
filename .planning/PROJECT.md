@@ -8,6 +8,25 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 
 Every execution mode works reliably and is tested in CI across both Django and standalone integration modes, on both SQLite and PostgreSQL.
 
+## Current State
+
+**Shipped:** v1.0 — Feature-Complete Run Modes (2026-05-15). All 6 execution modes (daemon, subprocess, HTTP trigger, Lambda, async worker, synchronous) production-ready in both Django and standalone integrations, tested on SQLite and Postgres. Async worker rebuilt with real async backends + drain-with-deadline shutdown. Security hardened: three-mode dashboard auth, webhook SSRF defense, CSRF protection, opt-in task module allowlist. 43/43 v1.0 requirements verified. Archive: `.planning/milestones/v1.0-*`.
+
+## Next Milestone Goals
+
+Top-priority direction (per `.planning/BACKLOG.md`): **drop-in compatibility is a permanent first-class feature** — users migrating from Celery, RQ, or django-tasks-scheduler should change only their import paths. Compat shims stay forever (reverses the v3.2.0 removal note in `compat/rq.py`).
+
+Next milestone work (one focused milestone, ~6-8 plans):
+1. New `sqlery.compat.celery` module — currently missing. Mirror Celery's `@app.task` / `@shared_task` decorators, `.delay()`, `.apply_async()`, `AsyncResult` API.
+2. De-deprecate `sqlery.compat.rq`; complete RQ public-API parity audit.
+3. Verify/audit `sqlery.compat.scheduler` for the django-tasks-scheduler `@job` decorator.
+4. Contract tests — each compat module exercises a representative slice of the original library's public API.
+5. Migration guide docs.
+
+Carry-forward `[FOLLOWUP]` items from v1.0 (lower priority): coverage gate 13→70%, Phase 1 CI human-verify push, Lambda fidelity (LocalStack/SAM), SSRF v2 hardening, quarterly dead-code retention sweep. See `.planning/BACKLOG.md` for the full list.
+
+Start the next milestone with `/gsd-new-milestone`.
+
 ## Requirements
 
 ### Validated

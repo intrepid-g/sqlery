@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.0
-milestone_name: milestone
-status: executing
-stopped_at: Roadmap and state initialized
+milestone_name: Feature-Complete Run Modes
+status: shipped
+stopped_at: Milestone v1.0 closed 2026-05-15
 last_updated: "2026-05-15T12:40:17.649Z"
-last_activity: 2026-05-14 -- Phase 04 execution started
+last_activity: 2026-05-15 -- Milestone v1.0 audit PASS 43/43; archived to .planning/milestones/v1.0-*
 progress:
   total_phases: 4
   completed_phases: 4
   total_plans: 25
-  completed_plans: 26
+  completed_plans: 25
   percent: 100
 ---
 
@@ -18,10 +18,10 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-12)
+See: .planning/PROJECT.md (updated 2026-05-15)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integration modes, on both SQLite and PostgreSQL.
-**Current focus:** Phase 04 — security-cleanup
+**Current focus:** Between milestones. Start the next milestone with `/gsd-new-milestone` — top backlog item is the Celery/RQ/scheduler drop-in compat work.
 
 ## Current Position
 
