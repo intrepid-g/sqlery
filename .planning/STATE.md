@@ -1,11 +1,11 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
+milestone: v0.21
 milestone_name: Feature-Complete Run Modes
 status: shipped
-stopped_at: Milestone v1.0 closed 2026-05-15
+stopped_at: Milestone v0.21 closed 2026-05-15
 last_updated: "2026-05-15T12:40:17.649Z"
-last_activity: 2026-05-15 -- Milestone v1.0 audit PASS 43/43; archived to .planning/milestones/v1.0-*
+last_activity: 2026-05-15 -- Milestone v0.21 audit PASS 43/43; archived to .planning/milestones/v0.21-*
 progress:
   total_phases: 4
   completed_phases: 4

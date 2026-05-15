@@ -10,7 +10,7 @@ Every execution mode works reliably and is tested in CI across both Django and s
 
 ## Current State
 
-**Shipped:** v1.0 — Feature-Complete Run Modes (2026-05-15). All 6 execution modes (daemon, subprocess, HTTP trigger, Lambda, async worker, synchronous) production-ready in both Django and standalone integrations, tested on SQLite and Postgres. Async worker rebuilt with real async backends + drain-with-deadline shutdown. Security hardened: three-mode dashboard auth, webhook SSRF defense, CSRF protection, opt-in task module allowlist. 43/43 v1.0 requirements verified. Archive: `.planning/milestones/v1.0-*`.
+**Shipped:** v0.21 — Feature-Complete Run Modes (2026-05-15). All 6 execution modes (daemon, subprocess, HTTP trigger, Lambda, async worker, synchronous) production-ready in both Django and standalone integrations, tested on SQLite and Postgres. Async worker rebuilt with real async backends + drain-with-deadline shutdown. Security hardened: three-mode dashboard auth, webhook SSRF defense, CSRF protection, opt-in task module allowlist. 43/43 v0.21 requirements verified. Archive: `.planning/milestones/v0.21-*`.
 
 ## Next Milestone Goals
 
@@ -23,7 +23,7 @@ Next milestone work (one focused milestone, ~6-8 plans):
 4. Contract tests — each compat module exercises a representative slice of the original library's public API.
 5. Migration guide docs.
 
-Carry-forward `[FOLLOWUP]` items from v1.0 (lower priority): coverage gate 13→70%, Phase 1 CI human-verify push, Lambda fidelity (LocalStack/SAM), SSRF v2 hardening, quarterly dead-code retention sweep. See `.planning/BACKLOG.md` for the full list.
+Carry-forward `[FOLLOWUP]` items from v0.21 (lower priority): coverage gate 13→70%, Phase 1 CI human-verify push, Lambda fidelity (LocalStack/SAM), SSRF v2 hardening, quarterly dead-code retention sweep. See `.planning/BACKLOG.md` for the full list.
 
 Start the next milestone with `/gsd-new-milestone`.
 

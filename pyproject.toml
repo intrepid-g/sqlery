@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlery"
-version = "0.13.0"
+version = "0.21.0"
 description = "Job queue + cron scheduling - works standalone or with Django"
 readme = "README.md"
 requires-python = ">=3.10"
