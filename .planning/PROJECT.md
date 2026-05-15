@@ -94,6 +94,7 @@ The standalone mode (FastAPI/SQLAlchemy) has zero test coverage. The async worke
 | Include security fixes in this milestone | Can't ship standalone mode without auth | — Pending |
 | Full cleanup (stubs, dead code, comments) | Part of making codebase maintainable | — Pending |
 | Mirror all modes in standalone | Standalone should be a first-class citizen | — Pending |
+| **Drop-in compatibility is a permanent first-class feature** (2026-05-15) | Users migrating from Celery, RQ, or django-tasks-scheduler should change only their import paths. Compat shims (`sqlery.compat.celery`, `sqlery.compat.rq`, `sqlery.compat.scheduler`) are NOT transitional — they stay forever. Means: every public decorator/queue/job API in those libraries needs a sqlery-backed equivalent. Reverses the "Deprecated since v3.1.0 — will be removed in v3.2.0" notes in `compat/rq.py`. | — Locked, implementation pending |
 
 ## Evolution
 
