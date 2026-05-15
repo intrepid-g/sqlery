@@ -84,6 +84,15 @@ def send_webhook(job, event='success'):
         logger.debug(f"Skipping webhook for job {job.id} - event '{event}' not in {job.webhook_events}")
         return True
 
+    # SSRF defense (SEC-02): block private/link-local/metadata/loopback targets
+    # before any HTTP work. WebhookURLBlocked is a ValueError subclass.
+    from sqlery.security.ssrf import validate_webhook_url, WebhookURLBlocked
+    try:
+        validate_webhook_url(job.webhook_url)
+    except WebhookURLBlocked as e:
+        logger.warning(f"Webhook blocked by SSRF policy for job {job.id}: {e}")
+        return False
+
     # from .settings import get_setting  # moved to top-level
 
     # Build webhook payload
