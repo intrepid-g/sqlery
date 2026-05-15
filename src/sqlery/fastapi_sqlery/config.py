@@ -52,6 +52,11 @@ class StandaloneConfig(Config):
             'DEFAULT_PRIORITY': 0,
             'DEFAULT_MAX_RETRIES': 0,
             'DEFAULT_RETRY_BACKOFF': 1.0,
+
+            # Security (SEC-04): opt-in allowlist for task module imports.
+            # None = allow all (BC). Loaded from SQLERY_ALLOWED_TASK_MODULES
+            # as comma-separated list (e.g. "myapp,otherapp.tasks").
+            'ALLOWED_TASK_MODULES': None,
         }
 
         # Load from environment variables
@@ -85,6 +90,13 @@ class StandaloneConfig(Config):
                     env_value = env_value.lower() in ('true', '1', 'yes')
 
                 self._config[config_key] = env_value
+
+        # SEC-04: comma-separated allowlist. Strip whitespace, drop empties.
+        # Absent env var leaves the default None (BC: allow all).
+        raw_allowed = os.getenv("SQLERY_ALLOWED_TASK_MODULES")
+        if raw_allowed is not None:
+            parsed = [item.strip() for item in raw_allowed.split(",") if item.strip()]
+            self._config["ALLOWED_TASK_MODULES"] = parsed if parsed else None
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""

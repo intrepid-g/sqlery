@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config
 from .utils import import_task
+from .security import check_task_module_allowed, warn_if_unconfigured
 from sqlery.core.db_resilience import configure_connection_resilience
 
 try:
@@ -237,6 +238,13 @@ class JobExecutor:
         # except (ImportError, AttributeError, ValueError) as e:
         #     raise ImportError(f"Cannot import task '{task_path}': {e}")
         # from .utils import import_task  # moved to top-level
+
+        # SEC-04 gate: enforce ALLOWED_TASK_MODULES before importlib resolves
+        # the module. Unset / empty list = pass-through (BC).
+        module_path = task_path.rsplit(".", 1)[0] if "." in task_path else task_path
+        allowed = get_config("ALLOWED_TASK_MODULES", None)
+        check_task_module_allowed(module_path, allowed)
+
         return import_task(task_path)
 
     def _should_retry(self, job) -> bool:
@@ -428,6 +436,11 @@ class WorkerProcess:
     def run(self):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
         # import sys  # moved to top-level
+
+        # SEC-04 (W3): production-shaped + unset = one WARNING per worker run.
+        # Pinned to first line BEFORE the fork loop so it fires exactly once
+        # per WorkerProcess.run, never inside forked children.
+        warn_if_unconfigured(get_config("ALLOWED_TASK_MODULES", None))
 
         logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
 
