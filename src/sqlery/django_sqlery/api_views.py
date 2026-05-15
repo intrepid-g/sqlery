@@ -14,7 +14,6 @@ from django.core.paginator import Paginator
 from django.db.models import Avg, Count, Max, Min, Q
 from django.http import JsonResponse
 from django.utils import timezone
-from django.views.decorators.csrf import csrf_exempt
 
 from ..compat import get_backend
 from .intervention import diagnose_system_health, do_manual_intervention_direct
@@ -217,7 +216,6 @@ def api_task_jobs(request, task_id):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_task_action(request, task_id):
     """POST /admin/api/sqlery/tasks/<task_id>/action/
@@ -289,7 +287,6 @@ def api_task_action(request, task_id):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_stop_job(request, job_id):
     """POST /admin/api/sqlery/jobs/<job_id>/stop/
@@ -383,7 +380,6 @@ def api_stop_job(request, job_id):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_worker_action(request, worker_id):
     """POST /admin/api/sqlery/workers/<worker_id>/action/
@@ -461,7 +457,6 @@ def api_worker_action(request, worker_id):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_remove_queued_job(request, job_id):
     """POST /admin/api/sqlery/jobs/<job_id>/remove/
@@ -483,7 +478,6 @@ def api_remove_queued_job(request, job_id):
     return JsonResponse({'success': True, 'job_id': job_id})
 
 
-@csrf_exempt
 @staff_required_json
 def api_enqueue_job_now(request, job_id):
     """POST /admin/api/sqlery/jobs/<job_id>/enqueue-now/
@@ -615,7 +609,6 @@ def api_worker_detail(request, worker_id):
     return JsonResponse(data)
 
 
-@csrf_exempt
 @staff_required_json
 def api_job_priority(request, job_id):
     """POST /admin/api/sqlery/jobs/<job_id>/priority/
@@ -815,7 +808,6 @@ def api_activity_feed(request):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_clear_jobs(request):
     """POST /admin/api/sqlery/jobs/clear/
@@ -848,7 +840,6 @@ def api_clear_jobs(request):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_archive_scheduled_jobs(request):
     """POST /admin/api/sqlery/jobs/archive-scheduled/
@@ -886,7 +877,6 @@ def api_archive_scheduled_jobs(request):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_vacuum(request):
     """POST /admin/api/sqlery/vacuum/
@@ -909,7 +899,6 @@ def api_vacuum(request):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@csrf_exempt
 @staff_required_json
 def api_manual_intervention(request):
     """POST /admin/api/sqlery/intervene/
