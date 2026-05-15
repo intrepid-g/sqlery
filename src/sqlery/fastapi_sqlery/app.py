@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ..compat import get_backend, is_standalone_mode
+from .auth import install as install_auth
 
 # Create FastAPI app
 app = FastAPI(
@@ -21,6 +22,18 @@ app = FastAPI(
     description="Background job queue management for Python",
     version="1.0.0",
 )
+
+# SEC-01: install dashboard auth middleware BEFORE any include_router calls so it
+# covers every route (including the /trigger admin endpoint added in Plan 02-08).
+install_auth(app)
+
+
+# /healthz: liveness probe — middleware unconditionally bypasses auth on this path.
+@app.get("/healthz")
+async def healthz():
+    """Liveness endpoint; always reachable in all auth modes."""
+    return {"status": "ok"}
+
 
 # Mount the HTTP trigger router (SMOD-03). Pure-core handler lives in
 # sqlery.core.triggers; this adapter is a thin request/response wrapper.
