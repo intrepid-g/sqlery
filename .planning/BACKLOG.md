@@ -2,6 +2,11 @@
 
 Items captured outside the current milestone. Promote to a new milestone via `/gsd-new-milestone` when ready.
 
+## Current milestone routing
+
+- **Promoted to active milestone:** `v0.22 — Stability, Coverage, and Operational Confidence`
+- **Why:** trust, battle-testing, and CI signal have higher leverage right now than adding another permanent compat surface
+
 ## Next-milestone candidates
 
 ### Drop-in compatibility — permanent first-class feature (2026-05-15)
@@ -26,7 +31,9 @@ This contradicts `src/sqlery/compat/rq.py` which currently says "Deprecated sinc
 
 **Why this matters:** the project's strategic moat is "swap one import line and get a Postgres-backed task queue with no Redis/RabbitMQ". Letting compat shims rot or deprecating them undermines that.
 
-**Estimated size:** 1 phase (~4-6 plans) for the celery shim + a 1-2 plan audit for rq/scheduler. Total ~6-8 plans, likely one milestone on its own.
+**Estimated size:** 1 phase (~4-6 plans) for the celery shim + a 1-2 plan audit for rq/scheduler. Total ~6-8 plans, likely the milestone after the maturity pass.
+
+**Prepared context:** `.planning/research/COMPAT-SUMMARY.md`
 
 ---
 
