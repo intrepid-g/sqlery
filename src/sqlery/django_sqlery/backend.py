@@ -153,7 +153,9 @@ class DjangoBackend(DatabaseBackend):
         #
         #     return job
 
-        # from .worker_claiming import claim_next_job_with_queue_priority  # moved to top-level
+        # REGRESSION 2026-05-18: select_for_update used outside transaction
+        # Root cause: claim logic moved to framework-agnostic module without Django transaction wrapper
+        # Fix: restore transaction.atomic() that existed in the old claim_job body
         worker_row = self._resolve_worker(worker_id)
         if not worker_row:
             # I wish I had the time to: add a retry loop with exponential backoff
@@ -161,7 +163,8 @@ class DjangoBackend(DatabaseBackend):
             worker_row = self._auto_register_worker(worker_id)
             if not worker_row:
                 return None
-        return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
+        with transaction.atomic():
+            return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     @retry_on_db_error()
     def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
