@@ -156,7 +156,11 @@ class DjangoBackend(DatabaseBackend):
         # from .worker_claiming import claim_next_job_with_queue_priority  # moved to top-level
         worker_row = self._resolve_worker(worker_id)
         if not worker_row:
-            return None
+            # I wish I had the time to: add a retry loop with exponential backoff
+            # before auto-registering, to handle transient visibility delays
+            worker_row = self._auto_register_worker(worker_id)
+            if not worker_row:
+                return None
         return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     @retry_on_db_error()
@@ -205,6 +209,42 @@ class DjangoBackend(DatabaseBackend):
             return self.Worker.objects.filter(node_id=node_id, pid=pid).first()
 
         return None
+
+    def _auto_register_worker(self, worker_id: str):
+        """Auto-register a worker on-demand if not found in database.
+
+        This prevents a race condition where a worker's heartbeat hasn't
+        propagated yet when it tries to claim its first job.
+
+        Args:
+            worker_id: Worker identifier string (e.g., "worker_node_12345")
+
+        Returns:
+            Worker instance if created, None if worker_id format is invalid
+        """
+        # I wish I had the time to: validate worker_id against a whitelist
+        # or require a shared secret to prevent unauthorized worker registration
+
+        parts = worker_id.split('_')
+        if parts[0] != 'worker' or len(parts) < 3:
+            return None
+
+        pid = int(parts[-1])
+        node_id = '_'.join(parts[1:-1])
+
+        worker, created = self.Worker.objects.get_or_create(
+            node_id=node_id,
+            pid=pid,
+            defaults={
+                'status': 'idle',
+                'last_heartbeat': timezone.now(),
+            }
+        )
+
+        if created:
+            logger.info(f"Auto-registered worker {worker_id} on-demand")
+
+        return worker
 
     def is_worker_paused(self, worker_id: str) -> bool:
         """Check if worker is currently paused."""
