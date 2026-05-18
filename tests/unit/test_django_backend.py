@@ -106,6 +106,27 @@ class TestEnqueueAndClaim:
         _create_basic_job(django_backend, queue_name="q")
         assert django_backend.claim_job(queues=["q"], worker_id=str(uuid.uuid4())) is None
 
+    def test_claim_job_runs_inside_transaction(self, django_backend):
+        """Regression: claim_job must wrap select_for_update in transaction.atomic()."""
+        from unittest.mock import patch, MagicMock
+        from django.db import transaction
+
+        _create_basic_job(django_backend, queue_name="txq")
+        wid, _ = _new_worker(django_backend, status="idle")
+
+        atomic_calls = []
+        original_atomic = transaction.atomic
+
+        def tracking_atomic(*args, **kwargs):
+            ctx = original_atomic(*args, **kwargs)
+            atomic_calls.append(True)
+            return ctx
+
+        with patch.object(transaction, "atomic", side_effect=tracking_atomic):
+            django_backend.claim_job(queues=["txq"], worker_id=str(wid))
+
+        assert len(atomic_calls) >= 1, "claim_job must use transaction.atomic()"
+
 
 # ---------------------------------------------------------------------------
 # 2. Status transitions + optimistic locking
