@@ -8,12 +8,33 @@ import socket
 from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
 
-from sqlalchemy import and_, or_, text
+from sqlalchemy import and_, or_, text, update
 from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend
 from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker
 from .database import get_session
+
+
+def determine_claim_strategy(dialect_name: str | None) -> str:
+    """Decide which atomic claiming strategy to use for a database dialect.
+
+    This is a swappable decision function (see bite2 principle #5).
+
+    Args:
+        dialect_name: SQLAlchemy dialect name (e.g., 'postgresql', 'sqlite').
+
+    Returns:
+        One of 'skip_locked', 'optimistic_version', or 'basic_lock'.
+    """
+    # I wish I had the time to: make this configurable via backend settings
+    # so users can force a strategy (e.g., 'optimistic_version' even on Postgres)
+    if dialect_name == "postgresql":
+        return "skip_locked"
+    if dialect_name == "sqlite":
+        return "optimistic_version"
+    # Fallback for other databases (mysql, oracle, etc.)
+    return "basic_lock"
 
 
 class SQLAlchemyBackend(DatabaseBackend):
@@ -107,10 +128,15 @@ class SQLAlchemyBackend(DatabaseBackend):
         return job
 
     def claim_job(self, queues: list[str], worker_id: str):
-        """Atomically claim next available job using SELECT FOR UPDATE SKIP LOCKED."""
+        """Atomically claim next available job.
+
+        PostgreSQL: uses SELECT FOR UPDATE SKIP LOCKED.
+        SQLite: uses optimistic version-based CAS update.
+        """
         with self._get_session() as session:
-            # Build query for claimable jobs
             now = datetime.now(UTC)
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            strategy = determine_claim_strategy(dialect)
 
             stmt = (
                 select(QueuedJob)
@@ -120,25 +146,52 @@ class SQLAlchemyBackend(DatabaseBackend):
                         QueuedJob.status == "queued",
                         or_(
                             QueuedJob.scheduled_at == None,
-                            QueuedJob.scheduled_at <= now
-                        )
+                            QueuedJob.scheduled_at <= now,
+                        ),
                     )
                 )
                 .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
-                .with_for_update(skip_locked=True)
                 .limit(1)
             )
+            if strategy == "skip_locked":
+                stmt = stmt.with_for_update(skip_locked=True)
 
             job = session.exec(stmt).first()
+            if job is None:
+                return None
 
-            if job:
-                # Mark as running
-                job.mark_running()
+            if strategy == "skip_locked":
+                job.status = "running"
+                job.started_at = now
+                job.worker_pid = os.getpid()
+                job.version = (job.version or 0) + 1
                 session.add(job)
                 session.commit()
                 session.refresh(job)
+                return job
 
-            return job
+            # SQLite / fallback: optimistic CAS update on version
+            current_version = job.version or 0
+            cas_stmt = (
+                update(QueuedJob)
+                .where(QueuedJob.id == job.id)
+                .where(QueuedJob.version == current_version)
+                .where(QueuedJob.status == "queued")
+                .values(
+                    status="running",
+                    started_at=now,
+                    worker_pid=os.getpid(),
+                    version=current_version + 1,
+                )
+            )
+            res = session.exec(cas_stmt)
+            session.commit()
+            if res.rowcount != 1:
+                return None
+            refreshed = session.exec(
+                select(QueuedJob).where(QueuedJob.id == job.id)
+            ).first()
+            return refreshed
 
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
         """Get queue statistics (counts by status)."""
@@ -802,21 +855,51 @@ class SQLAlchemyBackend(DatabaseBackend):
                     )
                 )
                 .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
-                .with_for_update(skip_locked=True)
                 .limit(limit)
             )
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if determine_claim_strategy(dialect) == "skip_locked":
+                stmt = stmt.with_for_update(skip_locked=True)
             return list(session.exec(stmt).all())
 
     def atomic_claim_job(self, job, worker) -> bool:
-        """Atomically claim a specific job for a worker."""
+        """Atomically claim a specific job for a worker.
+
+        PostgreSQL: relies on SELECT FOR UPDATE row lock from get_claimable_jobs.
+        SQLite: uses optimistic version-based CAS update.
+        """
         with self._get_session() as session:
-            db_job = session.get(QueuedJob, job.id)
-            if db_job and db_job.status == 'queued':
-                db_job.mark_running()
-                session.add(db_job)
-                session.commit()
-                return True
-            return False
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            strategy = determine_claim_strategy(dialect)
+
+            if strategy == "skip_locked":
+                db_job = session.get(QueuedJob, job.id)
+                if db_job and db_job.status == 'queued':
+                    db_job.mark_running()
+                    db_job.version = (db_job.version or 0) + 1
+                    session.add(db_job)
+                    session.commit()
+                    return True
+                return False
+
+            # SQLite / fallback: optimistic CAS update on version
+            current_version = job.version or 0
+            now = datetime.now(UTC)
+            cas_stmt = (
+                update(QueuedJob)
+                .where(QueuedJob.id == job.id)
+                .where(QueuedJob.version == current_version)
+                .where(QueuedJob.status == "queued")
+                .values(
+                    status="running",
+                    started_at=now,
+                    worker_pid=os.getpid(),
+                    version=current_version + 1,
+                )
+            )
+            res = session.exec(cas_stmt)
+            session.commit()
+            return res.rowcount == 1
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
