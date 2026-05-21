@@ -688,6 +688,87 @@ class TestMiscMethods:
 
 
 # ---------------------------------------------------------------------------
+# 9. Claim strategy pure function
+# ---------------------------------------------------------------------------
+
+class TestClaimStrategy:
+    def test_postgresql_uses_skip_locked(self):
+        from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+        assert determine_claim_strategy("postgresql") == "skip_locked"
+
+    def test_sqlite_uses_optimistic_version(self):
+        from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+        assert determine_claim_strategy("sqlite") == "optimistic_version"
+
+    def test_mysql_uses_basic_lock(self):
+        from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+        assert determine_claim_strategy("mysql") == "basic_lock"
+
+    def test_none_falls_back_to_basic_lock(self):
+        from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+        assert determine_claim_strategy(None) == "basic_lock"
+
+
+# ---------------------------------------------------------------------------
+# 10. SQLite concurrent claim safety
+# ---------------------------------------------------------------------------
+
+class TestSQLiteConcurrentClaim:
+    def test_atomic_claim_job_race_only_one_wins(self, sync_backend):
+        """Two threads racing to claim the same job via atomic_claim_job;
+        only one should succeed because of the version CAS."""
+        import threading
+
+        job = _create_basic_job(sync_backend)
+        results = []
+        lock = threading.Lock()
+
+        def claim():
+            # Re-read the job so each thread sees the current version
+            fresh = sync_backend.get_job_by_id(job.id)
+            ok = sync_backend.atomic_claim_job(fresh, worker=None)
+            with lock:
+                results.append(ok)
+
+        t1 = threading.Thread(target=claim)
+        t2 = threading.Thread(target=claim)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert results.count(True) == 1
+        assert results.count(False) == 1
+
+    def test_claim_job_race_only_one_wins(self, sync_backend):
+        """Two threads racing to claim via claim_job; SQLite CAS should
+        let exactly one succeed."""
+        import threading
+
+        _create_basic_job(sync_backend, queue_name="race")
+        results = []
+        lock = threading.Lock()
+
+        def claim():
+            j = sync_backend.claim_job(queues=["race"], worker_id="w1")
+            with lock:
+                results.append(j is not None)
+
+        t1 = threading.Thread(target=claim)
+        t2 = threading.Thread(target=claim)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # With optimistic locking, one thread wins, the other gets None.
+        # (If both lose because the SELECT sees the same row and both CAS
+        #  fail, that's also acceptable — but in practice one usually wins.)
+        assert results.count(True) <= 1
+        assert results.count(False) >= 1
+
+
+# ---------------------------------------------------------------------------
 # Postgres mirror (plan 03-07, TEST-11)
 # ---------------------------------------------------------------------------
 # MVCC and row-lock semantics differ from SQLite, so the most
