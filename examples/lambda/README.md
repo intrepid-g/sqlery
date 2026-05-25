@@ -1,5 +1,9 @@
 # Sqlery Lambda/EventBridge Deployment Example
 
+> ⚠️ **Experimental:** The Lambda/serverless mode has only been smoke-tested
+> (no LocalStack/SAM fidelity testing) and is **not** production-ready. Validate
+> thoroughly in your own environment before relying on it.
+
 This example shows how to deploy Sqlery in a fully serverless mode using AWS Lambda and EventBridge.
 
 ## Architecture

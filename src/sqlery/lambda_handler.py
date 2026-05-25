@@ -3,6 +3,13 @@
 This module provides the Lambda handler function for processing sqlery jobs
 in a serverless environment.
 
+.. warning::
+   **EXPERIMENTAL.** The Lambda/serverless execution mode has only been
+   smoke-tested. It has never been exercised against a real Lambda-shaped
+   runtime (no LocalStack/SAM fidelity testing), so it should NOT be
+   considered production-ready. Use at your own risk and validate
+   thoroughly in your own environment before relying on it.
+
 Deployment:
 ----------
 1. Package your Django app with this handler
@@ -69,6 +76,10 @@ from .models import QueuedJob, ScheduledTask
 
 logger = logging.getLogger(__name__)
 
+# One-time guard so the experimental warning fires once per process (per warm
+# Lambda container) rather than on every invocation.
+_experimental_warning_emitted = False
+
 
 def handler(event, context):
     """AWS Lambda handler for sqlery job processing.
@@ -80,6 +91,15 @@ def handler(event, context):
     Returns:
         dict: Response with execution details
     """
+    global _experimental_warning_emitted
+    if not _experimental_warning_emitted:
+        logger.warning(
+            "sqlery Lambda/serverless mode is EXPERIMENTAL: it has only been "
+            "smoke-tested (no LocalStack/SAM fidelity testing) and is not "
+            "production-ready."
+        )
+        _experimental_warning_emitted = True
+
     # Initialize Django
     setup_django()
 

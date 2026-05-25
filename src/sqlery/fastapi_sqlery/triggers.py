@@ -41,7 +41,12 @@ async def trigger_endpoint(request: Request) -> JSONResponse:
             logger.warning(f"Invalid trigger payload: {e}")
             return JSONResponse({"error": "invalid JSON payload"}, status_code=400)
 
-    envelope = TriggerEnvelope(body=body, headers=headers, payload=payload)
+    # Use the real socket peer (request.client.host), never X-Forwarded-For,
+    # which is attacker-controllable and must not gate the IP allowlist.
+    remote_addr = request.client.host if request.client else None
+    envelope = TriggerEnvelope(
+        body=body, headers=headers, payload=payload, remote_addr=remote_addr
+    )
     result = handle(envelope)
     return JSONResponse(result.body, status_code=result.status_code)
 

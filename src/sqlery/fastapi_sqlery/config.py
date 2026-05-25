@@ -57,6 +57,13 @@ class StandaloneConfig(Config):
             # None = allow all (BC). Loaded from SQLERY_ALLOWED_TASK_MODULES
             # as comma-separated list (e.g. "myapp,otherapp.tasks").
             'ALLOWED_TASK_MODULES': None,
+
+            # Defense-in-depth IP allowlist for the internal trigger endpoint.
+            # Matched against the socket peer (request.client.host), never
+            # X-Forwarded-For. Default: loopback only. Sentinel ["*"] (or None)
+            # disables the check for deployments that need external access.
+            # Loaded from SQLERY_INTERNAL_ALLOWED_IPS as a comma-separated list.
+            'INTERNAL_ALLOWED_IPS': ['127.0.0.1', '::1'],
         }
 
         # Load from environment variables
@@ -97,6 +104,12 @@ class StandaloneConfig(Config):
         if raw_allowed is not None:
             parsed = [item.strip() for item in raw_allowed.split(",") if item.strip()]
             self._config["ALLOWED_TASK_MODULES"] = parsed if parsed else None
+
+        # Comma-separated IP allowlist. Sentinel "*" disables the check.
+        raw_ips = os.getenv("SQLERY_INTERNAL_ALLOWED_IPS")
+        if raw_ips is not None:
+            parsed_ips = [item.strip() for item in raw_ips.split(",") if item.strip()]
+            self._config["INTERNAL_ALLOWED_IPS"] = parsed_ips
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""

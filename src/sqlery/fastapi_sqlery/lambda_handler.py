@@ -4,6 +4,13 @@ This module is the no-Django Lambda entry point for sqlery jobs running on
 the standalone (SQLAlchemy + FastAPI) integration. The Django twin lives at
 :mod:`sqlery.lambda_handler` and is unchanged.
 
+.. warning::
+   **EXPERIMENTAL.** The Lambda/serverless execution mode has only been
+   smoke-tested. It has never been exercised against a real Lambda-shaped
+   runtime (no LocalStack/SAM fidelity testing), so it should NOT be
+   considered production-ready. Use at your own risk and validate
+   thoroughly in your own environment before relying on it.
+
 Per CONTEXT decision E this is a **smoke-only** path: no LocalStack, no
 SAM, no moto. The handler imports nothing from Django, configures the
 standalone backend via :func:`sqlery.compat.initialize`, and delegates to
@@ -21,6 +28,10 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# One-time guard so the experimental warning fires once per process (per warm
+# Lambda container) rather than on every invocation.
+_experimental_warning_emitted = False
+
 
 def handler(event: dict, context) -> dict:
     """AWS Lambda entry point for the standalone (no-Django) backend.
@@ -31,6 +42,15 @@ def handler(event: dict, context) -> dict:
     """
     from sqlery.compat import initialize, get_backend, is_django_mode
     from sqlery.core.lambda_core import process_event
+
+    global _experimental_warning_emitted
+    if not _experimental_warning_emitted:
+        logger.warning(
+            "sqlery Lambda/serverless mode is EXPERIMENTAL: it has only been "
+            "smoke-tested (no LocalStack/SAM fidelity testing) and is not "
+            "production-ready."
+        )
+        _experimental_warning_emitted = True
 
     if is_django_mode():
         raise RuntimeError(

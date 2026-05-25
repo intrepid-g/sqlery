@@ -361,6 +361,14 @@ async def internal_worker(request):
         403: Invalid or missing signature
         405: Method not allowed (non-POST)
     """
+    # Defense-in-depth: reject non-allowlisted source IPs. Use the real socket
+    # peer (REMOTE_ADDR), never X-Forwarded-For (attacker-controllable).
+    from sqlery.core.triggers import is_ip_allowed
+    remote_addr = request.META.get("REMOTE_ADDR")
+    if not is_ip_allowed(remote_addr):
+        logger.warning(f"Internal worker request from disallowed IP: {remote_addr!r}")
+        return JsonResponse({"error": "Forbidden source address"}, status=403)
+
     # Get signature headers
     signature = request.headers.get("X-Signature")
     timestamp = request.headers.get("X-Timestamp")
@@ -947,6 +955,11 @@ def trigger_view(request):
             logger.warning(f"Invalid trigger payload: {e}")
             return JsonResponse({"error": "invalid JSON payload"}, status=400)
 
-    envelope = TriggerEnvelope(body=body, headers=headers, payload=payload)
+    # Use the real socket peer (REMOTE_ADDR), never X-Forwarded-For, which is
+    # attacker-controllable and must not gate the IP allowlist.
+    remote_addr = request.META.get("REMOTE_ADDR")
+    envelope = TriggerEnvelope(
+        body=body, headers=headers, payload=payload, remote_addr=remote_addr
+    )
     result = _handle(envelope)
     return JsonResponse(result.body, status=result.status_code)
