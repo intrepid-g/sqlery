@@ -6,6 +6,16 @@ if (typeof DASHBOARD_CONFIG === 'undefined') {
     var DASHBOARD_CONFIG = {};
 }
 
+// REGRESSION 2026-05-25: Dashboard polled /admin/sqlery/undefined when DASHBOARD_CONFIG was missing
+// Root cause: If the inline script defining DASHBOARD_CONFIG failed (e.g. CSP blocked it), the
+// fallback {} meant every fetch() received undefined and the browser resolved it as a relative
+// URL (/admin/sqlery/undefined) on every 3-second refresh cycle.
+// Fix: Each poller now returns early if its URL is not a string, so a missing config produces
+// a single console warning instead of an endless stream of 404s.
+function _urlOk(url) {
+    return typeof url === 'string' && url.length > 0;
+}
+
 // API-first approach - all data from API endpoints
 const URLS = {
     stats: () => DASHBOARD_CONFIG.statsUrl,
@@ -67,6 +77,10 @@ function feedEventToMsg(ev) {
 // Uses feedCursor so we only fetch new events after the first load.
 async function pollFeed() {
     try {
+        if (!_urlOk(DASHBOARD_CONFIG.activityFeedUrl)) {
+            console.warn('pollFeed skipped: activityFeedUrl missing');
+            return;
+        }
         let url = DASHBOARD_CONFIG.activityFeedUrl + '?limit=100';
         if (feedCursor) {
             url += '&since=' + encodeURIComponent(feedCursor);
@@ -632,7 +646,12 @@ function updateRefreshIndicator(loading) {
 // Fetch and update stats
 async function updateStats() {
     try {
-        const response = await fetch(URLS.stats());
+        const statsUrl = URLS.stats();
+        if (!_urlOk(statsUrl)) {
+            console.warn('updateStats skipped: statsUrl missing');
+            return;
+        }
+        const response = await fetch(statsUrl);
         if (response.status === 429) return;  // rate-limited — skip silently
 
         // REGRESSION 2026-05-25: Dashboard spammed console with "Failed to fetch stats" every 3s on session expiry
@@ -1504,7 +1523,13 @@ async function updateTasks() {
     try {
         updateRefreshIndicator(true);
 
-        const response = await fetch(URLS.tasks());
+        const tasksUrl = URLS.tasks();
+        if (!_urlOk(tasksUrl)) {
+            console.warn('updateTasks skipped: tasksListUrl missing');
+            updateRefreshIndicator(false);
+            return;
+        }
+        const response = await fetch(tasksUrl);
         if (response.status === 429) return;  // rate-limited — skip silently
 
         // REGRESSION 2026-05-25: Dashboard spammed console with "Failed to fetch tasks" every 3s on session expiry

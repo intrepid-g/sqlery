@@ -36,3 +36,17 @@ Use this file to:
 **Inline comment:** `// REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/static/sqlery/js/dashboard.js` in `updateStats`, `updateTasks`, and `pollFeed`.
 
 **Validation:** Re-read the modified `dashboard.js` code end-to-end to confirm the 401/403 guard clauses are placed before the JSON parse, the commented-out throw lines are preserved, and the `catch` blocks only surface genuine network/parse failures.
+
+## 2026-05-25 — Dashboard polls `/admin/sqlery/undefined` when config is missing
+
+**What broke:** The browser (or server logs) showed repeated requests to `/admin/sqlery/undefined` every ~3 seconds while the SQLery admin dashboard was open.
+
+**Root cause:** If the inline `<script>` defining `DASHBOARD_CONFIG` failed to execute (e.g., blocked by a Content Security Policy, syntax error in a `{% url %}` result, or any other reason), `dashboard.js` created a fallback `{}`. Every auto-refresh function (`updateStats`, `updateTasks`, `pollFeed`) then called `fetch(undefined)` because `URLS.stats()`, `URLS.tasks()`, and `DASHBOARD_CONFIG.activityFeedUrl` were all `undefined`. The browser resolves `fetch(undefined)` relative to the current page (`/admin/sqlery/`), producing requests to `/admin/sqlery/undefined` (and `/admin/sqlery/undefined?limit=100`).
+
+**Fix:** Added a `_urlOk()` helper that checks `typeof url === 'string' && url.length > 0`. Each of the three auto-refresh pollers now validates its URL before calling `fetch()` and returns early with a `console.warn` if the URL is missing. This turns an endless stream of 404s into a single console warning.
+
+**Regression test:** `test_dashboard_undefined_url_fix.py` in `tests/unit/` — validates that `_urlOk` exists and is called before `fetch()` in `updateStats`, `updateTasks`, and `pollFeed`.
+
+**Inline comment:** `// REGRESSION 2026-05-25: Dashboard polled /admin/sqlery/undefined` at `src/sqlery/django_sqlery/static/sqlery/js/dashboard.js:7`
+
+**Validation:** All 36 dashboard tests pass (35 passed, 1 skipped), including the new regression test.
