@@ -52,6 +52,19 @@ from sqlery.webhooks import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _bypass_ssrf_validation():
+    """Bypass SSRF validation in unit tests.
+
+    The SSRF module resolves DNS for the webhook URL before ``requests.post``
+    is called.  Test URLs use ``example.test`` which cannot be resolved, so
+    the validation blocks all deliveries.  We patch it to a no-op for the
+    unit-test module where ``requests`` is already fully mocked.
+    """
+    with patch("sqlery.security.ssrf.validate_webhook_url", return_value=None):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

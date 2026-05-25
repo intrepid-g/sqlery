@@ -7,8 +7,8 @@ from django.core.cache import cache
 from sqlery.middleware import ScheduledTaskMiddleware
 
 # Patch target is where the import happens in the middleware module
-TRIGGER_DUE_TASKS_PATH = "sqlery.triggers.trigger_due_tasks"
-TRIGGER_QUEUE_WORKERS_PATH = "sqlery.triggers.trigger_queue_workers"
+TRIGGER_DUE_TASKS_PATH = "sqlery.django_sqlery.middleware.trigger_due_tasks"
+TRIGGER_QUEUE_WORKERS_PATH = "sqlery.django_sqlery.middleware.trigger_queue_workers"
 
 
 class TestScheduledTaskMiddleware:

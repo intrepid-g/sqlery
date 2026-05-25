@@ -1,6 +1,7 @@
 """Compatibility layer for RQ (Redis Queue).
 
-Drop-in replacement: change only imports to migrate from RQ to SQLery.
+Permanent first-class feature — drop-in replacement for RQ. Change only imports
+to migrate from RQ to SQLery.
 
     # Before (RQ + django-tasks-scheduler)
     from rq import Retry
@@ -9,31 +10,20 @@ Drop-in replacement: change only imports to migrate from RQ to SQLery.
 
     # After (SQLery)
     from sqlery.compat.rq import Retry, get_queue, get_current_job
-
-Deprecated since v3.1.0 — will be removed in v3.2.0.
-Use sqlery.django_sqlery.queue.Queue and native sqlery APIs instead.
 """
 
 import logging
 import random
-import warnings
 from datetime import timedelta, datetime, UTC
 from typing import Any, Callable
 
 from sqlery.core.utils import import_task
 from sqlery.django_sqlery.models import Worker as _Worker
 
-warnings.warn(
-    "sqlery.compat.rq is deprecated and will be removed in v3.2.0. "
-    "Use sqlery.django_sqlery.queue.Queue and sqlery.cancel_job directly.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-
-from sqlery.compat.scheduler import Retry, get_current_job, JobStatus  # noqa: E402
-from sqlery.django_sqlery.models import QueuedJob  # noqa: E402
-from sqlery.django_sqlery.queue import Queue as _DjangoQueue  # noqa: E402
-from sqlery.django_sqlery.backend import DjangoBackend as _DjangoBackend  # noqa: E402
+from sqlery.compat.scheduler import Retry, get_current_job, JobStatus
+from sqlery.django_sqlery.models import QueuedJob
+from sqlery.django_sqlery.queue import Queue as _DjangoQueue
+from sqlery.django_sqlery.backend import DjangoBackend as _DjangoBackend
 
 
 def _make_django_queue(name: str) -> _DjangoQueue:
@@ -53,8 +43,7 @@ class Queue:
     Accepts RQ-style kwargs in enqueue() and translates them to sqlery's
     native Queue API so migrating projects need only change imports.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Use sqlery.django_sqlery.queue.Queue instead.
+
     """
 
     def __init__(self, name: str = "default", default_timeout: int | None = None, **_ignored):
@@ -129,9 +118,6 @@ class Queue:
         Accepts all standard RQ enqueue kwargs (job_id, retry, at_front,
         timeout, result_ttl, etc.) and translates them to sqlery.
 
-        Deprecated since v3.1.0 — will be removed in v3.2.0.
-        Use sqlery.django_sqlery.queue.Queue.enqueue() instead.
-
         Args:
             func: Callable to enqueue.
             *args: Positional arguments forwarded to func.
@@ -160,8 +146,6 @@ class Queue:
     def enqueue_in(self, delay: timedelta, func: Callable, *args, **kwargs) -> QueuedJob:
         """Enqueue a job after a timedelta delay.
 
-        Deprecated since v3.1.0 — will be removed in v3.2.0.
-        Use sqlery.django_sqlery.queue.Queue.enqueue_in() instead.
         """
         meta = kwargs.pop("meta", None)
         mapped = self._map_rq_kwargs(kwargs)
@@ -176,8 +160,6 @@ class Queue:
     def enqueue_at(self, when: datetime, func: Callable, *args, **kwargs) -> QueuedJob:
         """Enqueue a job at a specific datetime.
 
-        Deprecated since v3.1.0 — will be removed in v3.2.0.
-        Use sqlery.django_sqlery.queue.Queue.enqueue_at() instead.
         """
         meta = kwargs.pop("meta", None)
         mapped = self._map_rq_kwargs(kwargs)
@@ -202,9 +184,6 @@ def get_queue(name: str = "default") -> Queue:
 
     Drop-in for ``scheduler.queues.get_queue``.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Use sqlery.django_sqlery.queue.Queue(name) instead.
-
     Args:
         name: Queue name (default: 'default').
 
@@ -219,8 +198,6 @@ def get_job_registry_summary(queue_name: str) -> dict[str, list[int]]:
 
     Drop-in for RQ's StartedJobRegistry / FinishedJobRegistry enumeration.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Query QueuedJob.objects directly instead.
 
     Args:
         queue_name: Name of the queue to inspect.
@@ -256,8 +233,7 @@ def get_job_registry_summary(queue_name: str) -> dict[str, list[int]]:
 def clear_failed_jobs(queue_name: str) -> int:
     """Delete all failed jobs in the given queue.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Use QueuedJob.objects.filter(queue_name=..., status='failed').delete() instead.
+
 
     Args:
         queue_name: Name of the queue to clear.
@@ -271,9 +247,6 @@ def clear_failed_jobs(queue_name: str) -> int:
 
 def delete_other_jobs_by_same_meta_tag(current_job_id: int, meta_tag: str) -> int:
     """Cancel all non-running jobs sharing the same meta['tag'] value.
-
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Query and cancel QueuedJob objects directly instead.
 
     Args:
         current_job_id: PK of the currently-executing job (excluded from cancellation).
@@ -299,9 +272,6 @@ def delete_other_jobs_by_same_meta_tag(current_job_id: int, meta_tag: str) -> in
 def is_final_retry(job: QueuedJob) -> bool:
     """Return True if this is the last retry attempt for the given job.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Use ``job.retry_count >= job.max_retries`` directly instead.
-
     Args:
         job: QueuedJob instance currently executing.
 
@@ -316,8 +286,6 @@ def get_queue_wait_time(queue_name: str) -> int:
 
     Returns 0 if the queue is empty.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Query QueuedJob.objects directly instead.
 
     Args:
         queue_name: Name of the queue to measure.
@@ -350,8 +318,6 @@ def requeue_if_jobs_pending(
     seconds and returns True. Returns False if the queue is empty/only has the
     current job, allowing normal processing to proceed.
 
-    Deprecated since v3.1.0 — will be removed in v3.2.0.
-    Implement this pattern directly using Queue.enqueue_in() instead.
 
     Args:
         current_job: The QueuedJob currently being executed.

@@ -21,11 +21,25 @@
 **Deferred:**
 - Multi-worker PostgreSQL concurrent claim stress test under real contention (PG-only, needs CI service)
 
+## 2026-05-25 — Fork-safe connection lifecycle
+
+**Built:** Replaced manual `_reset_db_connections()` discipline in the fork path with `ForkSafeExecutor` — a hook-based system that guarantees DB connections are closed before `os.fork()` and reopened in both parent and child, with leak verification.
+
+**Decisions:**
+- Hook resolution: chose string identifiers resolved by `auto_configure()` (`build_default_hooks()`), alternative was direct callable registration — forced by: pure functions must be testable without Django/SQLAlchemy imports; revisit when: hook set grows beyond Django+SQLAlchemy
+- Leak verification: chose log-and-warn on leaked connections (`verify_no_open_connections()`), alternative was raise-on-leak (hard failure) — forced by: existing code has error-recovery `_reset_db_connections()` calls that may leave intentional transient connections; revisit when: all error-recovery paths migrated to hooks
+
+**Deferred:**
+- Migrate remaining error-recovery `_reset_db_connections()` calls (lines 196, 559, 674, 748) to ForkSafeExecutor hooks
+- Support user-registered custom pre/post-fork hooks (e.g. for connection pools, file descriptors, shared memory)
+
 ## Bite queue
 
-1. Add retry loop with exponential backoff before auto-registration `[pending]`
-2. Add worker registration security (whitelist or shared secret) `[pending]`
-3. Multi-worker PostgreSQL concurrent claim stress test under real contention `[pending]`
+1. Migrate error-recovery `_reset_db_connections()` calls to ForkSafeExecutor hooks `[pending]`
+2. Add retry loop with exponential backoff before auto-registration `[pending]`
+3. Add worker registration security (whitelist or shared secret) `[pending]`
+4. Multi-worker PostgreSQL concurrent claim stress test under real contention `[pending]`
+5. Support user-registered custom pre/post-fork hooks `[pending]`
 
 ## Ignored bites
 

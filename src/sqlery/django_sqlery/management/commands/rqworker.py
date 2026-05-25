@@ -1,8 +1,9 @@
 """Compatibility ``rqworker`` management command.
 
-Drop-in replacement for ``django-tasks-scheduler``'s
-``python manage.py rqworker`` so projects migrating to SQLery can keep
-the same process-management commands without changes.
+Permanent first-class feature — drop-in replacement for
+``django-tasks-scheduler``'s ``python manage.py rqworker`` so projects
+migrating to SQLery can keep the same process-management commands
+without changes.
 
 Usage (identical to django-tasks-scheduler)::
 
@@ -10,12 +11,7 @@ Usage (identical to django-tasks-scheduler)::
 
 Internally delegates to SQLery's daemon loop in foreground mode,
 processing jobs from the requested queues.
-
-Deprecated since v3.1.0 — will be removed in v3.2.0.
-Use ``python manage.py daemon`` or the SQLery worker API directly.
 """
-
-import warnings
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -51,22 +47,12 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        warnings.warn(
-            "The 'rqworker' management command is a django-tasks-scheduler "
-            "compatibility shim and will be removed in v3.2.0. "
-            "Use 'python manage.py daemon' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
         queues = options["queues"] or get_setting("WORKER_QUEUES", ["default"])
         burst = options.get("burst", False)
 
         self.stdout.write(
-            self.style.WARNING(
-                "rqworker is a django-tasks-scheduler compatibility shim — "
-                "consider switching to 'python manage.py daemon'."
-            )
+            "rqworker: django-tasks-scheduler compatibility command — "
+            "delegates to SQLery's daemon loop."
         )
         self.stdout.write(f"Listening on queues: {', '.join(queues)}")
 
