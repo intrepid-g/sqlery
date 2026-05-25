@@ -47,8 +47,8 @@ class DatabaseBackend(ABC):
         retry_intervals: list | None = None,
         meta: dict | None = None,
         dependencies: list | None = None,
-        on_success_path: str = '',
-        on_failure_path: str = '',
+        on_success_path: str = "",
+        on_failure_path: str = "",
         ttl: int | None = None,
         result_ttl: int | None = None,
         failure_ttl: int | None = None,
@@ -101,7 +101,9 @@ class DatabaseBackend(ABC):
         """
         return 0
 
-    def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
+    def release_claimed_job(
+        self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
+    ):
         """Release a job after processing and update worker state.
 
         Args:
@@ -322,7 +324,9 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None):
+    def update_worker_heartbeat(
+        self, worker_id: str, status: str, current_job_id: int | None = None
+    ):
         """Update or create worker heartbeat.
 
         Args:
@@ -595,6 +599,39 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
+    def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        """Return liveness snapshots for every running job (mode-agnostic).
+
+        Each element is a ``sqlery.core.liveness.RunningJobLiveness`` record
+        describing a ``status='running'`` job and its assigned worker. The
+        daemon's zombie-detection logic consumes these instead of touching the
+        ORM directly, so it works in both Django and standalone modes.
+
+        Args:
+            queue_names: If provided, only include jobs in these queues.
+                         None means all queues.
+
+        Returns:
+            List of RunningJobLiveness records (datetimes tz-aware UTC).
+        """
+        pass
+
+    @abstractmethod
+    def fail_zombie_job(self, job_id: int, reason: str) -> bool:
+        """Mark a running job failed because it was detected as a zombie.
+
+        Sets error=reason and termination_reason="zombie_job".
+
+        Args:
+            job_id: Job to fail.
+            reason: Human-readable reason recorded as the job error.
+
+        Returns:
+            True if the job was found and marked failed, else False.
+        """
+        pass
+
+    @abstractmethod
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         """Check if queue has running jobs.
 
@@ -683,9 +720,7 @@ class AsyncDatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def amark_failed(
-        self, job_id, error: str, traceback: str | None = None
-    ) -> None:
+    async def amark_failed(self, job_id, error: str, traceback: str | None = None) -> None:
         """Async analog of DatabaseBackend.mark_job_failed."""
         pass
 
@@ -720,9 +755,7 @@ class AsyncDatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def aclaim_lease(
-        self, queue_name: str, worker_id: str, ttl_seconds: int
-    ) -> bool:
+    async def aclaim_lease(self, queue_name: str, worker_id: str, ttl_seconds: int) -> bool:
         """Async analog of DatabaseBackend.claim_queue_leases (single queue)."""
         pass
 
@@ -778,16 +811,16 @@ def _detect_mode() -> str:
         'django' or 'standalone'
     """
     # Check if Django is configured and available
-    if 'django' in sys.modules:
+    if "django" in sys.modules:
         try:
             # from django.conf import settings  # moved to top-level
             # Check if Django settings are configured
             if _django_settings is not None and _django_settings.configured:
-                return 'django'
+                return "django"
         except ImportError:
             pass
 
-    return 'standalone'
+    return "standalone"
 
 
 def _initialize_backend():
@@ -799,13 +832,19 @@ def _initialize_backend():
 
     mode = _detect_mode()
 
-    if mode == 'django':
+    if mode == "django":
         # from .django_sqlery.backend import DjangoBackend  # Wrong: looks in compat/django_sqlery/
-        from sqlery.django_sqlery.backend import DjangoBackend  # Inline to avoid circular import: compat -> backend -> compat
+        from sqlery.django_sqlery.backend import (
+            DjangoBackend,
+        )  # Inline to avoid circular import: compat -> backend -> compat
+
         _backend = DjangoBackend()
     else:
         # from .fastapi_sqlery.backend import SQLAlchemyBackend  # Wrong: looks in compat/fastapi_sqlery/
-        from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend  # Inline to avoid circular import: compat -> backend -> compat
+        from sqlery.fastapi_sqlery.backend import (
+            SQLAlchemyBackend,
+        )  # Inline to avoid circular import: compat -> backend -> compat
+
         _backend = SQLAlchemyBackend()
 
     return _backend
@@ -820,13 +859,19 @@ def _initialize_config():
 
     mode = _detect_mode()
 
-    if mode == 'django':
+    if mode == "django":
         # from .django_sqlery.config import DjangoConfig  # Wrong: looks in compat/django_sqlery/
-        from sqlery.django_sqlery.config import DjangoConfig  # Inline to avoid circular import: compat -> backend -> compat
+        from sqlery.django_sqlery.config import (
+            DjangoConfig,
+        )  # Inline to avoid circular import: compat -> backend -> compat
+
         _config = DjangoConfig()
     else:
         # from .fastapi_sqlery.config import StandaloneConfig  # Wrong: looks in compat/fastapi_sqlery/
-        from sqlery.fastapi_sqlery.config import StandaloneConfig  # Inline to avoid circular import: compat -> backend -> compat
+        from sqlery.fastapi_sqlery.config import (
+            StandaloneConfig,
+        )  # Inline to avoid circular import: compat -> backend -> compat
+
         _config = StandaloneConfig()
 
     return _config
@@ -907,7 +952,7 @@ def is_django_mode() -> bool:
     Returns:
         True if Django mode, False if standalone
     """
-    return _detect_mode() == 'django'
+    return _detect_mode() == "django"
 
 
 def is_standalone_mode() -> bool:
@@ -916,7 +961,7 @@ def is_standalone_mode() -> bool:
     Returns:
         True if standalone mode, False if Django
     """
-    return _detect_mode() == 'standalone'
+    return _detect_mode() == "standalone"
 
 
 def initialize(
@@ -930,7 +975,7 @@ def initialize(
     max_overflow: int = 10,
     pool_timeout: int = 30,
     pool_recycle: int = 1800,
-    **kwargs
+    **kwargs,
 ):
     """Initialize sqlery in standalone mode.
 
@@ -968,16 +1013,16 @@ def initialize(
 
     # Set core configuration
     if database_url:
-        set_config('DATABASE_URL', database_url)
+        set_config("DATABASE_URL", database_url)
 
-    set_config('MAX_WORKERS_PER_NODE', max_workers)
-    set_config('WORKER_QUEUES', worker_queues or ['default'])
-    set_config('ENABLE_DAEMON', enable_daemon)
-    set_config('DAEMON_CHECK_INTERVAL', daemon_check_interval)
-    set_config('POOL_SIZE', pool_size)
-    set_config('MAX_OVERFLOW', max_overflow)
-    set_config('POOL_TIMEOUT', pool_timeout)
-    set_config('POOL_RECYCLE', pool_recycle)
+    set_config("MAX_WORKERS_PER_NODE", max_workers)
+    set_config("WORKER_QUEUES", worker_queues or ["default"])
+    set_config("ENABLE_DAEMON", enable_daemon)
+    set_config("DAEMON_CHECK_INTERVAL", daemon_check_interval)
+    set_config("POOL_SIZE", pool_size)
+    set_config("MAX_OVERFLOW", max_overflow)
+    set_config("POOL_TIMEOUT", pool_timeout)
+    set_config("POOL_RECYCLE", pool_recycle)
 
     # Set any additional config
     for key, value in kwargs.items():
@@ -985,10 +1030,13 @@ def initialize(
 
     # Initialize database (creates tables)
     # from .fastapi_sqlery.database import init_database  # Wrong: looks in compat/fastapi_sqlery/
-    from sqlery.fastapi_sqlery.database import init_database  # Inline to avoid circular import: compat -> backend -> compat
+    from sqlery.fastapi_sqlery.database import (
+        init_database,
+    )  # Inline to avoid circular import: compat -> backend -> compat
+
     # init_database(database_url or get_config('DATABASE_URL'))
     init_database(
-        database_url or get_config('DATABASE_URL'),
+        database_url or get_config("DATABASE_URL"),
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,
@@ -998,14 +1046,14 @@ def initialize(
 
 # Export main API
 __all__ = [
-    'DatabaseBackend',
-    'AsyncDatabaseBackend',
-    'Config',
-    'get_backend',
-    'get_config',
-    'set_config',
-    'get_all_config',
-    'is_django_mode',
-    'is_standalone_mode',
-    'initialize',
+    "DatabaseBackend",
+    "AsyncDatabaseBackend",
+    "Config",
+    "get_backend",
+    "get_config",
+    "set_config",
+    "get_all_config",
+    "is_django_mode",
+    "is_standalone_mode",
+    "initialize",
 ]

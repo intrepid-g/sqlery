@@ -73,7 +73,9 @@ class MockBackend(DatabaseBackend):
     def count_jobs(self, status: str | None = None, queue_name: str | None = None) -> int:
         return self._count
 
-    def cleanup_jobs(self, status=None, max_age_days=None, max_count=None, queue_name=None, dry_run=False) -> dict:
+    def cleanup_jobs(
+        self, status=None, max_age_days=None, max_count=None, queue_name=None, dry_run=False
+    ) -> dict:
         return {"deleted": 2}
 
     def get_job_by_id(self, job_id: int):
@@ -88,8 +90,19 @@ class MockBackend(DatabaseBackend):
 
     # --- Remaining abstract methods stubbed ---
 
-    def create_job(self, task_path, kwargs, queue_name, priority, scheduled_at, max_retries,
-                   retry_backoff, allow_parallel, timeout_seconds, **kw):
+    def create_job(
+        self,
+        task_path,
+        kwargs,
+        queue_name,
+        priority,
+        scheduled_at,
+        max_retries,
+        retry_backoff,
+        allow_parallel,
+        timeout_seconds,
+        **kw,
+    ):
         return FakeJob()
 
     def claim_job(self, queues, worker_id):
@@ -104,13 +117,17 @@ class MockBackend(DatabaseBackend):
     def get_due_scheduled_tasks(self):
         return []
 
-    def create_scheduled_task(self, name, task_path, cron_expression, queue_name, priority, enabled=True):
+    def create_scheduled_task(
+        self, name, task_path, cron_expression, queue_name, priority, enabled=True
+    ):
         return None
 
     def update_worker_heartbeat(self, worker_id, status, current_job_id=None):
         pass
 
-    def cleanup_jobs_by_count(self, status=None, keep_count=1000, queue_name=None, dry_run=False) -> dict:
+    def cleanup_jobs_by_count(
+        self, status=None, keep_count=1000, queue_name=None, dry_run=False
+    ) -> dict:
         return {"deleted": 0}
 
     def get_database_stats(self) -> dict:
@@ -163,6 +180,12 @@ class MockBackend(DatabaseBackend):
 
     def get_running_jobs(self, queue_name=None) -> list:
         return []
+
+    def get_running_jobs_for_liveness(self, queue_names=None) -> list:
+        return []
+
+    def fail_zombie_job(self, job_id, reason) -> bool:
+        return False
 
     def has_running_jobs_in_queue(self, queue_name, exclude_job_id=None) -> bool:
         return False
@@ -223,7 +246,12 @@ def test_get_job_registry_summary_standalone(standalone_backend):
         FakeJob(id=1, status="running", queue_name="default"),
         FakeJob(id=2, status="success", queue_name="default"),
         FakeJob(id=3, status="failed", queue_name="default"),
-        FakeJob(id=4, status="queued", queue_name="default", scheduled_at=datetime(2025, 1, 1, tzinfo=UTC)),
+        FakeJob(
+            id=4,
+            status="queued",
+            queue_name="default",
+            scheduled_at=datetime(2025, 1, 1, tzinfo=UTC),
+        ),
         FakeJob(id=5, status="queued", queue_name="default"),
     ]
     summary = get_job_registry_summary("default")
@@ -249,11 +277,11 @@ def test_delete_other_jobs_by_same_meta_tag_standalone(standalone_backend):
     from sqlery.compat.rq import delete_other_jobs_by_same_meta_tag
 
     standalone_backend._jobs = [
-        FakeJob(id=10, status="queued", meta={"tag": "import"}),   # current — excluded
-        FakeJob(id=11, status="queued", meta={"tag": "import"}),   # match
-        FakeJob(id=12, status="queued", meta={"tag": "export"}),   # different tag
-        FakeJob(id=13, status="queued", meta=None),                 # no meta
-        FakeJob(id=14, status="queued", meta={"tag": "import"}),   # match
+        FakeJob(id=10, status="queued", meta={"tag": "import"}),  # current — excluded
+        FakeJob(id=11, status="queued", meta={"tag": "import"}),  # match
+        FakeJob(id=12, status="queued", meta={"tag": "export"}),  # different tag
+        FakeJob(id=13, status="queued", meta=None),  # no meta
+        FakeJob(id=14, status="queued", meta={"tag": "import"}),  # match
     ]
     cancelled = delete_other_jobs_by_same_meta_tag(current_job_id=10, meta_tag="import")
 

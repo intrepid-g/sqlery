@@ -328,7 +328,8 @@ class FakeBackend(DatabaseBackend):
     def get_due_scheduled_tasks(self):
         now = _utcnow()
         return [
-            t for t in self._scheduled_tasks.values()
+            t
+            for t in self._scheduled_tasks.values()
             if t.enabled and t.next_run_at and t.next_run_at <= now
         ]
 
@@ -365,7 +366,9 @@ class FakeBackend(DatabaseBackend):
         return out
 
     # ---- @abstractmethod update_worker_heartbeat
-    def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None, **kwargs):
+    def update_worker_heartbeat(
+        self, worker_id: str, status: str, current_job_id: int | None = None, **kwargs
+    ):
         self._record("update_worker_heartbeat", worker_id, status, current_job_id)
         w = self._workers.get(worker_id)
         if w is None:
@@ -379,11 +382,15 @@ class FakeBackend(DatabaseBackend):
         return w
 
     # ---- @abstractmethod cleanup_jobs
-    def cleanup_jobs(self, status=None, max_age_days=None, max_count=None, queue_name=None, dry_run=False) -> dict:
+    def cleanup_jobs(
+        self, status=None, max_age_days=None, max_count=None, queue_name=None, dry_run=False
+    ) -> dict:
         return {"deleted": 0, "dry_run": dry_run}
 
     # ---- @abstractmethod cleanup_jobs_by_count
-    def cleanup_jobs_by_count(self, status=None, keep_count=1000, queue_name=None, dry_run=False) -> dict:
+    def cleanup_jobs_by_count(
+        self, status=None, keep_count=1000, queue_name=None, dry_run=False
+    ) -> dict:
         return {"deleted": 0, "kept": min(len(self._jobs), keep_count), "dry_run": dry_run}
 
     # ---- @abstractmethod get_database_stats
@@ -403,7 +410,9 @@ class FakeBackend(DatabaseBackend):
         self._registries.get(registry_type, set()).discard(job_id)
 
     # ---- @abstractmethod get_registry_jobs
-    def get_registry_jobs(self, registry_type: str, queue_name: str | None = None, limit: int | None = None) -> list:
+    def get_registry_jobs(
+        self, registry_type: str, queue_name: str | None = None, limit: int | None = None
+    ) -> list:
         ids = list(self._registries.get(registry_type, set()))
         jobs = [self._jobs[i] for i in ids if i in self._jobs]
         if queue_name:
@@ -463,7 +472,10 @@ class FakeBackend(DatabaseBackend):
     # ---- @abstractmethod has_pending_job_for_scheduled_task
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
         for j in self._jobs.values():
-            if getattr(j, "scheduled_task_id", None) == task_id and j.status in ("queued", "running"):
+            if getattr(j, "scheduled_task_id", None) == task_id and j.status in (
+                "queued",
+                "running",
+            ):
                 return True
         return False
 
@@ -504,6 +516,29 @@ class FakeBackend(DatabaseBackend):
             out = [j for j in out if j.queue_name == queue_name]
         return out
 
+    # ---- @abstractmethod get_running_jobs_for_liveness
+    def get_running_jobs_for_liveness(self, queue_names=None) -> list:
+        # Tests may inject crafted RunningJobLiveness records via
+        # ``liveness_records``; otherwise default to an empty sweep.
+        records = getattr(self, "liveness_records", None)
+        if records is None:
+            return []
+        if queue_names is None:
+            return list(records)
+        # No queue metadata on injected records — return them unfiltered.
+        return list(records)
+
+    # ---- @abstractmethod fail_zombie_job
+    def fail_zombie_job(self, job_id: int, reason: str) -> bool:
+        self._record("fail_zombie_job", job_id, reason)
+        job = self._jobs.get(job_id)
+        if job is not None:
+            job.status = "failed"
+            job.error = reason
+            job.termination_reason = "zombie_job"
+        # Return True for crafted-record tests (job may not be in _jobs).
+        return True
+
     # ---- @abstractmethod has_running_jobs_in_queue
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         for j in self._jobs.values():
@@ -525,7 +560,7 @@ class FakeBackend(DatabaseBackend):
             out = [j for j in out if j.status == status]
         if queue_name:
             out = [j for j in out if j.queue_name == queue_name]
-        return out[offset:offset + limit]
+        return out[offset : offset + limit]
 
     # ---- @abstractmethod count_jobs
     def count_jobs(self, status=None, queue_name=None) -> int:
@@ -558,10 +593,7 @@ class FakeBackend(DatabaseBackend):
         self._record("acquire_tag_locks", tuple(tags))
 
     def get_claimable_jobs(self, queues, priority_weights=None, limit=1) -> list:
-        out = [
-            j for j in self._jobs.values()
-            if j.status == "queued" and j.queue_name in queues
-        ]
+        out = [j for j in self._jobs.values() if j.status == "queued" and j.queue_name in queues]
         # Order by priority desc, then created_at asc.
         out.sort(key=lambda j: (-j.priority, j.created_at))
         # Optional queue weighting
@@ -626,7 +658,9 @@ class FakeBackend(DatabaseBackend):
     def delete_worker_registration(self, worker_id: str) -> int:
         return 1 if self._workers.pop(worker_id, None) else 0
 
-    def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
+    def release_claimed_job(
+        self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
+    ):
         live = self._jobs.get(job.id)
         if live is not None:
             live.status = status

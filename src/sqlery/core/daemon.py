@@ -9,6 +9,7 @@ import signal
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 
 from ..compat import get_backend, get_config, is_django_mode
@@ -62,8 +63,8 @@ class DaemonManager:
         self.pid_dir = Path(pid_dir)
         self.pid_dir.mkdir(parents=True, exist_ok=True)
 
-        self.pid_file = self.pid_dir / 'sqlery_daemon.pid'
-        self.heartbeat_file = self.pid_dir / 'sqlery_daemon.heartbeat'
+        self.pid_file = self.pid_dir / "sqlery_daemon.pid"
+        self.heartbeat_file = self.pid_dir / "sqlery_daemon.heartbeat"
 
     def _get_default_pid_dir(self) -> Path:
         """Get default PID directory based on mode."""
@@ -71,9 +72,9 @@ class DaemonManager:
 
         if is_django_mode():
             # from django.conf import settings  # moved to top-level (try/except as django_settings)
-            return Path(django_settings.BASE_DIR) / 'tmp'
+            return Path(django_settings.BASE_DIR) / "tmp"
         else:
-            return Path('/tmp/sqlery')
+            return Path("/tmp/sqlery")
 
     def read_pid(self) -> int | None:
         """Read PID from file.
@@ -85,7 +86,7 @@ class DaemonManager:
             return None
 
         try:
-            with open(self.pid_file, 'r') as f:
+            with open(self.pid_file, "r") as f:
                 pid = int(f.read().strip())
                 return pid
         except (ValueError, OSError) as e:
@@ -98,7 +99,7 @@ class DaemonManager:
         Args:
             pid: Process ID to write
         """
-        with open(self.pid_file, 'w') as f:
+        with open(self.pid_file, "w") as f:
             f.write(str(pid))
 
     def remove_pid(self):
@@ -154,7 +155,7 @@ class DaemonManager:
         # Check heartbeat
         if self.heartbeat_file.exists():
             try:
-                with open(self.heartbeat_file, 'r') as f:
+                with open(self.heartbeat_file, "r") as f:
                     heartbeat_ts = int(f.read().strip())
                     heartbeat_age = int(time.time()) - heartbeat_ts
 
@@ -173,11 +174,11 @@ class DaemonManager:
             worker_count = len(workers)
 
         return {
-            'running': running,
-            'pid': pid,
-            'heartbeat_age': heartbeat_age,
-            'stale': stale,
-            'worker_count': worker_count,
+            "running": running,
+            "pid": pid,
+            "heartbeat_age": heartbeat_age,
+            "stale": stale,
+            "worker_count": worker_count,
         }
 
     def spawn_daemon(self, daemon_script_path: Path | None = None):
@@ -206,15 +207,15 @@ class DaemonManager:
         # Determine daemon script
         if daemon_script_path is None:
             # Use core daemon runner
-            daemon_script_path = Path(__file__).parent / 'daemon_runner.py'
+            daemon_script_path = Path(__file__).parent / "daemon_runner.py"
 
         # Debug mode: redirect stdout/stderr to raw log file (grows forever).
         # Normal mode: subprocess configures its own RotatingFileHandler; parent
         # sends stdout/stderr to DEVNULL since the child manages its own logging.
         if is_debug_mode():
-            log_file_path = self.pid_dir / 'sqlery_daemon.log'
+            log_file_path = self.pid_dir / "sqlery_daemon.log"
             try:
-                log_file = open(log_file_path, 'a')
+                log_file = open(log_file_path, "a")
             except Exception as e:
                 logger.warning(f"Failed to open log file {log_file_path}: {e}")
                 log_file = subprocess.DEVNULL
@@ -282,7 +283,7 @@ class DaemonManager:
             raise RuntimeError(f"Fork failed: {e}")
 
         # Decouple from parent environment
-        os.chdir('/')
+        os.chdir("/")
         os.setsid()
         os.umask(0)
 
@@ -299,10 +300,10 @@ class DaemonManager:
         sys.stdout.flush()
         sys.stderr.flush()
 
-        with open('/dev/null', 'r') as devnull_r:
+        with open("/dev/null", "r") as devnull_r:
             os.dup2(devnull_r.fileno(), sys.stdin.fileno())
 
-        with open('/dev/null', 'a+') as devnull_w:
+        with open("/dev/null", "a+") as devnull_w:
             os.dup2(devnull_w.fileno(), sys.stdout.fileno())
             os.dup2(devnull_w.fileno(), sys.stderr.fileno())
 
@@ -343,10 +344,10 @@ class DaemonManager:
         configure_connection_resilience()
 
         # Get configuration
-        check_interval = get_config('DAEMON_CHECK_INTERVAL', 10)
+        check_interval = get_config("DAEMON_CHECK_INTERVAL", 10)
         if max_workers is None:
-            max_workers = get_config('MAX_WORKERS_PER_NODE', 1)
-        queues = get_config('WORKER_QUEUES', ['default'])
+            max_workers = get_config("MAX_WORKERS_PER_NODE", 1)
+        queues = get_config("WORKER_QUEUES", ["default"])
 
         # Initialize components
         backend = get_backend()
@@ -358,14 +359,12 @@ class DaemonManager:
         # A lease lives for 3 missed heartbeats before it's considered dead
         lease_secs = check_interval * 3
 
-        owned_queues = set(backend.claim_queue_leases(
-            queues, daemon_id, self.node_id, os.getpid(), lease_secs
-        ))
+        owned_queues = set(
+            backend.claim_queue_leases(queues, daemon_id, self.node_id, os.getpid(), lease_secs)
+        )
         unowned = set(queues) - owned_queues
         if unowned:
-            logger.info(
-                f"Queues {sorted(unowned)} held by live daemons — will retry each cycle."
-            )
+            logger.info(f"Queues {sorted(unowned)} held by live daemons — will retry each cycle.")
         logger.info(
             f"Daemon starting (workers: {max_workers}, queues: {queues}). "
             f"Scheduler responsibility: {sorted(owned_queues) or 'none yet'}"
@@ -381,7 +380,7 @@ class DaemonManager:
         dead_worker_purge_interval = 120  # Keep dead workers visible for 2 minutes
 
         # Auto-cleanup config
-        auto_cleanup = get_config('AUTO_CLEANUP_JOBS', True)
+        auto_cleanup = get_config("AUTO_CLEANUP_JOBS", True)
         last_cleanup_at: datetime | None = None
 
         # Track shutdown state
@@ -410,9 +409,11 @@ class DaemonManager:
                 # Try to claim any queues we don't yet own (previous holder may have died)
                 unowned = set(queues) - owned_queues
                 if unowned:
-                    newly_claimed = set(backend.claim_queue_leases(
-                        sorted(unowned), daemon_id, self.node_id, os.getpid(), lease_secs
-                    ))
+                    newly_claimed = set(
+                        backend.claim_queue_leases(
+                            sorted(unowned), daemon_id, self.node_id, os.getpid(), lease_secs
+                        )
+                    )
                     if newly_claimed:
                         owned_queues |= newly_claimed
                         logger.info(f"Acquired scheduler leases for: {sorted(newly_claimed)}")
@@ -446,9 +447,9 @@ class DaemonManager:
                 # FOR UPDATE SKIP LOCKED handles concurrency at the DB level.
                 try:
                     status = worker_pool.ensure_workers()
-                    if status['spawned'] > 0:
+                    if status["spawned"] > 0:
                         logger.info(f"Spawned {status['spawned']} workers")
-                    if status['cleaned_up'] > 0:
+                    if status["cleaned_up"] > 0:
                         logger.info(f"Cleaned up {status['cleaned_up']} dead workers")
                 except Exception as e:
                     logger.error(f"Worker pool error: {e}", exc_info=True)
@@ -537,7 +538,11 @@ class DaemonManager:
     def _fail_zombie_running_jobs(backend, queue_names=None):
         """Fail running jobs that are no longer being executed.
 
-        Checks every job in 'running' state for the given queues:
+        Mode-agnostic: operates on ``RunningJobLiveness`` records supplied by
+        the active backend, so the same decision logic runs in both Django and
+        standalone modes. Checks every job in 'running' state for the given
+        queues:
+
         1. worker_pid is set but that PID doesn't exist → worker crashed
         2. No worker assigned at all → job was never properly claimed
         3. Assigned worker is marked dead → worker was killed/crashed
@@ -549,102 +554,75 @@ class DaemonManager:
             queue_names: If provided, only check jobs in these queues.
                          None means check all queues.
         """
-        # import os  # moved to top-level
-
-        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
-        # try:  # moved to top-level (try/except)
-        #     from ..django_sqlery.models import QueuedJob
-        # except Exception:
-        #     return
-        if QueuedJob is None:
-            return
-
-        # from ..compat import get_config  # moved to top-level
         # Heartbeat stale threshold: the daemon sends SIGUSR1 every cycle
         # (~DAEMON_CHECK_INTERVAL seconds). If the worker can't respond for
         # this many seconds, something is wrong.
-        alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', 30)
+        alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", 30)
         # Use 3x alive_timeout as the stale threshold to allow for timing
         # jitter between daemon cycles and worker signal handling.
         stale_threshold = alive_timeout * 3
 
-        # import socket  # moved to top-level
         current_node = os.environ.get("NODE_ID", socket.gethostname())
+        now = datetime.now(timezone.utc)
 
-        running_jobs_qs = QueuedJob.objects.filter(status='running')
-        if queue_names:
-            running_jobs_qs = running_jobs_qs.filter(queue_name__in=queue_names)
-        running_jobs = running_jobs_qs.select_related('worker')
+        records = backend.get_running_jobs_for_liveness(queue_names)
         failed_count = 0
 
-        for job in running_jobs:
+        for rec in records:
             reason = None
 
             # Check 1: worker_pid doesn't exist on this machine
-            # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
-            # # Old: checked os.kill for ALL jobs globally — incorrect on multi-node
-            # if job.worker_pid:
-            #     try:
-            #         os.kill(job.worker_pid, 0)
-            #     except OSError:
-            #         reason = f"Worker process PID {job.worker_pid} no longer exists"
-            if job.worker_pid:
-                job_node = job.worker.node_id if job.worker else None
-                if job_node == current_node:
+            if rec.worker_pid:
+                if rec.worker_node_id == current_node:
                     try:
-                        os.kill(job.worker_pid, 0)
+                        os.kill(rec.worker_pid, 0)
                     except OSError:
-                        reason = f"Worker PID {job.worker_pid} no longer exists on {current_node}"
+                        reason = f"Worker PID {rec.worker_pid} no longer exists on {current_node}"
                 # Remote nodes: rely on heartbeat staleness (Check 5)
 
             # Check 2: running job has no worker assigned
-            if not reason and not job.worker:
+            if not reason and not rec.has_worker:
                 reason = "Running job has no worker assigned"
 
             # Check 3: assigned worker is marked dead
-            if not reason and job.worker and job.worker.status == 'dead':
-                reason = f"Assigned worker {job.worker.friendly_name} is dead"
+            if not reason and rec.has_worker and rec.worker_status == "dead":
+                reason = f"Assigned worker {rec.worker_friendly_name} is dead"
 
             # Check 4: worker moved on to a different job or is idle (this job is abandoned)
-            if not reason and job.worker and job.worker.current_job_id != job.id:
-                # from django.utils import timezone  # moved to top-level (try/except as django_timezone)
-                # from datetime import timedelta  # moved to top-level
-                if job.worker.current_job_id:
+            if not reason and rec.has_worker and rec.worker_current_job_id != rec.job_id:
+                if rec.worker_current_job_id:
                     reason = (
-                        f"Worker {job.worker.friendly_name} moved on to job "
-                        f"#{job.worker.current_job_id} — this job was abandoned"
+                        f"Worker {rec.worker_friendly_name} moved on to job "
+                        f"#{rec.worker_current_job_id} — this job was abandoned"
                     )
                 # Worker is idle (current_job_id=None) but job still running.
                 # Grace period: only flag if running longer than alive_timeout
                 # to avoid false positives during the brief claim→heartbeat window.
-                elif job.started_at and job.started_at < django_timezone.now() - timedelta(seconds=alive_timeout):
-                    age = int((django_timezone.now() - job.started_at).total_seconds())
+                elif rec.started_at and rec.started_at < now - timedelta(seconds=alive_timeout):
+                    age = int((now - rec.started_at).total_seconds())
                     reason = (
-                        f"Worker {job.worker.friendly_name} is idle but job has been "
+                        f"Worker {rec.worker_friendly_name} is idle but job has been "
                         f"running for {age}s — zombie"
                     )
 
             # Check 5: assigned worker heartbeat is stale
-            if not reason and job.worker:
-                # from django.utils import timezone  # moved to top-level (try/except as django_timezone)
-                # from datetime import timedelta  # moved to top-level
-                if job.worker.last_heartbeat and job.worker.last_heartbeat < django_timezone.now() - timedelta(seconds=stale_threshold):
-                    age = int((django_timezone.now() - job.worker.last_heartbeat).total_seconds())
+            if not reason and rec.has_worker:
+                if rec.worker_last_heartbeat and rec.worker_last_heartbeat < now - timedelta(
+                    seconds=stale_threshold
+                ):
+                    age = int((now - rec.worker_last_heartbeat).total_seconds())
                     reason = (
-                        f"Worker {job.worker.friendly_name} heartbeat stale "
+                        f"Worker {rec.worker_friendly_name} heartbeat stale "
                         f"({age}s old, threshold {stale_threshold}s)"
                     )
 
             if reason:
                 try:
-                    job.mark_failed(
-                        error=reason,
-                        termination_reason="zombie_job",
-                    )
-                    failed_count += 1
-                    logger.info(f"Failed zombie running job #{job.id}: {reason}")
+                    if backend.fail_zombie_job(rec.job_id, reason):
+                        failed_count += 1
+                        logger.info(f"Failed zombie running job #{rec.job_id}: {reason}")
                 except Exception as e:
-                    logger.error(f"Failed to mark zombie job #{job.id}: {e}")
+                    logger.error(f"Failed to mark zombie job #{rec.job_id}: {e}")
 
         if failed_count > 0:
             logger.info(f"Cleaned up {failed_count} zombie running jobs")
@@ -670,7 +648,7 @@ class DaemonManager:
                 return
 
             # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
-            orphaned = QueuedJob.objects.filter(worker=worker_row, status='running')
+            orphaned = QueuedJob.objects.filter(worker=worker_row, status="running")
             count = 0
             for job in orphaned:
                 job.mark_failed(
@@ -680,7 +658,9 @@ class DaemonManager:
                 count += 1
 
             if count > 0:
-                logger.info(f"Startup: Failed {count} orphaned running jobs from previous worker life")
+                logger.info(
+                    f"Startup: Failed {count} orphaned running jobs from previous worker life"
+                )
 
         except Exception as e:
             logger.warning(f"Failed to clean orphaned jobs on startup: {e}")
@@ -707,30 +687,32 @@ class DaemonManager:
 
             # Use configured alive timeout (default 30s)
             # from ..compat import get_config  # moved to top-level
-            alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', 30)
+            alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", 30)
             threshold = datetime.now(timezone.utc) - timedelta(seconds=alive_timeout)
             cleaned = 0
 
             for worker in workers:
                 # Skip daemon processes (PID=0)
-                if hasattr(worker, 'pid') and worker.pid == 0:
+                if hasattr(worker, "pid") and worker.pid == 0:
                     continue
-                elif isinstance(worker, dict) and worker.get('pid') == 0:
+                elif isinstance(worker, dict) and worker.get("pid") == 0:
                     continue
 
                 # Get last heartbeat
-                if hasattr(worker, 'last_heartbeat'):
+                if hasattr(worker, "last_heartbeat"):
                     last_heartbeat = worker.last_heartbeat
                     worker_id = str(worker.id)
                 elif isinstance(worker, dict):
-                    last_heartbeat = worker.get('last_heartbeat')
-                    worker_id = str(worker.get('id'))
+                    last_heartbeat = worker.get("last_heartbeat")
+                    worker_id = str(worker.get("id"))
                 else:
                     continue
 
                 # Skip workers already marked dead
-                worker_status = getattr(worker, 'status', None) or (worker.get('status') if isinstance(worker, dict) else None)
-                if worker_status == 'dead':
+                worker_status = getattr(worker, "status", None) or (
+                    worker.get("status") if isinstance(worker, dict) else None
+                )
+                if worker_status == "dead":
                     continue
 
                 # Check if heartbeat is too old
@@ -740,27 +722,29 @@ class DaemonManager:
                         # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
                         orphaned_jobs = QueuedJob.objects.filter(
                             worker_id=worker_id,
-                            status='running',
+                            status="running",
                         )
                         for job in orphaned_jobs:
                             job.mark_failed(
                                 error="Worker died — no heartbeat",
                                 termination_reason="worker_dead",
                             )
-                            logger.warning(f"Failed orphaned job {job.id} from dead worker {worker_id}")
+                            logger.warning(
+                                f"Failed orphaned job {job.id} from dead worker {worker_id}"
+                            )
                     except Exception as e:
                         logger.error(f"Failed to clean orphaned jobs for worker {worker_id}: {e}")
 
                     # Mark worker as dead
                     backend.update_worker_heartbeat(
-                        worker_id=worker_id,
-                        status='dead',
-                        current_job_id=None
+                        worker_id=worker_id, status="dead", current_job_id=None
                     )
                     cleaned += 1
 
             if cleaned > 0:
-                logger.info(f"Cleanup: Marked {cleaned} stale workers as dead (heartbeat > {alive_timeout}s old)")
+                logger.info(
+                    f"Cleanup: Marked {cleaned} stale workers as dead (heartbeat > {alive_timeout}s old)"
+                )
 
         except Exception as e:
             logger.warning(f"Failed to cleanup stale workers on startup: {e}")
@@ -783,14 +767,16 @@ class DaemonManager:
 
             for worker in workers:
                 # Only purge workers already marked as dead
-                status = getattr(worker, 'status', None) or (worker.get('status') if isinstance(worker, dict) else None)
-                if status != 'dead':
+                status = getattr(worker, "status", None) or (
+                    worker.get("status") if isinstance(worker, dict) else None
+                )
+                if status != "dead":
                     continue
 
-                if hasattr(worker, 'last_heartbeat'):
+                if hasattr(worker, "last_heartbeat"):
                     last_hb = worker.last_heartbeat
                 elif isinstance(worker, dict):
-                    last_hb = worker.get('last_heartbeat')
+                    last_hb = worker.get("last_heartbeat")
                 else:
                     continue
 
@@ -821,14 +807,14 @@ class DaemonManager:
 
         for worker in workers:
             # Extract node_id and pid
-            if hasattr(worker, 'node_id'):
+            if hasattr(worker, "node_id"):
                 w_node = worker.node_id
                 w_pid = worker.pid
                 w_id = worker.id
             elif isinstance(worker, dict):
-                w_node = worker.get('node_id')
-                w_pid = worker.get('pid', 0)
-                w_id = worker.get('id')
+                w_node = worker.get("node_id")
+                w_pid = worker.get("pid", 0)
+                w_id = worker.get("id")
             else:
                 continue
 
@@ -862,7 +848,7 @@ class DaemonManager:
                 # PID gone — mark dead and clear current_job
                 backend.update_worker_heartbeat(
                     worker_id=str(w_id),
-                    status='dead',
+                    status="dead",
                     current_job_id=None,
                 )
                 logger.warning(f"Worker {w_id} (PID {w_pid}) is dead, marked accordingly")
@@ -881,15 +867,15 @@ class DaemonManager:
         try:
             backend.update_worker_heartbeat(
                 worker_id=daemon_worker_id,
-                status='idle',  # Daemon is always "idle" (workers do the work)
-                current_job_id=None
+                status="idle",  # Daemon is always "idle" (workers do the work)
+                current_job_id=None,
             )
         except Exception as e:
             logger.warning(f"Failed to update daemon heartbeat in database: {e}")
 
             # Fallback to file-based heartbeat if DB fails
             try:
-                with open(self.heartbeat_file, 'w') as f:
+                with open(self.heartbeat_file, "w") as f:
                     f.write(str(int(time.time())))
             except Exception as e2:
                 logger.error(f"Failed to write file heartbeat: {e2}")

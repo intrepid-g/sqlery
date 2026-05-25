@@ -57,8 +57,8 @@ class DjangoBackend(DatabaseBackend):
         retry_intervals: list | None = None,
         meta: dict | None = None,
         dependencies: list | None = None,
-        on_success_path: str = '',
-        on_failure_path: str = '',
+        on_success_path: str = "",
+        on_failure_path: str = "",
         ttl: int | None = None,
         result_ttl: int | None = None,
         failure_ttl: int | None = None,
@@ -69,7 +69,7 @@ class DjangoBackend(DatabaseBackend):
         # conflict (SIGTERM + mark failed) before deleting all records with that name.
         if job_name:
             for conflicting in self.QueuedJob.objects.filter(job_name=job_name):
-                if conflicting.status == 'running':
+                if conflicting.status == "running":
                     conflicting.force_stop()
             self.QueuedJob.objects.filter(job_name=job_name).delete()
         job = self.QueuedJob.objects.create(
@@ -167,7 +167,9 @@ class DjangoBackend(DatabaseBackend):
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     @retry_on_db_error()
-    def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
+    def release_claimed_job(
+        self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
+    ):
         """Release a job after processing and update worker state."""
         with transaction.atomic():
             job.status = status
@@ -175,7 +177,7 @@ class DjangoBackend(DatabaseBackend):
             if job.started_at:
                 job.duration_seconds = (job.finished_at - job.started_at).total_seconds()
             # job.worker = None  # Keep worker FK for historical tracking
-            update_fields = ['status', 'finished_at', 'duration_seconds']
+            update_fields = ["status", "finished_at", "duration_seconds"]
             for key, value in kwargs.items():
                 if hasattr(job, key):
                     setattr(job, key, value)
@@ -185,11 +187,13 @@ class DjangoBackend(DatabaseBackend):
             # Update worker back to idle
             worker_row = self._resolve_worker(worker_id)
             if worker_row:
-                worker_row.status = 'idle'
+                worker_row.status = "idle"
                 worker_row.current_job = None
                 worker_row.jobs_processed = jobs_processed
                 worker_row.last_heartbeat = timezone.now()
-                worker_row.save(update_fields=['status', 'current_job', 'jobs_processed', 'last_heartbeat'])
+                worker_row.save(
+                    update_fields=["status", "current_job", "jobs_processed", "last_heartbeat"]
+                )
 
         return job
 
@@ -205,10 +209,10 @@ class DjangoBackend(DatabaseBackend):
             pass
 
         # Parse "worker_<node>_<pid>" format
-        parts = worker_id.split('_')
-        if parts[0] == 'worker' and len(parts) >= 3:
+        parts = worker_id.split("_")
+        if parts[0] == "worker" and len(parts) >= 3:
             pid = int(parts[-1])
-            node_id = '_'.join(parts[1:-1])
+            node_id = "_".join(parts[1:-1])
             return self.Worker.objects.filter(node_id=node_id, pid=pid).first()
 
         return None
@@ -228,20 +232,20 @@ class DjangoBackend(DatabaseBackend):
         # I wish I had the time to: validate worker_id against a whitelist
         # or require a shared secret to prevent unauthorized worker registration
 
-        parts = worker_id.split('_')
-        if parts[0] != 'worker' or len(parts) < 3:
+        parts = worker_id.split("_")
+        if parts[0] != "worker" or len(parts) < 3:
             return None
 
         pid = int(parts[-1])
-        node_id = '_'.join(parts[1:-1])
+        node_id = "_".join(parts[1:-1])
 
         worker, created = self.Worker.objects.get_or_create(
             node_id=node_id,
             pid=pid,
             defaults={
-                'status': 'idle',
-                'last_heartbeat': timezone.now(),
-            }
+                "status": "idle",
+                "last_heartbeat": timezone.now(),
+            },
         )
 
         if created:
@@ -258,7 +262,7 @@ class DjangoBackend(DatabaseBackend):
             return True
         # Pause expired, clear it
         worker.paused_until = None
-        worker.save(update_fields=['paused_until'])
+        worker.save(update_fields=["paused_until"])
         return False
 
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
@@ -268,47 +272,46 @@ class DjangoBackend(DatabaseBackend):
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
-        stats = query.values('status').annotate(count=Count('id'))
+        stats = query.values("status").annotate(count=Count("id"))
 
         result = {
-            'queued': 0,
-            'running': 0,
-            'success': 0,
-            'failed': 0,
+            "queued": 0,
+            "running": 0,
+            "success": 0,
+            "failed": 0,
         }
 
         for stat in stats:
-            result[stat['status']] = stat['count']
+            result[stat["status"]] = stat["count"]
 
         if queue_name:
-            result['queue_name'] = queue_name
+            result["queue_name"] = queue_name
 
         return result
 
     def cancel_job(self, job_id: int) -> bool:
         """Cancel a queued job."""
-        updated = self.QueuedJob.objects.filter(
-            id=job_id,
-            status='queued'
-        ).update(status='failed', error='Cancelled by user')
+        updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+            status="failed", error="Cancelled by user"
+        )
 
         return updated > 0
 
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
         """Retry failed jobs by resetting them to queued status."""
-        query = self.QueuedJob.objects.filter(status='failed')
+        query = self.QueuedJob.objects.filter(status="failed")
 
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
         if max_jobs:
-            job_ids = list(query.values_list('id', flat=True)[:max_jobs])
+            job_ids = list(query.values_list("id", flat=True)[:max_jobs])
             query = self.QueuedJob.objects.filter(id__in=job_ids)
 
         count = query.update(
-            status='queued',
-            error='',
-            traceback='',
+            status="queued",
+            error="",
+            traceback="",
             retry_count=0,
         )
 
@@ -318,9 +321,8 @@ class DjangoBackend(DatabaseBackend):
         """Get scheduled tasks that are due to run."""
         return list(
             self.ScheduledTask.objects.filter(
-                enabled=True,
-                next_run_at__lte=timezone.now()
-            ).order_by('next_run_at')
+                enabled=True, next_run_at__lte=timezone.now()
+            ).order_by("next_run_at")
         )
 
     def create_scheduled_task(
@@ -349,14 +351,19 @@ class DjangoBackend(DatabaseBackend):
 
         if active_only:
             threshold = timezone.now() - timedelta(seconds=60)
-            query = query.filter(
-                last_heartbeat__gte=threshold
-            ).exclude(status='dead')
+            query = query.filter(last_heartbeat__gte=threshold).exclude(status="dead")
 
-        return list(query.order_by('-last_heartbeat'))
+        return list(query.order_by("-last_heartbeat"))
 
     @retry_on_db_error()
-    def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None, jobs_processed: int | None = None, total_busy_seconds: float | None = None):
+    def update_worker_heartbeat(
+        self,
+        worker_id: str,
+        status: str,
+        current_job_id: int | None = None,
+        jobs_processed: int | None = None,
+        total_busy_seconds: float | None = None,
+    ):
         """Update or create worker heartbeat."""
         # import socket  # moved to top-level
         # import uuid  # moved to top-level
@@ -366,17 +373,17 @@ class DjangoBackend(DatabaseBackend):
             worker_uuid = uuid.UUID(worker_id)
             # Update by UUID - DO NOT update heartbeat when marking as dead
             update_fields = {
-                'status': status,
-                'current_job_id': current_job_id,
+                "status": status,
+                "current_job_id": current_job_id,
             }
             # Only update heartbeat for active workers, not dead ones
-            if status != 'dead':
-                update_fields['last_heartbeat'] = timezone.now()
+            if status != "dead":
+                update_fields["last_heartbeat"] = timezone.now()
             # Update jobs_processed if provided
             if jobs_processed is not None:
-                update_fields['jobs_processed'] = jobs_processed
+                update_fields["jobs_processed"] = jobs_processed
             if total_busy_seconds is not None:
-                update_fields['total_busy_seconds'] = total_busy_seconds
+                update_fields["total_busy_seconds"] = total_busy_seconds
 
             self.Worker.objects.filter(id=worker_uuid).update(**update_fields)
             return
@@ -386,42 +393,38 @@ class DjangoBackend(DatabaseBackend):
 
         # Extract node_id and pid from worker_id parameter
         # Format: "worker_<node>_<pid>" or "daemon_<node>"
-        parts = worker_id.split('_')
+        parts = worker_id.split("_")
 
-        if parts[0] == 'daemon':
+        if parts[0] == "daemon":
             # Daemon heartbeat - use PID 0 as special marker for daemon processes
-            node_id = '_'.join(parts[1:])  # Join remaining parts for node_id
+            node_id = "_".join(parts[1:])  # Join remaining parts for node_id
             pid = 0
-        elif parts[0] == 'worker':
+        elif parts[0] == "worker":
             # Worker heartbeat - extract node and pid from worker_id
             # Format: worker_<node>_<pid>
             pid = int(parts[-1])  # Last part is PID
-            node_id = '_'.join(parts[1:-1])  # Middle parts are node_id
+            node_id = "_".join(parts[1:-1])  # Middle parts are node_id
         else:
             # Fallback for unknown format - use current process
             node_id = socket.gethostname()
             pid = os.getpid()
 
         defaults = {
-            'status': status,
-            'current_job_id': current_job_id,
-            'last_heartbeat': timezone.now(),
+            "status": status,
+            "current_job_id": current_job_id,
+            "last_heartbeat": timezone.now(),
         }
         # Update jobs_processed if provided
         if jobs_processed is not None:
-            defaults['jobs_processed'] = jobs_processed
+            defaults["jobs_processed"] = jobs_processed
         if total_busy_seconds is not None:
-            defaults['total_busy_seconds'] = total_busy_seconds
+            defaults["total_busy_seconds"] = total_busy_seconds
 
         # Try lightweight UPDATE first (no row lock contention).
         # Only fall back to update_or_create for initial registration.
-        rows = self.Worker.objects.filter(
-            node_id=node_id, pid=pid
-        ).update(**defaults)
+        rows = self.Worker.objects.filter(node_id=node_id, pid=pid).update(**defaults)
         if rows == 0:
-            self.Worker.objects.update_or_create(
-                node_id=node_id, pid=pid, defaults=defaults
-            )
+            self.Worker.objects.update_or_create(node_id=node_id, pid=pid, defaults=defaults)
 
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete any Worker row for this worker_id (stale record from a crashed run).
@@ -445,9 +448,7 @@ class DjangoBackend(DatabaseBackend):
 
         try:
             worker_uuid = uuid.UUID(str(worker_id))
-            self.Worker.objects.filter(id=worker_uuid).update(
-                last_heartbeat=timezone.now()
-            )
+            self.Worker.objects.filter(id=worker_uuid).update(last_heartbeat=timezone.now())
         except (ValueError, TypeError):
             logger.warning(f"refresh_worker_heartbeat: invalid worker_id {worker_id}")
 
@@ -476,7 +477,7 @@ class DjangoBackend(DatabaseBackend):
         if not dry_run:
             query.delete()
 
-        return {'deleted': count, 'count': count}
+        return {"deleted": count, "count": count}
 
     def cleanup_jobs_by_count(
         self,
@@ -495,7 +496,7 @@ class DjangoBackend(DatabaseBackend):
             query = query.filter(queue_name=queue_name)
 
         # Get IDs of jobs to keep (most recent N)
-        keep_ids = list(query.order_by('-created_at').values_list('id', flat=True)[:keep_count])
+        keep_ids = list(query.order_by("-created_at").values_list("id", flat=True)[:keep_count])
 
         # Delete jobs not in keep list
         delete_query = query.exclude(id__in=keep_ids)
@@ -503,21 +504,23 @@ class DjangoBackend(DatabaseBackend):
         if not dry_run:
             delete_query.delete()
 
-        return {'deleted': count, 'count': count, 'kept': len(keep_ids)}
+        return {"deleted": count, "count": count, "kept": len(keep_ids)}
 
     def get_database_stats(self) -> dict:
         """Get database statistics."""
-        job_counts = self.QueuedJob.objects.values('status').annotate(count=Count('id'))
-        registry_counts = self.JobRegistry.objects.values('registry_type').annotate(count=Count('id'))
+        job_counts = self.QueuedJob.objects.values("status").annotate(count=Count("id"))
+        registry_counts = self.JobRegistry.objects.values("registry_type").annotate(
+            count=Count("id")
+        )
 
         stats = {
-            'total_jobs': self.QueuedJob.objects.count(),
-            'job_counts': {item['status']: item['count'] for item in job_counts},
-            'total_registries': self.JobRegistry.objects.count(),
-            'registry_counts': {item['registry_type']: item['count'] for item in registry_counts},
-            'total_scheduled_tasks': self.ScheduledTask.objects.count(),
-            'enabled_scheduled_tasks': self.ScheduledTask.objects.filter(enabled=True).count(),
-            'total_workers': self.Worker.objects.count(),
+            "total_jobs": self.QueuedJob.objects.count(),
+            "job_counts": {item["status"]: item["count"] for item in job_counts},
+            "total_registries": self.JobRegistry.objects.count(),
+            "registry_counts": {item["registry_type"]: item["count"] for item in registry_counts},
+            "total_scheduled_tasks": self.ScheduledTask.objects.count(),
+            "enabled_scheduled_tasks": self.ScheduledTask.objects.filter(enabled=True).count(),
+            "total_workers": self.Worker.objects.count(),
         }
 
         return stats
@@ -538,9 +541,9 @@ class DjangoBackend(DatabaseBackend):
                     cursor.execute("VACUUM ANALYZE sqlery_scheduled_task")
                     cursor.execute("VACUUM ANALYZE sqlery_registry")
                     cursor.execute("VACUUM ANALYZE sqlery_worker")
-                return {'success': True, 'message': 'Database vacuumed successfully'}
+                return {"success": True, "message": "Database vacuumed successfully"}
             except Exception as e:
-                return {'success': False, 'error': str(e)}
+                return {"success": False, "error": str(e)}
 
     def add_job_to_registry(
         self,
@@ -573,7 +576,7 @@ class DjangoBackend(DatabaseBackend):
         query = self.JobRegistry.objects.filter(
             registry_type=registry_type,
             exited_at__isnull=True,
-        ).select_related('job')
+        ).select_related("job")
 
         if queue_name:
             query = query.filter(job__queue_name=queue_name)
@@ -601,7 +604,7 @@ class DjangoBackend(DatabaseBackend):
         count = query.count()
         query.delete()
 
-        return {'deleted': count}
+        return {"deleted": count}
 
     def get_job_by_id(self, job_id: int):
         """Get job by ID."""
@@ -626,20 +629,26 @@ class DjangoBackend(DatabaseBackend):
 
     def mark_job_archived(self, job_id: int):
         """Mark a failed job as archived (a retry has been created for it)."""
-        self.QueuedJob.objects.filter(id=job_id, status='failed').update(status='archived')
+        self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
 
     def cascade_ancestor_status(self, job_id: int, status: str):
         """Walk parent_job_id chain, set all ancestors to given status."""
-        current_id = self.QueuedJob.objects.filter(id=job_id).values_list('parent_job_id', flat=True).first()
+        current_id = (
+            self.QueuedJob.objects.filter(id=job_id).values_list("parent_job_id", flat=True).first()
+        )
         while current_id:
             self.QueuedJob.objects.filter(id=current_id).update(status=status)
-            current_id = self.QueuedJob.objects.filter(id=current_id).values_list('parent_job_id', flat=True).first()
+            current_id = (
+                self.QueuedJob.objects.filter(id=current_id)
+                .values_list("parent_job_id", flat=True)
+                .first()
+            )
 
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
         """Check if scheduled task has pending jobs."""
         return self.QueuedJob.objects.filter(
             scheduled_task_id=task_id,
-            status__in=['queued', 'running'],
+            status__in=["queued", "running"],
         ).exists()
 
     def update_scheduled_task_next_run(self, task_id: int, next_run_at: datetime):
@@ -663,7 +672,7 @@ class DjangoBackend(DatabaseBackend):
         if enabled_only:
             query = query.filter(enabled=True)
 
-        return list(query.order_by('name'))
+        return list(query.order_by("name"))
 
     def get_scheduled_task(self, task_id: int):
         """Get scheduled task by ID."""
@@ -674,18 +683,57 @@ class DjangoBackend(DatabaseBackend):
 
     def get_running_jobs(self, queue_name: str | None = None) -> list:
         """Get currently running jobs."""
-        query = self.QueuedJob.objects.filter(status='running')
+        query = self.QueuedJob.objects.filter(status="running")
 
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
         return list(query)
 
+    def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        """Build RunningJobLiveness records for the zombie sweep.
+
+        Preserves the original daemon query: select_related('worker') over all
+        ``status='running'`` jobs, optionally filtered to ``queue_names``.
+        """
+        from sqlery.core.liveness import RunningJobLiveness
+
+        query = self.QueuedJob.objects.filter(status="running")
+        if queue_names:
+            query = query.filter(queue_name__in=queue_names)
+        query = query.select_related("worker")
+
+        records = []
+        for job in query:
+            worker = job.worker
+            records.append(
+                RunningJobLiveness(
+                    job_id=job.id,
+                    started_at=job.started_at,
+                    worker_pid=job.worker_pid,
+                    worker_node_id=worker.node_id if worker else None,
+                    worker_status=worker.status if worker else None,
+                    worker_current_job_id=worker.current_job_id if worker else None,
+                    worker_last_heartbeat=worker.last_heartbeat if worker else None,
+                    worker_friendly_name=worker.friendly_name if worker else None,
+                    has_worker=worker is not None,
+                )
+            )
+        return records
+
+    def fail_zombie_job(self, job_id: int, reason: str) -> bool:
+        """Mark a running job failed with termination_reason='zombie_job'."""
+        job = self.QueuedJob.objects.filter(id=job_id).first()
+        if job is None:
+            return False
+        job.mark_failed(error=reason, termination_reason="zombie_job")
+        return True
+
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         """Check if queue has running jobs."""
         query = self.QueuedJob.objects.filter(
             queue_name=queue_name,
-            status='running',
+            status="running",
         )
 
         if exclude_job_id:
@@ -730,7 +778,7 @@ class DjangoBackend(DatabaseBackend):
         # from .db_compat import is_sqlite  # moved to top-level
 
         # Ensure TagLock rows exist
-        existing = set(TagLock.objects.filter(tag__in=tags).values_list('tag', flat=True))
+        existing = set(TagLock.objects.filter(tag__in=tags).values_list("tag", flat=True))
         new_tags = [tag for tag in tags if tag not in existing]
         if new_tags:
             TagLock.objects.bulk_create(
@@ -753,13 +801,8 @@ class DjangoBackend(DatabaseBackend):
         """Get next claimable jobs ordered by queue priority, job priority, age."""
         # from django.db import models as db_models  # moved to top-level
 
-        queryset = (
-            self.QueuedJob.objects
-            .filter(status="queued", queue_name__in=queues)
-            .filter(
-                db_models.Q(scheduled_at__isnull=True) |
-                db_models.Q(scheduled_at__lte=timezone.now())
-            )
+        queryset = self.QueuedJob.objects.filter(status="queued", queue_name__in=queues).filter(
+            db_models.Q(scheduled_at__isnull=True) | db_models.Q(scheduled_at__lte=timezone.now())
         )
 
         queryset = atomic_claim_job_queryset(queryset)
@@ -807,7 +850,7 @@ class DjangoBackend(DatabaseBackend):
     def release_job(self, job_id: int):
         """Release a claimed job back to queued status."""
         self.QueuedJob.objects.filter(id=job_id).update(
-            status='queued',
+            status="queued",
             started_at=None,
             worker_pid=None,
         )
@@ -829,10 +872,10 @@ class DjangoBackend(DatabaseBackend):
             query = query.filter(queue_name=queue_name)
 
         # Order by priority (desc) and created_at (asc)
-        query = query.order_by('-priority', 'created_at')
+        query = query.order_by("-priority", "created_at")
 
         # Apply pagination
-        return list(query[offset:offset + limit])
+        return list(query[offset : offset + limit])
 
     def count_jobs(
         self,
