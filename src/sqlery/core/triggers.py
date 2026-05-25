@@ -30,6 +30,7 @@ Result shape:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import time
 from collections import OrderedDict
@@ -53,6 +54,10 @@ class TriggerEnvelope:
     body: bytes = b""
     headers: dict[str, str] = field(default_factory=dict)
     payload: dict = field(default_factory=dict)
+    # Socket peer address of the request. Adapters MUST populate this from the
+    # real transport peer (Django REMOTE_ADDR / Starlette request.client.host),
+    # never from X-Forwarded-For — that header is attacker-controllable.
+    remote_addr: str | None = None
 
 
 @dataclass
@@ -125,6 +130,48 @@ def _resolve_max_age() -> int:
 
 
 # ---------------------------------------------------------------------------
+# IP allowlist (defense-in-depth on top of the HMAC signature)
+# ---------------------------------------------------------------------------
+
+# Default-locked to loopback only. The sentinel ["*"] (or None) disables the
+# check entirely, letting deployments that genuinely require external access
+# opt out explicitly. Default behaviour stays localhost-only.
+_DEFAULT_ALLOWED_IPS = ["127.0.0.1", "::1"]
+
+
+def _resolve_allowed_ips() -> list[str] | None:
+    try:
+        from sqlery.compat import get_config
+        return get_config("INTERNAL_ALLOWED_IPS", _DEFAULT_ALLOWED_IPS)
+    except Exception:
+        return _DEFAULT_ALLOWED_IPS
+
+
+def is_ip_allowed(remote_addr: str | None) -> bool:
+    """Return True if ``remote_addr`` is permitted by the allowlist.
+
+    The ["*"] / None sentinel disables the check. Addresses are normalised
+    via :mod:`ipaddress` so equivalent IPv4/IPv6 loopback forms compare equal.
+    """
+    allowed = _resolve_allowed_ips()
+    if allowed is None or "*" in allowed:
+        return True
+    if not remote_addr:
+        return False
+    try:
+        source = ipaddress.ip_address(remote_addr)
+    except ValueError:
+        return False
+    for entry in allowed:
+        try:
+            if source == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -146,6 +193,12 @@ def handle(envelope: TriggerEnvelope) -> TriggerResult:
     Returns:
         :class:`TriggerResult` with the appropriate status_code and body.
     """
+    # Defense-in-depth: reject non-allowlisted source IPs regardless of
+    # signature. Uses the socket peer address only (see TriggerEnvelope).
+    if not is_ip_allowed(envelope.remote_addr):
+        logger.warning(f"Trigger request from disallowed IP: {envelope.remote_addr!r}")
+        return TriggerResult(403, {"error": "forbidden source address"})
+
     signature = envelope.headers.get("X-Signature") or envelope.headers.get("x-signature")
     timestamp = envelope.headers.get("X-Timestamp") or envelope.headers.get("x-timestamp")
     if not signature or not timestamp:
@@ -235,5 +288,6 @@ __all__ = [
     "TriggerEnvelope",
     "TriggerResult",
     "handle",
+    "is_ip_allowed",
     "_reset_idempotency_cache",
 ]

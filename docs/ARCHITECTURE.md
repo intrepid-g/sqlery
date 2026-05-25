@@ -158,6 +158,10 @@ def send_welcome_email(request):
 ```
 
 ### Use Case 3: Serverless
+
+> ⚠️ **Experimental:** The Lambda/serverless mode has only been smoke-tested
+> (no LocalStack/SAM fidelity testing) and is **not** production-ready.
+
 ```bash
 # AWS Lambda triggered every minute by EventBridge
 python manage.py run_queue_workers --once

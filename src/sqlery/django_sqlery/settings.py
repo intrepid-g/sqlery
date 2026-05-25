@@ -25,6 +25,11 @@ DEFAULTS = {
     "INTERNAL_BASE_URL": None,  # e.g., 'http://127.0.0.1:8000' (required for http mode)
     "INTERNAL_SECRET": None,  # Shared secret for HMAC signatures (required for http mode)
     "SIGNATURE_MAX_AGE": 5,  # Signature validity in seconds
+    # Defense-in-depth IP allowlist for the internal trigger endpoints. Source
+    # IP is matched against the socket peer (REMOTE_ADDR), never X-Forwarded-For.
+    # Default: loopback only. Sentinel ["*"] (or None) disables the check to
+    # allow external access for deployments that genuinely require it.
+    "INTERNAL_ALLOWED_IPS": ["127.0.0.1", "::1"],
 
     # EventBridge trigger settings (for serverless/Lambda deployments)
     "EVENTBRIDGE_LAMBDA_ARN": None,  # ARN of Lambda worker function (required for eventbridge mode)

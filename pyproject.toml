@@ -162,9 +162,10 @@ omit = [
 # due to 196 test-collection errors (pre-existing test-infra issue in this
 # worktree state, not a real coverage deficit). Threshold set to baseline-2
 # so the gate fires on regression but does not block CI until the test-infra
-# issue is resolved and the threshold can be raised toward 70%.
+# issue is resolved and the threshold can be raised toward 70%. Raised to 20
+# as the collection errors are worked down; target remains 70%.
 # See .planning/phases/03-testing-ci/03-08-SUMMARY.md for details.
-fail_under = 13
+fail_under = 20
 show_missing = true
 skip_covered = false
 precision = 1
