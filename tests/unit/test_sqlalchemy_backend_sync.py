@@ -12,6 +12,7 @@ below therefore calls ``init_database(url)`` and instantiates the backend
 without arguments, monkey-patching the module-level engine per-test to keep
 tests fully isolated.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,6 +32,7 @@ def sync_backend(tmp_path, monkeypatch):
     from sqlmodel import SQLModel
 
     from sqlery.fastapi_sqlery import database as db_mod
+
     # Importing core.models populates SQLModel.metadata (used by create_all).
     from sqlery.core import models as _core_models  # noqa: F401
 
@@ -46,6 +48,7 @@ def sync_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
 
     from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
     backend = SQLAlchemyBackend()
     try:
         yield backend
@@ -56,6 +59,7 @@ def sync_backend(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _create_basic_job(backend, **overrides):
     """Create a QueuedJob via the backend with sensible defaults."""
@@ -77,6 +81,7 @@ def _create_basic_job(backend, **overrides):
 # ---------------------------------------------------------------------------
 # 1. Enqueue / Claim
 # ---------------------------------------------------------------------------
+
 
 class TestEnqueueAndClaim:
     def test_create_job_persists_row(self, sync_backend):
@@ -118,6 +123,7 @@ class TestEnqueueAndClaim:
         # Only one job with that name should remain after dedup.
         from sqlery.core.models import QueuedJob
         from sqlmodel import select
+
         with sync_backend._get_session() as session:
             rows = list(session.exec(select(QueuedJob).where(QueuedJob.job_name == "dup")).all())
         assert len(rows) == 1
@@ -157,6 +163,7 @@ class TestEnqueueAndClaim:
 # ---------------------------------------------------------------------------
 # 2. Status transitions
 # ---------------------------------------------------------------------------
+
 
 class TestStatusTransitions:
     def test_mark_job_success(self, sync_backend):
@@ -212,6 +219,7 @@ class TestStatusTransitions:
 # 3. Retry / TTL
 # ---------------------------------------------------------------------------
 
+
 class TestRetryAndTTL:
     def test_retry_failed_jobs_resets_status(self, sync_backend):
         job = _create_basic_job(sync_backend, max_retries=1)
@@ -253,6 +261,7 @@ class TestRetryAndTTL:
         j = _create_basic_job(sync_backend, ttl=1)
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
+
             row = session.get(QueuedJob, j.id)
             row.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
             session.add(row)
@@ -280,9 +289,11 @@ class TestRetryAndTTL:
 # 4. Worker lifecycle
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerLifecycle:
     def test_update_worker_heartbeat_creates_row(self, sync_backend):
         from uuid6 import uuid7
+
         wid = uuid7()
         sync_backend.update_worker_heartbeat(worker_id=wid, status="idle")
         rows = sync_backend.get_worker_heartbeats(active_only=False)
@@ -290,6 +301,7 @@ class TestWorkerLifecycle:
 
     def test_update_worker_heartbeat_updates_existing(self, sync_backend):
         from uuid6 import uuid7
+
         wid = uuid7()
         sync_backend.update_worker_heartbeat(worker_id=wid, status="idle")
         sync_backend.update_worker_heartbeat(
@@ -320,8 +332,40 @@ class TestWorkerLifecycle:
         assert new_id in active_ids
         assert old_id not in active_ids
 
+    def test_refresh_worker_heartbeat_updates_last_heartbeat(self, sync_backend):
+        from uuid6 import uuid7
+        from sqlery.core.models import Worker
+
+        wid = uuid7()
+        sync_backend.update_worker_heartbeat(worker_id=wid, status="busy")
+        # Backdate the heartbeat so the refresh produces a measurable change.
+        old = datetime.now(UTC) - timedelta(minutes=10)
+        with sync_backend._get_session() as session:
+            row = session.get(Worker, wid)
+            row.last_heartbeat = old
+            session.add(row)
+            session.commit()
+
+        sync_backend.refresh_worker_heartbeat(wid)
+
+        with sync_backend._get_session() as session:
+            refreshed = session.get(Worker, wid)
+            # last_heartbeat advanced; status/current_job untouched.
+            hb = refreshed.last_heartbeat
+            hb = hb if hb.tzinfo else hb.replace(tzinfo=UTC)
+            assert hb > old
+            assert refreshed.status == "busy"
+
+    def test_refresh_worker_heartbeat_missing_worker_is_noop(self, sync_backend):
+        from uuid6 import uuid7
+
+        # Unknown worker id must not raise and must not create a row.
+        sync_backend.refresh_worker_heartbeat(uuid7())
+        assert sync_backend.get_worker_heartbeats(active_only=False) == []
+
     def test_delete_worker_registration(self, sync_backend):
         from uuid6 import uuid7
+
         wid = uuid7()
         sync_backend.update_worker_heartbeat(worker_id=wid, status="idle")
         assert sync_backend.delete_worker_registration(wid) == 1
@@ -354,30 +398,36 @@ class TestWorkerLifecycle:
 # 5. Scheduled tasks
 # ---------------------------------------------------------------------------
 
+
 class TestScheduledTasks:
     def test_create_and_get_scheduled_task(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="t1", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="t1",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         assert t.id is not None
         assert sync_backend.get_scheduled_task(t.id).name == "t1"
 
     def test_get_due_scheduled_tasks_honors_next_run_at(self, sync_backend):
         t1 = sync_backend.create_scheduled_task(
-            name="due", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="due",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         t2 = sync_backend.create_scheduled_task(
-            name="not_due", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="not_due",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
-        sync_backend.update_scheduled_task_next_run(
-            t1.id, datetime.now(UTC) - timedelta(minutes=1)
-        )
-        sync_backend.update_scheduled_task_next_run(
-            t2.id, datetime.now(UTC) + timedelta(hours=1)
-        )
+        sync_backend.update_scheduled_task_next_run(t1.id, datetime.now(UTC) - timedelta(minutes=1))
+        sync_backend.update_scheduled_task_next_run(t2.id, datetime.now(UTC) + timedelta(hours=1))
         due = sync_backend.get_due_scheduled_tasks()
         due_ids = {t.id for t in due}
         assert t1.id in due_ids
@@ -385,18 +435,23 @@ class TestScheduledTasks:
 
     def test_get_due_skips_disabled(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="off", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0, enabled=False,
+            name="off",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
+            enabled=False,
         )
-        sync_backend.update_scheduled_task_next_run(
-            t.id, datetime.now(UTC) - timedelta(minutes=1)
-        )
+        sync_backend.update_scheduled_task_next_run(t.id, datetime.now(UTC) - timedelta(minutes=1))
         assert all(d.id != t.id for d in sync_backend.get_due_scheduled_tasks())
 
     def test_update_scheduled_task_next_run(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="x", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="x",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         new_time = datetime.now(UTC) + timedelta(hours=2)
         sync_backend.update_scheduled_task_next_run(t.id, new_time)
@@ -405,36 +460,53 @@ class TestScheduledTasks:
 
     def test_update_scheduled_task_arbitrary(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="y", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="y",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         updated = sync_backend.update_scheduled_task(t.id, priority=10)
         assert updated.priority == 10
 
     def test_delete_scheduled_task(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="del", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="del",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         assert sync_backend.delete_scheduled_task(t.id) is True
         assert sync_backend.delete_scheduled_task(t.id) is False
 
     def test_get_scheduled_tasks_enabled_only(self, sync_backend):
         sync_backend.create_scheduled_task(
-            name="on", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0, enabled=True,
+            name="on",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
+            enabled=True,
         )
         sync_backend.create_scheduled_task(
-            name="off", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0, enabled=False,
+            name="off",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
+            enabled=False,
         )
         names = {t.name for t in sync_backend.get_scheduled_tasks(enabled_only=True)}
         assert names == {"on"}
 
     def test_has_pending_job_for_scheduled_task(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="p", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="p",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
         assert sync_backend.has_pending_job_for_scheduled_task(t.id) is False
         _create_basic_job(sync_backend, scheduled_task_id=t.id)
@@ -442,12 +514,13 @@ class TestScheduledTasks:
 
     def test_claim_due_scheduled_task(self, sync_backend):
         t = sync_backend.create_scheduled_task(
-            name="cl", task_path="m.f", cron_expression="* * * * *",
-            queue_name="default", priority=0,
+            name="cl",
+            task_path="m.f",
+            cron_expression="* * * * *",
+            queue_name="default",
+            priority=0,
         )
-        sync_backend.update_scheduled_task_next_run(
-            t.id, datetime.now(UTC) - timedelta(minutes=1)
-        )
+        sync_backend.update_scheduled_task_next_run(t.id, datetime.now(UTC) - timedelta(minutes=1))
         claimed = sync_backend.claim_due_scheduled_task(t.id)
         assert claimed is not None and claimed.id == t.id
 
@@ -455,6 +528,7 @@ class TestScheduledTasks:
 # ---------------------------------------------------------------------------
 # 6. Registry operations
 # ---------------------------------------------------------------------------
+
 
 class TestRegistry:
     def test_add_and_get_registry(self, sync_backend):
@@ -493,6 +567,7 @@ class TestRegistry:
         job = _create_basic_job(sync_backend)
         sync_backend.add_job_to_registry(job.id, "finished")
         from sqlery.core.models import JobRegistry
+
         with sync_backend._get_session() as session:
             entry = session.exec(__import__("sqlmodel").select(JobRegistry)).first()
             entry.entered_at = datetime.now(UTC) - timedelta(days=30)
@@ -505,6 +580,7 @@ class TestRegistry:
 # ---------------------------------------------------------------------------
 # 7. Cleanup / stats
 # ---------------------------------------------------------------------------
+
 
 class TestCleanup:
     def test_cleanup_jobs_by_status(self, sync_backend):
@@ -524,6 +600,7 @@ class TestCleanup:
         j = _create_basic_job(sync_backend)
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
+
             row = session.get(QueuedJob, j.id)
             row.created_at = datetime.now(UTC) - timedelta(days=30)
             session.add(row)
@@ -572,6 +649,7 @@ class TestCleanup:
 # ---------------------------------------------------------------------------
 # 8. Misc / remaining methods
 # ---------------------------------------------------------------------------
+
 
 class TestMiscMethods:
     def test_get_job_by_id_missing(self, sync_backend):
@@ -642,7 +720,9 @@ class TestMiscMethods:
     def test_get_claimable_jobs_priority_weights(self, sync_backend):
         _create_basic_job(sync_backend, queue_name="q", priority=0)
         out = sync_backend.get_claimable_jobs(
-            queues=["q"], priority_weights={"q": 5}, limit=5,
+            queues=["q"],
+            priority_weights={"q": 5},
+            limit=5,
         )
         assert len(out) == 1
 
@@ -659,6 +739,7 @@ class TestMiscMethods:
         j = _create_basic_job(sync_backend)
         # Tag via direct session, then mark running
         from sqlery.core.models import QueuedJob
+
         with sync_backend._get_session() as session:
             row = session.get(QueuedJob, j.id)
             row.tags = ["acme"]
@@ -691,27 +772,33 @@ class TestMiscMethods:
 # 9. Claim strategy pure function
 # ---------------------------------------------------------------------------
 
+
 class TestClaimStrategy:
     def test_postgresql_uses_skip_locked(self):
         from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+
         assert determine_claim_strategy("postgresql") == "skip_locked"
 
     def test_sqlite_uses_optimistic_version(self):
         from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+
         assert determine_claim_strategy("sqlite") == "optimistic_version"
 
     def test_mysql_uses_basic_lock(self):
         from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+
         assert determine_claim_strategy("mysql") == "basic_lock"
 
     def test_none_falls_back_to_basic_lock(self):
         from sqlery.fastapi_sqlery.backend import determine_claim_strategy
+
         assert determine_claim_strategy(None) == "basic_lock"
 
 
 # ---------------------------------------------------------------------------
 # 10. SQLite concurrent claim safety
 # ---------------------------------------------------------------------------
+
 
 class TestSQLiteConcurrentClaim:
     def test_atomic_claim_job_race_only_one_wins(self, sync_backend):
@@ -802,6 +889,7 @@ def pg_sync_backend(monkeypatch):
     monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
 
     from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
     backend = SQLAlchemyBackend()
     try:
         yield backend
@@ -860,21 +948,30 @@ class TestLeaseLifecyclePostgres:
         assert set(claimed) == {"pg-life-a", "pg-life-b"}
         # Renew must not raise.
         pg_sync_backend.renew_queue_leases(
-            owned_queues=["pg-life-a", "pg-life-b"], daemon_id="d1", lease_secs=120,
+            owned_queues=["pg-life-a", "pg-life-b"],
+            daemon_id="d1",
+            lease_secs=120,
         )
         pg_sync_backend.release_queue_leases(
-            owned_queues=["pg-life-a", "pg-life-b"], daemon_id="d1",
+            owned_queues=["pg-life-a", "pg-life-b"],
+            daemon_id="d1",
         )
 
     def test_lease_held_blocks_other_daemon(self, pg_sync_backend):
         first = pg_sync_backend.claim_queue_leases(
-            queues=["pg-contended"], daemon_id="d1",
-            node_id="n1", pid=1, lease_secs=60,
+            queues=["pg-contended"],
+            daemon_id="d1",
+            node_id="n1",
+            pid=1,
+            lease_secs=60,
         )
         assert first == ["pg-contended"]
         # Second daemon must NOT win the same queue.
         second = pg_sync_backend.claim_queue_leases(
-            queues=["pg-contended"], daemon_id="d2",
-            node_id="n2", pid=2, lease_secs=60,
+            queues=["pg-contended"],
+            daemon_id="d2",
+            node_id="n2",
+            pid=2,
+            lease_secs=60,
         )
         assert second == []
