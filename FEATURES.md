@@ -7,6 +7,7 @@ What this app currently does.
 - Run background jobs via Python task queue with Django ORM or SQLAlchemy backends
 - Workers claim and execute jobs using atomic SELECT FOR UPDATE SKIP LOCKED on PostgreSQL
 - Workers claim and execute jobs using optimistic version-based locking on SQLite (prevents duplicate execution under concurrent workers)
+- Fork-per-job execution uses hook-based connection lifecycle (`ForkSafeExecutor`) — DB connections are guaranteed closed before fork and reopened after, with leak verification
 - Daemon manages worker pool lifecycle and scheduled task enqueueing
 - Dashboard and CLI for job monitoring and management
 
@@ -20,3 +21,5 @@ What this app currently does.
 - Worker auto-registration could use retry with exponential backoff instead of immediate creation
 - Worker registration security: no whitelist validation or shared secret required
 - Multi-worker PostgreSQL concurrent claim stress test under real contention (PG-only, needs CI service)
+- Remaining `_reset_db_connections()` calls in error-recovery paths could be migrated to ForkSafeExecutor hooks
+- ForkSafeExecutor does not yet support custom user-registered hooks (only built-in Django/SQLAlchemy)

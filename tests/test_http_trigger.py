@@ -295,7 +295,7 @@ class TestSubprocessSpawning:
         mock_proc = MagicMock()
         mock_proc.pid = 12345
 
-        with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path", return_value="/fake/manage.py"), \
+        with patch("sqlery.django_sqlery.views.get_manage_py_path", return_value="/fake/manage.py"), \
              patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc) as mock_create:
             await spawn_worker_subprocess()
 

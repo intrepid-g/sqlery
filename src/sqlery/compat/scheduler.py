@@ -1,6 +1,7 @@
 """Compatibility layer for django-tasks-scheduler (v2.1.1).
 
-Drop-in replacement: change only imports to migrate from django-tasks-scheduler to SQLery.
+Permanent first-class feature — drop-in replacement for django-tasks-scheduler.
+Change only imports to migrate to SQLery.
 
     # Before (django-tasks-scheduler)
     from scheduler.models import Task, TaskType, TaskArg, TaskKwarg
@@ -18,7 +19,6 @@ Drop-in replacement: change only imports to migrate from django-tasks-scheduler 
 """
 
 import logging
-import warnings
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
@@ -29,14 +29,6 @@ from django.utils import timezone
 
 from sqlery.core.worker import _current_job_var as _core_job_var
 from sqlery.core.worker import _current_job_var as _django_job_var
-
-warnings.warn(
-    "sqlery.compat.scheduler is deprecated and will be removed in v3.2.0. "
-    "Use sqlery.django_sqlery.queue.Queue, sqlery.django_sqlery.models, "
-    "and sqlery.django_sqlery.decorators directly.",
-    DeprecationWarning,
-    stacklevel=2,
-)
 
 from sqlery.django_sqlery.decorators import job
 from sqlery.django_sqlery.models import QueuedJob, ScheduledTask as _ScheduledTaskModel, Worker

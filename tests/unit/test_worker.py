@@ -263,6 +263,10 @@ class TestForkLifecycle:
         monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)
         # Ensure we don't actually sleep waiting.
         monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
+        # Prevent Django from checking real DB connections (no django_db mark).
+        monkeypatch.setattr(
+            "sqlery.core.worker.close_old_connections", lambda: None
+        )
 
         result = wp._fork_and_execute(job)
         assert result["success"] is True

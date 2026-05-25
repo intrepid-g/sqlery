@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from ..compat import get_backend, get_config
 from .utils import import_task
 from .security import check_task_module_allowed, warn_if_unconfigured
+from .fork_safety import ForkSafeExecutor
 from sqlery.core.db_resilience import configure_connection_resilience
 
 try:
@@ -121,9 +122,6 @@ class JobExecutor:
         # write_fd = int(os.environ.pop('_SQLERY_RESULT_FD'))
 
         try:
-            # Close inherited DB connections — child must open its own
-            self._reset_db_connections()
-
             # Configure DB resilience for child's fresh connection.
             # for_job_child=True skips statement_timeout — user task queries can
             # legitimately take longer than the daemon/worker guard value.
@@ -416,6 +414,7 @@ class WorkerProcess:
         self.backend = backend
         self.queues = queues or ['default']
         self.executor = JobExecutor(backend)
+        self._fork_ctx = ForkSafeExecutor.auto_configure()
         self.shutdown_requested = False
         self.jobs_processed = 0
         self.current_job = None
@@ -584,46 +583,25 @@ class WorkerProcess:
         # from ..compat import get_config  # moved to top-level
         timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
-        # # Pipe removed — child writes results directly to DB (like RQ)
-        # read_fd, write_fd = os.pipe()
-
-        # Close DB connections BEFORE fork so parent and child don't share
-        # the same socket FDs. Each side will reconnect on first DB access.
-        self.executor._reset_db_connections()
-
-        child_pid = os.fork()
+        child_pid = self._fork_ctx.fork()
 
         if child_pid == 0:
             # === CHILD PROCESS ===
-            # Process group isolation — kill the whole group on stop/timeout
             os.setpgrp()
-            # os.close(read_fd)
-            # os.environ['_SQLERY_RESULT_FD'] = str(write_fd)
             try:
                 self.executor.execute_job_in_child(job)
             except Exception:
-                # execute_job_in_child calls os._exit(), but just in case
                 os._exit(1)
-            os._exit(0)  # Should never reach here
+            os._exit(0)
 
         # === PARENT PROCESS ===
-        # os.close(write_fd)
         self.child_pid = child_pid
         logger.info(f"Forked child PID {child_pid} for job {job.id}")
 
-        # Persist child PID to DB so admin "Stop Job" can target the child
         try:
             self.backend.update_job_child_pid(job.id, child_pid)
         except Exception:
             pass
-
-        # Reconnect DB after fork (close_all before fork severed the connection)
-        self.executor._reset_db_connections()
-
-        # Also prune stale connections (parent may wait a long time for child)
-        # from django.db import close_old_connections  # moved to top-level (try/except)
-        if close_old_connections is not None:
-            close_old_connections()
 
         # Update heartbeat with child info
         self._heartbeat('busy', job_id=job.id)
@@ -796,16 +774,17 @@ def __getattr__(name):
     """Lazy re-export of `TaskExecutor`.
 
     `TaskExecutor` is the historic public name. In Django mode it resolves
-    to `sqlery.django_sqlery.executor.TaskExecutor` (a Django-coupled class
-    with scheduled-task helpers). In standalone mode (no Django installed)
-    it falls back to the framework-agnostic `JobExecutor` in this module.
+    to `sqlery.django_sqlery._executor_impl.TaskExecutor` (a Django-coupled
+    class with scheduled-task helpers). In standalone mode (no Django
+    installed) it falls back to the framework-agnostic `JobExecutor` in
+    this module.
 
     This indirection lets callers do `from sqlery.core.worker import
     TaskExecutor` without `core/worker.py` importing Django at module load.
     """
     if name == "TaskExecutor":
         try:
-            from sqlery.django_sqlery.executor import TaskExecutor as _TE
+            from sqlery.django_sqlery._executor_impl import TaskExecutor as _TE
             return _TE
         except ImportError:
             return JobExecutor

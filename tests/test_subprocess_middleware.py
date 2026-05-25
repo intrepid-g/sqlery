@@ -29,7 +29,7 @@ class TestSubprocessTriggerMiddleware:
 
         # Mock subprocess.Popen and get_manage_py_path
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 # Create request
@@ -61,7 +61,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -130,7 +130,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -154,7 +154,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -178,7 +178,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.DEVNULL") as mock_devnull:
                     mock_path.return_value = "/path/to/manage.py"
 
@@ -203,7 +203,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
                 mock_popen.side_effect = OSError("Resource temporarily unavailable")
 
@@ -239,7 +239,7 @@ class TestSubprocessTriggerMiddleware:
         middleware.get_response = track_get_response
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=track_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -261,7 +261,7 @@ class TestSubprocessTriggerMiddleware:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/absolute/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -320,7 +320,7 @@ class TestSubprocessTriggerLifecycle:
             return MagicMock()
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -352,7 +352,7 @@ class TestSubprocessTriggerLifecycle:
             return MagicMock()
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -398,7 +398,7 @@ class TestSubprocessTriggerLifecycle:
             return MagicMock()
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -424,7 +424,7 @@ class TestSubprocessTriggerLifecycle:
             return MagicMock()
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -446,7 +446,7 @@ class TestSubprocessTriggerLifecycle:
         middleware = SubprocessTriggerMiddleware(get_response)
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()
@@ -490,7 +490,7 @@ class TestSubprocessTriggerLifecycle:
             return MagicMock()
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen", side_effect=fake_popen):
-            with patch("sqlery.django_sqlery.subprocess_executor.get_manage_py_path") as mock_path:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
                 mock_path.return_value = "/path/to/manage.py"
 
                 factory = RequestFactory()

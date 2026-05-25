@@ -286,7 +286,7 @@ class TestScheduledTaskRecomputation:
 
         # Create disabled task at a fixed time (minute=10)
         frozen_t1 = datetime(2026, 3, 10, 1, 10, 0, tzinfo=dt_tz.utc)
-        with patch("sqlery.django_sqlery.utils.datetime") as mock_dt:
+        with patch("sqlery.core.utils.datetime") as mock_dt:
             mock_dt.now.return_value = frozen_t1
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             task = ScheduledTask.objects.create(
@@ -305,7 +305,7 @@ class TestScheduledTaskRecomputation:
 
         # Re-enable task at a later time (past the next cron boundary)
         frozen_t2 = datetime(2026, 3, 10, 2, 15, 0, tzinfo=dt_tz.utc)
-        with patch("sqlery.django_sqlery.utils.datetime") as mock_dt:
+        with patch("sqlery.core.utils.datetime") as mock_dt:
             mock_dt.now.return_value = frozen_t2
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             task.enabled = True
@@ -408,7 +408,7 @@ class TestScheduledTaskRecomputation:
 
         # Create at fixed time
         frozen_t1 = datetime(2026, 3, 10, 1, 10, 0, tzinfo=dt_tz.utc)
-        with patch("sqlery.django_sqlery.utils.datetime") as mock_dt:
+        with patch("sqlery.core.utils.datetime") as mock_dt:
             mock_dt.now.return_value = frozen_t1
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             task = ScheduledTask.objects.create(
@@ -425,7 +425,7 @@ class TestScheduledTaskRecomputation:
         next_run_after_disable = task.next_run_at
 
         # Change cron while disabled — expression change triggers recalculation
-        with patch("sqlery.django_sqlery.utils.datetime") as mock_dt:
+        with patch("sqlery.core.utils.datetime") as mock_dt:
             mock_dt.now.return_value = frozen_t1
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             task.cron_expression = "0 * * * *"  # Hourly
@@ -438,7 +438,7 @@ class TestScheduledTaskRecomputation:
 
         # Re-enable at a later time (past the next hourly boundary)
         frozen_t2 = datetime(2026, 3, 10, 2, 15, 0, tzinfo=dt_tz.utc)
-        with patch("sqlery.django_sqlery.utils.datetime") as mock_dt:
+        with patch("sqlery.core.utils.datetime") as mock_dt:
             mock_dt.now.return_value = frozen_t2
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             task.enabled = True

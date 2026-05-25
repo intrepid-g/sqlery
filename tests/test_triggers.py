@@ -245,7 +245,7 @@ class TestErrorHandling:
         except Exception:
             pytest.fail("Should not raise exception")
 
-    @patch("sqlery.executor.TaskExecutor")
+    @patch("sqlery.triggers.TaskExecutor")
     def test_synchronous_error_is_raised(self, mock_executor):
         """Synchronous execution errors should propagate."""
         mock_executor.return_value.run_due_tasks.side_effect = Exception("Test error")
