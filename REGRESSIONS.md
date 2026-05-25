@@ -50,3 +50,17 @@ Use this file to:
 **Inline comment:** `// REGRESSION 2026-05-25: Dashboard polled /admin/sqlery/undefined` at `src/sqlery/django_sqlery/static/sqlery/js/dashboard.js:7`
 
 **Validation:** All 36 dashboard tests pass (35 passed, 1 skipped), including the new regression test.
+
+## 2026-05-25 — QueuedJob admin change page crashes on Django 6.0
+
+**What broke:** Viewing a QueuedJob detail page at `/admin/sqlery/queuedjob/<id>/change/` raises `TypeError: args or kwargs must be provided` during template rendering of the "Execution History" readonly field.
+
+**Root cause:** `runs_display()` in `QueuedJobAdmin` built an HTML table using f-strings and passed the result to `format_html(html_string)` with no format arguments. Django 6.0 tightened `format_html()` to require at least one positional arg or kwarg (enforced in `django/utils/html.py:137`).
+
+**Fix:** Replaced `format_html(''.join(html_parts))` with `mark_safe(''.join(html_parts))` since the HTML is pre-constructed and no interpolation is needed.
+
+**Regression test:** `test_runs_display_does_not_crash_with_execution_history` in `tests/test_admin.py`
+
+**Inline comment:** `# REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/admin.py:539`
+
+**Validation:** All 12 admin tests pass. Manual verification that `runs_display` returns valid HTML for both populated and empty run histories.

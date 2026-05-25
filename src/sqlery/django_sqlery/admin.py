@@ -9,6 +9,7 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
+from django.utils.safestring import mark_safe
 
 from sqlery.core.cleanup import CleanupManager
 
@@ -534,7 +535,11 @@ class QueuedJobAdmin(admin.ModelAdmin):
             )
 
         html_parts.append('</tbody></table>')
-        return format_html(''.join(html_parts))
+        # REGRESSION 2026-05-25: format_html() with no args crashes on Django 6.0
+        # Root cause: Django 6.0 requires at least one format arg/kwarg in format_html()
+        # Fix: use mark_safe() since the HTML is pre-constructed (no interpolation needed)
+        # I wish I had the time to: escape user data (output/error) with html.escape() in the f-strings above
+        return mark_safe(''.join(html_parts))
 
     runs_display.short_description = "Execution History"
 
