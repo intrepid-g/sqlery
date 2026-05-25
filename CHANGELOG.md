@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-05-25
+
+### Added
+
+- RQ compatibility layer (`sqlery.compat.rq`) now works in **standalone mode** — Django is no longer required to import or use it. The `Queue` wrapper, utility functions, and `Job`/`Worker` stubs route through the framework-agnostic `DatabaseBackend` ABC via `get_backend()`, with the Django fast-path preserved. Closes the strategic gap that left standalone RQ migrants without a migration path.
+- `refresh_worker_heartbeat()` on the SQLAlchemy (standalone) backend — previously missing, leaving standalone worker heartbeats un-refreshed.
+- IP/origin allowlist for internal trigger endpoints (`INTERNAL_ALLOWED_IPS` for Django, `SQLERY_INTERNAL_ALLOWED_IPS` for standalone), defense-in-depth on top of the existing HMAC check. Matches the real socket peer (`REMOTE_ADDR` / `request.client.host`), never `X-Forwarded-For`; loopback-only by default.
+
+### Changed
+
+- Daemon zombie detection is now **mode-agnostic**: the five-heuristic liveness logic lives once in `sqlery.core` and consumes structured data via two new backend methods (`get_running_jobs_for_liveness`, `fail_zombie_job`). Standalone mode now gets worker crash/zombie recovery that was previously Django-only. Django behavior is unchanged.
+- Lambda/serverless handlers marked **EXPERIMENTAL** (docstring warnings, one-time runtime log per warm container, and doc callouts). Handler logic unchanged.
+- Coverage gate `fail_under` raised 13 → 20.
+
+### Fixed
+
+- Corrected stale `__version__` in `sqlery/__init__.py` (was `0.13.0`, now tracks the real release version).
+
 ## [0.21.2] - 2026-05-25
 
 ### Added
