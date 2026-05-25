@@ -23,7 +23,7 @@ EOF
 
 echo "==> Creating sample scheduled tasks..."
 python manage.py shell <<EOF
-from sqlery.models import ScheduledTask
+from sqlery.django_sqlery.models import ScheduledTask
 from django.db import IntegrityError
 
 tasks = [
@@ -66,7 +66,7 @@ echo "Django Admin Credentials:"
 echo "  Username: admin"
 echo "  Password: admin"
 echo "=========================================="
-echo "  Dashboard: http://localhost:8855/admin/dashboard/"
+echo "  Dashboard: http://localhost:8855/admin/sqlery/dashboard/"
 echo "  Admin: http://localhost:8855/admin/"
 echo "=========================================="
 echo ""

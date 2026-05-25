@@ -758,7 +758,7 @@ jobs-clear: ## Clear all queued/failed jobs (WARNING)
 
 .PHONY: docker-build
 docker-build: ## Build Docker image
-	@cd $(SAMPLE_PROJECT) && docker build -t sqlery-demo .
+	@docker build -t sqlery-demo -f $(SAMPLE_PROJECT)/Dockerfile .
 
 .PHONY: docker-up
 docker-up: ## Start Docker Compose stack
