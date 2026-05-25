@@ -318,3 +318,28 @@ class TestAdminDisplayMethods:
         # Test started_display
         started = admin.started_display(job)
         assert started != "-"
+
+    def test_runs_display_does_not_crash_with_execution_history(self):
+        """Regression: runs_display crashed on Django 6.0 with format_html() and no args."""
+        job = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            status="failed",
+            runs=[
+                {
+                    "attempt_number": 1,
+                    "started_at": "2026-05-25T10:00:00Z",
+                    "finished_at": "2026-05-25T10:00:01Z",
+                    "duration": 1.0,
+                    "status": "failed",
+                    "error": "Something went wrong",
+                    "output": "",
+                },
+            ],
+        )
+
+        site = AdminSite()
+        admin = QueuedJobAdmin(QueuedJob, site)
+
+        result = admin.runs_display(job)
+        assert "Something went wrong" in result
+        assert "<table" in result
