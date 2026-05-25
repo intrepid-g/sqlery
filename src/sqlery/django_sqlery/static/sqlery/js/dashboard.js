@@ -72,6 +72,16 @@ async function pollFeed() {
             url += '&since=' + encodeURIComponent(feedCursor);
         }
         const resp = await fetch(url);
+
+        // REGRESSION 2026-05-25: Dashboard kept polling feed silently forever after session expiry
+        // Root cause: pollFeed returned silently on any non-OK, never stopping the 3s auto-refresh.
+        // Fix: Handle 401/403 by stopping auto-refresh and showing a toast so the user knows to re-login.
+        if (resp.status === 401 || resp.status === 403) {
+            if (typeof autoRefreshInterval !== "undefined") clearInterval(autoRefreshInterval);
+            showToast("Session expired", "Please reload and sign in again.", "error");
+            return;
+        }
+
         if (!resp.ok) return;
         const data = await resp.json();
 
@@ -624,7 +634,24 @@ async function updateStats() {
     try {
         const response = await fetch(URLS.stats());
         if (response.status === 429) return;  // rate-limited — skip silently
-        if (!response.ok) throw new Error("Failed to fetch stats");
+
+        // REGRESSION 2026-05-25: Dashboard spammed console with "Failed to fetch stats" every 3s on session expiry
+        // Root cause: Only HTTP 429 was treated as a non-error; 401/403 and other non-OK responses threw,
+        // causing the catch block to log a hard error on every refresh cycle indefinitely.
+        // Fix: Handle 401/403 by stopping auto-refresh and showing a toast; treat other non-OK as
+        // transient warnings that skip one tick without throwing.
+        if (response.status === 401 || response.status === 403) {
+            if (typeof autoRefreshInterval !== "undefined") clearInterval(autoRefreshInterval);
+            updateRefreshIndicator(false);
+            showToast("Session expired", "Please reload and sign in again.", "error");
+            return;
+        }
+
+        // if (!response.ok) throw new Error("Failed to fetch stats");
+        if (!response.ok) {
+            console.warn(`Stats request failed (HTTP ${response.status}); will retry on next refresh.`);
+            return;  // transient (e.g. 502/504): skip this tick, keep polling
+        }
 
         const data = await response.json();
         lastStatsData = data;
@@ -1478,7 +1505,24 @@ async function updateTasks() {
         updateRefreshIndicator(true);
 
         const response = await fetch(URLS.tasks());
-        if (!response.ok) throw new Error("Failed to fetch tasks");
+        if (response.status === 429) return;  // rate-limited — skip silently
+
+        // REGRESSION 2026-05-25: Dashboard spammed console with "Failed to fetch tasks" every 3s on session expiry
+        // Root cause: Only HTTP 429 was treated as a non-error in updateStats; updateTasks had the same bug.
+        // Fix: Handle 401/403 by stopping auto-refresh and showing a toast; treat other non-OK as transient.
+        if (response.status === 401 || response.status === 403) {
+            if (typeof autoRefreshInterval !== "undefined") clearInterval(autoRefreshInterval);
+            updateRefreshIndicator(false);
+            showToast("Session expired", "Please reload and sign in again.", "error");
+            return;
+        }
+
+        // if (!response.ok) throw new Error("Failed to fetch tasks");
+        if (!response.ok) {
+            console.warn(`Tasks request failed (HTTP ${response.status}); will retry on next refresh.`);
+            updateRefreshIndicator(false);
+            return;
+        }
 
         const data = await response.json();
         // Pre-compute numeric sort key for next_run_at (avoids JS date-parse issues in sort)
