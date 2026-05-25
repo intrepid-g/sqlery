@@ -757,6 +757,62 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             return list(session.exec(stmt).all())
 
+    def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        """Build RunningJobLiveness records for the zombie sweep.
+
+        Loads each ``status='running'`` job together with its assigned worker
+        and maps to the framework-agnostic dataclass. Datetimes are normalised
+        to timezone-aware UTC (SQLite/Postgres may return naive values).
+        """
+        from sqlery.core.liveness import RunningJobLiveness
+        from sqlery.django_sqlery.friendly_name import uuid_to_friendly
+
+        def _aware(dt):
+            if dt is None:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+        with self._get_session() as session:
+            stmt = select(QueuedJob).where(QueuedJob.status == "running")
+            if queue_names:
+                stmt = stmt.where(QueuedJob.queue_name.in_(queue_names))
+
+            records = []
+            for job in session.exec(stmt).all():
+                worker = job.worker
+                if worker is not None:
+                    try:
+                        friendly = uuid_to_friendly(worker.id)
+                    except Exception:
+                        friendly = str(worker.id)
+                else:
+                    friendly = None
+                records.append(
+                    RunningJobLiveness(
+                        job_id=job.id,
+                        started_at=_aware(job.started_at),
+                        worker_pid=job.worker_pid,
+                        worker_node_id=worker.node_id if worker else None,
+                        worker_status=worker.status if worker else None,
+                        worker_current_job_id=worker.current_job_id if worker else None,
+                        worker_last_heartbeat=_aware(worker.last_heartbeat) if worker else None,
+                        worker_friendly_name=friendly,
+                        has_worker=worker is not None,
+                    )
+                )
+            return records
+
+    def fail_zombie_job(self, job_id: int, reason: str) -> bool:
+        """Mark a running job failed with termination_reason='zombie_job'."""
+        with self._get_session() as session:
+            job = session.get(QueuedJob, job_id)
+            if job is None:
+                return False
+            job.mark_failed(error=reason, termination_reason="zombie_job")
+            session.add(job)
+            session.commit()
+            return True
+
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         """Check if queue has running jobs."""
         with self._get_session() as session:
