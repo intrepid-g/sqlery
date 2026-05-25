@@ -5,6 +5,7 @@ This backend uses SQLModel/SQLAlchemy for all database operations.
 
 import os
 import socket
+import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
 
@@ -49,6 +50,37 @@ class SQLAlchemyBackend(DatabaseBackend):
 
         self._get_session = get_session
 
+    def _resolve_worker(self, worker_id):
+        """Resolve a worker_id (UUID or "worker_<node>_<pid>" string) to a Worker.
+
+        Mirrors DjangoBackend._resolve_worker so daemon code can pass either a
+        UUID (from get_worker_heartbeats) or the "worker_<node>_<pid>" id format.
+        """
+        # UUID (object or string) — primary-key lookup.
+        if isinstance(worker_id, uuid.UUID):
+            with self._get_session() as session:
+                return session.get(Worker, worker_id)
+        try:
+            worker_uuid = uuid.UUID(str(worker_id))
+            with self._get_session() as session:
+                return session.get(Worker, worker_uuid)
+        except (ValueError, TypeError):
+            pass
+
+        # Parse "worker_<node>_<pid>" format.
+        parts = str(worker_id).split("_")
+        if parts[0] == "worker" and len(parts) >= 3:
+            try:
+                pid = int(parts[-1])
+            except ValueError:
+                return None
+            node_id = "_".join(parts[1:-1])
+            with self._get_session() as session:
+                stmt = select(Worker).where(and_(Worker.node_id == node_id, Worker.pid == pid))
+                return session.exec(stmt).first()
+
+        return None
+
     # def create_job(  # Original 9-param signature
     #     self,
     #     task_path: str,
@@ -79,8 +111,8 @@ class SQLAlchemyBackend(DatabaseBackend):
         retry_intervals: list | None = None,
         meta: dict | None = None,
         dependencies: list | None = None,
-        on_success_path: str = '',
-        on_failure_path: str = '',
+        on_success_path: str = "",
+        on_failure_path: str = "",
         ttl: int | None = None,
         result_ttl: int | None = None,
         failure_ttl: int | None = None,
@@ -188,15 +220,13 @@ class SQLAlchemyBackend(DatabaseBackend):
             session.commit()
             if res.rowcount != 1:
                 return None
-            refreshed = session.exec(
-                select(QueuedJob).where(QueuedJob.id == job.id)
-            ).first()
+            refreshed = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             return refreshed
 
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
         """Get queue statistics (counts by status)."""
         with self._get_session() as session:
-            stmt = select(QueuedJob.status, func.count(QueuedJob.id).label('count'))
+            stmt = select(QueuedJob.status, func.count(QueuedJob.id).label("count"))
 
             if queue_name:
                 stmt = stmt.where(QueuedJob.queue_name == queue_name)
@@ -205,17 +235,17 @@ class SQLAlchemyBackend(DatabaseBackend):
             results = session.exec(stmt).all()
 
             stats = {
-                'queued': 0,
-                'running': 0,
-                'success': 0,
-                'failed': 0,
+                "queued": 0,
+                "running": 0,
+                "success": 0,
+                "failed": 0,
             }
 
             for status, count in results:
                 stats[status] = count
 
             if queue_name:
-                stats['queue_name'] = queue_name
+                stats["queue_name"] = queue_name
 
             return stats
 
@@ -224,9 +254,9 @@ class SQLAlchemyBackend(DatabaseBackend):
         with self._get_session() as session:
             job = session.get(QueuedJob, job_id)
 
-            if job and job.status == 'queued':
-                job.status = 'failed'
-                job.error = 'Cancelled by user'
+            if job and job.status == "queued":
+                job.status = "failed"
+                job.error = "Cancelled by user"
                 session.add(job)
                 session.commit()
                 return True
@@ -236,7 +266,7 @@ class SQLAlchemyBackend(DatabaseBackend):
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
         """Retry failed jobs by resetting them to queued status."""
         with self._get_session() as session:
-            stmt = select(QueuedJob).where(QueuedJob.status == 'failed')
+            stmt = select(QueuedJob).where(QueuedJob.status == "failed")
 
             if queue_name:
                 stmt = stmt.where(QueuedJob.queue_name == queue_name)
@@ -247,9 +277,9 @@ class SQLAlchemyBackend(DatabaseBackend):
             jobs = session.exec(stmt).all()
 
             for job in jobs:
-                job.status = 'queued'
-                job.error = ''
-                job.traceback = ''
+                job.status = "queued"
+                job.error = ""
+                job.traceback = ""
                 job.retry_count = 0
                 session.add(job)
 
@@ -264,7 +294,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .where(
                     and_(
                         ScheduledTask.enabled == True,
-                        ScheduledTask.next_run_at <= datetime.now(UTC)
+                        ScheduledTask.next_run_at <= datetime.now(UTC),
                     )
                 )
                 .order_by(ScheduledTask.next_run_at)
@@ -311,7 +341,13 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             return list(session.exec(stmt).all())
 
-    def update_worker_heartbeat(self, worker_id: str, status: str, current_job_id: int | None = None, jobs_processed: int | None = None):
+    def update_worker_heartbeat(
+        self,
+        worker_id: str,
+        status: str,
+        current_job_id: int | None = None,
+        jobs_processed: int | None = None,
+    ):
         """Update or create worker heartbeat."""
         # import socket  # moved to top-level
 
@@ -336,6 +372,23 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             session.add(worker)
             session.commit()
+
+    def refresh_worker_heartbeat(self, worker_id):
+        """Update ONLY last_heartbeat for a worker. Does not touch status or current_job.
+
+        Used by the daemon to keep workers alive without interfering with
+        the worker's own state management (status, current_job). Mirrors
+        DjangoBackend.refresh_worker_heartbeat semantics.
+        """
+        worker = self._resolve_worker(worker_id)
+        if worker is None:
+            return
+        with self._get_session() as session:
+            row = session.get(Worker, worker.id)
+            if row is not None:
+                row.last_heartbeat = datetime.now(UTC)
+                session.add(row)
+                session.commit()
 
     def cleanup_jobs(
         self,
@@ -370,12 +423,12 @@ class SQLAlchemyBackend(DatabaseBackend):
                 if max_age_days:
                     count_stmt = count_stmt.where(QueuedJob.created_at < cutoff)
                 count = session.exec(count_stmt).one()
-                return {'deleted': 0, 'count': count}
+                return {"deleted": 0, "count": count}
 
             result = session.exec(stmt)
             session.commit()
 
-            return {'deleted': result.rowcount, 'count': result.rowcount}
+            return {"deleted": result.rowcount, "count": result.rowcount}
 
     def cleanup_jobs_by_count(
         self,
@@ -421,29 +474,30 @@ class SQLAlchemyBackend(DatabaseBackend):
                 if keep_ids:
                     count_stmt = count_stmt.where(~QueuedJob.id.in_(keep_ids))
                 count = session.exec(count_stmt).one()
-                return {'deleted': 0, 'count': count, 'kept': len(keep_ids)}
+                return {"deleted": 0, "count": count, "kept": len(keep_ids)}
 
             result = session.exec(delete_stmt)
             session.commit()
 
-            return {'deleted': result.rowcount, 'count': result.rowcount, 'kept': len(keep_ids)}
+            return {"deleted": result.rowcount, "count": result.rowcount, "kept": len(keep_ids)}
 
     def get_database_stats(self) -> dict:
         """Get database statistics."""
         with self._get_session() as session:
             # Job counts
-            job_count_stmt = (
-                select(QueuedJob.status, func.count(QueuedJob.id).label('count'))
-                .group_by(QueuedJob.status)
-            )
+            job_count_stmt = select(
+                QueuedJob.status, func.count(QueuedJob.id).label("count")
+            ).group_by(QueuedJob.status)
             job_counts = {status: count for status, count in session.exec(job_count_stmt).all()}
 
             # Registry counts
-            registry_count_stmt = (
-                select(JobRegistry.registry_type, func.count(JobRegistry.id).label('count'))
-                .group_by(JobRegistry.registry_type)
-            )
-            registry_counts = {registry_type: count for registry_type, count in session.exec(registry_count_stmt).all()}
+            registry_count_stmt = select(
+                JobRegistry.registry_type, func.count(JobRegistry.id).label("count")
+            ).group_by(JobRegistry.registry_type)
+            registry_counts = {
+                registry_type: count
+                for registry_type, count in session.exec(registry_count_stmt).all()
+            }
 
             # Total counts
             total_jobs = session.exec(select(func.count(QueuedJob.id))).one()
@@ -455,13 +509,13 @@ class SQLAlchemyBackend(DatabaseBackend):
             total_workers = session.exec(select(func.count(Worker.id))).one()
 
             stats = {
-                'total_jobs': total_jobs,
-                'job_counts': job_counts,
-                'total_registries': total_registries,
-                'registry_counts': registry_counts,
-                'total_scheduled_tasks': total_scheduled_tasks,
-                'enabled_scheduled_tasks': enabled_scheduled_tasks,
-                'total_workers': total_workers,
+                "total_jobs": total_jobs,
+                "job_counts": job_counts,
+                "total_registries": total_registries,
+                "registry_counts": registry_counts,
+                "total_scheduled_tasks": total_scheduled_tasks,
+                "enabled_scheduled_tasks": enabled_scheduled_tasks,
+                "total_workers": total_workers,
             }
 
             return stats
@@ -478,9 +532,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.exec(text("VACUUM ANALYZE sqlery_worker"))
                 session.commit()
 
-            return {'success': True, 'message': 'Database vacuumed successfully'}
+            return {"success": True, "message": "Database vacuumed successfully"}
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return {"success": False, "error": str(e)}
 
     def add_job_to_registry(
         self,
@@ -502,14 +556,11 @@ class SQLAlchemyBackend(DatabaseBackend):
     def remove_job_from_registry(self, job_id: int, registry_type: str):
         """Remove job from a registry."""
         with self._get_session() as session:
-            stmt = (
-                select(JobRegistry)
-                .where(
-                    and_(
-                        JobRegistry.job_id == job_id,
-                        JobRegistry.registry_type == registry_type,
-                        JobRegistry.exited_at == None
-                    )
+            stmt = select(JobRegistry).where(
+                and_(
+                    JobRegistry.job_id == job_id,
+                    JobRegistry.registry_type == registry_type,
+                    JobRegistry.exited_at == None,
                 )
             )
 
@@ -532,10 +583,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             stmt = (
                 select(JobRegistry)
                 .where(
-                    and_(
-                        JobRegistry.registry_type == registry_type,
-                        JobRegistry.exited_at == None
-                    )
+                    and_(JobRegistry.registry_type == registry_type, JobRegistry.exited_at == None)
                 )
                 .join(QueuedJob, QueuedJob.id == JobRegistry.job_id)
             )
@@ -576,7 +624,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             result = session.exec(stmt)
             session.commit()
 
-            return {'deleted': result.rowcount}
+            return {"deleted": result.rowcount}
 
     def get_job_by_id(self, job_id: int):
         """Get job by ID."""
@@ -613,8 +661,8 @@ class SQLAlchemyBackend(DatabaseBackend):
         """Mark a failed job as archived (a retry has been created for it)."""
         with self._get_session() as session:
             job = session.get(QueuedJob, job_id)
-            if job and job.status == 'failed':
-                job.status = 'archived'
+            if job and job.status == "failed":
+                job.status = "archived"
                 session.add(job)
                 session.commit()
 
@@ -635,13 +683,10 @@ class SQLAlchemyBackend(DatabaseBackend):
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
         """Check if scheduled task has pending jobs."""
         with self._get_session() as session:
-            stmt = (
-                select(func.count(QueuedJob.id))
-                .where(
-                    and_(
-                        QueuedJob.scheduled_task_id == task_id,
-                        QueuedJob.status.in_(['queued', 'running'])
-                    )
+            stmt = select(func.count(QueuedJob.id)).where(
+                and_(
+                    QueuedJob.scheduled_task_id == task_id,
+                    QueuedJob.status.in_(["queued", "running"]),
                 )
             )
 
@@ -705,7 +750,7 @@ class SQLAlchemyBackend(DatabaseBackend):
     def get_running_jobs(self, queue_name: str | None = None) -> list:
         """Get currently running jobs."""
         with self._get_session() as session:
-            stmt = select(QueuedJob).where(QueuedJob.status == 'running')
+            stmt = select(QueuedJob).where(QueuedJob.status == "running")
 
             if queue_name:
                 stmt = stmt.where(QueuedJob.queue_name == queue_name)
@@ -715,14 +760,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         """Check if queue has running jobs."""
         with self._get_session() as session:
-            stmt = (
-                select(func.count(QueuedJob.id))
-                .where(
-                    and_(
-                        QueuedJob.queue_name == queue_name,
-                        QueuedJob.status == 'running'
-                    )
-                )
+            stmt = select(func.count(QueuedJob.id)).where(
+                and_(QueuedJob.queue_name == queue_name, QueuedJob.status == "running")
             )
 
             if exclude_job_id:
@@ -750,7 +789,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return 1
             return 0
 
-    def release_claimed_job(self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs):
+    def release_claimed_job(
+        self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
+    ):
         """Release a job after processing and update worker state."""
         with self._get_session() as session:
             db_job = session.get(QueuedJob, job.id)
@@ -758,7 +799,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 db_job.status = status
                 db_job.finished_at = datetime.now(UTC)
                 if db_job.started_at:
-                    db_job.duration_seconds = (db_job.finished_at - db_job.started_at).total_seconds()
+                    db_job.duration_seconds = (
+                        db_job.finished_at - db_job.started_at
+                    ).total_seconds()
                 for key, value in kwargs.items():
                     if hasattr(db_job, key):
                         setattr(db_job, key, value)
@@ -767,7 +810,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             # Update worker back to idle
             worker = session.get(Worker, worker_id)
             if worker:
-                worker.status = 'idle'
+                worker.status = "idle"
                 worker.current_job_id = None
                 worker.jobs_processed = jobs_processed
                 worker.last_heartbeat = datetime.now(UTC)
@@ -781,13 +824,10 @@ class SQLAlchemyBackend(DatabaseBackend):
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""
         with self._get_session() as session:
-            stmt = (
-                select(func.count(QueuedJob.id))
-                .where(
-                    and_(
-                        QueuedJob.status == 'running',
-                        QueuedJob.tags.contains([tag]),
-                    )
+            stmt = select(func.count(QueuedJob.id)).where(
+                and_(
+                    QueuedJob.status == "running",
+                    QueuedJob.tags.contains([tag]),
                 )
             )
             return session.exec(stmt).one()
@@ -795,15 +835,12 @@ class SQLAlchemyBackend(DatabaseBackend):
     def count_started_with_tag_since(self, tag: str, threshold: datetime) -> int:
         """Count jobs with the given tag that started since threshold."""
         with self._get_session() as session:
-            stmt = (
-                select(func.count(QueuedJob.id))
-                .where(
-                    and_(
-                        QueuedJob.status.in_(['running', 'success', 'failed']),
-                        QueuedJob.tags.contains([tag]),
-                        QueuedJob.started_at >= threshold,
-                        QueuedJob.started_at != None,
-                    )
+            stmt = select(func.count(QueuedJob.id)).where(
+                and_(
+                    QueuedJob.status.in_(["running", "success", "failed"]),
+                    QueuedJob.tags.contains([tag]),
+                    QueuedJob.started_at >= threshold,
+                    QueuedJob.started_at != None,
                 )
             )
             return session.exec(stmt).one()
@@ -811,13 +848,10 @@ class SQLAlchemyBackend(DatabaseBackend):
     def get_expired_ttl_jobs(self) -> list:
         """Get queued jobs whose TTL has expired."""
         with self._get_session() as session:
-            stmt = (
-                select(QueuedJob)
-                .where(
-                    and_(
-                        QueuedJob.status == 'queued',
-                        QueuedJob.ttl != None,
-                    )
+            stmt = select(QueuedJob).where(
+                and_(
+                    QueuedJob.status == "queued",
+                    QueuedJob.ttl != None,
                 )
             )
             now = datetime.now(UTC)
@@ -847,7 +881,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .where(
                     and_(
                         QueuedJob.queue_name.in_(queues),
-                        QueuedJob.status == 'queued',
+                        QueuedJob.status == "queued",
                         or_(
                             QueuedJob.scheduled_at == None,
                             QueuedJob.scheduled_at <= now,
@@ -874,7 +908,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             if strategy == "skip_locked":
                 db_job = session.get(QueuedJob, job.id)
-                if db_job and db_job.status == 'queued':
+                if db_job and db_job.status == "queued":
                     db_job.mark_running()
                     db_job.version = (db_job.version or 0) + 1
                     session.add(db_job)
@@ -925,7 +959,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             job = session.get(QueuedJob, job_id)
 
             if job:
-                job.status = 'queued'
+                job.status = "queued"
                 job.started_at = None
                 job.worker_pid = None
                 session.add(job)
