@@ -13,43 +13,23 @@ The codebase did not exist before 2026-03-16; v0.19.0 is a fiction. v0.20.0 was 
 
 **Key finding:** The project has spent more energy proving it *can* do six execution modes than proving it *should*, or that any of them are safe to run unattended.
 
-**Open strategic gap:** The compat layer remains Django-only, so standalone RQ migrants have no path.
-
 ---
 
 ## 1. v0.20.0 — The Foundation Was Rushed
 
 **Shipped:** 2026-03-16 (same day as project scaffolding)
 
-### 1.1 Same-day release anti-pattern
-The first commit (`fe0773a`) and the first release tag (`v0.20.0`) share a calendar day. This is not agile; this is **absence of soak time**. The "core library with Django and FastAPI integrations" was committed, tagged, and presumably declared stable before a single production workload could have exercised it.
-[This has been the work of many many days, but moved to its current repo]
+*Both findings originally filed under this section (1.1 same-day release anti-pattern, 1.2 the v0.20.x fire-drill) have been moved to NO LONGER RELEVANT — see R-H and R-I.*
 
-
-### 1.2 The v0.20.x fire-drill
-Four patch releases in three days (v0.20.1–v0.20.4, 2026-03-18 to 2026-03-19) confirm the initial release was undertested:
-
-| Patch | What broke | What it reveals |
-|-------|-----------|-----------------|
-| v0.20.1/2 | "finish top-level import migration in core/" + daemon watchdog | The core module structure was not finalized before release. The daemon required an intervention API and import cleanup *after* shipping. |
-| v0.20.3 | "increase job output truncation limits" | Either the original limit was chosen arbitrarily, or production data immediately hit it. |
-| v0.20.4 | "bulk archive scheduled jobs from dashboard" | A dashboard feature was missing from the v0.20.0 UI/UX surface, implying the initial release was feature-checked, not integration-checked. |
-
-**Verdict:** v0.20.0 was a developer preview dressed as a stable release.
-[OK, but this is not actionable]
 ---
 
 ## 2. v0.21 — A Milestone Built on Process, Not Proof
 
 **Shipped:** 2026-05-15 (after 8 weeks, 137 commits, 25 plans)
 
-### 2.1 Core Unification (Phase 01) — Compat layer is Django-only
+### 2.1 Core Unification (Phase 01)
 
-The compat layer (`sqlery/compat/rq.py` and `sqlery/compat/scheduler.py`, ~1,575 lines) is the primary user-facing surface for market-share capture from RQ/Celery/django-tasks-scheduler.
-
-**Finding:** The compat layer is Django-only. `compat/rq.py` imports `sqlery.django_sqlery.models`, `sqlery.django_sqlery.queue`, and `sqlery.django_sqlery.backend`. A standalone user migrating from RQ has no path. If you want RQ's market share, you cannot ignore the standalone integration path — RQ itself is backend-agnostic.
-
-**Risk:** The dated stubs in `django_sqlery/` rot, but the *real* risk is that the `compat/` layer is treated as second-class while being the primary user-facing surface for market-share capture.
+*The "compat layer is Django-only" finding originally filed under this section has been resolved in code and moved to NO LONGER RELEVANT — see R-J.*
 
 ### 2.2 Execution Modes (Phase 02) — Six modes, one reality
 
@@ -58,14 +38,7 @@ The milestone claims "6 execution modes × 2 integrations = 12 combinations". Th
 **Daemon mode (DMOD-01 / SMOD-01)**  
 A database-backed lease system with heartbeats and SIGUSR1 signal flags. The worker's signal handler sets a flag (not a direct DB write) because psycopg is not async-signal-safe — but the daemon itself calls `refresh_worker_heartbeat()` immediately after sending SIGUSR1, so the DB timestamp is always updated server-side. The worker's deferred flag-check (every 0.5–1s) only enriches the heartbeat with status/current_job metadata. Liveness is DB-backed by design. The "zombie detection" uses five heuristics (PID gone, no worker, worker dead, worker moved on, heartbeat stale) as defense-in-depth, not because no single source of truth exists.
 
-**HTTP trigger (SMOD-03)**  
-"Signed internal requests" rely on a shared secret. There is no mention of key rotation, nonce replay protection, or clock-skew tolerance in the trigger handler. The security model is "trust anyone with the secret"—which is fine, until it is not.
-
-**Lambda/serverless (DMOD-04 / SMOD-04)**  
-Only smoke-tested. The milestone audit admits "LocalStack/SAM fidelity testing" is deferred. A serverless handler that has never run in a Lambda-shaped container is not a serverless handler; it is a **locally tested Python function with optimistic packaging**.
-
-**Async worker (ASYN-04 / ASYN-05)**  
-The async rebuild is the most technically sound part of Phase 02, but it introduced a **hard dependency on Django 5.2 LTS** that breaks existing users on Django 4.2. More critically, the drain-with-deadline shutdown relies on `amark_shutting_down` writing transient state to the DB before `asyncio.wait`. If the DB write hangs (network partition to Postgres), the drain deadline is defeated by the very system it depends on.
+*HTTP trigger (SMOD-03), Lambda/serverless (DMOD-04 / SMOD-04), and async worker (ASYN-04 / ASYN-05) findings originally filed under this section have been resolved or accepted and moved to NO LONGER RELEVANT — see R-K, R-L, and R-M.*
 
 **Synchronous thread (DMOD-05 / SMOD-05)**  
 The simplest mode, yet it shares the same `JobExecutor` that was retroactively patched for the `ALLOWED_TASK_MODULES` gate in Phase 04. This means synchronous execution paths received security hardening **after** the execution-mode milestone was declared complete.
@@ -73,6 +46,8 @@ The simplest mode, yet it shares the same `JobExecutor` that was retroactively p
 ### 2.3 Testing & CI (Phase 03) — The 13% coverage confession
 
 The milestone audit admits the coverage gate is pinned at `fail_under=13`. Thirteen percent. The justification—"196 pre-existing Django test-collection errors"—is a **collection error**, not a coverage problem. If 196 tests cannot even be collected, the test suite is structurally unsound, not merely under-covered.
+
+> **Partially addressed 2026-05-25.** The gate was raised from `fail_under=13` to `fail_under=20` in `pyproject.toml`. This is a ratchet, not a fix — the underlying 196 collection errors remain the real defect (see Recommendation #5, which argues for fixing/deleting the broken tests rather than tuning the floor). Note: baseline coverage was measured at ~15%, so the suite must actually clear 20% for CI to stay green.
 
 **The gap-closure pass fixed a real production bug:** `claim_next_job_with_queue_priority` had an arity mismatch. This was caught by tests, but the initial verifier diagnosed it as a missing `@pytest.mark.django_db` mark. The fact that the project's own verification tooling misdiagnosed a production bug should terrify anyone relying on the test suite for safety.
 
@@ -92,7 +67,7 @@ The webhook URL validator blocks private IP ranges. The audit admits four limita
 Ten state-changing admin endpoints lost `@csrf_exempt`. Good. But three endpoints in `views.py` still intentionally use it. The regression suite passes, but the **intentional exceptions are not audited** for whether they are still justified.
 
 **SEC-04 — ALLOWED_TASK_MODULES**  
-An opt-in allowlist for task module imports, wired into worker dispatch. The default is unconfigured, and the code emits a warning. In practice, most deployments will never configure this, making it **security-by-opt-in**, which is indistinguishable from no security.
+*Finding moved to NO LONGER RELEVANT as a deliberate WON'T-FIX — see R-N.*
 
 **CLEAN-01 — Backward-compatibility stubs**  
 The project date-stamped 22 stubs instead of deleting them. The estimate was 24; the reconciliation is documented, but the underlying decision—"keep dead code because we are afraid to delete it"—remains unchallenged.
@@ -105,9 +80,15 @@ Shipped within a week of the milestone (2026-05-18 to 2026-05-25), these patches
 
 - **v0.21.1:** `wrap claim_job in transaction.atomic to fix worker crash-loop on PostgreSQL`  
   A worker crash-loop on Postgres is not a minor bug; it is a **production outage**. That this was found after the Phase 03 verifier PASS means the verifier was insufficient.
+[CAN ANYTHING BE DONE that was not already? no, then not relevant anymore]
 
-- **v0.21.2:** `auto-register workers on-demand to fix jobs waiting with idle workers`  
-  Jobs were waiting while workers sat idle. This is a **scheduling deadlock** in the daemon's worker pool logic. Again, found after the milestone was audited and closed.
+- **v0.21.2:** `stop dashboard from spamming console errors when session expires`  
+  The dashboard's `updateStats()` threw an error every 3 seconds when a 403 was returned on session expiry, logging a hard failure to the console indefinitely. The same bug existed in `updateTasks()` and `pollFeed()`. Fixed by handling 401/403 gracefully (stop polling, show toast) and treating other non-OK responses as transient warnings instead of thrown errors.
+[RESOLVED 2026-05-25 — see R-O]
+
+- **v0.21.2 (cont'd):** `prevent dashboard from polling /admin/sqlery/undefined when config is missing`  
+  When the inline `DASHBOARD_CONFIG` script failed to load (CSP block, syntax error, etc.), `dashboard.js` created a fallback `{}`, causing `fetch(undefined)` on every 3-second refresh cycle and producing an endless stream of requests to `/admin/sqlery/undefined`. Fixed by adding a `_urlOk()` guard that validates URLs are non-empty strings before each fetch.
+[RESOLVED 2026-05-25 — see R-P]
 
 - **Dialect-aware atomic claiming:**  
   A v0.21.2 feature that swaps `SELECT FOR UPDATE SKIP LOCKED` for optimistic version-CAS depending on the DB dialect. Adding a fundamental concurrency primitive **after** the security and testing milestone is complete suggests the Postgres path was never seriously load-tested.
@@ -153,17 +134,20 @@ These are not features; they are **apologies**.
 
 ## 7. Open Recommendations
 
-3. **Make the compat layer standalone-capable.** The RQ compat currently hard-codes Django imports. If you want RQ's market share, you must support standalone mode — many RQ users are not Django shops. The `Queue` wrapper in `compat/rq.py` should delegate to `sqlery.core.job_queue` and use `get_backend()`, not `_DjangoQueue`.
+3. **Make the compat layer standalone-capable.** ~~The RQ compat currently hard-codes Django imports.~~
+   > **Resolved 2026-05-25.** `compat/rq.py` was rewritten to be backend-agnostic: the four top-level Django imports were removed and made lazy/mode-detecting, utility functions and the `Job`/`Worker` stubs now route through `get_backend()` / the `DatabaseBackend` ABC (Django fast-path preserved), and `Retry`/`JobStatus` were inlined to drop the Django transitive import. A standalone suite (`tests/test_compat_rq_standalone.py`, 9 tests) proves `import sqlery.compat.rq` works with Django absent. Commits `a1ea763`, `f91e37e`. See R-J.
 
 4. **Add compat contract tests.** There are no tests proving that `from sqlery.compat.rq import Queue` behaves like `from rq import Queue` for common call patterns. Without regression tests, the compat layer will drift from the APIs it claims to mirror.
 
 5. **Replace the 13% coverage floor with a 0% floor.** A dishonest number is worse than no number. Force the team to fix the 196 collection errors or delete the tests causing them.
+   > **Partially addressed 2026-05-25.** Floor raised 13 → 20 (not 0). The core objection — fix or delete the 196 broken collections — is still open.
 
 6. **Demote Lambda and HTTP trigger to "experimental."** They have not run in realistic environments. Labeling them production-ready is reckless.
+   > **Partially addressed 2026-05-25.** The Lambda half is **resolved**: Lambda/serverless is now explicitly marked EXPERIMENTAL (docstring warning + runtime log + doc callouts) — see R-L. HTTP trigger was *hardened* rather than demoted: it gained an IP/origin allowlist (loopback-only by default) on top of the existing HMAC + 5s-window signature, and the secret-only trust model is accepted by design (R-K). Whether HTTP trigger should additionally carry an "experimental" label remains an open judgment call.
 
 8. **Stop adding security features until the test suite can catch arity bugs.** SEC-01 through SEC-04 are meaningless if the verifier cannot distinguish a missing decorator from a production crash.
 
-**Score:** 5 of 8 original recommendations remain open.
+**Score:** 4 of 8 original recommendations remain open (#4, #5, #6, #8). Recommendation #3 (standalone-capable compat layer) is now **fully resolved** as of 2026-05-25. Of the still-open four, #5 is partially addressed (coverage floor raised, collection errors unfixed) and #6 is partially addressed (Lambda half resolved via EXPERIMENTAL labeling; HTTP-trigger label still a judgment call). The SMOD-03 security gap is no longer counted as open — it is accepted by design (R-K).
 
 ---
 
@@ -225,6 +209,64 @@ No longer applies — the hook-based executor handles this structurally.
 
 ---
 
+## R-H. Same-Day Release Anti-Pattern (was Section 1.1)
+
+**Original complaint:** The first commit (`fe0773a`) and the first release tag (`v0.20.0`) share a calendar day — "absence of soak time." The "core library with Django and FastAPI integrations" was committed, tagged, and presumably declared stable before a single production workload could have exercised it.
+
+**Resolution / Verdict (2026-05-25):** Premise rejected. The same-day premise is false — the repository's first commit is not the project's actual start. This has been the work of many days; the codebase was migrated into its current repo from prior work that predates this repository's history.
+
+---
+
+## R-I. The v0.20.x Fire-Drill (was Section 1.2)
+
+**Original complaint:** Four patch releases in three days (v0.20.1–v0.20.4) — an import-migration/daemon-watchdog fix, an output-truncation-limit bump, and a dashboard archive feature — confirm the initial release was undertested. **Original verdict:** v0.20.0 was a developer preview dressed as a stable release.
+
+**Resolution / Verdict (2026-05-25):** Non-actionable observation. The maintainer accepts the characterization but notes there is nothing to act on — the patches already shipped and the underlying releases are historical. Retained for the record only.
+
+---
+
+## R-J. Compat Layer Was Django-Only (was Section 2.1, Recommendation #3)
+
+**Original finding:** The compat layer (`compat/rq.py`, `compat/scheduler.py`) was Django-only. `compat/rq.py` imported `sqlery.django_sqlery.models`, `sqlery.django_sqlery.queue`, and `sqlery.django_sqlery.backend`, so a standalone user migrating from RQ had no path — despite the compat layer being the primary user-facing surface for market-share capture from RQ/Celery/django-tasks-scheduler.
+
+**Resolution / Verdict (2026-05-25):** **RESOLVED IN CODE.** `compat/rq.py` was rewritten to be backend-agnostic: all four top-level Django imports were removed and made lazy/mode-detecting; utility functions and the `Job`/`Worker` stubs now route through the framework-agnostic `get_backend()` / `DatabaseBackend` ABC, with the Django fast-path preserved; `Retry`/`JobStatus` were inlined to drop the Django transitive import. A standalone test suite (`tests/test_compat_rq_standalone.py`, 9 tests) proves `import sqlery.compat.rq` works with Django absent. Commits `a1ea763`, `f91e37e`.
+
+---
+
+## R-K. HTTP Trigger Secret-Only Trust (was Section 2.2, SMOD-03)
+
+**Original complaint:** "Signed internal requests" rely on a shared secret. No key rotation, nonce replay protection, or clock-skew tolerance was mentioned in the trigger handler. The security model is "trust anyone with the secret."
+
+> **Partially addressed 2026-05-25.** Added an IP/origin allowlist (`INTERNAL_ALLOWED_IPS`, default loopback-only `["127.0.0.1", "::1"]`, opt-out via `["*"]`/`None`) as defense-in-depth on top of the HMAC check. Enforced in the framework-agnostic `core/triggers.py:handle()` plus the Django and FastAPI entry points, matched against the real socket peer (`REMOTE_ADDR` / `request.client.host`), never the attacker-controllable `X-Forwarded-For`. The handler already verified HMAC-SHA256 with a 5s timestamp window (clock-skew/replay bound) via constant-time compare; key rotation and a true nonce remain open.
+
+**Resolution / Verdict (2026-05-25):** **ACCEPTED — by design.** The "trust anyone with the secret" critique is acceptable: a secret is, by definition, secret. Combined with HMAC-SHA256, the 5s timestamp window, and the loopback-default IP allowlist already in place, the threat model is considered adequate. Not counted as an open security gap.
+
+---
+
+## R-L. Lambda/Serverless Maturity Label (was Section 2.2, DMOD-04 / SMOD-04)
+
+**Original complaint:** Only smoke-tested. "LocalStack/SAM fidelity testing" is deferred. A serverless handler that has never run in a Lambda-shaped container is not a serverless handler; it is a locally tested Python function with optimistic packaging.
+
+**Resolution / Verdict (2026-05-25):** **RESOLVED by labeling.** The maintainer's directive was "specify and log: Experimental," and the mode is now explicitly marked EXPERIMENTAL: a `.. warning::` block in both `lambda_handler.py` module docstrings (Django + standalone), a one-time `logger.warning` emitted on first handler invocation per process, and ⚠️ callouts in `examples/lambda/README.md` and `docs/ARCHITECTURE.md`. Handler logic unchanged. This satisfies the Lambda half of Recommendation #6; the maturity gap (no LocalStack/SAM fidelity testing) is unchanged but is now honestly labeled.
+
+---
+
+## R-M. Async Worker Risks (was Section 2.2, ASYN-04 / ASYN-05)
+
+**Original complaint:** The async rebuild introduced a hard dependency on Django 5.2 LTS that breaks existing users on Django 4.2. More critically, the drain-with-deadline shutdown relies on `amark_shutting_down` writing transient state to the DB before `asyncio.wait`; if the DB write hangs (network partition to Postgres), the drain deadline is defeated by the very system it depends on.
+
+**Resolution / Verdict (2026-05-25):** **ACCEPTED — won't-fix.** The maintainer accepts the risk as not a relevant issue for the supported deployment profile. Retained for the record only.
+
+---
+
+## R-N. SEC-04 — ALLOWED_TASK_MODULES Security-by-Opt-In (was Section 2.4)
+
+**Original complaint:** An opt-in allowlist for task module imports, wired into worker dispatch. The default is unconfigured and the code emits a warning. In practice most deployments will never configure this, making it security-by-opt-in, which is indistinguishable from no security.
+
+**Resolution / Verdict (2026-05-25):** **WON'T-FIX — accepted as designed.** Security-by-opt-in is the intended posture: the allowlist is deliberately opt-in with a startup warning, and the maintainer has marked this as not going to be addressed.
+
+---
+
 ## R-G. Rectification Log (was Section 9)
 
 | # | Finding | Status | Date |
@@ -232,6 +274,16 @@ No longer applies — the hook-based executor handles this structurally.
 | R-1 | CHANGELOG references ghost versions, omits real releases | **RESOLVED** | 2026-05-25 |
 | R-2 | Compat layer emits DeprecationWarning contradicting "permanent" decision | **RESOLVED** | 2026-05-25 |
 | R-3 | Fork safety via manual `_reset_db_connections()` | **RESOLVED** | 2026-05-25 |
+| R-4 | SMOD-03 HTTP trigger has no network enforcement (secret-only trust) | **ACCEPTED** — by design; HMAC + 5s window + loopback-default IP allowlist deemed adequate (a secret is secret) | 2026-05-25 |
+| R-5 | Lambda/serverless (DMOD-04/SMOD-04) mislabeled despite smoke-only testing | **RESOLVED** — marked EXPERIMENTAL in code + docs (specify-and-log directive met); fidelity testing remains a known, labeled gap | 2026-05-25 |
+| R-6 | Coverage gate dishonestly pinned at `fail_under=13` | **PARTIAL** — raised to 20; 196 collection errors still unfixed | 2026-05-25 |
+| R-7 | Compat layer Django-only; no standalone RQ migration path | **RESOLVED** — `compat/rq.py` made backend-agnostic via `get_backend()`/`DatabaseBackend`; standalone test suite added (commits `a1ea763`, `f91e37e`) | 2026-05-25 |
+| R-8 | Async worker (ASYN-04/05): Django 5.2 dependency + DB-dependent drain deadline | **ACCEPTED** — won't-fix; risk accepted for supported deployment profile | 2026-05-25 |
+| R-9 | SEC-04 ALLOWED_TASK_MODULES is security-by-opt-in | **WON'T-FIX** — opt-in posture accepted as designed | 2026-05-25 |
+| R-10 | v0.20.0 same-day release anti-pattern (Section 1.1) | **N/A** — premise rejected; prior work predates this repo | 2026-05-25 |
+| R-11 | v0.20.x fire-drill (Section 1.2) | **N/A** — non-actionable historical observation | 2026-05-25 |
+| R-12 | Dashboard session expiry produces infinite console.error spam (dashboard.js) | **RESOLVED** — 401/403 now stops polling + shows toast; other non-OK logs console.warn (commit `2dedcec`) | 2026-05-25 |
+| R-13 | Missing DASHBOARD_CONFIG causes fetch(undefined) → /admin/sqlery/undefined 404s | **RESOLVED** — `_urlOk()` guard added before all auto-refresh fetch() calls (commit `9d86ff2`) | 2026-05-25 |
 
 ---
 
