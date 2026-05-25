@@ -19,7 +19,7 @@ For standalone projects (FastAPI, Flask, etc.):
     from sqlery.core import Queue, Worker
 """
 
-__version__ = "0.13.0"
+__version__ = "0.22.0"
 
 # Re-exports for backward compatibility
 from .core.job_queue import (
