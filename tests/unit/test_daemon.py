@@ -9,7 +9,7 @@ testable units:
 * ``status()`` aggregation
 * DB-backed lease acquire / renew / expire (via the FakeBackend's
   in-memory ``_leases`` dict)
-* Zombie-job detection sequence skips when QueuedJob model is absent
+* Zombie-job detection sequence (mode-agnostic, over RunningJobLiveness)
 * Stop / restart / cleanup-stale plumbing (mocked ``os.kill``)
 """
 
@@ -78,6 +78,7 @@ class TestProcessLiveness:
     def test_is_process_running_false_when_kill_raises(self, dm, monkeypatch):
         def boom(pid, sig):
             raise OSError("no such process")
+
         monkeypatch.setattr(os, "kill", boom)
         assert dm.is_process_running(123) is False
 
@@ -193,16 +194,99 @@ class TestLeaseLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# TestZombieDetection — _fail_zombie_running_jobs is a no-op without Django.
+# TestZombieDetection — mode-agnostic _fail_zombie_running_jobs over
+# backend-supplied RunningJobLiveness records (works for Django + standalone).
 # ---------------------------------------------------------------------------
 
 
+def socket_hostname():
+    import socket
+
+    return os.environ.get("NODE_ID", socket.gethostname())
+
+
+def _liveness(**overrides):
+    """Build a healthy RunningJobLiveness record, overridable per-check."""
+    from sqlery.core.liveness import RunningJobLiveness
+
+    now = datetime.now(timezone.utc)
+    base = dict(
+        job_id=101,
+        started_at=now,
+        worker_pid=os.getpid(),  # alive PID on this node
+        worker_node_id=socket_hostname(),
+        worker_status="busy",
+        worker_current_job_id=101,  # points at this job → healthy
+        worker_last_heartbeat=now,
+        worker_friendly_name="wise-builder-1a",
+        has_worker=True,
+    )
+    base.update(overrides)
+    return RunningJobLiveness(**base)
+
+
 class TestZombieDetection:
-    def test_fail_zombie_no_op_when_queued_job_absent(self, fake_backend, monkeypatch):
-        """Without the Django QueuedJob model the routine returns silently."""
-        monkeypatch.setattr(daemon_module, "QueuedJob", None)
-        # Should not raise.
+    def _run(self, fake_backend, records):
+        fake_backend.liveness_records = records
         DaemonManager._fail_zombie_running_jobs(fake_backend, queue_names=["default"])
+        return [c for c in fake_backend.calls if c[0] == "fail_zombie_job"]
+
+    def test_no_op_when_no_running_jobs(self, fake_backend):
+        """Empty sweep (e.g. standalone with no records) does nothing."""
+        fake_backend.liveness_records = []
+        DaemonManager._fail_zombie_running_jobs(fake_backend, queue_names=["default"])
+        assert [c for c in fake_backend.calls if c[0] == "fail_zombie_job"] == []
+
+    def test_healthy_worker_not_failed(self, fake_backend):
+        calls = self._run(fake_backend, [_liveness()])
+        assert calls == [], "healthy running job must not be failed"
+
+    def test_check1_pid_gone(self, fake_backend):
+        rec = _liveness(worker_pid=999_999)  # PID almost certainly absent
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert calls[0][1][0] == rec.job_id
+        assert "no longer exists" in calls[0][1][1]
+
+    def test_check2_no_worker(self, fake_backend):
+        rec = _liveness(
+            has_worker=False,
+            worker_pid=None,
+            worker_node_id=None,
+            worker_status=None,
+            worker_current_job_id=None,
+            worker_last_heartbeat=None,
+            worker_friendly_name=None,
+        )
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert calls[0][1][1] == "Running job has no worker assigned"
+
+    def test_check3_worker_dead(self, fake_backend):
+        rec = _liveness(worker_pid=None, worker_status="dead")
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert "is dead" in calls[0][1][1]
+
+    def test_check4_worker_moved_on(self, fake_backend):
+        rec = _liveness(worker_pid=None, worker_current_job_id=999)
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert "moved on to job #999" in calls[0][1][1]
+
+    def test_check4_worker_idle_past_grace(self, fake_backend):
+        old = datetime.now(timezone.utc) - timedelta(seconds=300)
+        rec = _liveness(worker_pid=None, worker_current_job_id=None, started_at=old)
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert "is idle but job has been running" in calls[0][1][1]
+
+    def test_check5_heartbeat_stale(self, fake_backend):
+        stale = datetime.now(timezone.utc) - timedelta(hours=1)
+        rec = _liveness(worker_pid=None, worker_last_heartbeat=stale)
+        calls = self._run(fake_backend, [rec])
+        assert len(calls) == 1
+        assert "heartbeat stale" in calls[0][1][1]
 
 
 # ---------------------------------------------------------------------------
