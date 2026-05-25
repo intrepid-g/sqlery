@@ -14,23 +14,90 @@ to migrate from RQ to SQLery.
 
 import logging
 import random
+from dataclasses import dataclass, field
 from datetime import timedelta, datetime, UTC
+from enum import Enum
 from typing import Any, Callable
 
 from sqlery.core.utils import import_task
-from sqlery.django_sqlery.models import Worker as _Worker
-
-from sqlery.compat.scheduler import Retry, get_current_job, JobStatus
-from sqlery.django_sqlery.models import QueuedJob
-from sqlery.django_sqlery.queue import Queue as _DjangoQueue
-from sqlery.django_sqlery.backend import DjangoBackend as _DjangoBackend
-
-
-def _make_django_queue(name: str) -> _DjangoQueue:
-    """Instantiate a Django-backed Queue with DjangoBackend."""
-    return _DjangoQueue(name, backend=_DjangoBackend())
+from sqlery.compat import is_django_mode, get_backend
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Retry and JobStatus — copied inline so this module has zero cross-module
+# Django dependency at import time (scheduler.py has top-level Django imports).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Retry:
+    """RQ-compatible Retry descriptor.
+
+    Args:
+        max: Maximum number of retries.
+        intervals: List of seconds between retries (or a single int broadcast to all).
+    """
+
+    max: int = 0
+    intervals: list[int] = field(default_factory=lambda: [0])
+
+    def __post_init__(self):
+        if isinstance(self.intervals, int):
+            self.intervals = [self.intervals] * max(self.max, 1)
+        if not self.intervals:
+            self.intervals = [0]
+
+
+class JobStatus(str, Enum):
+    """Job status enumeration compatible with django-tasks-scheduler's JobStatus."""
+
+    QUEUED = "queued"
+    STARTED = "running"
+    FINISHED = "success"
+    FAILED = "failed"
+    STOPPED = "cancelled"
+    SCHEDULED = "scheduled"
+    DEFERRED = "deferred"
+    CANCELLED = "cancelled"
+
+
+def get_current_job():
+    """Return the currently-executing job object, or None.
+
+    Drop-in for rq.get_current_job().  In Django mode delegates to the
+    scheduler compat layer; in standalone mode reads the same contextvar
+    set by WorkerProcess.
+    """
+    if is_django_mode():
+        from sqlery.compat.scheduler import get_current_job as _gcj
+        return _gcj()
+    else:
+        try:
+            from sqlery.core.worker import _current_job_var
+            return _current_job_var.get(None)
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — lazy Django imports, mode-aware queue factory
+# ---------------------------------------------------------------------------
+
+
+def _make_queue(name: str):
+    """Return the appropriate queue object for the current mode.
+
+    In Django mode returns a DjangoQueue backed by DjangoBackend.
+    In standalone mode returns the core job_queue.Queue.
+    """
+    if is_django_mode():
+        from sqlery.django_sqlery.queue import Queue as _DQ
+        from sqlery.django_sqlery.backend import DjangoBackend as _DB
+        return _DQ(name, backend=_DB())
+    else:
+        from sqlery.core.job_queue import Queue as _CoreQ
+        return _CoreQ(name)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +114,7 @@ class Queue:
     """
 
     def __init__(self, name: str = "default", default_timeout: int | None = None, **_ignored):
-        """Initialise a Queue wrapping sqlery's Django Queue.
+        """Initialise a Queue wrapping sqlery's Queue.
 
         Args:
             name: Queue name (default: 'default').
@@ -56,7 +123,7 @@ class Queue:
         """
         self.name = name
         self.default_timeout = default_timeout
-        self._q = _make_django_queue(name)
+        self._q = _make_queue(name)
 
     # --- Internal helpers ---
 
@@ -112,7 +179,7 @@ class Queue:
 
     # --- Public API ---
 
-    def enqueue(self, func: Callable, *args, **kwargs) -> QueuedJob:
+    def enqueue(self, func: Callable, *args, **kwargs) -> Any:
         """Enqueue a job immediately.
 
         Accepts all standard RQ enqueue kwargs (job_id, retry, at_front,
@@ -124,7 +191,7 @@ class Queue:
             **kwargs: RQ-style options + keyword arguments for func.
 
         Returns:
-            QueuedJob instance.
+            Job instance (QueuedJob in Django mode; SQLAlchemy Job in standalone).
         """
         meta = kwargs.pop("meta", None)
         mapped = self._map_rq_kwargs(kwargs)
@@ -135,15 +202,20 @@ class Queue:
         elif args:
             mapped["_args"] = list(args) + mapped["_args"]
 
-        job = self._q.enqueue(func, **mapped)
+        if is_django_mode():
+            job = self._q.enqueue(func, **mapped)
+        else:
+            task_path = f"{func.__module__}.{func.__qualname__}"
+            job = self._q.enqueue(task_path, **mapped)
 
-        if meta:
+        if meta and job is not None:
             job.meta = dict(meta)
-            job.save_meta()
+            if hasattr(job, "save_meta"):
+                job.save_meta()
 
         return job
 
-    def enqueue_in(self, delay: timedelta, func: Callable, *args, **kwargs) -> QueuedJob:
+    def enqueue_in(self, delay: timedelta, func: Callable, *args, **kwargs) -> Any:
         """Enqueue a job after a timedelta delay.
 
         """
@@ -151,13 +223,21 @@ class Queue:
         mapped = self._map_rq_kwargs(kwargs)
         if args:
             mapped.setdefault("_args", list(args))
-        job = self._q.enqueue_in(delay, func, **mapped)
-        if meta:
+
+        if is_django_mode():
+            job = self._q.enqueue_in(delay, func, **mapped)
+        else:
+            run_at = datetime.now(UTC) + delay
+            task_path = f"{func.__module__}.{func.__qualname__}"
+            job = self._q.enqueue_at(run_at, task_path, **mapped)
+
+        if meta and job is not None:
             job.meta = dict(meta)
-            job.save_meta()
+            if hasattr(job, "save_meta"):
+                job.save_meta()
         return job
 
-    def enqueue_at(self, when: datetime, func: Callable, *args, **kwargs) -> QueuedJob:
+    def enqueue_at(self, when: datetime, func: Callable, *args, **kwargs) -> Any:
         """Enqueue a job at a specific datetime.
 
         """
@@ -165,10 +245,17 @@ class Queue:
         mapped = self._map_rq_kwargs(kwargs)
         if args:
             mapped.setdefault("_args", list(args))
-        job = self._q.enqueue_at(when, func, **mapped)
-        if meta:
+
+        if is_django_mode():
+            job = self._q.enqueue_at(when, func, **mapped)
+        else:
+            task_path = f"{func.__module__}.{func.__qualname__}"
+            job = self._q.enqueue_at(when, task_path, **mapped)
+
+        if meta and job is not None:
             job.meta = dict(meta)
-            job.save_meta()
+            if hasattr(job, "save_meta"):
+                job.save_meta()
         return job
 
     def __repr__(self) -> str:
@@ -206,7 +293,6 @@ def get_job_registry_summary(queue_name: str) -> dict[str, list[int]]:
         Dict with keys 'started', 'finished', 'failed', 'scheduled', 'queued',
         each containing a list of job PKs.
     """
-    qs = QueuedJob.objects.filter(queue_name=queue_name).values("id", "status", "scheduled_at")
     summary: dict[str, list[int]] = {
         "started": [],
         "finished": [],
@@ -214,19 +300,39 @@ def get_job_registry_summary(queue_name: str) -> dict[str, list[int]]:
         "scheduled": [],
         "queued": [],
     }
-    for row in qs:
-        status = row["status"]
-        pk = row["id"]
-        if status == "running":
-            summary["started"].append(pk)
-        elif status == "success":
-            summary["finished"].append(pk)
-        elif status == "failed":
-            summary["failed"].append(pk)
-        elif status == "queued" and row.get("scheduled_at"):
-            summary["scheduled"].append(pk)
-        else:
-            summary["queued"].append(pk)
+
+    if is_django_mode():
+        from sqlery.django_sqlery.models import QueuedJob
+        qs = QueuedJob.objects.filter(queue_name=queue_name).values("id", "status", "scheduled_at")
+        for row in qs:
+            status = row["status"]
+            pk = row["id"]
+            if status == "running":
+                summary["started"].append(pk)
+            elif status == "success":
+                summary["finished"].append(pk)
+            elif status == "failed":
+                summary["failed"].append(pk)
+            elif status == "queued" and row.get("scheduled_at"):
+                summary["scheduled"].append(pk)
+            else:
+                summary["queued"].append(pk)
+    else:
+        jobs = get_backend().get_jobs(queue_name=queue_name, limit=100000)
+        for job_obj in jobs:
+            status = job_obj.status
+            pk = job_obj.id
+            if status == "running":
+                summary["started"].append(pk)
+            elif status == "success":
+                summary["finished"].append(pk)
+            elif status == "failed":
+                summary["failed"].append(pk)
+            elif status == "queued" and getattr(job_obj, "scheduled_at", None):
+                summary["scheduled"].append(pk)
+            else:
+                summary["queued"].append(pk)
+
     return summary
 
 
@@ -241,8 +347,13 @@ def clear_failed_jobs(queue_name: str) -> int:
     Returns:
         Number of jobs deleted.
     """
-    count, _ = QueuedJob.objects.filter(queue_name=queue_name, status="failed").delete()
-    return count
+    if is_django_mode():
+        from sqlery.django_sqlery.models import QueuedJob
+        count, _ = QueuedJob.objects.filter(queue_name=queue_name, status="failed").delete()
+        return count
+    else:
+        result = get_backend().cleanup_jobs(status="failed", queue_name=queue_name)
+        return result.get("deleted", 0)
 
 
 def delete_other_jobs_by_same_meta_tag(current_job_id: int, meta_tag: str) -> int:
@@ -256,24 +367,37 @@ def delete_other_jobs_by_same_meta_tag(current_job_id: int, meta_tag: str) -> in
         Number of jobs cancelled.
     """
     cancelled = 0
-    candidates = QueuedJob.objects.filter(
-        status="queued",
-    ).exclude(pk=current_job_id)
 
-    for job in candidates:
-        if (job.meta or {}).get("tag") == meta_tag:
-            job.status = "cancelled"
-            job.save(update_fields=["status"])
-            cancelled += 1
+    if is_django_mode():
+        from sqlery.django_sqlery.models import QueuedJob
+        candidates = QueuedJob.objects.filter(
+            status="queued",
+        ).exclude(pk=current_job_id)
+
+        for job_obj in candidates:
+            if (job_obj.meta or {}).get("tag") == meta_tag:
+                job_obj.status = "cancelled"
+                job_obj.save(update_fields=["status"])
+                cancelled += 1
+    else:
+        backend = get_backend()
+        # Fetch all queued jobs (global, since meta-tag match is cross-queue)
+        jobs = backend.get_jobs(status="queued", limit=10000)
+        for job_obj in jobs:
+            if job_obj.id == current_job_id:
+                continue
+            if (getattr(job_obj, "meta", None) or {}).get("tag") == meta_tag:
+                backend.cancel_job(job_obj.id)
+                cancelled += 1
 
     return cancelled
 
 
-def is_final_retry(job: QueuedJob) -> bool:
+def is_final_retry(job: Any) -> bool:
     """Return True if this is the last retry attempt for the given job.
 
     Args:
-        job: QueuedJob instance currently executing.
+        job: QueuedJob or standalone Job instance currently executing.
 
     Returns:
         True if no more retries will occur after this attempt.
@@ -286,6 +410,8 @@ def get_queue_wait_time(queue_name: str) -> int:
 
     Returns 0 if the queue is empty.
 
+    Note: In standalone mode, ordering is backend-defined and may not be strictly
+    by created_at; the wait time returned reflects the first job in the returned list.
 
     Args:
         queue_name: Name of the queue to measure.
@@ -293,20 +419,31 @@ def get_queue_wait_time(queue_name: str) -> int:
     Returns:
         Integer seconds since oldest queued job was created (0 if empty).
     """
-    oldest = (
-        QueuedJob.objects.filter(queue_name=queue_name, status="queued")
-        .order_by("created_at")
-        .values("created_at")
-        .first()
-    )
-    if oldest is None:
-        return 0
-    delta = datetime.now(UTC) - oldest["created_at"]
-    return max(0, int(delta.total_seconds()))
+    if is_django_mode():
+        from sqlery.django_sqlery.models import QueuedJob
+        oldest = (
+            QueuedJob.objects.filter(queue_name=queue_name, status="queued")
+            .order_by("created_at")
+            .values("created_at")
+            .first()
+        )
+        if oldest is None:
+            return 0
+        delta = datetime.now(UTC) - oldest["created_at"]
+        return max(0, int(delta.total_seconds()))
+    else:
+        jobs = get_backend().get_jobs(status="queued", queue_name=queue_name, limit=1)
+        if not jobs:
+            return 0
+        created_at = getattr(jobs[0], "created_at", None)
+        if created_at is None:
+            return 0
+        delta = datetime.now(UTC) - created_at
+        return max(0, int(delta.total_seconds()))
 
 
 def requeue_if_jobs_pending(
-    current_job: QueuedJob,
+    current_job: Any,
     min_delay: int = 5,
     max_delay: int = 20,
     **override_kwargs,
@@ -320,28 +457,34 @@ def requeue_if_jobs_pending(
 
 
     Args:
-        current_job: The QueuedJob currently being executed.
+        current_job: The job currently being executed (QueuedJob in Django mode,
+            SQLAlchemy Job in standalone mode).
         min_delay: Minimum re-queue delay in seconds (default: 5).
         max_delay: Maximum re-queue delay in seconds (default: 20).
-        **override_kwargs: Extra kwargs passed to enqueue_in() (e.g. priority).
+        **override_kwargs: Extra kwargs passed to enqueue (e.g. priority).
 
     Returns:
         True if the job was re-enqueued (caller should return early).
         False if the queue is clear and the job should proceed normally.
     """
-    pending_count = QueuedJob.objects.filter(
-        queue_name=current_job.queue_name,
-        status="queued",
-    ).exclude(pk=current_job.pk).count()
+    if is_django_mode():
+        from sqlery.django_sqlery.models import QueuedJob
+        pending_count = QueuedJob.objects.filter(
+            queue_name=current_job.queue_name,
+            status="queued",
+        ).exclude(pk=current_job.pk).count()
+    else:
+        pending_count = get_backend().count_jobs(
+            status="queued", queue_name=current_job.queue_name
+        )
+        # Subtract 1 for the current job itself if it's counted as queued
+        if pending_count > 0:
+            pending_count -= 1
 
     if pending_count == 0:
         return False
 
     delay_seconds = random.randint(min_delay, max_delay)
-    q = _make_django_queue(current_job.queue_name)
-
-    # from sqlery.django_sqlery.utils import import_task  # Promoted to core
-    # from sqlery.core.utils import import_task  # moved to top-level
     func = import_task(current_job.task_path)
 
     enqueue_kwargs: dict[str, Any] = {
@@ -356,6 +499,8 @@ def requeue_if_jobs_pending(
     enqueue_kwargs.update(override_kwargs)
 
     task_kwargs = dict(current_job.kwargs or {})
+
+    q = Queue(current_job.queue_name)
     q.enqueue_in(timedelta(seconds=delay_seconds), func, **task_kwargs, **enqueue_kwargs)
     return True
 
@@ -373,15 +518,15 @@ class NoSuchJobError(Exception):
 
 
 class Job:
-    """Minimal rq.job.Job compat backed by QueuedJob."""
+    """Minimal rq.job.Job compat backed by QueuedJob or standalone Job model."""
 
-    def __init__(self, queued_job: QueuedJob):
+    def __init__(self, queued_job: Any):
         self._qj = queued_job
 
     # -- rq-compatible properties --
     @property
     def id(self):
-        return str(self._qj.pk)
+        return str(self._qj.pk if hasattr(self._qj, "pk") else self._qj.id)
 
     @property
     def meta(self):
@@ -398,16 +543,31 @@ class Job:
         return self._qj.status
 
     def delete(self):
-        self._qj.delete()
+        """Delete the job. In standalone mode, cancels the job (closest equivalent)."""
+        if is_django_mode():
+            self._qj.delete()
+        else:
+            job_id = self._qj.pk if hasattr(self._qj, "pk") else self._qj.id
+            get_backend().cancel_job(job_id)
 
     @classmethod
     def fetch(cls, job_id, connection=None):
         """Fetch a job by ID. Raises NoSuchJobError if not found."""
-        try:
-            qj = QueuedJob.objects.get(pk=job_id)
-        except (QueuedJob.DoesNotExist, ValueError):
-            raise NoSuchJobError(f"No such job: {job_id}")
-        return cls(qj)
+        if is_django_mode():
+            from sqlery.django_sqlery.models import QueuedJob
+            try:
+                qj = QueuedJob.objects.get(pk=job_id)
+            except (QueuedJob.DoesNotExist, ValueError):
+                raise NoSuchJobError(f"No such job: {job_id}")
+            return cls(qj)
+        else:
+            try:
+                qj = get_backend().get_job_by_id(int(job_id))
+            except (ValueError, TypeError):
+                raise NoSuchJobError(f"No such job: {job_id}")
+            if qj is None:
+                raise NoSuchJobError(f"No such job: {job_id}")
+            return cls(qj)
 
 
 class Worker:
@@ -416,15 +576,21 @@ class Worker:
     RQ workers are separate OS processes that poll Redis; sqlery workers
     are daemon threads (or management command processes) that poll the
     database.  Worker.all() in RQ discovers processes via Redis keys;
-    here it queries the sqlery Worker ORM model instead.
+    here it queries the sqlery Worker ORM model or backend heartbeats instead.
     """
 
     @classmethod
     def all(cls, connection=None):
-        """Return all active sqlery workers (connection kwarg ignored)."""
-        # from sqlery.django_sqlery.models import Worker as _Worker  # moved to top-level
+        """Return all active sqlery workers (connection kwarg ignored).
 
-        return list(_Worker.objects.filter(status__in=["idle", "busy"]))
+        In Django mode returns Worker ORM instances (status idle or busy).
+        In standalone mode returns worker heartbeat records from the backend.
+        """
+        if is_django_mode():
+            from sqlery.django_sqlery.models import Worker as _Worker
+            return list(_Worker.objects.filter(status__in=["idle", "busy"]))
+        else:
+            return get_backend().get_worker_heartbeats(active_only=True)
 
 
 # ---------------------------------------------------------------------------
