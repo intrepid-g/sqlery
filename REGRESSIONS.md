@@ -64,3 +64,17 @@ Use this file to:
 **Inline comment:** `# REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/admin.py:539`
 
 **Validation:** All 12 admin tests pass. Manual verification that `runs_display` returns valid HTML for both populated and empty run histories.
+
+## 2026-05-25 — Sync executor silently "succeeds" @async_job tasks without running them
+
+**What broke:** When an `@async_job` (coroutine) task was processed by the sync `WorkerProcess`, the executor called the task, got back a coroutine object, and marked the job successful without ever awaiting it. The task body never ran. `QueuedJob.output` stored the coroutine repr string.
+
+**Root cause:** The sync execution paths in both `_executor_impl.py` (Django mode) and `core/worker.py` (standalone mode) assumed `task_func(**kwargs)` always returns a plain value. For async tasks, calling the function returns a coroutine that must be awaited/run to completion.
+
+**Fix:** After `result = task_func(...)`, check `inspect.iscoroutine(result)` and if true, run it via `asyncio.run(result)`. Applied at all three sync execution sites (1 in `_executor_impl.py`, 2 in `core/worker.py`).
+
+**Regression test:** `test_sync_executor_awaits_async_task_coroutine` in `tests/test_executor.py`
+
+**Inline comment:** `# REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/_executor_impl.py:318`, `src/sqlery/core/worker.py:88`, `src/sqlery/core/worker.py:170`
+
+**Validation:** Regression test passes; all 16 executor tests pass; direct validation confirms coroutine is detected and run to completion.

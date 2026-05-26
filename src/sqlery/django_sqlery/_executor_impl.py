@@ -6,6 +6,8 @@ as part of phase 01-core-unification. Public callers should import
 when Django is installed) — NOT from this private module directly.
 """
 
+import asyncio
+import inspect
 import logging
 import os
 import signal
@@ -312,6 +314,11 @@ class TaskExecutor:
                 _token = _current_job_var.set(job)
                 try:
                     result = task_func(**kwargs)
+                    # REGRESSION 2026-05-25: @async_job silently "succeeded" without running
+                    # Root cause: coroutine returned by async task was never awaited
+                    # Fix: detect coroutine result and run it to completion via asyncio.run()
+                    if inspect.iscoroutine(result):
+                        result = asyncio.run(result)
                 finally:
                     _current_job_var.reset(_token)
 

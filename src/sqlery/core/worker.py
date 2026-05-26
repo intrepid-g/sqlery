@@ -1,6 +1,8 @@
 """Django-agnostic worker execution logic with fork-per-job support."""
 
+import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import re
@@ -81,6 +83,11 @@ class JobExecutor:
                 _token = _current_job_var.set(job)
                 try:
                     result = task_func(*positional_args, **kwargs)
+                    # REGRESSION 2026-05-25: @async_job silently "succeeded" without running
+                    # Root cause: coroutine returned by async task was never awaited
+                    # Fix: detect coroutine result and run it to completion via asyncio.run()
+                    if inspect.iscoroutine(result):
+                        result = asyncio.run(result)
                 finally:
                     _current_job_var.reset(_token)
 
@@ -158,6 +165,8 @@ class JobExecutor:
             _token = _current_job_var.set(job)
             try:
                 result = task_func(*positional_args, **kwargs)
+                if inspect.iscoroutine(result):
+                    result = asyncio.run(result)
             finally:
                 _current_job_var.reset(_token)
 
