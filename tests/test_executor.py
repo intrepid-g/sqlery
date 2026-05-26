@@ -18,6 +18,11 @@ def failing_task():
     raise ValueError("Task failed")
 
 
+async def async_dummy_task():
+    """An async test task."""
+    return "async_result"
+
+
 @pytest.mark.django_db
 class TestSchedulerMethods:
     """Test scheduler-specific methods."""
@@ -307,3 +312,19 @@ class TestWorkerMethods:
         # 5 should still be queued
         queued = QueuedJob.objects.filter(status="queued").count()
         assert queued == 5
+
+    def test_sync_executor_awaits_async_task_coroutine(self):
+        """Regression: sync executor stored coroutine repr as output instead of running it."""
+        executor = TaskExecutor()
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_executor.async_dummy_task",
+            status="queued",
+        )
+
+        result_job = executor.execute_job(job)
+
+        result_job.refresh_from_db()
+        assert result_job.status == "success"
+        assert "coroutine" not in str(result_job.output)
+        assert result_job.output == "async_result"
