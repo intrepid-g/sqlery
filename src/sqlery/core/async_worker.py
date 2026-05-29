@@ -64,19 +64,11 @@ def _generate_worker_id():
 def _load_task(task_path: str) -> Callable[..., Any]:
     """Import a dotted ``module.attr`` task path and return the callable.
 
-    Salvaged shape from the legacy ``sqlery.async_worker`` (RESEARCH §4).
+    Delegates to :func:`sqlery.core.utils.import_task` which enforces the
+    SEC-04 ``ALLOWED_TASK_MODULES`` allowlist before importing.
     """
-    if "." not in task_path:
-        raise ImportError(f"Invalid task path: {task_path}")
-    module_name, func_name = task_path.rsplit(".", 1)
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as e:
-        raise ImportError(f"Cannot import module {module_name}: {e}") from e
-    try:
-        func = getattr(module, func_name)
-    except AttributeError as e:
-        raise ImportError(f"Module {module_name} has no attribute {func_name}") from e
+    from .utils import import_task
+    func = import_task(task_path)
     # Unwrap @job / @async_job decorations if present.
     inner = getattr(func, "func", None)
     if inner is not None and callable(inner):
