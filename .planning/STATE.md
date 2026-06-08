@@ -4,14 +4,14 @@ milestone: v0.23.0
 milestone_name: milestone
 status: executing
 stopped_at: Roadmap created for v0.23.0 (Phases 8–11); requirements traceability filled
-last_updated: "2026-06-08T09:53:26.691Z"
-last_activity: 2026-06-08 -- Phase 10 execution started
+last_updated: "2026-06-08T10:38:35.365Z"
+last_activity: 2026-06-08 -- Phase 11 execution started
 progress:
   total_phases: 4
-  completed_phases: 2
-  total_plans: 8
-  completed_plans: 4
-  percent: 50
+  completed_phases: 3
+  total_plans: 11
+  completed_plans: 8
+  percent: 73
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-08)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integrations, on both SQLite and PostgreSQL, with operational guidance that maintainers can trust in production.
-**Current focus:** Phase 10 — harden-cron-semantics
+**Current focus:** Phase 11 — parity-gated-tests-ci
 
 ## Current Position
 
-Phase: 10 (harden-cron-semantics) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 10
-Last activity: 2026-06-08 -- Phase 10 execution started
+Phase: 11 (parity-gated-tests-ci) — EXECUTING
+Plan: 1 of 3
+Status: Executing Phase 11
+Last activity: 2026-06-08 -- Phase 11 execution started
 
 ## Performance Metrics
 
