@@ -10,10 +10,11 @@ from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
 
 from sqlalchemy import and_, or_, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend
-from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker
+from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker, DaemonLease
 from .database import get_session
 
 
@@ -222,6 +223,229 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return None
             refreshed = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             return refreshed
+
+    def claim_queue_leases(
+        self,
+        queues: list[str],
+        daemon_id: str,
+        node_id: str,
+        pid: int,
+        lease_secs: int,
+    ) -> list[str]:
+        """Claim scheduler leases for the given queues.
+
+        Atomically claims one lease per queue, returning the subset successfully
+        claimed. Expired leases are taken over; live leases held by other daemons
+        are skipped. PostgreSQL uses ``SELECT FOR UPDATE SKIP LOCKED``; SQLite uses
+        an optimistic version-based CAS update.
+
+        Args:
+            queues: Queue names to attempt to claim.
+            daemon_id: Unique daemon identifier.
+            node_id: Node/host identifier.
+            pid: Daemon process ID.
+            lease_secs: Lease duration in seconds.
+
+        Returns:
+            The subset of ``queues`` successfully claimed.
+        """
+        with self._get_session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            strategy = determine_claim_strategy(dialect)
+
+            claimed: list[str] = []
+            for queue_name in queues:
+                if self._claim_one_lease(
+                    session, queue_name, daemon_id, node_id, pid, lease_secs, strategy
+                ):
+                    claimed.append(queue_name)
+            return claimed
+
+    def _claim_one_lease(
+        self,
+        session: Session,
+        queue_name: str,
+        daemon_id: str,
+        node_id: str,
+        pid: int,
+        lease_secs: int,
+        strategy: str,
+    ) -> bool:
+        """Atomically claim a single queue lease within an open session.
+
+        Args:
+            session: Active SQLAlchemy session to operate within.
+            queue_name: Queue whose lease to claim.
+            daemon_id: Unique daemon identifier.
+            node_id: Node/host identifier.
+            pid: Daemon process ID.
+            lease_secs: Lease duration in seconds.
+            strategy: Claim strategy from ``determine_claim_strategy``.
+
+        Returns:
+            True if the lease was claimed (insert or take-over), else False.
+        """
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=lease_secs)
+
+        if strategy == "skip_locked":
+            stmt = (
+                select(DaemonLease)
+                .where(DaemonLease.queue_name == queue_name)
+                .with_for_update(skip_locked=True)
+            )
+            existing = session.exec(stmt).first()
+            if existing is None:
+                lease = DaemonLease(
+                    queue_name=queue_name,
+                    daemon_id=daemon_id,
+                    node_id=node_id,
+                    pid=pid,
+                    acquired_at=now,
+                    expires_at=expires,
+                    version=0,
+                )
+                session.add(lease)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # Another claimer inserted the row concurrently — lost the race.
+                    session.rollback()
+                    return False
+                return True
+
+            # Take over an expired lease, or refresh our own (idempotent re-claim).
+            if existing.expires_at < now or existing.daemon_id == daemon_id:
+                existing.daemon_id = daemon_id
+                existing.node_id = node_id
+                existing.pid = pid
+                existing.acquired_at = now
+                existing.expires_at = expires
+                existing.version = (existing.version or 0) + 1
+                session.add(existing)
+                session.commit()
+                return True
+
+            # Live lease held by another daemon — do not steal.
+            return False
+
+        # optimistic_version (SQLite) / basic_lock fallback: version-CAS take-over.
+        existing = session.exec(
+            select(DaemonLease).where(DaemonLease.queue_name == queue_name)
+        ).first()
+        if existing is None:
+            lease = DaemonLease(
+                queue_name=queue_name,
+                daemon_id=daemon_id,
+                node_id=node_id,
+                pid=pid,
+                acquired_at=now,
+                expires_at=expires,
+                version=0,
+            )
+            session.add(lease)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Another claimer won the insert race.
+                session.rollback()
+                return False
+            return True
+
+        current_version = existing.version or 0
+
+        # Idempotent re-claim of a lease we already hold (still live or not).
+        if existing.daemon_id == daemon_id:
+            cas_stmt = (
+                update(DaemonLease)
+                .where(DaemonLease.queue_name == queue_name)
+                .where(DaemonLease.version == current_version)
+                .values(
+                    daemon_id=daemon_id,
+                    node_id=node_id,
+                    pid=pid,
+                    acquired_at=now,
+                    expires_at=expires,
+                    version=current_version + 1,
+                )
+            )
+            res = session.exec(cas_stmt)
+            session.commit()
+            return res.rowcount == 1
+
+        # Take over an expired lease via version-CAS (guards against a concurrent
+        # claimer that mutated the row between the read and the update).
+        if existing.expires_at < now:
+            cas_stmt = (
+                update(DaemonLease)
+                .where(DaemonLease.queue_name == queue_name)
+                .where(DaemonLease.version == current_version)
+                .where(DaemonLease.expires_at < now)
+                .values(
+                    daemon_id=daemon_id,
+                    node_id=node_id,
+                    pid=pid,
+                    acquired_at=now,
+                    expires_at=expires,
+                    version=current_version + 1,
+                )
+            )
+            res = session.exec(cas_stmt)
+            session.commit()
+            return res.rowcount == 1
+
+        # Live lease held by another daemon — do not steal.
+        return False
+
+    def renew_queue_leases(
+        self,
+        owned_queues: list[str],
+        daemon_id: str,
+        lease_secs: int,
+    ) -> None:
+        """Extend expires_at for all owned leases by lease_secs from now.
+
+        Only rows whose ``queue_name`` is in ``owned_queues`` AND whose
+        ``daemon_id`` matches are touched; leases owned by other daemons are
+        left intact.
+
+        Args:
+            owned_queues: Owned queue names to renew.
+            daemon_id: Daemon identifier that owns the leases.
+            lease_secs: New lease duration from now, in seconds.
+        """
+        with self._get_session() as session:
+            stmt = (
+                update(DaemonLease)
+                .where(DaemonLease.queue_name.in_(owned_queues))
+                .where(DaemonLease.daemon_id == daemon_id)
+                .values(expires_at=datetime.now(UTC) + timedelta(seconds=lease_secs))
+            )
+            session.exec(stmt)
+            session.commit()
+
+    def release_queue_leases(
+        self,
+        owned_queues: list[str],
+        daemon_id: str,
+    ) -> None:
+        """Delete lease rows for all owned queues on clean shutdown.
+
+        Only rows whose ``queue_name`` is in ``owned_queues`` AND whose
+        ``daemon_id`` matches are deleted; leases owned by other daemons survive.
+
+        Args:
+            owned_queues: Owned queue names to release.
+            daemon_id: Daemon identifier that owns the leases.
+        """
+        with self._get_session() as session:
+            stmt = (
+                delete(DaemonLease)
+                .where(DaemonLease.queue_name.in_(owned_queues))
+                .where(DaemonLease.daemon_id == daemon_id)
+            )
+            session.exec(stmt)
+            session.commit()
 
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
         """Get queue statistics (counts by status)."""
