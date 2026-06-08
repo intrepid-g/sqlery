@@ -1,9 +1,11 @@
 """Django-agnostic scheduled task management."""
 
 import logging
+import random
+import time
 from datetime import datetime, timedelta, timezone
 
-from ..compat import get_backend
+from ..compat import get_backend, get_config, is_django_mode
 from ..crontab import next_cron_occurrence
 
 logger = logging.getLogger(__name__)
@@ -71,66 +73,121 @@ class Scheduler:
     def _enqueue_for_scheduled_task(self, task):
         """Enqueue a job for a scheduled task.
 
-        Checks if task already has a queued/running job to avoid duplicates.
+        For cron tasks, the next_run_at advance and the enqueue are a single
+        atomic compare-and-swap (backend.advance_scheduled_task_if_due). The CAS
+        winner is the only caller that enqueues, so double-fire is impossible even
+        under brief two-leader overlap (CRON-01, CRON-04). The next occurrence is
+        computed from the scheduled time (task.next_run_at), correcting drift
+        (CRON-02), and an optional bounded jitter delay is applied before enqueue
+        (CRON-03). interval/once branches keep their prior check-then-act behavior.
 
         Args:
             task: ScheduledTask instance
 
         Returns:
-            Job instance if created, None if already queued
+            Job instance if created, None if already fired / lost CAS
         """
-        # Check if already queued
-        has_pending = self.backend.has_pending_job_for_scheduled_task(task.id)
+        # Capture the scheduled due time BEFORE any advance — this is the CAS token.
+        observed_due = task.next_run_at
 
+        # Build the same job_kwargs the old create_job call used.
+        kwargs = task.get_kwargs_dict() if hasattr(task, "get_kwargs_dict") else {}
+        job_kwargs = {
+            "task_path": task.task_path,
+            "kwargs": kwargs,
+            "queue_name": task.queue_name,
+            "priority": task.priority,
+            "scheduled_at": None,  # Run immediately
+            "max_retries": getattr(task, "max_retries", 0),
+            "retry_backoff": getattr(task, "retry_backoff", 1.0),
+            "allow_parallel": getattr(task, "allow_parallel", False),
+            "timeout_seconds": getattr(task, "timeout_seconds", None),
+            "scheduled_task_id": task.id,
+        }
+
+        schedule_type = getattr(task, "schedule_type", "cron")
+        is_cron = (schedule_type == "cron" and task.cron_expression) or (
+            schedule_type not in ("cron", "interval", "once") and task.cron_expression
+        )
+
+        if is_cron:
+            # # Old (check-then-act — replaced by the atomic CAS below; race-prone
+            # # under two-leader overlap, see Phase 9 WR-01/WR-02):
+            # has_pending = self.backend.has_pending_job_for_scheduled_task(task.id)
+            # if has_pending:
+            #     logger.info(
+            #         f"Scheduled task '{task.name}' already has queued/running job, skipping"
+            #     )
+            #     return None
+            # job = self.backend.create_job(**job_kwargs)
+            # next_run = self.calculate_next_run(task.cron_expression)
+            # self.backend.update_scheduled_task_next_run(task.id, next_run)
+
+            # Drift-corrected next occurrence from the scheduled time (CRON-02).
+            new_next_run = self.calculate_next_run(task.cron_expression, base_time=task.next_run_at)
+
+            # Optional bounded jitter (CRON-03): config-only, never request-derived,
+            # never fed into next_run_at. Applied before the atomic advance so a
+            # crash during the sleep simply re-evaluates the tick next cycle.
+            jitter = self._get_jitter_seconds()
+            if jitter and jitter > 0:
+                time.sleep(random.uniform(0, jitter))
+
+            # Atomic advance+enqueue: only the CAS winner gets a job back (CRON-01/04).
+            job = self.backend.advance_scheduled_task_if_due(
+                task.id, observed_due, new_next_run, job_kwargs
+            )
+            if job is None:
+                logger.info(
+                    f"Scheduled task '{task.name}' already fired / lost advance CAS, skipping"
+                )
+                return None
+
+            logger.info(
+                f"Enqueued job {job.id} for scheduled task '{task.name}' "
+                f"in queue '{task.queue_name}'"
+            )
+            return job
+
+        # Non-cron paths keep their prior check-then-act behavior (no atomic
+        # advance primitive this phase). Preserve the pending-job dedup gate.
+        has_pending = self.backend.has_pending_job_for_scheduled_task(task.id)
         if has_pending:
             logger.info(
                 f"Scheduled task '{task.name}' already has queued/running job, skipping"
             )
             return None
 
-        # Create queued job
-        # kwargs={},
-        kwargs = task.get_kwargs_dict() if hasattr(task, 'get_kwargs_dict') else {}
-        job = self.backend.create_job(
-            task_path=task.task_path,
-            kwargs=kwargs,
-            queue_name=task.queue_name,
-            priority=task.priority,
-            scheduled_at=None,  # Run immediately
-            max_retries=getattr(task, 'max_retries', 0),
-            retry_backoff=getattr(task, 'retry_backoff', 1.0),
-            allow_parallel=getattr(task, 'allow_parallel', False),
-            timeout_seconds=getattr(task, 'timeout_seconds', None),
-            scheduled_task_id=task.id,
-        )
+        job = self.backend.create_job(**job_kwargs)
 
-        # Update next run time based on schedule_type
-        # # Old: always used cron — broke interval and once schedule types
-        # next_run = self.calculate_next_run(task.cron_expression)
-        # self.backend.update_scheduled_task_next_run(task.id, next_run)
-        schedule_type = getattr(task, 'schedule_type', 'cron')
-        if schedule_type == 'cron' and task.cron_expression:
-            next_run = self.calculate_next_run(task.cron_expression)
-            self.backend.update_scheduled_task_next_run(task.id, next_run)
-        elif schedule_type == 'interval':
+        if schedule_type == "interval":
             # from datetime import timedelta  # moved to top-level
-            interval = getattr(task, 'get_interval_seconds', lambda: 0)()
+            interval = getattr(task, "get_interval_seconds", lambda: 0)()
             if interval > 0:
                 next_run = datetime.now(timezone.utc) + timedelta(seconds=interval)
                 self.backend.update_scheduled_task_next_run(task.id, next_run)
-        elif schedule_type == 'once':
+        elif schedule_type == "once":
             self.backend.update_scheduled_task(task.id, enabled=False, next_run_at=None)
-        else:
-            # Fallback: try cron if expression is available
-            if task.cron_expression:
-                next_run = self.calculate_next_run(task.cron_expression)
-                self.backend.update_scheduled_task_next_run(task.id, next_run)
 
         logger.info(
             f"Enqueued job {job.id} for scheduled task '{task.name}' in queue '{task.queue_name}'"
         )
 
         return job
+
+    def _get_jitter_seconds(self) -> float:
+        """Resolve the scheduler jitter delay (seconds) for the active mode.
+
+        Uses a mode-aware key so operator overrides take effect in both modes
+        (Django stores SCHEDULER_JITTER_SECONDS upper-snake; standalone stores
+        scheduler_jitter_seconds lowercase). Defaults to 0 (jitter off).
+        """
+        jitter_key = "SCHEDULER_JITTER_SECONDS" if is_django_mode() else "scheduler_jitter_seconds"
+        value = get_config(jitter_key, 0)
+        try:
+            return float(value) if value else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def calculate_next_run(self, cron_expression: str, base_time: datetime | None = None) -> datetime:
         """Calculate next run time from cron expression.
