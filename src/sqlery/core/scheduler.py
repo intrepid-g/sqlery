@@ -8,6 +8,11 @@ from ..crontab import next_cron_occurrence
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on the future-clamp loop in calculate_next_run. Guards against a
+# misbehaving cron expression spinning forever; 2,000,000 covers ~3.8 years of
+# every-minute ticks of downtime before the cap is reached.
+_MAX_CLAMP_ITERATIONS = 2_000_000
+
 
 class Scheduler:
     """Manages scheduled tasks and enqueues jobs when tasks are due.
@@ -146,7 +151,24 @@ class Scheduler:
         if base_time.tzinfo is None:
             base_time = base_time.replace(tzinfo=timezone.utc)
 
-        return next_cron_occurrence(cron_expression, base_time)
+        # # Old: returned the first occurrence after base_time, even when base_time
+        # # was far in the past — replaying every missed tick one-by-one (CRON-02).
+        # return next_cron_occurrence(cron_expression, base_time)
+        candidate = next_cron_occurrence(cron_expression, base_time)
+        # Future-clamp: when base_time is stale (long downtime), advance to the
+        # next FUTURE occurrence instead of replaying missed ticks. Bounded loop
+        # so a misbehaving cron cannot spin forever.
+        now = datetime.now(timezone.utc)
+        iterations = 0
+        while candidate <= now and iterations < _MAX_CLAMP_ITERATIONS:
+            candidate = next_cron_occurrence(cron_expression, candidate)
+            iterations += 1
+        if iterations >= _MAX_CLAMP_ITERATIONS and candidate <= now:
+            logger.warning(
+                f"calculate_next_run hit clamp cap ({_MAX_CLAMP_ITERATIONS}) for "
+                f"'{cron_expression}'; returning last candidate {candidate}"
+            )
+        return candidate
 
     def register_scheduled_task(
         self,
