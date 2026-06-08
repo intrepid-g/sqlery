@@ -63,6 +63,12 @@ def db(request):
     if request.param == "postgres":
         if not os.environ.get("SQLERY_TEST_PG_URL"):
             pytest.skip("postgres engine requires SQLERY_TEST_PG_URL")
+        # WR-B (11-REVIEW iter2): -m selection is driven by the static param mark
+        # (pytest.param("postgres", marks=pytest.mark.postgres)) resolved at collection
+        # time. This add_marker runs at fixture-setup (post-collection) and is therefore
+        # a NO-OP for `-m postgres` / `-m "postgres and standalone_pg"` filtering; it is
+        # decorative only (visible to request.node.iter_markers introspection). Do NOT
+        # rely on it for selection.
         request.node.add_marker(pytest.mark.postgres)
     return request.param
 
