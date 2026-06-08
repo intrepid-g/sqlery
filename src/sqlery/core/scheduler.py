@@ -221,10 +221,21 @@ class Scheduler:
             candidate = next_cron_occurrence(cron_expression, candidate)
             iterations += 1
         if iterations >= _MAX_CLAMP_ITERATIONS and candidate <= now:
+            # # Old (CR-01): returned the past candidate, which was persisted into
+            # # next_run_at and made the task re-qualify as due every cycle — a
+            # # runaway enqueue-every-cycle producer. The CAS dedup does not help
+            # # since each cycle the row still equals the observed value.
+            # logger.warning(
+            #     f"calculate_next_run hit clamp cap ({_MAX_CLAMP_ITERATIONS}) for "
+            #     f"'{cron_expression}'; returning last candidate {candidate}"
+            # )
             logger.warning(
                 f"calculate_next_run hit clamp cap ({_MAX_CLAMP_ITERATIONS}) for "
-                f"'{cron_expression}'; returning last candidate {candidate}"
+                f"'{cron_expression}'; recomputing from now to avoid re-fire loop"
             )
+            # Recompute strictly from the current time so the persisted next_run_at
+            # is in the future and the task does not immediately re-qualify as due.
+            candidate = next_cron_occurrence(cron_expression, now)
         return candidate
 
     def register_scheduled_task(
