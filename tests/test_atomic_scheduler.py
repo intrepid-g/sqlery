@@ -19,6 +19,7 @@ To fix: Either:
 - Refactor tests to not rely on true concurrent database access
 """
 
+import os
 import pytest
 import threading
 import time
@@ -627,3 +628,118 @@ class TestCronSemanticsHardening:
         once_task.refresh_from_db()
         assert once_task.enabled is False
         assert once_task.next_run_at is None
+
+
+@pytest.mark.postgres
+@pytest.mark.django_db(transaction=True)
+class TestCronSemanticsHardeningPostgres:
+    """Django x Postgres mirror of :class:`TestCronSemanticsHardening` (Phase 11).
+
+    PARITY-02 / PARITY-03: Phase 10 proved no-duplicate firing and drift-free
+    next_run_at advance on SQLite only and explicitly deferred the
+    ``{Django, standalone} x Postgres`` cells to Phase 11. This class adds the
+    Django x Postgres half: it asserts the SAME single-fire and drift-free
+    invariants against the SAME hardened path on Postgres' MVCC / row-lock
+    semantics, not just SQLite's optimistic version CAS.
+
+    Like the SQLite class, these tests drive the real
+    ``sqlery.core.scheduler.Scheduler`` wired to ``get_backend()`` (DjangoBackend)
+    and the atomic ``advance_scheduled_task_if_due`` CAS — NOT the legacy
+    ``sqlery.executor.TaskExecutor`` (which still uses SELECT FOR UPDATE SKIP
+    LOCKED, computes next_run_at from wall-clock now, and never calls
+    advance_scheduled_task_if_due). See 10-04-SUMMARY "Deviations" Rule 1.
+
+    The class-level ``@pytest.mark.postgres`` routes these to the dedicated PG CI
+    rail; without ``SQLERY_TEST_PG_URL`` they SKIP cleanly (belt-and-suspenders to
+    the conftest collection gate), and they only execute when it is set.
+    """
+
+    def test_cron_fires_exactly_once_under_simulated_overlap_pg(self):
+        """Two leaders observing the same due tick produce exactly one QueuedJob (PG).
+
+        Mirrors the SQLite single-fire cell: read ``observed_due`` once, then fire
+        two ``advance_scheduled_task_if_due`` attempts with that SAME stale
+        observed_due (as two overlapping leaders would). Exactly one CAS wins,
+        proving the single-winner invariant on Postgres.
+        """
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("SQLERY_TEST_PG_URL not set; PG cell skipped")
+
+        task = TestCronSemanticsHardening._make_due_cron_task(name="cron-hardening-pg")
+        scheduler = TestCronSemanticsHardening._scheduler()
+        backend = scheduler.backend
+
+        observed_due = task.next_run_at
+        new_next_run = scheduler.calculate_next_run(task.cron_expression, base_time=observed_due)
+        job_kwargs = {
+            "task_path": task.task_path,
+            "kwargs": {},
+            "queue_name": task.queue_name,
+            "priority": task.priority,
+            "scheduled_at": None,
+            "max_retries": 0,
+            "retry_backoff": 1.0,
+            "allow_parallel": False,
+            "timeout_seconds": None,
+            "scheduled_task_id": task.id,
+        }
+
+        # Both attempts use the SAME observed_due — the second is stale once the
+        # first has advanced the row. Exactly one CAS wins on Postgres' MVCC.
+        job_a = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+        job_b = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+
+        winners = [j for j in (job_a, job_b) if j is not None]
+        assert len(winners) == 1, "exactly one advance attempt must win the CAS"
+        assert QueuedJob.objects.filter(scheduled_task_id=task.id).count() == 1
+
+        # The row advanced exactly once, to the computed next occurrence.
+        task.refresh_from_db()
+        assert task.next_run_at == new_next_run
+
+    def test_next_run_at_advances_without_drift_across_ticks_pg(self):
+        """next_run_at advances from the SCHEDULED time, not wall-clock now (PG).
+
+        Mirrors the SQLite drift cell: over several ticks each fired advance is
+        computed from the PRIOR scheduled next_run_at (future-clamped), so a slow
+        scheduler does not accumulate drift. Asserts monotonic, drift-free advance
+        on the Postgres path.
+        """
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("SQLERY_TEST_PG_URL not set; PG cell skipped")
+
+        task = TestCronSemanticsHardening._make_due_cron_task(
+            name="cron-drift-pg", cron="*/5 * * * *"
+        )
+        scheduler = TestCronSemanticsHardening._scheduler()
+
+        prior_scheduled = task.next_run_at
+        last_next = prior_scheduled
+        for _ in range(3):
+            expected = scheduler.calculate_next_run(task.cron_expression, base_time=last_next)
+            jobs = scheduler.run_due_tasks()
+            fired = [j for j in jobs if j.scheduled_task_id == task.id]
+            task.refresh_from_db()
+
+            if fired:
+                # When the task fired, the advance is computed from the scheduled
+                # time, not from now, and is strictly after the prior value.
+                assert task.next_run_at == expected
+                assert task.next_run_at > last_next
+                last_next = task.next_run_at
+                # Re-arm the task as due for the next tick by rewinding it to a
+                # past scheduled time derived from the LAST scheduled occurrence
+                # (drift-free) so the next iteration fires again.
+                rewound = last_next - timedelta(minutes=5)
+                ScheduledTask.objects.filter(id=task.id).update(next_run_at=rewound)
+                task.refresh_from_db()
+                last_next = rewound
+
+        # Final next_run_at is in the future (clamped) once we let it settle.
+        scheduler.run_due_tasks()
+        task.refresh_from_db()
+        assert task.next_run_at > datetime.now(dt_timezone.utc)
