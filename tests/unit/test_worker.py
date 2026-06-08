@@ -32,7 +32,7 @@ import pytest
 from sqlery.core import worker as worker_module
 from sqlery.core.worker import JobExecutor, WorkerProcess
 
-from .conftest import make_job, make_scheduled_task, _utcnow
+from .conftest import FakeBackend, make_job, make_scheduled_task, _utcnow
 
 
 # A globally-importable success task — JobExecutor imports via dotted path.
@@ -492,3 +492,79 @@ class TestWorkerSchedulerElection:
         # was enqueued for the daemon-owned queue.
         assert fake_backend._leases["default"]["daemon_id"] == "daemon_other"
         assert _job_count_for_task(fake_backend, task) == 0
+
+    def test_expired_lease_is_taken_over_and_cron_fires(self, fake_backend, monkeypatch):
+        """ELECT-06: once a prior leader's lease expires, another worker
+        re-claims the queue and fires its due cron — failover within one TTL.
+
+        The production failover window is bounded by the lease TTL
+        (`poll_interval * 3`, Plan 01); here we simulate the prior leader's
+        death directly by setting a PAST `expires_at` rather than sleeping for
+        a real TTL, so the test stays instant (mitigates T-09-T2).
+        """
+        wp = WorkerProcess(queues=["default"], backend=fake_backend)
+        # Prior leader's lease is already expired (dead leader).
+        fake_backend._leases["default"] = {
+            "daemon_id": "dead_leader",
+            "node_id": "dead-node",
+            "pid": 111,
+            "expires_at": _utcnow() - timedelta(seconds=5),
+        }
+        task = _seed_due_task(fake_backend, name="failover-cron", queue_name="default")
+
+        lease_calls = _run_one_election_cycle(wp, monkeypatch)
+
+        # The worker re-claimed `default` (proven by the claim call) and fired
+        # the due cron. The lease is released again in finally:, so we assert
+        # the takeover via the claim record + the freshly enqueued job rather
+        # than the post-shutdown _leases state.
+        assert "default" in _claimed_queues(lease_calls, wp.worker_id)
+        assert _job_count_for_task(fake_backend, task) == 1
+
+    def test_job_claim_path_uses_full_queue_set_regardless_of_leases(
+        self, fake_backend, monkeypatch
+    ):
+        """ELECT-07: claim_job is always called with the full self.queues,
+        whether the worker holds all leases or none — leases gate cron-firing
+        only, never job execution."""
+
+        def _claim_job_queues(backend):
+            return [args[0] for name, args, _kw in backend.calls if name == "claim_job"]
+
+        # (a) Worker holds BOTH leases (no contention).
+        wp_all = WorkerProcess(queues=["a", "b"], backend=fake_backend)
+        _run_one_election_cycle(wp_all, monkeypatch)
+        assert _claim_job_queues(fake_backend) == [["a", "b"]]
+
+        # (b) Fresh worker holding NONE because live foreign leases cover both.
+        fresh = FakeBackend()
+        for q in ("a", "b"):
+            fresh._leases[q] = {
+                "daemon_id": "daemon_other",
+                "node_id": "other-node",
+                "pid": 999,
+                "expires_at": _utcnow() + timedelta(seconds=300),
+            }
+        wp_none = WorkerProcess(queues=["a", "b"], backend=fresh)
+        _run_one_election_cycle(wp_none, monkeypatch)
+        # Full queue set even though the worker holds no leases.
+        assert _claim_job_queues(fresh) == [["a", "b"]]
+
+    def test_held_leases_released_on_graceful_shutdown(self, fake_backend, monkeypatch):
+        """ELECT-03: held leases are released when run() exits via the
+        graceful-shutdown finally: path."""
+        wp = WorkerProcess(queues=["default"], backend=fake_backend)
+
+        lease_calls = _run_one_election_cycle(wp, monkeypatch)
+
+        # The worker held `default` during the cycle, then released it on the
+        # shutdown path so another worker/daemon can take over immediately.
+        assert "default" in _claimed_queues(lease_calls, wp.worker_id)
+        assert "default" not in fake_backend._leases
+        released = {
+            q
+            for queues, daemon_id in lease_calls["release"]
+            if daemon_id == wp.worker_id
+            for q in queues
+        }
+        assert "default" in released
