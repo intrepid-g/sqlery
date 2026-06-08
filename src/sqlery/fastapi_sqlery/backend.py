@@ -236,8 +236,20 @@ class SQLAlchemyBackend(DatabaseBackend):
 
         Atomically claims one lease per queue, returning the subset successfully
         claimed. Expired leases are taken over; live leases held by other daemons
-        are skipped. PostgreSQL uses ``SELECT FOR UPDATE SKIP LOCKED``; SQLite uses
-        an optimistic version-based CAS update.
+        are skipped. PostgreSQL uses a blocking ``SELECT FOR UPDATE`` row lock on
+        the single-key lease row (see CR-01); SQLite uses an optimistic
+        version-based CAS update.
+
+        Parity note (WR-01): re-claiming a lease THIS daemon already holds (still
+        live) returns ``True`` here — the standalone contract treats own-live
+        re-claim as an idempotent refresh. The Django backend returns ``False``
+        in that case (its conditional UPDATE only matches ``expires_at < now``,
+        so a live own-lease falls through to an INSERT that conflicts on the PK).
+        This divergence is intentional and currently latent: the daemon caller
+        (``core/daemon.py``) only ever claims ``queues - owned_queues``, so it
+        never re-claims a queue it already owns. Callers depending on Django
+        semantics for own-live re-claim must not assume parity on the return
+        value.
 
         Args:
             queues: Queue names to attempt to claim.
