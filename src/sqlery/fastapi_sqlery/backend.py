@@ -446,6 +446,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             daemon_id: Daemon identifier that owns the leases.
             lease_secs: New lease duration from now, in seconds.
         """
+        # WR-02: defend against an empty list — `in_([])` emits a SQLAlchemy
+        # warning on some versions and behaves inconsistently across dialects.
+        if not owned_queues:
+            return
         with self._get_session() as session:
             stmt = (
                 update(DaemonLease)
@@ -470,6 +474,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             owned_queues: Owned queue names to release.
             daemon_id: Daemon identifier that owns the leases.
         """
+        # WR-02: defend against an empty list — `in_([])` emits a SQLAlchemy
+        # warning on some versions and behaves inconsistently across dialects.
+        if not owned_queues:
+            return
         with self._get_session() as session:
             stmt = (
                 delete(DaemonLease)
