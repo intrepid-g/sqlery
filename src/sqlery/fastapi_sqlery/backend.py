@@ -409,6 +409,11 @@ class SQLAlchemyBackend(DatabaseBackend):
                     expires_at=expires,
                     version=current_version + 1,
                 )
+                # Match the expired-takeover CAS: skip the ORM synchronize
+                # evaluator so both lease CAS statements share one consistent
+                # rule and stay future-proof against any datetime/JSON predicate
+                # later added to this UPDATE (WR-01).
+                .execution_options(synchronize_session=False)
             )
             res = session.exec(cas_stmt)
             session.commit()
