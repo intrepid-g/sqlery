@@ -323,6 +323,7 @@ def pg_standalone_backend(monkeypatch):
 
 
 @pytest.mark.postgres
+@pytest.mark.standalone_pg  # CR-01 (11-REVIEW): genuinely-standalone PG cell (real SQLAlchemy engine).
 class TestStandaloneAdvanceScheduledTaskPostgres:
     """Standalone x Postgres mirror of :class:`TestStandaloneAdvanceScheduledTask`.
 
