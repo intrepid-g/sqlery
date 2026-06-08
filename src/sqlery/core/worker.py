@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config
 from .utils import import_task
+from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
 from sqlery.core.db_resilience import configure_connection_resilience
@@ -490,6 +491,32 @@ class WorkerProcess:
             pass
 
         self._heartbeat('idle')
+
+        # --- Scheduler-election lifecycle (ported from DaemonManager.run) ---
+        # A bare sqlery-worker self-elects as scheduler-leader per queue using
+        # its own identity. The per-queue lease primitive (Phase 8) skips live
+        # foreign leases, so a running daemon stays authoritative (ELECT-05).
+        # owned_queues is defined BEFORE the try: so the finally: block can
+        # always release it, even if the worker crashes before the loop.
+        scheduler = Scheduler(backend=self.backend)
+        # TTL mirrors the daemon's check_interval * 3 (≈30s) — failover within
+        # one TTL once a dead leader's lease expires (ELECT-06).
+        lease_secs = self.poll_interval * 3
+        try:
+            owned_queues = set(
+                self.backend.claim_queue_leases(
+                    self.queues, self.worker_id, self.node_id, self.pid, lease_secs
+                )
+            )
+        except Exception as e:
+            # Election must never prevent the worker from starting — a worker
+            # that can't elect still claims and executes jobs (ELECT-07).
+            logger.error(f"Initial scheduler-lease claim failed: {e}", exc_info=True)
+            owned_queues = set()
+        logger.info(
+            f"Worker {self.worker_id} scheduler responsibility: "
+            f"{sorted(owned_queues) or 'none yet'}"
+        )
 
         try:
             while not self.shutdown_requested:
