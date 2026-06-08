@@ -429,6 +429,11 @@ class WorkerProcess:
         self.jobs_processed = 0
         self.current_job = None
         self.child_pid = None  # PID of forked child currently executing a job
+        # WR-01: scheduler-election state exposed to _fork_and_execute so leases
+        # can be renewed during long-running (blocking) jobs. Held queues this
+        # worker leads and the lease TTL; populated by run() once election runs.
+        self._owned_queues: set[str] = set()
+        self._lease_secs: int = 0
         self.total_busy_seconds = 0.0
         self._heartbeat_due = False
         self._last_loop_time = time.monotonic()
@@ -502,6 +507,10 @@ class WorkerProcess:
         # TTL mirrors the daemon's check_interval * 3 (≈30s) — failover within
         # one TTL once a dead leader's lease expires (ELECT-06).
         lease_secs = self.poll_interval * 3
+        # WR-01: mirror the TTL onto the instance so _fork_and_execute can renew
+        # held leases during a long blocking job (otherwise the lease expires
+        # mid-job and another worker takes over scheduling — leadership flap).
+        self._lease_secs = lease_secs
         try:
             owned_queues = set(
                 self.backend.claim_queue_leases(
@@ -513,6 +522,8 @@ class WorkerProcess:
             # that can't elect still claims and executes jobs (ELECT-07).
             logger.error(f"Initial scheduler-lease claim failed: {e}", exc_info=True)
             owned_queues = set()
+        # WR-01: keep the instance view of held queues in sync with the local.
+        self._owned_queues = owned_queues
         logger.info(
             f"Worker {self.worker_id} scheduler responsibility: "
             f"{sorted(owned_queues) or 'none yet'}"
@@ -728,6 +739,19 @@ class WorkerProcess:
             # Sleep briefly so parent stays responsive to signals
             time.sleep(0.5)
             self._check_heartbeat()
+            # WR-01: keep scheduler leadership alive across long jobs. The main
+            # loop only renews leases at the top of each iteration, but this
+            # wait blocks for up to (timeout + 60s); without renewal here the
+            # lease (poll_interval*3) expires mid-job and another worker takes
+            # over scheduling (two-leader overlap). Guarded so a renew error
+            # never aborts the wait — election must never crash job execution.
+            try:
+                if self._owned_queues:
+                    self.backend.renew_queue_leases(
+                        sorted(self._owned_queues), self.worker_id, self._lease_secs
+                    )
+            except Exception as e:
+                logger.warning(f"Lease renew during job execution failed: {e}")
 
         # # Pipe read removed — read result from DB instead
         # try:

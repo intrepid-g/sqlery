@@ -291,6 +291,51 @@ class TestForkLifecycle:
 
         assert exit_calls and exit_calls[0] == 0
 
+    def test_leases_renewed_while_blocking_on_long_job(self, fake_backend, monkeypatch):
+        """WR-01: held scheduler leases are renewed from inside the blocking
+        wait loop so leadership does not flap during a job longer than the TTL.
+
+        The main loop only renews at the top of each iteration, but
+        `_fork_and_execute` blocks for the whole job. Here we simulate a job
+        that spans several wait-loop iterations while its lease TTL has already
+        elapsed; without in-wait renewal the lease's `expires_at` would stay in
+        the past (expired mid-job). The renewal must push it back into the
+        future, proving leadership stays alive across the long job.
+        """
+        wp = WorkerProcess(queues=["default"], backend=fake_backend)
+        job = fake_backend.add_job(make_job(task_path=_TASK_OK, timeout_seconds=600))
+
+        # Worker holds the `default` scheduler lease — but it is already at the
+        # edge of expiry (expires_at in the past), exactly the WR-01 scenario
+        # where a long job has run past `poll_interval * 3`.
+        wp._owned_queues = {"default"}
+        wp._lease_secs = wp.poll_interval * 3
+        fake_backend._leases["default"] = {
+            "daemon_id": wp.worker_id,
+            "node_id": wp.node_id,
+            "pid": wp.pid,
+            "expires_at": _utcnow() - timedelta(seconds=1),
+        }
+
+        # Parent branch (fork returns a positive PID). waitpid returns "not yet
+        # exited" for the first few polls (simulating a long-running job), then
+        # reports the child exited — so the wait loop iterates several times and
+        # the in-wait renewal runs at least once.
+        monkeypatch.setattr(os, "fork", lambda: 4242)
+        poll_results = iter([(0, 0), (0, 0), (0, 0), (4242, 0)])
+        monkeypatch.setattr(os, "waitpid", lambda pid, opts: next(poll_results))
+        monkeypatch.setattr(os, "WIFEXITED", lambda s: True)
+        monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)
+        monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
+        monkeypatch.setattr("sqlery.core.worker.close_old_connections", lambda: None)
+
+        wp._fork_and_execute(job)
+
+        # The lease was renewed during the blocking wait: its expiry is now in
+        # the future (it started in the past). Without the WR-01 fix it would
+        # remain expired, letting another worker take over scheduling.
+        assert fake_backend._leases["default"]["expires_at"] > _utcnow()
+
 
 # ---------------------------------------------------------------------------
 # TestCleanupStaleJobs
