@@ -314,11 +314,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             # row, mirroring the Django reference's contention semantics. There
             # is no "different row" to fall through to for a single-key lease,
             # so SKIP LOCKED is the wrong primitive here.
-            stmt = (
-                select(DaemonLease)
-                .where(DaemonLease.queue_name == queue_name)
-                .with_for_update()
-            )
+            stmt = select(DaemonLease).where(DaemonLease.queue_name == queue_name).with_for_update()
             existing = session.exec(stmt).first()
             if existing is None:
                 lease = DaemonLease(
@@ -987,6 +983,125 @@ class SQLAlchemyBackend(DatabaseBackend):
                 task.next_run_at = next_run_at
                 session.add(task)
                 session.commit()
+
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ) -> Any:
+        """Atomically advance next_run_at on a CAS and enqueue in the same txn.
+
+        Advances ``next_run_at`` to ``new_next_run_at`` ONLY when the row still
+        equals ``observed_next_run_at`` (CAS on the observed due time — the
+        ScheduledTask has no version column). On a winning advance, the queued
+        job is created from ``job_kwargs`` inside the SAME session so the advance
+        and the enqueue commit together (CRON-01); only the caller whose CAS
+        wins enqueues, so concurrent leaders cannot double-fire (CRON-04).
+
+        PostgreSQL uses a blocking ``with_for_update()`` row lock (NOT
+        ``skip_locked`` — a single-key row, per CR-01) then a read-compare-write.
+        SQLite/fallback uses a predicate-CAS ``update(...).where(next_run_at ==
+        observed)`` with ``synchronize_session=False`` so the ORM evaluator does
+        not run against the naive SQLite datetime column; success is
+        ``rowcount == 1``.
+
+        Args:
+            task_id: Scheduled task ID.
+            observed_next_run_at: The ``next_run_at`` observed when the task was due.
+            new_next_run_at: The value to advance to when the CAS wins.
+            job_kwargs: Fields passed through to build the QueuedJob in-session.
+
+        Returns:
+            The created QueuedJob when this caller won the CAS, otherwise ``None``.
+        """
+        with self._get_session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            strategy = determine_claim_strategy(dialect)
+
+            if strategy == "skip_locked":
+                # Postgres: blocking row lock on the single-key row (CR-01),
+                # then read-compare-write under the lock.
+                stmt = select(ScheduledTask).where(ScheduledTask.id == task_id).with_for_update()
+                existing = session.exec(stmt).first()
+                if existing is None:
+                    return None
+                # SQLite returns naive datetimes; normalize before compare.
+                existing_due = (
+                    existing.next_run_at
+                    if existing.next_run_at.tzinfo
+                    else existing.next_run_at.replace(tzinfo=UTC)
+                )
+                observed = (
+                    observed_next_run_at
+                    if observed_next_run_at.tzinfo
+                    else observed_next_run_at.replace(tzinfo=UTC)
+                )
+                if existing_due != observed:
+                    # Another leader already advanced this tick — lost the CAS.
+                    return None
+                existing.next_run_at = new_next_run_at
+                session.add(existing)
+                job = self._build_queued_job(job_kwargs)
+                session.add(job)
+                session.commit()
+                session.refresh(job)
+                return job
+
+            # SQLite / fallback: predicate-CAS on the observed next_run_at.
+            cas_stmt = (
+                update(ScheduledTask)
+                .where(ScheduledTask.id == task_id)
+                .where(ScheduledTask.next_run_at == observed_next_run_at)
+                .values(next_run_at=new_next_run_at)
+                # Raw SQL: skip the ORM evaluator so the naive SQLite datetime
+                # column is compared in the database, not in Python.
+                .execution_options(synchronize_session=False)
+            )
+            res = session.exec(cas_stmt)
+            if res.rowcount != 1:
+                # Lost the CAS (another leader advanced first) — do not enqueue.
+                session.rollback()
+                return None
+            job = self._build_queued_job(job_kwargs)
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return job
+
+    def _build_queued_job(self, job_kwargs: dict) -> QueuedJob:
+        """Construct a queued QueuedJob from create_job-style kwargs.
+
+        Mirrors create_job's field mapping so the advance+enqueue can share one
+        session/transaction without create_job opening its own session.
+        """
+        return QueuedJob(
+            task_path=job_kwargs["task_path"],
+            kwargs=job_kwargs.get("kwargs") or {},
+            queue_name=job_kwargs["queue_name"],
+            priority=job_kwargs.get("priority", 0),
+            scheduled_at=job_kwargs.get("scheduled_at"),
+            max_retries=job_kwargs.get("max_retries", 0),
+            retry_backoff=job_kwargs.get("retry_backoff", 0.0),
+            allow_parallel=job_kwargs.get("allow_parallel", False),
+            timeout_seconds=job_kwargs.get("timeout_seconds"),
+            retry_count=(
+                job_kwargs["retry_count"] if job_kwargs.get("retry_count") is not None else 0
+            ),
+            scheduled_task_id=job_kwargs.get("scheduled_task_id"),
+            job_name=job_kwargs.get("job_name"),
+            retry_intervals=job_kwargs.get("retry_intervals"),
+            meta=job_kwargs.get("meta"),
+            dependencies=job_kwargs.get("dependencies") or [],
+            on_success_path=job_kwargs.get("on_success_path", ""),
+            on_failure_path=job_kwargs.get("on_failure_path", ""),
+            ttl=job_kwargs.get("ttl"),
+            result_ttl=job_kwargs.get("result_ttl"),
+            failure_ttl=job_kwargs.get("failure_ttl"),
+            parent_job_id=job_kwargs.get("parent_job_id"),
+            status="queued",
+        )
 
     def update_scheduled_task(self, task_id: int, **updates) -> Any:
         """Update scheduled task fields."""
