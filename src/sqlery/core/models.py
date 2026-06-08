@@ -308,7 +308,16 @@ class Worker(SQLModel, table=True):
 
 
 class DaemonLease(SQLModel, table=True):
-    """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone)."""
+    """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone).
+
+    Schema divergence note (WR-05): this standalone table intentionally carries
+    an extra ``version`` column that the Django ``DaemonLease`` model
+    (``django_sqlery/models.py``) does NOT have. The column backs the SQLite
+    optimistic-CAS take-over path; Django relies on ``SELECT FOR UPDATE SKIP
+    LOCKED`` and never needs it. Both stacks share the same ``db_table``
+    (``sqlery_daemon_lease``); a deployment must not run migrations from both
+    stacks against the same database, since the column sets differ by design.
+    """
 
     __tablename__ = "sqlery_daemon_lease"
 
