@@ -26,8 +26,15 @@ def upgrade() -> None:
         sa.Column('daemon_id', sa.String(length=255), nullable=False),
         sa.Column('node_id', sa.String(length=255), nullable=False),
         sa.Column('pid', sa.Integer(), nullable=False),
-        sa.Column('acquired_at', sa.DateTime(), nullable=False),
-        sa.Column('expires_at', sa.DateTime(), nullable=False),
+        # Old (WR-04): naive TIMESTAMP forced "store aware, read naive,
+        # re-attach UTC" normalization at every comparison site.
+        # sa.Column('acquired_at', sa.DateTime(), nullable=False),
+        # sa.Column('expires_at', sa.DateTime(), nullable=False),
+        # New (WR-04): timezone-aware columns so Postgres stores timestamptz
+        # and reads come back aware (SQLite still returns naive — the read-site
+        # normalization helper handles that case).
+        sa.Column('acquired_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
         sa.Column('version', sa.Integer(), nullable=False, server_default='0'),
         sa.PrimaryKeyConstraint('queue_name'),
     )

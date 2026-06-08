@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import Index
+from sqlalchemy import Index, DateTime
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -316,7 +316,13 @@ class DaemonLease(SQLModel, table=True):
     daemon_id: str = Field(max_length=255, description="daemon_{node_id}_{pid}")
     node_id: str = Field(max_length=255)
     pid: int
-    acquired_at: datetime
-    expires_at: datetime = Field(index=True)
+    # Old (WR-04): naive columns forced re-normalization at every read site.
+    # acquired_at: datetime
+    # expires_at: datetime = Field(index=True)
+    # New (WR-04): timezone-aware columns so Postgres stores timestamptz and
+    # reads come back aware (SQLite still returns naive; comparison sites keep
+    # the UTC-normalization helper for that case).
+    acquired_at: datetime = Field(sa_column=Column(DateTime(timezone=True)))
+    expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), index=True))
     # Optimistic locking (SQLite CAS) — mirrors QueuedJob.version (models.py:113-114)
     version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
