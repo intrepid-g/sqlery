@@ -305,3 +305,18 @@ class Worker(SQLModel, table=True):
         # from datetime import timedelta  # moved to top-level
         threshold = datetime.now(UTC) - timedelta(seconds=timeout_seconds)
         return self.last_heartbeat >= threshold
+
+
+class DaemonLease(SQLModel, table=True):
+    """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone)."""
+
+    __tablename__ = "sqlery_daemon_lease"
+
+    queue_name: str = Field(max_length=255, primary_key=True)
+    daemon_id: str = Field(max_length=255, description="daemon_{node_id}_{pid}")
+    node_id: str = Field(max_length=255)
+    pid: int
+    acquired_at: datetime
+    expires_at: datetime = Field(index=True)
+    # Optimistic locking (SQLite CAS) — mirrors QueuedJob.version (models.py:113-114)
+    version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
