@@ -485,6 +485,30 @@ class FakeBackend(DatabaseBackend):
         if t:
             t.next_run_at = next_run_at
 
+    # ---- @abstractmethod advance_scheduled_task_if_due
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ):
+        """In-memory CAS on observed next_run_at, then enqueue in the same step.
+
+        Mirrors the real backends: only the caller whose observed next_run_at
+        still matches the row wins the advance and creates the job; concurrent
+        losers get None. Single-threaded test backend, so the compare-and-swap
+        is trivially atomic.
+        """
+        self._record("advance_scheduled_task_if_due", task_id)
+        t = self._scheduled_tasks.get(task_id)
+        if t is None:
+            return None
+        if getattr(t, "next_run_at", None) != observed_next_run_at:
+            return None  # CAS lost — another caller already advanced
+        t.next_run_at = new_next_run_at
+        return self.create_job(**job_kwargs)
+
     # ---- @abstractmethod update_scheduled_task
     def update_scheduled_task(self, task_id: int, **updates):
         t = self._scheduled_tasks.get(task_id)
