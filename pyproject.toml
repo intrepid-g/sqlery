@@ -144,6 +144,12 @@ pythonpath = ["."]
 markers = [
     "slow: tests that hit serverful resources (e.g. Postgres); deselect with '-m \"not slow\"'",
     "postgres: requires a running PostgreSQL service (skipped on SQLite-only jobs)",
+    # CR-01 (11-REVIEW): tags the genuinely-standalone PG parity cells (those
+    # backed by a real SQLAlchemy engine via the pg_standalone_backend fixture
+    # or the no-Django subprocess) so the forced-standalone CI step can select
+    # them with `-m \"postgres and standalone_pg\"` WITHOUT pulling in Django-mode
+    # PG cells that would error under an uninitialized standalone backend.
+    "standalone_pg: standalone-backend parity cell that runs against real Postgres",
 ]
 
 [tool.coverage.run]

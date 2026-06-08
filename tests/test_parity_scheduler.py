@@ -83,6 +83,13 @@ def _lease_supported(backend) -> bool:
         return False
     except TypeError:
         return False
+    # WR-01 (11-REVIEW): a RuntimeError here means the engine/config is not
+    # ready (e.g. SQLAlchemyBackend with an uninitialized _engine). Treat that
+    # as "unsupported in this run" rather than claiming support and then erroring
+    # on the real _claim() call far from the cause.
+    # Old: except Exception: return True  # masked RuntimeError("Database not initialized")
+    except RuntimeError:
+        return False
     except Exception:
         return True
 
@@ -196,6 +203,11 @@ class TestParityBareWorkerE2E:
         assert _job_count_for_task(fake_backend, task) == 1
 
     @pytest.mark.slow
+    # CR-01 (11-REVIEW): genuinely-standalone PG cell (real no-Django subprocess).
+    # standalone_pg marks BOTH db params, but only the [postgres] param also
+    # carries @pytest.mark.postgres (added by the `db` fixture), so the CI
+    # selector `-m "postgres and standalone_pg"` collects ONLY the postgres param.
+    @pytest.mark.standalone_pg
     def test_bare_worker_standalone_real_process(self, db):
         """PARITY-04 standalone E2E: a real no-Django ``sqlery`` process with NO
         daemon constructs a bare ``WorkerProcess`` that self-elects and fires a

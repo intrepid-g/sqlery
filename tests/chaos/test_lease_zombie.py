@@ -242,6 +242,12 @@ def _lease_supported(backend) -> bool:
         # Signature drift between Django and SQLAlchemy backends — treat as
         # 'unsupported on this backend' rather than masking other bugs.
         return False
+    # WR-01 (11-REVIEW): a RuntimeError here means the engine/config is not
+    # ready (uninitialized standalone _engine). Treat as 'unsupported in this
+    # run' rather than claiming support and then erroring on the real _claim().
+    # Old: except Exception: return True  # masked RuntimeError("Database not initialized")
+    except RuntimeError:
+        return False
     except Exception:
         return True
 
@@ -269,15 +275,25 @@ class TestLeaseExpiry:
         if not _lease_supported(backend):
             pytest.skip("active backend does not implement queue leases")
 
-        # Acquire with a near-zero TTL, wait it out, re-acquire from a
-        # different daemon_id — the takeover must succeed.
+        # WR-04 (11-REVIEW): force expiry via a PAST expires_at write instead of
+        # a real time.sleep(1.5) — mirrors the parity cells' "no real TTL sleep"
+        # convention (11-PATTERNS) and removes 1.5s of wall-clock per run.
+        # Acquire, expire the lease in-place, then re-acquire from a different
+        # daemon_id — the takeover must succeed.
         first = _claim(backend, "chaos-q", "daemon-a", lease_secs=1)
         assert "chaos-q" in (first or [])
-        import time
+        # Old (real wall-clock sleep aged a 1s lease):
+        # import time
+        # time.sleep(1.5)
+        from django.utils import timezone
 
-        time.sleep(1.5)
+        from sqlery.django_sqlery.models import DaemonLease
+
+        DaemonLease.objects.filter(queue_name="chaos-q").update(
+            expires_at=timezone.now() - timedelta(seconds=5)
+        )
         second = _claim(backend, "chaos-q", "daemon-b", lease_secs=10)
-        assert "chaos-q" in (second or [])
+        assert "chaos-q" in (second or []), "expired lease must be re-claimable by daemon-b"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -395,6 +411,7 @@ def pg_standalone_backend(monkeypatch):
 
 
 @pytest.mark.postgres
+@pytest.mark.standalone_pg  # CR-01 (11-REVIEW): genuinely-standalone PG cell (real SQLAlchemy engine).
 class TestStandaloneLeaseFailoverPostgres:
     """Standalone SQLAlchemyBackend lease takeover on a real Postgres service.
 
