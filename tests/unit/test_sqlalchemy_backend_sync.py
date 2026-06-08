@@ -975,3 +975,164 @@ class TestLeaseLifecyclePostgres:
             lease_secs=60,
         )
         assert second == []
+
+
+# ---------------------------------------------------------------------------
+# 11. SQLite lease lifecycle (LEASE-03/04/05)
+# ---------------------------------------------------------------------------
+# Mirrors the FakeBackend lease contract in tests/unit/test_daemon.py
+# (TestLeaseLifecycle) against the real SQLite-backed SQLAlchemyBackend.
+
+
+def _read_lease(backend, queue_name):
+    """Return the DaemonLease row for a queue, or None, via the backend session."""
+    from sqlmodel import select
+    from sqlery.core.models import DaemonLease
+
+    with backend._get_session() as session:
+        return session.exec(select(DaemonLease).where(DaemonLease.queue_name == queue_name)).first()
+
+
+def _count_leases(backend):
+    """Return the total number of DaemonLease rows via the backend session."""
+    from sqlmodel import select
+    from sqlery.core.models import DaemonLease
+
+    with backend._get_session() as session:
+        return len(session.exec(select(DaemonLease)).all())
+
+
+class TestSQLAlchemyLeaseLifecycle:
+    """Lease claim/renew/release lifecycle on the real SQLite backend."""
+
+    def test_claim_free_queue_inserts_and_returns(self, sync_backend):
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1", "q2"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        assert set(owned) == {"q1", "q2"}
+        assert _count_leases(sync_backend) == 2
+        assert _read_lease(sync_backend, "q1").daemon_id == "d1"
+        assert _read_lease(sync_backend, "q2").daemon_id == "d1"
+
+    def test_claim_skips_live_lease_of_other_daemon(self, sync_backend):
+        pre = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="other", node_id="n1", pid=1, lease_secs=300
+        )
+        assert pre == ["q1"]
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="self", node_id="n2", pid=2, lease_secs=30
+        )
+        assert owned == []
+        # Live holder is untouched.
+        assert _read_lease(sync_backend, "q1").daemon_id == "other"
+
+    def test_expired_lease_is_reclaimed(self, sync_backend):
+        # Seed a lease held by another daemon that is already expired.
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="other", node_id="n1", pid=1, lease_secs=300
+        )
+        with sync_backend._get_session() as session:
+            from sqlmodel import select
+            from sqlery.core.models import DaemonLease
+
+            row = session.exec(select(DaemonLease).where(DaemonLease.queue_name == "q1")).first()
+            row.expires_at = datetime.now(UTC) - timedelta(seconds=10)
+            session.add(row)
+            session.commit()
+
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="self", node_id="n2", pid=2, lease_secs=30
+        )
+        assert owned == ["q1"]
+        reclaimed = _read_lease(sync_backend, "q1")
+        assert reclaimed.daemon_id == "self"
+        assert reclaimed.node_id == "n2"
+        assert reclaimed.pid == 2
+        # Take-over must still be a single row (no duplicate insert).
+        assert _count_leases(sync_backend) == 1
+
+    def test_reclaim_own_live_lease_is_idempotent(self, sync_backend):
+        first = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=300
+        )
+        assert first == ["q1"]
+        # Re-claiming a queue we already hold (still live) is treated as held.
+        again = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=300
+        )
+        assert again == ["q1"]
+        assert _count_leases(sync_backend) == 1
+
+    def test_renew_extends_expires_at(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=5
+        )
+        original = _read_lease(sync_backend, "q1").expires_at
+        sync_backend.renew_queue_leases(["q1"], "d1", lease_secs=60)
+        assert _read_lease(sync_backend, "q1").expires_at > original
+
+    def test_renew_by_wrong_daemon_is_noop(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=5
+        )
+        original = _read_lease(sync_backend, "q1").expires_at
+        # A renew from a non-owner daemon must not change expires_at.
+        sync_backend.renew_queue_leases(["q1"], "intruder", lease_secs=600)
+        assert _read_lease(sync_backend, "q1").expires_at == original
+
+    def test_release_deletes_only_owned(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1", "q2"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        sync_backend.release_queue_leases(["q1", "q2"], "d1")
+        assert _read_lease(sync_backend, "q1") is None
+        assert _read_lease(sync_backend, "q2") is None
+        assert _count_leases(sync_backend) == 0
+
+    def test_release_by_wrong_daemon_leaves_row_intact(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        # A release from a non-owner daemon must not delete the row.
+        sync_backend.release_queue_leases(["q1"], "intruder")
+        assert _read_lease(sync_backend, "q1") is not None
+        assert _read_lease(sync_backend, "q1").daemon_id == "d1"
+
+    def test_concurrent_claim_one_winner(self, sync_backend):
+        """Two threads racing to claim the same free queue: exactly one wins."""
+        import threading
+
+        results = []
+        lock = threading.Lock()
+
+        def claim(daemon_id):
+            owned = sync_backend.claim_queue_leases(
+                queues=["race"], daemon_id=daemon_id, node_id="n", pid=1, lease_secs=60
+            )
+            with lock:
+                results.append(owned == ["race"])
+
+        t1 = threading.Thread(target=claim, args=("d1",))
+        t2 = threading.Thread(target=claim, args=("d2",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Optimistic CAS / unique PK guarantees a single lease row regardless of
+        # how many threads observed the queue as free.
+        assert results.count(True) == 1
+        assert _count_leases(sync_backend) == 1
+
+    def test_daemon_call_contract_matches_signatures(self, sync_backend):
+        """Pin LEASE-05: the daemon's exact call shape (daemon.py:363/413) works.
+
+        The daemon calls ``claim_queue_leases(queues, daemon_id, node_id, pid,
+        lease_secs)``; confirm that arity is satisfiable and returns a list,
+        without spawning the daemon process.
+        """
+        owned = sync_backend.claim_queue_leases(
+            ["default"], daemon_id="daemon_node_1", node_id="node", pid=1, lease_secs=30
+        )
+        assert isinstance(owned, list)
+        assert owned == ["default"]

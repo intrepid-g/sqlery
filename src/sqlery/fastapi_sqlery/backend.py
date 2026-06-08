@@ -315,7 +315,13 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return True
 
             # Take over an expired lease, or refresh our own (idempotent re-claim).
-            if existing.expires_at < now or existing.daemon_id == daemon_id:
+            # SQLite returns naive datetimes; normalize to UTC-aware before compare.
+            existing_expires = (
+                existing.expires_at
+                if existing.expires_at.tzinfo
+                else existing.expires_at.replace(tzinfo=UTC)
+            )
+            if existing_expires < now or existing.daemon_id == daemon_id:
                 existing.daemon_id = daemon_id
                 existing.node_id = node_id
                 existing.pid = pid
@@ -353,6 +359,12 @@ class SQLAlchemyBackend(DatabaseBackend):
             return True
 
         current_version = existing.version or 0
+        # SQLite returns naive datetimes; normalize to UTC-aware before compare.
+        existing_expires = (
+            existing.expires_at
+            if existing.expires_at.tzinfo
+            else existing.expires_at.replace(tzinfo=UTC)
+        )
 
         # Idempotent re-claim of a lease we already hold (still live or not).
         if existing.daemon_id == daemon_id:
@@ -375,7 +387,7 @@ class SQLAlchemyBackend(DatabaseBackend):
 
         # Take over an expired lease via version-CAS (guards against a concurrent
         # claimer that mutated the row between the read and the update).
-        if existing.expires_at < now:
+        if existing_expires < now:
             cas_stmt = (
                 update(DaemonLease)
                 .where(DaemonLease.queue_name == queue_name)
@@ -389,6 +401,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                     expires_at=expires,
                     version=current_version + 1,
                 )
+                # Emit raw SQL: skip the ORM evaluator, which cannot compare the
+                # SQLite naive `expires_at` column against the aware `now`.
+                .execution_options(synchronize_session=False)
             )
             res = session.exec(cas_stmt)
             session.commit()
