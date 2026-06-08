@@ -79,7 +79,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 
 - [x] 10-01-PLAN.md — New atomic `advance_scheduled_task_if_due` ABC method + both backend implementations (CAS on observed `next_run_at` + same-txn enqueue) (CRON-01, CRON-04)
 - [x] 10-02-PLAN.md — `scheduler_jitter_seconds` config key (default 0) in both config default sets (CRON-03)
-- [ ] 10-03-PLAN.md — Rework scheduler firing path: atomic advance+enqueue, drift correction from `task.next_run_at`, bounded jitter; preserve interval/once (CRON-01, CRON-02, CRON-03, CRON-04)
+- [x] 10-03-PLAN.md — Rework scheduler firing path: atomic advance+enqueue, drift correction from `task.next_run_at`, bounded jitter; preserve interval/once (CRON-01, CRON-02, CRON-03, CRON-04)
 - [ ] 10-04-PLAN.md — DB-correctness tests: atomic single-fire under simulated overlap (SQLite), drift across ticks, jitter respected, interval/once not regressed (CRON-01..04)
 
 **UI hint**: no
@@ -108,7 +108,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 | 8. Standalone Lease Parity | 2/2 | Complete   | 2026-06-08 |
 | 9. Core-Shared Scheduler Election | 2/2 | Complete   | 2026-06-08 |
 <!-- Old: | 10. Harden Cron Semantics | 0/TBD | Not started | - | -->
-| 10. Harden Cron Semantics | 2/4 | In Progress|  |
+| 10. Harden Cron Semantics | 3/4 | In Progress|  |
 | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
