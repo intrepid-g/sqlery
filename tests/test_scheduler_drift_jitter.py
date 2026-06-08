@@ -48,6 +48,39 @@ class TestCalculateNextRunDriftClamp:
         assert nxt.tzinfo is not None
         assert nxt > datetime.now(timezone.utc)
 
+    def test_clamp_cap_exhaustion_does_not_return_past(self):
+        """CR-01: when the future-clamp loop exhausts its cap with candidate still
+        in the past, calculate_next_run must NOT persist a past next_run_at (which
+        would re-qualify the task as due every cycle — a runaway producer). It must
+        recompute strictly from now so the persisted value is in the future.
+        """
+        s = _bare_scheduler()
+        now = datetime.now(timezone.utc)
+        past = now - timedelta(days=400)
+        future = now + timedelta(minutes=1)
+        # Simulate a pathological/unreachable expression: every clamp step keeps
+        # returning a past time, so the loop runs to the cap. Only when the final
+        # recompute-from-now is invoked (base_time == now) do we return a future.
+        calls = []
+
+        def fake_occurrence(expr, base):
+            calls.append(base)
+            # The recovery path recomputes from `now` (a fresh value >= now).
+            if base >= now:
+                return future
+            return past
+
+        with patch(
+            "sqlery.core.scheduler._MAX_CLAMP_ITERATIONS", 5
+        ), patch("sqlery.core.scheduler.next_cron_occurrence", side_effect=fake_occurrence):
+            nxt = s.calculate_next_run("@unsatisfiable", base_time=past)
+
+        # The persisted value must be strictly in the future — never the stale past
+        # candidate that would busy-loop the scheduler.
+        assert nxt > datetime.now(timezone.utc), (nxt, now)
+        # And the recovery path must have recomputed from a current time.
+        assert any(base >= now for base in calls)
+
 
 class TestEnqueueAtomicAdvance:
     """Task 2: atomic advance+enqueue, lost-CAS None, bounded jitter."""
