@@ -529,6 +529,40 @@ class WorkerProcess:
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
 
+                    # --- Scheduler-election step (every cycle, incl. idle) ---
+                    # Renew held leases, re-claim any expired/unowned queues,
+                    # then fire cron only for queues this worker leads. Wrapped
+                    # in its own try/except so an election error logs and the
+                    # loop continues — election never crashes the worker
+                    # (ELECT-07 safe-degradation).
+                    try:
+                        if owned_queues:
+                            self.backend.renew_queue_leases(
+                                sorted(owned_queues), self.worker_id, lease_secs
+                            )
+                        unowned = set(self.queues) - owned_queues
+                        if unowned:
+                            newly_claimed = set(
+                                self.backend.claim_queue_leases(
+                                    sorted(unowned),
+                                    self.worker_id,
+                                    self.node_id,
+                                    self.pid,
+                                    lease_secs,
+                                )
+                            )
+                            if newly_claimed:
+                                owned_queues |= newly_claimed
+                                logger.info(
+                                    f"Acquired scheduler leases for: {sorted(newly_claimed)}"
+                                )
+                        # Fire cron for held queues only (ELECT-01 + ELECT-02)
+                        jobs = scheduler.run_due_tasks(queue_names=owned_queues)
+                        if jobs:
+                            logger.info(f"Scheduler created {len(jobs)} jobs")
+                    except Exception as e:
+                        logger.error(f"Scheduler-election error: {e}", exc_info=True)
+
                     job = self.backend.claim_job(self.queues, self.worker_id)
 
                     if not job:
@@ -605,6 +639,14 @@ class WorkerProcess:
                 )
             except Exception:
                 pass
+            # Release held scheduler leases on graceful shutdown so another
+            # worker/daemon can take over the queues immediately (ELECT-03).
+            # SIGTERM/SIGINT set self.shutdown_requested, exiting the loop into
+            # this finally; owned_queues is always defined (init'd before try:).
+            try:
+                self.backend.release_queue_leases(sorted(owned_queues), self.worker_id)
+            except Exception as e:
+                logger.error(f"Error releasing scheduler leases: {e}")
             logger.info(f"Worker {self.worker_id} stopped (processed {self.jobs_processed} jobs)")
 
         return self.jobs_processed
