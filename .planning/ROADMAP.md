@@ -30,7 +30,10 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
   3. `SQLAlchemyBackend` implements real `claim_queue_leases` / `renew_queue_leases` / `release_queue_leases`, replacing the inherited fake-election default
   4. Standalone lease claiming is atomic and matches Django semantics — Postgres uses `SELECT FOR UPDATE`, SQLite uses optimistic CAS on the `version` field
   5. The existing standalone daemon runs against the real leases instead of the silent fake election
-**Plans**: TBD
+<!-- Old: **Plans**: TBD -->
+**Plans**: 2 plans (2 waves)
+- [ ] 08-01-PLAN.md — DaemonLease SQLModel + DAEMON_LEASE constant + date-prefixed Alembic migration (LEASE-01, LEASE-02)
+- [ ] 08-02-PLAN.md — Real SQLAlchemyBackend atomic claim/renew/release + lease lifecycle tests + daemon parity (LEASE-03, LEASE-04, LEASE-05)
 **UI hint**: no
 
 ### Phase 9: Core-Shared Scheduler Election
@@ -75,7 +78,8 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Standalone Lease Parity | 0/TBD | Not started | - |
+<!-- Old: | 8. Standalone Lease Parity | 0/TBD | Not started | - | -->
+| 8. Standalone Lease Parity | 0/2 | Planned | - |
 | 9. Core-Shared Scheduler Election | 0/TBD | Not started | - |
 | 10. Harden Cron Semantics | 0/TBD | Not started | - |
 | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - |
