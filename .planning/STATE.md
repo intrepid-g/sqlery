@@ -1,14 +1,15 @@
 ---
 gsd_state_version: 1.0
 milestone: v0.23.0
-milestone_name: Worker-Elected Cron Scheduler
-status: planning
-last_updated: "2026-06-08T08:18:18.936Z"
-last_activity: 2026-06-08
+milestone_name: milestone
+status: executing
+stopped_at: Roadmap created for v0.23.0 (Phases 8–11); requirements traceability filled
+last_updated: "2026-06-08T08:34:54.472Z"
+last_activity: 2026-06-08 -- Phase 08 execution started
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 0
+  total_plans: 2
   completed_plans: 0
   percent: 0
 ---
@@ -20,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-08)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integrations, on both SQLite and PostgreSQL, with operational guidance that maintainers can trust in production.
-**Current focus:** Milestone v0.23.0 Worker-Elected Cron Scheduler — roadmap defined (Phases 8–11); ready to plan Phase 8 (Standalone Lease Parity).
+**Current focus:** Phase 08 — standalone-lease-parity
 
 ## Current Position
 
-Phase: Not started (roadmap defined, Phases 8–11)
-Plan: —
-Status: Roadmap complete, awaiting phase planning
-Last activity: 2026-06-08 — Roadmap created for v0.23.0 (4 phases, 21 requirements mapped)
+Phase: 08 (standalone-lease-parity) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 08
+Last activity: 2026-06-08 -- Phase 08 execution started
 
 ## Performance Metrics
 
