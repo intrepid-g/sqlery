@@ -12,16 +12,18 @@ Every execution mode works reliably and is tested in CI across both Django and s
 
 **Shipped:** v0.21 — Feature-Complete Run Modes (2026-05-15). All 6 execution modes (daemon, subprocess, HTTP trigger, Lambda, async worker, synchronous) are production-ready in both Django and standalone integrations, tested on SQLite and Postgres. Async worker was rebuilt with real async backends plus drain-with-deadline shutdown. Security was hardened with dashboard auth, webhook SSRF defense, CSRF protection, and an opt-in task module allowlist. Archive: `.planning/milestones/v0.21-*`.
 
-## Current Milestone: v0.22 Stability, Coverage, and Operational Confidence
+**Shipped:** v0.22 — Stability, Coverage, and Operational Confidence (released through v0.22.3). CI/coverage signal restored, failure-path and PostgreSQL concurrency hardening added, and operator readiness improved across the six execution modes.
 
-**Goal:** Raise confidence in the existing six execution modes before adding new compatibility surface area by fixing CI signal, hardening failure/concurrency behavior, and closing the highest-value operational gaps.
+## Current Milestone: v0.23.0 Worker-Elected Cron Scheduler
+
+**Goal:** Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemon present by self-electing a per-queue scheduler-leader over the existing lease scheme — at true feature parity across both Django and standalone integration modes.
 
 **Target features:**
-- Eliminate the temporary coverage/collection workaround and make CI signal trustworthy
-- Add battle-testing for crashes, retries, heartbeats, leases, concurrency, and fork/DB lifecycle
-- Verify PostgreSQL-heavy operational behavior with stronger regression coverage
-- Close the highest-value operator and security hardening gaps that affect production trust
-- Improve runbooks and troubleshooting docs for real deployment/recovery workflows
+- Build a real standalone lease (SQLModel + Alembic migration + SQLAlchemy backend methods) so leader election stops being a silent Django-only fake
+- Core-shared scheduler election in the worker poll loop: claim/renew per-queue leases, fire due cron for held queues, release on shutdown
+- Harden cron semantics: atomic enqueue + `next_run_at` advance, drift correction from scheduled time, idempotency under leader overlap
+- Automatic failover within one lease TTL when the leader dies; daemon stays authoritative when present
+- Parity-gated CI proof across the full matrix: {Django, standalone} × {SQLite, Postgres}
 
 ## Requirements
 
@@ -44,15 +46,19 @@ Every execution mode works reliably and is tested in CI across both Django and s
 - ✓ Alembic migrations for standalone mode — existing
 - ✓ RQ and django-tasks-scheduler compatibility layers — existing
 - ✓ Database resilience (retry decorator, WAL mode, busy_timeout, connection pooling) — existing
+- ✓ Trustworthy CI/coverage signal without the collection-error workaround — v0.22
+- ✓ Battle-tested failure handling (crash, retry, timeout, zombie, heartbeat, lease recovery) — v0.22
+- ✓ Stronger PostgreSQL concurrency and claim/lease regression coverage — v0.22
+- ✓ Operator runbooks and troubleshooting docs for production-facing modes — v0.22
 
 ### Active
 
-- [ ] Test suite runs without the known collection-error workaround that kept coverage pinned to a temporary 13% floor
-- [ ] CI signal is trustworthy for default and PostgreSQL rails, including the standalone-no-Django path
-- [ ] Failure handling is battle-tested for daemon/worker crash, retry, timeout, zombie, heartbeat, and lease-recovery paths
-- [ ] PostgreSQL concurrency and claim/lease behavior have stronger regression coverage under multi-worker scenarios
-- [ ] Operator docs cover deploy, run, observe, recover, and troubleshoot flows for the production-facing modes
-- [ ] The most important documented follow-up hardening gaps are either closed or explicitly deferred with evidence
+- [ ] A bare `sqlery-worker` cluster fires recurring cron tasks with no daemon present, in both Django and standalone modes
+- [ ] Exactly one worker schedules a given queue at a time via a real per-queue lease in both backends
+- [ ] Scheduler leadership fails over to another worker within one lease TTL when the leader dies
+- [ ] Cron ticks are not double-enqueued during brief leader overlap and do not miss or drift
+- [ ] A running daemon stays authoritative for scheduling; workers defer to it
+- [ ] Feature parity across {Django, standalone} × {SQLite, Postgres} is a first-class, CI-enforced acceptance gate
 
 ### Out of Scope
 
@@ -82,6 +88,9 @@ This milestone deliberately favors maturity over feature expansion. The compatib
 |----------|-----------|---------|
 | **Maturity before expansion** (2026-05-15) | After shipping all six execution modes in v0.21, the highest-value next step is to raise confidence in CI, battle-test failure paths, and improve operational guidance before adding permanent new compatibility surface area. | — Locked for v0.22 |
 | **Drop-in compatibility is a permanent first-class feature** (2026-05-15) | Users migrating from Celery, RQ, or django-tasks-scheduler should change only their import paths. Compat shims (`sqlery.compat.celery`, `sqlery.compat.rq`, `sqlery.compat.scheduler`) are NOT transitional — they stay forever. Means: every public decorator/queue/job API in those libraries needs a sqlery-backed equivalent. Reverses the "Deprecated since v3.1.0 — will be removed in v3.2.0" notes in `compat/rq.py`. | — Locked, implementation pending |
+| **Scheduling = holding the per-queue lease** (2026-06-08) | The `DaemonLease` table is keyed per queue, and scheduling is already per-queue. "Being the scheduler for queue X" is identical to "holding queue X's lease." Reuse the existing `sqlery_daemon_lease` scheme — no new role, no `__scheduler__` reserved key, no second table. Lease gates who *fires cron* for a queue, never who *executes* its jobs (job-claiming path untouched). | — Locked for v0.23 |
+| **Build real standalone lease for parity** (2026-06-08) | Standalone/SQLAlchemy inherits the ABC default of `claim_queue_leases` (returns all queues) — a silent fake election with no `DaemonLease` SQLModel. Honest parity requires building it from scratch (SQLModel + Alembic migration + SQLAlchemy methods), matching Django semantics (Postgres `FOR UPDATE`, SQLite optimistic CAS). This milestone is therefore not "no migrations." | — Locked for v0.23 |
+| **Daemon stays authoritative; election always-on** (2026-06-08) | When a daemon is running it keeps winning the lease and workers defer (backward compatible). Worker scheduler-eligibility is always-on with no config knob. Reuse `check_interval` for poll cadence; lease TTL = `check_interval × 3` (mirrors daemon). Jitter default off (`scheduler_jitter_seconds = 0`). | — Locked for v0.23 |
 
 ## Evolution
 
@@ -101,4 +110,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-15 after milestone v0.22 reset*
+*Last updated: 2026-06-08 — milestone v0.23.0 Worker-Elected Cron Scheduler started*

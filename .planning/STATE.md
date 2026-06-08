@@ -1,11 +1,10 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.22
-milestone_name: Stability, Coverage, and Operational Confidence
+milestone: v0.23.0
+milestone_name: Worker-Elected Cron Scheduler
 status: planning
-stopped_at: Milestone v0.22 scope reset to maturity-first on 2026-05-15
-last_updated: "2026-05-15T16:00:00.000Z"
-last_activity: 2026-05-15 -- Milestone v0.22 redirected to stability/coverage/ops hardening
+last_updated: "2026-06-08T08:18:18.936Z"
+last_activity: 2026-06-08
 progress:
   total_phases: 0
   completed_phases: 0
@@ -26,11 +25,9 @@ See: .planning/PROJECT.md (updated 2026-05-15)
 ## Current Position
 
 Phase: Not started (defining requirements)
-Plan: -
+Plan: —
 Status: Defining requirements
-Last activity: 2026-05-15 -- Milestone v0.22 maturity-first scope confirmed
-
-Progress: [..........] 0%
+Last activity: 2026-06-08 — Milestone v0.23.0 started
 
 ## Performance Metrics
 
