@@ -688,8 +688,13 @@ class DjangoBackend(DatabaseBackend):
             The created QueuedJob when this caller won the CAS, otherwise ``None``.
         """
         with transaction.atomic():
+            # # Old (WR-05): filtered only on id + next_run_at, so a task disabled
+            # # mid-cycle could still win the CAS and fire. Re-check enabled=True.
+            # advanced = self.ScheduledTask.objects.filter(
+            #     id=task_id, next_run_at=observed_next_run_at
+            # ).update(next_run_at=new_next_run_at)
             advanced = self.ScheduledTask.objects.filter(
-                id=task_id, next_run_at=observed_next_run_at
+                id=task_id, next_run_at=observed_next_run_at, enabled=True
             ).update(next_run_at=new_next_run_at)
             if advanced != 1:
                 # Another leader already advanced this tick — do not enqueue.
