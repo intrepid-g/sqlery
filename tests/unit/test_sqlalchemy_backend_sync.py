@@ -976,6 +976,83 @@ class TestLeaseLifecyclePostgres:
         )
         assert second == []
 
+    def test_expired_lease_taken_over_under_concurrent_lock(self, pg_sync_backend):
+        """CR-01 regression: an EXPIRED lease row held (locked) inside another
+        open transaction must still be taken over by a second claimant.
+
+        The old ``SELECT FOR UPDATE SKIP LOCKED`` probe returned zero rows when
+        the row was locked by an open transaction, so the second daemon fell
+        into the INSERT branch (PK conflict -> IntegrityError -> False) and the
+        expired lease was left unclaimed for that cycle. With a blocking row
+        lock, the second daemon waits for the lock, then observes the expired
+        row and takes it over.
+        """
+        import threading
+        from datetime import datetime, timedelta, UTC
+
+        from sqlmodel import select
+        from sqlery.core.models import DaemonLease
+
+        # Seed an EXPIRED lease held by daemon d1.
+        assert pg_sync_backend.claim_queue_leases(
+            queues=["pg-takeover"], daemon_id="d1", node_id="n1", pid=1, lease_secs=60
+        ) == ["pg-takeover"]
+        with pg_sync_backend._get_session() as session:
+            row = session.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "pg-takeover")
+            ).first()
+            row.expires_at = datetime.now(UTC) - timedelta(seconds=30)
+            session.add(row)
+            session.commit()
+
+        # Open a transaction that locks the (expired) lease row and holds the
+        # lock while a second daemon attempts to claim in another thread.
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        holder_session = pg_sync_backend._get_session()
+        try:
+            locked = holder_session.exec(
+                select(DaemonLease)
+                .where(DaemonLease.queue_name == "pg-takeover")
+                .with_for_update()
+            ).first()
+            assert locked is not None
+            lock_acquired.set()
+
+            takeover_result: list[list[str]] = []
+
+            def claim_from_other_daemon():
+                lock_acquired.wait(timeout=5)
+                takeover_result.append(
+                    pg_sync_backend.claim_queue_leases(
+                        queues=["pg-takeover"],
+                        daemon_id="d2",
+                        node_id="n2",
+                        pid=2,
+                        lease_secs=60,
+                    )
+                )
+
+            t = threading.Thread(target=claim_from_other_daemon)
+            t.start()
+            # Give the claimant time to block on the row lock, then release.
+            release_lock.wait(timeout=0.5)
+            holder_session.rollback()  # release the lock without altering the row
+            t.join(timeout=10)
+        finally:
+            holder_session.close()
+
+        # The blocking lock makes the expired row visible; d2 takes it over.
+        assert takeover_result == [["pg-takeover"]]
+        owner = pg_sync_backend._get_session()
+        try:
+            final = owner.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "pg-takeover")
+            ).first()
+            assert final.daemon_id == "d2"
+        finally:
+            owner.close()
+
 
 # ---------------------------------------------------------------------------
 # 11. SQLite lease lifecycle (LEASE-03/04/05)
