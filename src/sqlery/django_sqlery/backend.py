@@ -655,6 +655,47 @@ class DjangoBackend(DatabaseBackend):
         """Update scheduled task's next run time."""
         self.ScheduledTask.objects.filter(id=task_id).update(next_run_at=next_run_at)
 
+    @retry_on_db_error()
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ) -> Any:
+        """Atomically advance next_run_at on a CAS and enqueue in the same txn.
+
+        Inside a single ``transaction.atomic()`` block, a queryset ``.update()``
+        filtered on ``next_run_at=observed_next_run_at`` advances the row to
+        ``new_next_run_at`` ONLY when it still matches (rowcount-CAS — the
+        ScheduledTask has no version column, so the observed due time is the
+        idempotency token). On a winning CAS (rowcount == 1) the queued job is
+        created via ``self.create_job`` in the ambient transaction so the advance
+        and the enqueue commit together (CRON-01); only the caller whose advance
+        wins enqueues, so two briefly-overlapping leaders cannot double-fire
+        (CRON-04). When the CAS is lost (rowcount != 1) no job is created.
+
+        The rowcount-CAS gives exactly-once on both SQLite and Postgres, so a
+        ``select_for_update`` is not required.
+
+        Args:
+            task_id: Scheduled task ID.
+            observed_next_run_at: The ``next_run_at`` observed when the task was due.
+            new_next_run_at: The value to advance to when the CAS wins.
+            job_kwargs: Keyword arguments forwarded to ``create_job``.
+
+        Returns:
+            The created QueuedJob when this caller won the CAS, otherwise ``None``.
+        """
+        with transaction.atomic():
+            advanced = self.ScheduledTask.objects.filter(
+                id=task_id, next_run_at=observed_next_run_at
+            ).update(next_run_at=new_next_run_at)
+            if advanced != 1:
+                # Another leader already advanced this tick — do not enqueue.
+                return None
+            return self.create_job(**job_kwargs)
+
     def update_scheduled_task(self, task_id: int, **updates) -> Any:
         """Update scheduled task fields."""
         self.ScheduledTask.objects.filter(id=task_id).update(**updates)
