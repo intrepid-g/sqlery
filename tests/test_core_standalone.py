@@ -117,6 +117,7 @@ print("RETRY_OK")
 # fire exactly once.
 # ---------------------------------------------------------------------------
 
+import os
 from datetime import datetime, timedelta, UTC
 
 import pytest
@@ -264,3 +265,139 @@ class TestStandaloneAdvanceScheduledTask:
         stored = advanced.next_run_at
         stored = stored if stored.tzinfo else stored.replace(tzinfo=UTC)
         assert stored == new_next_run
+
+
+# ---------------------------------------------------------------------------
+# Standalone x Postgres parity mirror (Phase 11 — PARITY-02 / PARITY-03)
+#
+# Phase 10 proved the standalone advance/CAS primitive on a temp-file SQLite
+# engine only and deferred the standalone x Postgres cells to Phase 11. This
+# section adds them: a PG-bound twin of the SQLite ``standalone_backend``
+# fixture plus a class mirroring the single-fire and drift-free coverage
+# against the real ``SQLAlchemyBackend.advance_scheduled_task_if_due`` on
+# Postgres' MVCC / row-lock semantics. The fixture (modeled on
+# ``pg_sync_backend`` in tests/unit/test_sqlalchemy_backend_sync.py) auto-skips
+# without ``SQLERY_TEST_PG_URL`` and does drop_all + create_all per test for
+# row isolation across the shared PG service.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pg_standalone_backend(monkeypatch):
+    """Per-test SQLAlchemyBackend bound to a real PG service (Phase 11).
+
+    Postgres-bound twin of the SQLite ``standalone_backend`` fixture, mirroring
+    ``pg_sync_backend`` in tests/unit/test_sqlalchemy_backend_sync.py. Auto-skips
+    when ``SQLERY_TEST_PG_URL`` is unset; uses a fresh engine +
+    ``SQLModel.metadata.drop_all`` / ``create_all`` so each test starts from an
+    empty schema, and disposes the engine on teardown.
+    """
+    pg_url = os.environ.get("SQLERY_TEST_PG_URL")
+    if not pg_url:
+        pytest.skip("SQLERY_TEST_PG_URL not set; PG mirror skipped")
+
+    from sqlalchemy import create_engine
+    from sqlmodel import SQLModel
+
+    from sqlery.fastapi_sqlery import database as db_mod
+
+    # Importing core.models populates SQLModel.metadata (used by create_all).
+    from sqlery.core import models as _core_models  # noqa: F401
+
+    engine = create_engine(pg_url, future=True)
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+
+    monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+    from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+    backend = SQLAlchemyBackend()
+    try:
+        yield backend
+    finally:
+        try:
+            SQLModel.metadata.drop_all(engine)
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.postgres
+class TestStandaloneAdvanceScheduledTaskPostgres:
+    """Standalone x Postgres mirror of :class:`TestStandaloneAdvanceScheduledTask`.
+
+    PARITY-02 / PARITY-03 on the standalone PG path: proves
+    ``SQLAlchemyBackend``'s ``with_for_update`` / CAS is single-winner and that
+    next_run_at advances drift-free on a real Postgres engine, reusing the
+    existing module helpers ``_make_due_scheduled_task``, ``_job_kwargs_for``,
+    and ``_count_jobs_for``. Routed to the PG CI rail by
+    ``@pytest.mark.postgres``; the ``pg_standalone_backend`` fixture skips before
+    any assertion when ``SQLERY_TEST_PG_URL`` is unset.
+    """
+
+    def test_two_attempts_same_observed_due_fire_exactly_once_pg(self, pg_standalone_backend):
+        """Two advances with the same observed_due: first wins, second None, one job (PG)."""
+        backend = pg_standalone_backend
+        task = _make_due_scheduled_task(backend, name="cron-once-pg")
+        observed_due = task.next_run_at
+        new_next_run = datetime.now(UTC) + timedelta(minutes=5)
+        job_kwargs = _job_kwargs_for(task)
+
+        first = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+        second = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+
+        assert first is not None
+        assert second is None
+        assert _count_jobs_for(backend, task.id) == 1
+
+        advanced = backend.get_scheduled_task(task.id)
+        stored = advanced.next_run_at
+        stored = stored if stored.tzinfo else stored.replace(tzinfo=UTC)
+        assert stored == new_next_run
+
+    def test_next_run_at_advances_drift_free_pg(self, pg_standalone_backend):
+        """next_run_at advances from the PRIOR scheduled time, not wall-clock now (PG).
+
+        Fire several successive advances, each time computing the expected next
+        occurrence from the prior scheduled ``next_run_at`` (not ``now``), and
+        re-arm the row as due between ticks via ``update_scheduled_task_next_run``
+        (the same idiom ``_make_due_scheduled_task`` uses). Asserts monotonic,
+        drift-free advance on the standalone PG path.
+        """
+        from sqlery.core.utils import calculate_next_run
+
+        backend = pg_standalone_backend
+        task = _make_due_scheduled_task(backend, name="cron-drift-pg")
+        cron = task.cron_expression
+
+        observed = task.next_run_at
+        observed = observed if observed.tzinfo else observed.replace(tzinfo=UTC)
+        last_scheduled = observed
+        for _ in range(3):
+            expected = calculate_next_run(cron, base_time=last_scheduled)
+            job = backend.advance_scheduled_task_if_due(
+                task.id, last_scheduled, expected, _job_kwargs_for(task)
+            )
+
+            assert job is not None, "the matching observed_due must win the CAS each tick"
+
+            advanced = backend.get_scheduled_task(task.id)
+            stored = advanced.next_run_at
+            stored = stored if stored.tzinfo else stored.replace(tzinfo=UTC)
+            # Drift-free: advanced exactly to the occurrence computed from the
+            # PRIOR scheduled time, strictly after it.
+            assert stored == expected
+            assert stored > last_scheduled
+
+            # Re-arm the task as due for the next tick by rewinding to a past
+            # scheduled time derived from the LAST scheduled occurrence
+            # (drift-free), then carry that rewound value as the next observed_due.
+            rewound = stored - timedelta(minutes=5)
+            backend.update_scheduled_task_next_run(task.id, rewound)
+            last_scheduled = rewound
+
+        assert _count_jobs_for(backend, task.id) == 3
