@@ -11,10 +11,10 @@ files_reviewed_list:
   - src/sqlery/fastapi_sqlery/backend.py
   - tests/unit/test_sqlalchemy_backend_sync.py
 findings:
-  critical: 1
-  warning: 6
-  info: 4
-  total: 11
+  critical: 0
+  warning: 1
+  info: 3
+  total: 4
 status: issues_found
 ---
 
@@ -27,163 +27,138 @@ status: issues_found
 
 ## Summary
 
-Phase 08 adds a standalone per-queue lease (`DaemonLease` SQLModel, Alembic migration `20260608_0015`, and `claim_queue_leases` / `renew_queue_leases` / `release_queue_leases` on `SQLAlchemyBackend`) mirroring the Django implementation. The review focused on atomicity of the Postgres `SELECT FOR UPDATE SKIP LOCKED` vs SQLite version-CAS paths, timezone-aware datetime comparison, take-over races, SQL injection, and Django parity.
+Iteration 2 re-review of the standalone per-queue lease parity work (`DaemonLease`
+SQLModel, Alembic migration `20260608_0015`, and `claim_queue_leases` /
+`renew_queue_leases` / `release_queue_leases` on `SQLAlchemyBackend`). Focus was
+confirming the prior 1 BLOCKER + 6 warnings are genuinely fixed (not merely
+masked) and surfacing any regressions introduced by the fixes.
 
-Overall the ORM-based queries are parameterized (no SQL injection surface), the SQLite version-CAS take-over is well guarded, and timezone normalization is handled at the comparison sites. However, there is one **BLOCKER**: the Postgres `SELECT FOR UPDATE SKIP LOCKED` lease-claim path is not actually atomic against a concurrently-locked live row — `skip_locked=True` causes a locked row to read back as `None`, which then routes into the INSERT branch and corrupts the take-over semantics. There are also several parity divergences from the Django reference (own-live-lease re-claim returns `True` here but `False` in Django; the SKIP LOCKED expired take-over is read-then-write rather than a single conditional UPDATE) and a `renew_queue_leases` no-op-on-empty-list footgun.
+**Prior findings — all confirmed resolved:**
 
-## Critical Issues
+- **CR-01 (BLOCKER)** — RESOLVED. The Postgres lease probe now uses a blocking
+  `with_for_update()` (no `skip_locked`); the old SKIP-LOCKED variant is
+  commented out per house rules (`backend.py:303-321`). The take-over branch
+  (lines 342-365) is now reachable under contention because a concurrent
+  claimant blocks on the row lock and then observes the real row. A dedicated
+  PG regression test was added (`test_expired_lease_taken_over_under_concurrent_lock`,
+  test lines 979-1054) that holds a lock on an expired row in one transaction
+  while a second daemon takes it over — exactly the concurrent-lock scenario the
+  prior tests could not exercise.
+- **WR-01** — RESOLVED (documented divergence). The own-live re-claim returning
+  `True` vs Django's `False` is now spelled out in a multi-line docstring with
+  the latency rationale (`backend.py:243-252`).
+- **WR-02** — RESOLVED. Both `renew_queue_leases` (lines 463-464) and
+  `release_queue_leases` (lines 491-492) early-return on empty `owned_queues`.
+- **WR-03** — RESOLVED. The SKIP-LOCKED-branch take-over is now guarded by the
+  same `expired OR own-lease` predicate as the version-CAS branch and is
+  serialized by the blocking row lock (`backend.py:349-362`).
+- **WR-04** — RESOLVED. Columns are now `DateTime(timezone=True)` in both the
+  model (`models.py:334-335`) and the migration (`20260608_0015:36-37`); old
+  naive columns commented out.
+- **WR-05** — RESOLVED. The `version`-column schema divergence is now documented
+  in both the standalone model (`models.py:310-320`) and the Django model
+  (`django_sqlery/models.py:1199-1204`).
+- **WR-06** — RESOLVED. The `update_worker_heartbeat` create branch now passes
+  `jobs_processed` (`backend.py:647-650`).
 
-### CR-01: `SELECT FOR UPDATE SKIP LOCKED` on the lease row makes a live, locked lease look free and routes into INSERT
-
-**File:** `src/sqlery/fastapi_sqlery/backend.py:291-336`
-**Issue:**
-In the `skip_locked` branch of `_claim_one_lease`, the existing-row probe is:
-
-```python
-stmt = (
-    select(DaemonLease)
-    .where(DaemonLease.queue_name == queue_name)
-    .with_for_update(skip_locked=True)
-)
-existing = session.exec(stmt).first()
-if existing is None:
-    lease = DaemonLease(...)
-    session.add(lease)
-    try:
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        return False
-    return True
-```
-
-`SKIP LOCKED` instructs Postgres to *omit* rows currently locked by another transaction rather than block on them. So when daemon B probes a queue whose lease row is held (locked) inside daemon A's still-open transaction, the `SELECT ... FOR UPDATE SKIP LOCKED` returns **zero rows** — `existing is None` is `True` even though a live row exists. Daemon B then falls into the INSERT branch.
-
-This is masked only because `queue_name` is the primary key, so the duplicate INSERT raises `IntegrityError` and returns `False`. That happens to be the safe outcome here, but it is accidental, not designed:
-
-1. The take-over / idempotent-refresh logic (lines 317-336) is **unreachable whenever another transaction holds the row lock** — the only time take-over contention actually matters. The expired-lease take-over therefore silently degrades: under contention the loser does not take over the expired lease, it just fails the INSERT and returns `False`, so an *expired* lease that is momentarily locked by another (also-failing) claimant is left unclaimed for that cycle.
-2. The pattern is the wrong primitive. The Django reference (`django_sqlery/backend.py:918-961`) does a single **conditional `UPDATE ... WHERE expires_at < now`** inside `@transaction.atomic`, then an INSERT — it never relies on `SKIP LOCKED` for the lease and never has a "locked row reads as absent" hole. `SKIP LOCKED` is correct for *job claiming* (you want to skip a locked job and grab a different one) but wrong for a *single-keyed lease row* where there is no "different row" to fall through to.
-
-**Fix:** Do not use `with_for_update(skip_locked=True)` for the lease row. Either mirror Django's conditional-UPDATE-then-INSERT for Postgres, or use a blocking `with_for_update()` (no `skip_locked`) so a concurrent claimant waits for the lock and then sees the real row:
-
-```python
-# Postgres: blocking row lock so the real row is always observed
-stmt = (
-    select(DaemonLease)
-    .where(DaemonLease.queue_name == queue_name)
-    .with_for_update()          # do NOT skip_locked on a single-key lease row
-)
-existing = session.exec(stmt).first()
-# ... existing take-over / insert logic now reachable under contention
-```
-
-Alternatively, prefer the Django-parity conditional UPDATE which is take-over-atomic in one statement:
-
-```python
-res = session.exec(
-    update(DaemonLease)
-    .where(DaemonLease.queue_name == queue_name)
-    .where(DaemonLease.expires_at < now)
-    .values(daemon_id=daemon_id, node_id=node_id, pid=pid,
-            acquired_at=now, expires_at=expires)
-    .execution_options(synchronize_session=False)
-)
-if res.rowcount == 1:
-    session.commit()
-    return True
-# then attempt INSERT, catch IntegrityError -> live lease held elsewhere
-```
-
-Note: the existing PG tests (`TestLeaseLifecyclePostgres`) only exercise the *uncontended* sequential path (claim, then a second daemon claims after the first commit), so they never lock a row across the probe and cannot catch this. A test with two concurrent open transactions is required to expose it.
+The full SQLite suite passes (84 passed, 7 PG-skipped, 2 documented xfail). No
+new BLOCKER was introduced. One genuine WARNING-level inconsistency between the
+two SQLite-branch take-over UPDATEs remains, plus three INFO items. No SQL
+injection surface (all queries parameterized via ORM); no secrets; no dangerous
+calls. The migration revision chain is intact (0015 → 0014 → 0013).
 
 ## Warnings
 
-### WR-01: Own-live-lease re-claim returns `True` here but Django returns `False` — parity divergence
+### WR-01: SQLite own-live re-claim CAS lacks `synchronize_session=False`, unlike its sibling expired-takeover CAS
 
-**File:** `src/sqlery/fastapi_sqlery/backend.py:324, 370-386`
-**Issue:** Both lease-claim branches treat `existing.daemon_id == daemon_id` as a successful (re)claim and refresh `expires_at`, returning `True` (SKIP LOCKED branch line 324 `or existing.daemon_id == daemon_id`; version-CAS branch lines 370-386). The Django reference (`django_sqlery/backend.py:935-961`) only updates rows with `expires_at < now`; a daemon re-claiming its **own still-live** lease matches neither the expired-UPDATE nor the INSERT (PK conflict → `IntegrityError` → `False`). So the two backends disagree on the return value for "re-claim my own live lease."
+**File:** `src/sqlery/fastapi_sqlery/backend.py:399-415` (vs `419-439`)
+**Issue:** Within the version-CAS (`optimistic_version` / `basic_lock`) branch
+there are two `update(DaemonLease)` statements that are meant to be siblings:
 
-In practice the daemon caller (`core/daemon.py:362-418`) only ever calls `claim_queue_leases` for `queues - owned_queues`, so it never re-claims a queue it already owns, and the divergence is currently latent. But this is exactly the kind of cross-backend semantic drift the phase set out to eliminate, and any future caller (or test) that relies on Django semantics will break on standalone.
+- The **own-live re-claim** UPDATE (lines 400-413) filters on
+  `queue_name == ... AND version == current_version` and does **not** set
+  `.execution_options(synchronize_session=False)`.
+- The **expired take-over** UPDATE (lines 420-436) filters on
+  `... AND version == ... AND expires_at < now` and **does** set
+  `synchronize_session=False`, with an explicit comment that the ORM
+  synchronize evaluator cannot compare the SQLite naive `expires_at` column
+  against the aware `now`.
 
-**Fix:** Pick one contract and document it. Either make Django return `True` for own-live re-claim, or make the standalone version return `False` for `existing.daemon_id == daemon_id and existing_expires >= now` to match Django. Add a parity note in the docstring stating the chosen semantics.
+The two are asymmetric without a stated reason. The own-live branch happens to
+avoid the evaluator's datetime problem only because its `WHERE` clause has no
+datetime predicate — but `existing` (the ORM object read at line 368) is still
+attached to the same session, so the default `synchronize_session='evaluate'`
+will attempt to evaluate the `version == current_version` predicate against the
+in-memory object and synchronize its attributes. This works today, but it is a
+latent fragility: any future addition of a datetime/JSON predicate to that
+UPDATE (e.g. tightening own-live re-claim to also require non-expiry, mirroring a
+future Django change) would silently raise the same evaluator `TypeError` the
+expired branch was patched to avoid. Two CAS statements that operate on the same
+table in the same method should share one consistent rule, not two.
 
-### WR-02: `renew_queue_leases([], ...)` issues an unfiltered-by-queue UPDATE
-
-**File:** `src/sqlery/fastapi_sqlery/backend.py:432-440`
-**Issue:** When `owned_queues` is empty, `DaemonLease.queue_name.in_([])` is a valid (always-false) predicate, so the UPDATE matches nothing — that part is fine. But the daemon guards this call with `if owned_queues:` (`core/daemon.py:406-407`), so the empty case is never reached there. The risk is that the method itself does not defend against the empty list, and `in_([])` emits a SQLAlchemy warning on some versions and can behave inconsistently across dialects. `release_queue_leases` (lines 456-463) has the same shape. This is defensive-hardening rather than a live bug, but a direct caller passing `[]` relies entirely on dialect behavior of `IN ()`.
-
-**Fix:** Early-return on empty input in both `renew_queue_leases` and `release_queue_leases`:
-
-```python
-if not owned_queues:
-    return
-```
-
-### WR-03: SKIP LOCKED take-over is read-then-write, not a single conditional UPDATE (TOCTOU window)
-
-**File:** `src/sqlery/fastapi_sqlery/backend.py:317-333`
-**Issue:** In the SKIP LOCKED branch, take-over of an expired lease reads `existing`, evaluates `existing_expires < now` in Python, then mutates and commits the same ORM object. The `FOR UPDATE` row lock does protect this once the row is actually returned — but combined with CR-01 (locked rows read as `None`) and the fact that the version-CAS branch *does* guard the UPDATE with `WHERE expires_at < now AND version == current_version` (lines 390-407), the SKIP LOCKED branch is inconsistent with its own SQLite sibling. The SQLite path is the more defensive of the two; the Postgres path leans entirely on the row lock that CR-01 shows can be bypassed.
-
-**Fix:** After resolving CR-01 (blocking lock or conditional UPDATE), also add the `expires_at < now` / `daemon_id` guard to the UPDATE in the Postgres branch so the two backends share identical take-over predicates.
-
-### WR-04: Naive/aware datetime mismatch is patched at read sites but the schema stores naive timestamps — fragile and duplicated
-
-**File:** `src/sqlery/core/models.py:319, 320` and `alembic/versions/20260608_0015_add_daemon_lease.py:29-30`
-**Issue:** The migration declares `acquired_at` / `expires_at` as `sa.DateTime()` (TIMESTAMP WITHOUT TIME ZONE). The model annotates them as `datetime` (no tz) and writes `datetime.now(UTC)` (aware) values into them. Every comparison site then has to re-normalize naive reads back to UTC (`backend.py:319-323`, `362-367`, and the same pattern repeated in `models.py:167`, `187`, `get_running_jobs_for_liveness:1009-1012`). This "store aware, read naive, re-attach UTC everywhere" pattern is the root cause of the pre-existing `get_expired_ttl_jobs` `TypeError` bug the tests mark `xfail` (`test_sqlalchemy_backend_sync.py:253-280`). Adding `DaemonLease` perpetuates it.
-
-**Fix:** Use timezone-aware columns so reads come back aware and no re-normalization is needed: `sa.DateTime(timezone=True)` in the migration and `Field(sa_column=Column(DateTime(timezone=True)))` on `acquired_at` / `expires_at`. (Postgres stores `timestamptz`; SQLite still returns naive, so keep the normalization helper but centralize it rather than inlining the ternary at each call site.)
-
-### WR-05: `version` column added to standalone `DaemonLease` but absent from Django model — schema divergence
-
-**File:** `src/sqlery/core/models.py:321-322` vs `src/sqlery/django_sqlery/models.py:1191-1206`
-**Issue:** The standalone `DaemonLease` carries a `version` field for SQLite CAS; the Django `DaemonLease` has no such column. The two "mirrored" tables (`sqlery_daemon_lease`) now have different schemas depending on which backend created them. If a single deployment ever runs migrations from both stacks against the same database (or a tool inspects the table cross-backend), the column set will not match. The migration comment acknowledges this ("plus a version column for SQLite CAS") but the divergence is not enforced or documented in the Django model.
-
-**Fix:** Either add a matching `version = models.IntegerField(default=0)` to the Django `DaemonLease` (so both stacks produce identical DDL), or explicitly document in both models that the standalone table intentionally carries an extra `version` column that Django ignores.
-
-### WR-06: `update_worker_heartbeat` create-branch ignores `jobs_processed`
-
-**File:** `src/sqlery/fastapi_sqlery/backend.py:602-610`
-**Issue:** Not in the lease scope but in a reviewed file: when the worker row does not yet exist, the `else` branch constructs `Worker(...)` without passing `jobs_processed`, so a first heartbeat that supplies `jobs_processed` silently drops it (defaults to 0). The update branch (lines 600-601) handles it correctly. This is an inconsistency that will under-report stats for a worker whose very first heartbeat carries a non-zero count.
-
-**Fix:** Pass it through in the create branch:
+**Fix:** Add the same option to the own-live re-claim UPDATE so both lease CAS
+statements behave identically and are future-proof:
 
 ```python
-worker = Worker(
-    id=worker_id,
-    ...
-    jobs_processed=jobs_processed if jobs_processed is not None else 0,
+cas_stmt = (
+    update(DaemonLease)
+    .where(DaemonLease.queue_name == queue_name)
+    .where(DaemonLease.version == current_version)
+    .values(
+        daemon_id=daemon_id,
+        node_id=node_id,
+        pid=pid,
+        acquired_at=now,
+        expires_at=expires,
+        version=current_version + 1,
+    )
+    .execution_options(synchronize_session=False)  # match the expired-takeover CAS
 )
 ```
 
 ## Info
 
-### IN-01: `claim_queue_leases` commits per-queue inside a shared session, so a partial failure leaves some leases claimed
+### IN-01: Duplicated naive→aware normalization ternary still appears at 4+ sites
 
-**File:** `src/sqlery/fastapi_sqlery/backend.py:252-262`
-**Issue:** The loop calls `_claim_one_lease` per queue, and each call commits independently within the same session. If queue N raises mid-loop, queues `0..N-1` are already committed/claimed but the returned `claimed` list is never returned (exception propagates), so the daemon believes it owns nothing while the DB says otherwise. This matches Django's per-queue commit model, so it is acceptable for parity, but worth noting: leases are self-healing via TTL expiry, so the orphaned rows recover within `lease_secs`.
+**File:** `src/sqlery/fastapi_sqlery/backend.py:344-348, 392-396` and
+`src/sqlery/core/models.py:167, 187`
+**Issue:** The prior IN-04 noted the `dt if dt.tzinfo else dt.replace(tzinfo=UTC)`
+idiom is copy-pasted. The WR-04 fix moved the lease columns to tz-aware (so
+Postgres reads come back aware), but the read-site ternary is still required for
+SQLite (which still returns naive) and remains inlined twice inside
+`_claim_one_lease` (lines 344-348 and 392-396) plus twice in `models.py`. The
+schema change reduced the blast radius but did not eliminate the duplication.
 
-**Fix:** Acceptable as-is given TTL recovery; optionally wrap the per-queue claim in try/except and return the partial `claimed` list rather than propagating.
+**Fix:** Promote a module-level `_aware(dt)` helper in `backend.py` and call it
+at all sites, including both lease branches and `get_running_jobs_for_liveness`.
 
-### IN-02: `determine_claim_strategy` `basic_lock` fallback has no distinct behavior from `optimistic_version`
+### IN-02: `determine_claim_strategy` `basic_lock` remains a named-but-unimplemented third strategy
 
-**File:** `src/sqlery/fastapi_sqlery/backend.py:21-39, 338-413`
-**Issue:** `basic_lock` (MySQL/Oracle/etc.) is returned by the strategy function but every consumer treats anything that is not `skip_locked` identically to `optimistic_version` (the `else` path). The named third strategy is effectively dead — there is no `basic_lock`-specific branch. The "I wish I had the time to" comment (line 32) confirms it is aspirational.
+**File:** `src/sqlery/fastapi_sqlery/backend.py:21-39`, consumed at line 303 and 367-442
+**Issue:** `basic_lock` (returned for MySQL/Oracle/`None`) has no distinct branch
+anywhere; both `claim_job` and `_claim_one_lease` treat anything that is not
+`skip_locked` as the version-CAS (`else`) path. The "I wish I had the time to"
+comment (line 32) confirms it is aspirational. Tests
+(`test_mysql_uses_basic_lock`, `test_none_falls_back_to_basic_lock`) pin the
+string value but not any behavior. This is correctness-neutral (MySQL silently
+gets the version-CAS path) but the third name is misleading.
 
-**Fix:** Either collapse to two strategies (`skip_locked` / `optimistic_version`) or implement a real `SELECT ... FOR UPDATE` (blocking) branch for `basic_lock`. As-is, MySQL would silently rely on the version-CAS path, which is fine for correctness but the third name is misleading.
+**Fix:** Either collapse to two strategies (`skip_locked` / `optimistic_version`)
+or implement a real blocking `SELECT ... FOR UPDATE` branch for `basic_lock`.
 
-### IN-03: `version` not exposed via the standalone model's optimistic-lock semantics for renew/release
+### IN-03: `claim_queue_leases` commits per queue; a mid-loop exception leaves earlier queues claimed but discards the partial result
 
-**File:** `src/sqlery/fastapi_sqlery/backend.py:432-463`
-**Issue:** `renew_queue_leases` and `release_queue_leases` filter on `daemon_id` but do not touch `version`, while the claim path increments it. The version counter is therefore only meaningful for the claim race, not renew/release. This is fine (renew/release are already `daemon_id`-scoped), but the asymmetry is undocumented and a future reader may assume `version` guards all three operations.
+**File:** `src/sqlery/fastapi_sqlery/backend.py:264-274`
+**Issue:** Each `_claim_one_lease` commits independently within the shared
+session. If queue N raises after queues `0..N-1` committed, the exception
+propagates and the `claimed` list is never returned, so the daemon believes it
+owns nothing while the DB rows say otherwise. This matches Django's per-queue
+commit model (`django_sqlery/backend.py:912-916`), and leases self-heal via TTL
+expiry within `lease_secs`, so it is acceptable for parity — noted for
+completeness only.
 
-**Fix:** Add a one-line docstring note that `version` guards only the claim/take-over CAS, not renew/release (which are owner-scoped by `daemon_id`).
-
-### IN-04: Duplicated naive→aware normalization ternary appears 4+ times
-
-**File:** `src/sqlery/fastapi_sqlery/backend.py:319-323, 363-367, 1009-1012` and `src/sqlery/core/models.py:167, 187`
-**Issue:** The `dt if dt.tzinfo else dt.replace(tzinfo=UTC)` idiom is copy-pasted across the module. `get_running_jobs_for_liveness` already factored it into a local `_aware` helper (line 1009). The lease methods re-inline it.
-
-**Fix:** Promote `_aware(dt)` to a module-level helper in `backend.py` (or a shared util) and call it from all sites, including the two lease branches.
+**Fix:** Acceptable as-is given TTL recovery. Optionally wrap the per-queue claim
+in try/except and return the partial `claimed` list rather than propagating.
 
 ---
 
