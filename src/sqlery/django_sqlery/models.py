@@ -1195,6 +1195,13 @@ class DaemonLease(models.Model):
     running the scheduler and zombie cleanup for that queue. Renewed every
     loop iteration; expires after check_interval × 3 seconds if the daemon
     dies without a clean shutdown.
+
+    Schema divergence note (WR-05): the standalone SQLModel ``DaemonLease``
+    (``core/models.py``) carries an extra ``version`` column for SQLite
+    optimistic-CAS take-over. Django uses ``SELECT FOR UPDATE SKIP LOCKED`` and
+    intentionally omits that column, so the two stacks produce slightly
+    different DDL for the shared ``sqlery_daemon_lease`` table. A single
+    database must not be migrated by both stacks.
     """
 
     queue_name = models.CharField(max_length=255, primary_key=True)
