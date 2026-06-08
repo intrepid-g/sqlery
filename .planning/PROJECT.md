@@ -14,16 +14,11 @@ Every execution mode works reliably and is tested in CI across both Django and s
 
 **Shipped:** v0.22 — Stability, Coverage, and Operational Confidence (released through v0.22.3). CI/coverage signal restored, failure-path and PostgreSQL concurrency hardening added, and operator readiness improved across the six execution modes.
 
-## Current Milestone: v0.23.0 Worker-Elected Cron Scheduler
+**Shipped:** v0.23.0 — Worker-Elected Cron Scheduler (2026-06-08). A bare `sqlery-worker` cluster now fires recurring cron with no daemon present by self-electing a per-queue scheduler-leader over a real lease scheme, at true parity across {Django, standalone} × {SQLite, Postgres}. Built the standalone `sqlery_daemon_lease` (SQLModel + migration + atomic claim/renew/release), wired core-shared scheduler election into the worker poll loop (daemon stays authoritative; failover within one TTL), hardened cron to fire exactly-once via an atomic `advance_scheduled_task_if_due` CAS with drift correction and an optional jitter knob, and made the full matrix a first-class CI gate. Archive: `.planning/milestones/v0.23.0-*`.
 
-**Goal:** Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemon present by self-electing a per-queue scheduler-leader over the existing lease scheme — at true feature parity across both Django and standalone integration modes.
+## Next Milestone
 
-**Target features:**
-- Build a real standalone lease (SQLModel + Alembic migration + SQLAlchemy backend methods) so leader election stops being a silent Django-only fake
-- Core-shared scheduler election in the worker poll loop: claim/renew per-queue leases, fire due cron for held queues, release on shutdown
-- Harden cron semantics: atomic enqueue + `next_run_at` advance, drift correction from scheduled time, idempotency under leader overlap
-- Automatic failover within one lease TTL when the leader dies; daemon stays authoritative when present
-- Parity-gated CI proof across the full matrix: {Django, standalone} × {SQLite, Postgres}
+None active. Run `/gsd-new-milestone` to start the next cycle. The strongest candidate (per backlog) is the **drop-in compatibility milestone** (Celery/RQ/scheduler permanent shim surface), which has been deliberately deferred behind the v0.22 maturity pass and v0.23 scheduler-parity work.
 
 ## Requirements
 
@@ -50,15 +45,16 @@ Every execution mode works reliably and is tested in CI across both Django and s
 - ✓ Battle-tested failure handling (crash, retry, timeout, zombie, heartbeat, lease recovery) — v0.22
 - ✓ Stronger PostgreSQL concurrency and claim/lease regression coverage — v0.22
 - ✓ Operator runbooks and troubleshooting docs for production-facing modes — v0.22
+- ✓ A bare `sqlery-worker` cluster fires recurring cron tasks with no daemon present, in both Django and standalone modes — v0.23.0
+- ✓ Exactly one worker schedules a given queue at a time via a real per-queue lease in both backends — v0.23.0
+- ✓ Scheduler leadership fails over to another worker within one lease TTL when the leader dies — v0.23.0
+- ✓ Cron ticks are not double-enqueued during brief leader overlap and do not miss or drift — v0.23.0 (atomic `advance_scheduled_task_if_due` CAS)
+- ✓ A running daemon stays authoritative for scheduling; workers defer to it — v0.23.0
+- ✓ Feature parity across {Django, standalone} × {SQLite, Postgres} is a first-class, CI-enforced acceptance gate — v0.23.0
 
 ### Active
 
-- [ ] A bare `sqlery-worker` cluster fires recurring cron tasks with no daemon present, in both Django and standalone modes
-- [ ] Exactly one worker schedules a given queue at a time via a real per-queue lease in both backends
-- [ ] Scheduler leadership fails over to another worker within one lease TTL when the leader dies
-- [ ] Cron ticks are not double-enqueued during brief leader overlap and do not miss or drift
-- [ ] A running daemon stays authoritative for scheduling; workers defer to it
-- [ ] Feature parity across {Django, standalone} × {SQLite, Postgres} is a first-class, CI-enforced acceptance gate
+(None — v0.23.0 shipped. Next milestone's requirements will be defined via `/gsd-new-milestone`.)
 
 ### Out of Scope
 
@@ -90,7 +86,9 @@ This milestone deliberately favors maturity over feature expansion. The compatib
 | **Drop-in compatibility is a permanent first-class feature** (2026-05-15) | Users migrating from Celery, RQ, or django-tasks-scheduler should change only their import paths. Compat shims (`sqlery.compat.celery`, `sqlery.compat.rq`, `sqlery.compat.scheduler`) are NOT transitional — they stay forever. Means: every public decorator/queue/job API in those libraries needs a sqlery-backed equivalent. Reverses the "Deprecated since v3.1.0 — will be removed in v3.2.0" notes in `compat/rq.py`. | — Locked, implementation pending |
 | **Scheduling = holding the per-queue lease** (2026-06-08) | The `DaemonLease` table is keyed per queue, and scheduling is already per-queue. "Being the scheduler for queue X" is identical to "holding queue X's lease." Reuse the existing `sqlery_daemon_lease` scheme — no new role, no `__scheduler__` reserved key, no second table. Lease gates who *fires cron* for a queue, never who *executes* its jobs (job-claiming path untouched). | — Locked for v0.23 |
 | **Build real standalone lease for parity** (2026-06-08) | Standalone/SQLAlchemy inherits the ABC default of `claim_queue_leases` (returns all queues) — a silent fake election with no `DaemonLease` SQLModel. Honest parity requires building it from scratch (SQLModel + Alembic migration + SQLAlchemy methods), matching Django semantics (Postgres `FOR UPDATE`, SQLite optimistic CAS). This milestone is therefore not "no migrations." | — Locked for v0.23 |
-| **Daemon stays authoritative; election always-on** (2026-06-08) | When a daemon is running it keeps winning the lease and workers defer (backward compatible). Worker scheduler-eligibility is always-on with no config knob. Reuse `check_interval` for poll cadence; lease TTL = `check_interval × 3` (mirrors daemon). Jitter default off (`scheduler_jitter_seconds = 0`). | — Locked for v0.23 |
+| **Daemon stays authoritative; election always-on** (2026-06-08) | When a daemon is running it keeps winning the lease and workers defer (backward compatible). Worker scheduler-eligibility is always-on with no config knob. Reuse `check_interval` for poll cadence; lease TTL = `check_interval × 3` (mirrors daemon). Jitter default off (`scheduler_jitter_seconds = 0`). | ✓ Good — shipped v0.23.0 |
+| **Atomic advance is the idempotency token** (2026-06-08) | Folded CRON-01 (atomic enqueue+advance) and CRON-04 (exactly-once under two-leader overlap) into one primitive: `advance_scheduled_task_if_due` does a CAS on the observed `next_run_at` (ScheduledTask has no version column) and enqueues in the same transaction. Only the CAS winner enqueues, so double-fire is impossible regardless of brief leader overlap — correctness no longer depends on perfect single-leadership. | ✓ Good — shipped v0.23.0 |
+| **Force-standalone honored in mode detection** (2026-06-08) | `_detect_mode()` now returns `standalone` when `SQLERY_FORCE_STANDALONE=1`, making the three existing call sites (subprocess launchers, parity CI rail) genuinely force standalone even when Django is importable — needed for an honest standalone×Postgres CI parity rail. | ✓ Good — shipped v0.23.0 |
 
 ## Evolution
 
@@ -110,4 +108,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-08 — milestone v0.23.0 Worker-Elected Cron Scheduler started*
+*Last updated: 2026-06-08 — after v0.23.0 Worker-Elected Cron Scheduler milestone (shipped)*
