@@ -6,7 +6,7 @@ status: planning
 last_updated: "2026-06-08T08:18:18.936Z"
 last_activity: 2026-06-08
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +17,17 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-15)
+See: .planning/PROJECT.md (updated 2026-06-08)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integrations, on both SQLite and PostgreSQL, with operational guidance that maintainers can trust in production.
-**Current focus:** Milestone v0.22 Stability, Coverage, and Operational Confidence — define requirements and roadmap for hardening before feature expansion.
+**Current focus:** Milestone v0.23.0 Worker-Elected Cron Scheduler — roadmap defined (Phases 8–11); ready to plan Phase 8 (Standalone Lease Parity).
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: Not started (roadmap defined, Phases 8–11)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-08 — Milestone v0.23.0 started
+Status: Roadmap complete, awaiting phase planning
+Last activity: 2026-06-08 — Roadmap created for v0.23.0 (4 phases, 21 requirements mapped)
 
 ## Performance Metrics
 
@@ -57,8 +57,9 @@ Last activity: 2026-06-08 — Milestone v0.23.0 started
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- Maturity before expansion for v0.22: trust the current six modes before adding more surface area
-- Drop-in compatibility remains strategic, but it moves behind the maturity milestone
+- Scheduling = holding the per-queue lease: reuse the existing `sqlery_daemon_lease` scheme, no reserved `__scheduler__` key, no second table
+- Build a real standalone lease for parity: SQLModel + Alembic migration + SQLAlchemy methods matching Django semantics (Postgres `FOR UPDATE`, SQLite optimistic CAS)
+- Daemon stays authoritative and election is always-on (no config knob); reuse `check_interval` for cadence, lease TTL = `check_interval × 3`, jitter default off
 
 ### Pending Todos
 
@@ -66,7 +67,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- Need to define scoped requirements and roadmap for stability/coverage/ops hardening before execution starts
+- None — roadmap is complete with 100% requirement coverage. Phase 10 (cron hardening) can run parallel with Phase 9 but both depend on Phase 8's lease foundation.
 
 ## Deferred Items
 
@@ -74,10 +75,11 @@ Items acknowledged and carried forward from previous milestone close:
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| *(none)* | | | |
+| Feature | Worker takeover of scheduling even when a daemon is up | Deferred | 2026-06-08 |
+| Config | `WORKER_SCHEDULER_ELIGIBLE` opt-out knob (default always-eligible) | Deferred | 2026-06-08 |
 
 ## Session Continuity
 
-Last session: 2026-05-15
-Stopped at: Milestone scope reset complete; requirements pending
+Last session: 2026-06-08
+Stopped at: Roadmap created for v0.23.0 (Phases 8–11); requirements traceability filled
 Resume file: None

@@ -58,4 +58,28 @@ This milestone makes a plain worker **self-elect as scheduler-leader** by partic
 
 ## Traceability
 
-_Filled by roadmap._
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| LEASE-01 | Phase 8 | Pending |
+| LEASE-02 | Phase 8 | Pending |
+| LEASE-03 | Phase 8 | Pending |
+| LEASE-04 | Phase 8 | Pending |
+| LEASE-05 | Phase 8 | Pending |
+| ELECT-01 | Phase 9 | Pending |
+| ELECT-02 | Phase 9 | Pending |
+| ELECT-03 | Phase 9 | Pending |
+| ELECT-04 | Phase 9 | Pending |
+| ELECT-05 | Phase 9 | Pending |
+| ELECT-06 | Phase 9 | Pending |
+| ELECT-07 | Phase 9 | Pending |
+| CRON-01 | Phase 10 | Pending |
+| CRON-02 | Phase 10 | Pending |
+| CRON-03 | Phase 10 | Pending |
+| CRON-04 | Phase 10 | Pending |
+| PARITY-01 | Phase 11 | Pending |
+| PARITY-02 | Phase 11 | Pending |
+| PARITY-03 | Phase 11 | Pending |
+| PARITY-04 | Phase 11 | Pending |
+| PARITY-05 | Phase 11 | Pending |
+
+**Coverage:** 21/21 v1 requirements mapped ✓ — no orphans, no duplicates.
