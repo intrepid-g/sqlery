@@ -1025,9 +1025,19 @@ class SQLAlchemyBackend(DatabaseBackend):
                 # then read-compare-write under the lock.
                 stmt = select(ScheduledTask).where(ScheduledTask.id == task_id).with_for_update()
                 existing = session.exec(stmt).first()
-                if existing is None:
+                # # Old (WR-06): guarded only `existing is None`, then dereferenced
+                # # existing.next_run_at.tzinfo unconditionally — but next_run_at is
+                # # nullable (a concurrent once-disable can null it), raising
+                # # AttributeError inside the txn. Treat a None next_run_at as a lost CAS.
+                # if existing is None:
+                #     return None
+                if existing is None or existing.next_run_at is None:
                     return None
-                # SQLite returns naive datetimes; normalize before compare.
+                # WR-05: re-check enabled under the lock so a task disabled mid-cycle
+                # (operator action, or a `once` task disabling itself) does not fire.
+                if not existing.enabled:
+                    return None
+                # DB column may be naive (SQLite); normalize before compare.
                 existing_due = (
                     existing.next_run_at
                     if existing.next_run_at.tzinfo
@@ -1054,6 +1064,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 update(ScheduledTask)
                 .where(ScheduledTask.id == task_id)
                 .where(ScheduledTask.next_run_at == observed_next_run_at)
+                # WR-05: re-check enabled in the predicate so a task disabled
+                # mid-cycle does not win the CAS and fire.
+                .where(ScheduledTask.enabled == True)  # noqa: E712 — SQL boolean compare
                 .values(next_run_at=new_next_run_at)
                 # Raw SQL: skip the ORM evaluator so the naive SQLite datetime
                 # column is compared in the database, not in Python.
