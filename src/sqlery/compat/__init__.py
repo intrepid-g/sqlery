@@ -5,6 +5,7 @@ Auto-detects the running mode and provides unified interfaces for:
 - Configuration (Django settings vs standalone config)
 """
 
+import os
 import sys
 from abc import ABC, abstractmethod
 from typing import Any
@@ -848,6 +849,12 @@ def _detect_mode() -> str:
     Returns:
         'django' or 'standalone'
     """
+    # Explicit standalone override: honored even when Django happens to be
+    # importable/configured in the same process (e.g. the parity CI rail and
+    # the no-Django subprocess launchers that already set this env var).
+    if os.environ.get("SQLERY_FORCE_STANDALONE") == "1":
+        return "standalone"
+
     # Check if Django is configured and available
     if "django" in sys.modules:
         try:
