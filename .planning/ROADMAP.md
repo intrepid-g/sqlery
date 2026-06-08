@@ -101,7 +101,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 **Plans**: 3 plans (2 waves)
 
 - [x] 11-01-PLAN.md — Django×Postgres + standalone×Postgres no-duplicate & drift cells (PARITY-02, PARITY-03)
-- [ ] 11-02-PLAN.md — tests/test_parity_scheduler.py failover + bare-worker E2E + standalone PG lease-takeover cell (PARITY-01, PARITY-04)
+- [x] 11-02-PLAN.md — tests/test_parity_scheduler.py failover + bare-worker E2E + standalone PG lease-takeover cell (PARITY-01, PARITY-04)
 - [ ] 11-03-PLAN.md — CI gate: standalone×Postgres parity step + four-cell matrix enforcement (PARITY-05)
 
 **UI hint**: no
@@ -116,7 +116,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 <!-- Old: | 10. Harden Cron Semantics | 0/TBD | Not started | - | -->
 | 10. Harden Cron Semantics | 4/4 | Complete   | 2026-06-08 |
 <!-- Old: | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - | -->
-| 11. Parity-Gated Tests & CI | 1/3 | In Progress|  |
+| 11. Parity-Gated Tests & CI | 2/3 | In Progress|  |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
 
