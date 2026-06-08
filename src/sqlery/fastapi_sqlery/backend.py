@@ -1096,7 +1096,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             priority=job_kwargs.get("priority", 0),
             scheduled_at=job_kwargs.get("scheduled_at"),
             max_retries=job_kwargs.get("max_retries", 0),
-            retry_backoff=job_kwargs.get("retry_backoff", 0.0),
+            # # Old (WR-01): defaulted to 0.0, diverging from the model field /
+            # # create_job canonical baseline of 1.0 (yields 0.0 * 2**n = 0 backoff).
+            # retry_backoff=job_kwargs.get("retry_backoff", 0.0),
+            retry_backoff=job_kwargs.get("retry_backoff", 1.0),
             allow_parallel=job_kwargs.get("allow_parallel", False),
             timeout_seconds=job_kwargs.get("timeout_seconds"),
             retry_count=(
