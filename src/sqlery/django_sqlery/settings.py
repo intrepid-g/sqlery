@@ -9,6 +9,11 @@ DEFAULTS = {
     # Scheduler settings
     "ENABLE_MIDDLEWARE_TRIGGER": True,
     "CHECK_INTERVAL_SECONDS": 60,  # Check for due tasks every 60 seconds
+    # CRON-03: bounded random enqueue delay in seconds. Default 0 = jitter off
+    # (PROJECT.md locked). Plan 03 applies random.uniform(0, jitter) before
+    # enqueue. NOTE: read via get_config (DjangoConfig reads DJANGO_SQL_JOBS
+    # directly, NOT DEFAULTS) — Plan 03 must pass get_config's default (0).
+    "SCHEDULER_JITTER_SECONDS": 0,
 
     # Queue settings
     "DEFAULT_QUEUE": "default",
