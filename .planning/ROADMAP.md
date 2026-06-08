@@ -13,7 +13,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 
 ## Phases
 
-- [ ] **Phase 8: Standalone Lease Parity** - Build a real standalone `sqlery_daemon_lease` (SQLModel + Alembic migration + atomic SQLAlchemy claim/renew/release) to replace the silent fake election
+- [x] **Phase 8: Standalone Lease Parity** - Build a real standalone `sqlery_daemon_lease` (SQLModel + Alembic migration + atomic SQLAlchemy claim/renew/release) to replace the silent fake election (completed 2026-06-08)
 - [ ] **Phase 9: Core-Shared Scheduler Election** - Lift per-queue claim/renew/release-and-schedule orchestration into core and wire it into the worker poll loop, with the daemon staying authoritative
 - [ ] **Phase 10: Harden Cron Semantics** - Atomic enqueue + `next_run_at` advance, drift correction from scheduled time, optional jitter knob, and idempotency under leader overlap
 - [ ] **Phase 11: Parity-Gated Tests & CI** - Prove failover, no-duplicate firing, drift correctness, and bare-worker E2E across the full `{Django, standalone} × {SQLite, Postgres}` matrix as a first-class acceptance gate
@@ -37,7 +37,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 **Plans**: 2 plans (2 waves)
 
 - [x] 08-01-PLAN.md — DaemonLease SQLModel + DAEMON_LEASE constant + date-prefixed Alembic migration (LEASE-01, LEASE-02)
-- [ ] 08-02-PLAN.md — Real SQLAlchemyBackend atomic claim/renew/release + lease lifecycle tests + daemon parity (LEASE-03, LEASE-04, LEASE-05)
+- [x] 08-02-PLAN.md — Real SQLAlchemyBackend atomic claim/renew/release + lease lifecycle tests + daemon parity (LEASE-03, LEASE-04, LEASE-05)
 
 **UI hint**: no
 
@@ -93,7 +93,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 <!-- Old: | 8. Standalone Lease Parity | 0/TBD | Not started | - | -->
-| 8. Standalone Lease Parity | 1/2 | In Progress|  |
+| 8. Standalone Lease Parity | 2/2 | Complete   | 2026-06-08 |
 | 9. Core-Shared Scheduler Election | 0/TBD | Not started | - |
 | 10. Harden Cron Semantics | 0/TBD | Not started | - |
 | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - |
