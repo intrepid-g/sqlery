@@ -54,7 +54,12 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
   4. Scheduler leadership fails over to another worker within one lease TTL (`check_interval × 3`, ≈30s) when the leader dies
   5. The worker releases held leases on graceful shutdown (SIGTERM/SIGINT), and holding a lease gates only who fires cron — all workers still claim and execute jobs from all queues unchanged
 
-**Plans**: TBD
+<!-- Old: **Plans**: TBD -->
+**Plans**: 2 plans (2 waves)
+
+- [ ] 09-01-PLAN.md — Wire daemon-style per-queue election (claim/renew/re-claim/release) into WorkerProcess.run; fire run_due_tasks for held queues only; release on shutdown (ELECT-01, 02, 03, 05, 06, 07)
+- [ ] 09-02-PLAN.md — TestWorkerSchedulerElection: prove bare-worker cron firing, fire-only-held, foreign/daemon authority, TTL takeover, unchanged job-claim path, release on shutdown (ELECT-01..07)
+
 **UI hint**: no
 
 ### Phase 10: Harden Cron Semantics
@@ -94,7 +99,7 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 |-------|----------------|--------|-----------|
 <!-- Old: | 8. Standalone Lease Parity | 0/TBD | Not started | - | -->
 | 8. Standalone Lease Parity | 2/2 | Complete   | 2026-06-08 |
-| 9. Core-Shared Scheduler Election | 0/TBD | Not started | - |
+| 9. Core-Shared Scheduler Election | 0/2 | Not started | - |
 | 10. Harden Cron Semantics | 0/TBD | Not started | - |
 | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - |
 
