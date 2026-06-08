@@ -116,6 +116,7 @@ class TestEnqueueAtomicAdvance:
 
     def test_interval_branch_preserved(self):
         s = _bare_scheduler()
+        s.backend.has_pending_job_for_scheduled_task.return_value = False
         task = self._make_task(schedule_type="interval")
         task.get_interval_seconds = lambda: 60
         s.backend.create_job.return_value = SimpleNamespace(id=9)
@@ -127,6 +128,7 @@ class TestEnqueueAtomicAdvance:
 
     def test_once_branch_preserved(self):
         s = _bare_scheduler()
+        s.backend.has_pending_job_for_scheduled_task.return_value = False
         task = self._make_task(schedule_type="once")
         s.backend.create_job.return_value = SimpleNamespace(id=10)
         with patch("sqlery.core.scheduler.get_config", return_value=0):
