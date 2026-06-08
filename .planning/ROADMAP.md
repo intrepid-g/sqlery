@@ -97,7 +97,12 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
   4. An end-to-end bare-worker test proves cron fires with only `sqlery-worker` processes and no daemon
   5. Every behavioral test asserts identical outcomes across `{Django, standalone} × {SQLite, Postgres}` as a first-class, CI-enforced acceptance gate
 
-**Plans**: TBD
+<!-- Old: **Plans**: TBD -->
+**Plans**: 3 plans (2 waves)
+
+- [ ] 11-01-PLAN.md — Django×Postgres + standalone×Postgres no-duplicate & drift cells (PARITY-02, PARITY-03)
+- [ ] 11-02-PLAN.md — tests/test_parity_scheduler.py failover + bare-worker E2E + standalone PG lease-takeover cell (PARITY-01, PARITY-04)
+- [ ] 11-03-PLAN.md — CI gate: standalone×Postgres parity step + four-cell matrix enforcement (PARITY-05)
 **UI hint**: no
 
 ## Progress
@@ -109,7 +114,8 @@ Goal: Let a bare `sqlery-worker` cluster fire recurring cron tasks with no daemo
 | 9. Core-Shared Scheduler Election | 2/2 | Complete   | 2026-06-08 |
 <!-- Old: | 10. Harden Cron Semantics | 0/TBD | Not started | - | -->
 | 10. Harden Cron Semantics | 4/4 | Complete   | 2026-06-08 |
-| 11. Parity-Gated Tests & CI | 0/TBD | Not started | - |
+<!-- Old: | 11. Parity-Gated Tests & CI | 0/TBD | Not started | - | -->
+| 11. Parity-Gated Tests & CI | 0/3 | Not started | - |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
 
