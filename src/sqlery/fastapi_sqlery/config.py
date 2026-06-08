@@ -30,6 +30,13 @@ class StandaloneConfig(Config):
             'ENABLE_DAEMON': True,
             'DAEMON_CHECK_INTERVAL': 10,
 
+            # Scheduler jitter (CRON-03): bounded random enqueue delay in seconds.
+            # Default 0 = jitter off (PROJECT.md locked). Plan 03 reads this via
+            # get_config('scheduler_jitter_seconds', 0) and applies
+            # random.uniform(0, jitter) before enqueue. Overridable as a float
+            # via SQLERY_SCHEDULER_JITTER_SECONDS.
+            'scheduler_jitter_seconds': 0,
+
             # Connection pool settings (PostgreSQL only)
             'POOL_SIZE': 5,
             'MAX_OVERFLOW': 10,
@@ -83,6 +90,7 @@ class StandaloneConfig(Config):
             'SQLERY_MAX_OVERFLOW': 'MAX_OVERFLOW',
             'SQLERY_POOL_TIMEOUT': 'POOL_TIMEOUT',
             'SQLERY_POOL_RECYCLE': 'POOL_RECYCLE',
+            'SQLERY_SCHEDULER_JITTER_SECONDS': 'scheduler_jitter_seconds',
         }
 
         for env_key, config_key in env_mappings.items():
@@ -93,6 +101,9 @@ class StandaloneConfig(Config):
                 if config_key in ['MAX_WORKERS_PER_NODE', 'DAEMON_CHECK_INTERVAL',
                                    'POOL_SIZE', 'MAX_OVERFLOW', 'POOL_TIMEOUT', 'POOL_RECYCLE']:
                     env_value = int(env_value)
+                elif config_key == 'scheduler_jitter_seconds':
+                    # CRON-03: jitter is a fractional-second delay, parse as float.
+                    env_value = float(env_value)
                 elif config_key == 'ENABLE_DAEMON':
                     env_value = env_value.lower() in ('true', '1', 'yes')
 
