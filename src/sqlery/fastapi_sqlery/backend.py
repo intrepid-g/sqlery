@@ -632,6 +632,10 @@ class SQLAlchemyBackend(DatabaseBackend):
                     status=status,
                     current_job_id=current_job_id,
                     last_heartbeat=datetime.now(UTC),
+                    # WR-06: carry jobs_processed through on the create branch so
+                    # a first heartbeat with a non-zero count is not silently
+                    # dropped (the update branch already handles this).
+                    jobs_processed=jobs_processed if jobs_processed is not None else 0,
                 )
 
             session.add(worker)
