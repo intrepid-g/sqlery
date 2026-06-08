@@ -538,6 +538,44 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ) -> Any:
+        """Atomically advance a scheduled task and enqueue its job in one transaction.
+
+        Conditionally advances the task's ``next_run_at`` to ``new_next_run_at``
+        ONLY when the row's ``next_run_at`` still equals ``observed_next_run_at``
+        (a compare-and-swap on the observed due time). ScheduledTask has no
+        ``version`` column, so the observed ``next_run_at`` is itself the
+        idempotency token. On a winning advance, the queued job is created from
+        ``job_kwargs`` in the SAME transaction so the advance and the enqueue
+        commit (or roll back) together. When another caller already advanced the
+        row (the CAS is lost), no job is created and ``None`` is returned.
+
+        This folds CRON-01 (atomic enqueue + next_run_at advance — a crash cannot
+        double-fire or skip a tick) and CRON-04 (idempotency under two-leader
+        overlap — only the caller whose advance wins enqueues) into a single
+        primitive, replacing the prior non-atomic check-then-act sequence.
+
+        Args:
+            task_id: Scheduled task ID.
+            observed_next_run_at: The ``next_run_at`` value observed when the task
+                was found due; the CAS predicate compares against this.
+            new_next_run_at: The value to advance ``next_run_at`` to when the CAS wins.
+            job_kwargs: Keyword arguments passed through to create the queued job
+                (e.g. ``task_path``, ``kwargs``, ``queue_name``, ``priority``,
+                ``scheduled_task_id``) within the same transaction.
+
+        Returns:
+            The created job instance when this caller won the CAS, otherwise ``None``.
+        """
+        pass
+
+    @abstractmethod
     def update_scheduled_task(self, task_id: int, **updates) -> Any:
         """Update scheduled task fields.
 
