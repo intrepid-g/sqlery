@@ -289,10 +289,23 @@ class SQLAlchemyBackend(DatabaseBackend):
         expires = now + timedelta(seconds=lease_secs)
 
         if strategy == "skip_locked":
+            # Old (CR-01): SKIP LOCKED on a single-keyed lease row makes a live,
+            # locked lease read back as None, routing into the INSERT branch and
+            # leaving the take-over path (below) unreachable under contention.
+            # stmt = (
+            #     select(DaemonLease)
+            #     .where(DaemonLease.queue_name == queue_name)
+            #     .with_for_update(skip_locked=True)
+            # )
+            # New (CR-01): use a blocking row lock (no skip_locked) so a
+            # concurrent claimant waits on the lock and then observes the real
+            # row, mirroring the Django reference's contention semantics. There
+            # is no "different row" to fall through to for a single-key lease,
+            # so SKIP LOCKED is the wrong primitive here.
             stmt = (
                 select(DaemonLease)
                 .where(DaemonLease.queue_name == queue_name)
-                .with_for_update(skip_locked=True)
+                .with_for_update()
             )
             existing = session.exec(stmt).first()
             if existing is None:
@@ -321,6 +334,10 @@ class SQLAlchemyBackend(DatabaseBackend):
                 if existing.expires_at.tzinfo
                 else existing.expires_at.replace(tzinfo=UTC)
             )
+            # WR-03: take-over is guarded by the same predicate as the version-CAS
+            # branch below (expired OR our own lease). With the blocking row lock
+            # from CR-01, concurrent claimants are serialized, so this read-then-
+            # write of the locked row is now contention-safe.
             if existing_expires < now or existing.daemon_id == daemon_id:
                 existing.daemon_id = daemon_id
                 existing.node_id = node_id
