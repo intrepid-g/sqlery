@@ -68,6 +68,15 @@ def import_task(task_path):
     """
     try:
         module_path, function_name = task_path.rsplit(".", 1)
+    except ValueError:
+        raise ImportError(f"Cannot import task '{task_path}': no module separator")
+
+    # SEC-04: enforce ALLOWED_TASK_MODULES before importlib resolves the module.
+    from .security import check_task_module_allowed
+    from ..compat import get_config
+    check_task_module_allowed(module_path, get_config("ALLOWED_TASK_MODULES", None))
+
+    try:
         module = import_module(module_path)
         task_func = getattr(module, function_name)
 
@@ -75,7 +84,7 @@ def import_task(task_path):
             raise ImportError(f"{task_path} is not callable")
 
         return task_func
-    except (ValueError, ImportError, AttributeError) as e:
+    except (ImportError, AttributeError) as e:
         raise ImportError(f"Cannot import task '{task_path}': {e}")
 
 

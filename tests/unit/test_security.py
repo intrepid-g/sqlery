@@ -144,9 +144,12 @@ class TestWorkerDispatchEnforcement:
         from sqlery.core.security import check_task_module_allowed  # noqa: F401
 
     def test_executor_import_task_gates_before_importlib(self, monkeypatch):
-        """JobExecutor._import_task must raise TaskModuleNotAllowed BEFORE
+        """import_task must raise TaskModuleNotAllowed BEFORE
         importlib.import_module is called when the module is outside the
-        allowlist (verifies the gate placement, not just the primitive)."""
+        allowlist (verifies the gate placement, not just the primitive).
+
+        SEC-04 gate is now centralized inside import_task() (core/utils.py),
+        so we patch compat.get_config at its source."""
         from sqlery.core import utils as core_utils
         from sqlery.core.worker import JobExecutor
 
@@ -158,7 +161,7 @@ class TestWorkerDispatchEnforcement:
 
         monkeypatch.setattr(core_utils, "import_module", fail_if_called)
         monkeypatch.setattr(
-            "sqlery.core.worker.get_config",
+            "sqlery.compat.get_config",
             lambda key, default=None: ["myapp"] if key == "ALLOWED_TASK_MODULES" else default,
         )
 
@@ -173,7 +176,7 @@ class TestWorkerDispatchEnforcement:
         from sqlery.core.worker import JobExecutor
 
         monkeypatch.setattr(
-            "sqlery.core.worker.get_config",
+            "sqlery.compat.get_config",
             lambda key, default=None: None if key == "ALLOWED_TASK_MODULES" else default,
         )
 

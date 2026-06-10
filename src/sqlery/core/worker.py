@@ -237,22 +237,7 @@ class JobExecutor:
             pass
 
     def _import_task(self, task_path: str):
-        # # Duplicated logic — now delegates to core.utils.import_task
-        # try:
-        #     module_path, func_name = task_path.rsplit('.', 1)
-        # #CLEANUP 2026-05-14: dead code below — Remove after 2027-05-14.
-        #     module = __import__(module_path, fromlist=[func_name])
-        #     return getattr(module, func_name)
-        # except (ImportError, AttributeError, ValueError) as e:
-        #     raise ImportError(f"Cannot import task '{task_path}': {e}")
-        # from .utils import import_task  # moved to top-level
-
-        # SEC-04 gate: enforce ALLOWED_TASK_MODULES before importlib resolves
-        # the module. Unset / empty list = pass-through (BC).
-        module_path = task_path.rsplit(".", 1)[0] if "." in task_path else task_path
-        allowed = get_config("ALLOWED_TASK_MODULES", None)
-        check_task_module_allowed(module_path, allowed)
-
+        # SEC-04 is now enforced inside import_task() itself.
         return import_task(task_path)
 
     def _should_retry(self, job) -> bool:
