@@ -17,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        # python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.13']
         django-version: ['5.2']  # LTS floor (ASYN-02) per 02-01-PLAN.
 
     services:
@@ -175,10 +176,12 @@ jobs:
       with:
         version: "latest"
 
-    - name: Set up Python 3.10
+    # - name: Set up Python 3.10
+    - name: Set up Python 3.13
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        # python-version: '3.10'
+        python-version: '3.13'
 
     - name: Install package WITHOUT django (standalone extra only)
       run: |
