@@ -1,0 +1,29 @@
+{
+  "source_path": "/Users/gabriel/Documents/GitHub/sqlery-public/.planning/intel/ingest-src/GSD-CONTEXT.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "GSD Milestone Context — sqlery partition-based bloat elimination",
+  "summary": "Self-sufficient milestone context defining the partition-bloat-elimination milestone: requirements R1-R10, a 7-phase breakdown, and pre-answered locked decisions for zero-intervention GSD planning.",
+  "scope": [
+    "partition-bloat-elimination milestone",
+    "PostgreSQL daily time-range partitioning of jobs table",
+    "partial pending index",
+    "batched cleanup DELETEs",
+    "core/partitioning.py maintenance (ensure/reclaim/check_default)",
+    "scheduled-job staging table and promotion",
+    "Django migrations 0028/0029/0030",
+    "daemon advisory-lock partition maintenance",
+    "migration and rename-based rollback for existing installs",
+    "SQLite divergence matrix"
+  ],
+  "cross_refs": [
+    "/Users/gabriel/Documents/GitHub/empty/sqlery-pgque/PLAN.md",
+    "/Users/gabriel/Documents/GitHub/empty/sqlery-pgque/sqlery-vs-pgque.md",
+    "/Users/gabriel/Documents/GitHub/empty/sqlery-pgque/sql/pgwq.sql",
+    "/Users/gabriel/Documents/GitHub/empty/sqlery-pgque/clients/python/pgwq/"
+  ],
+  "locked": false,
+  "precedence": 0,
+  "notes": "Manifest declared type SPEC with precedence 0; content also matches SPEC (concrete technical contracts, index/migration/SQL specifics). Contains 10 locked decisions per the milestone context, but locked=false applies since type is not an Accepted ADR."
+}

@@ -1,34 +1,36 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.23.0
-milestone_name: milestone
-status: Awaiting next milestone
-stopped_at: Roadmap created for v0.23.0 (Phases 8–11); requirements traceability filled
-last_updated: "2026-06-08T12:37:54.311Z"
-last_activity: 2026-06-08 — Milestone v0.23.0 completed and archived
+milestone: v0.24.0
+milestone_name: partition-bloat-elimination
+status: Ready to plan Phase 12
+stopped_at: Roadmap created for v0.24.0 (Phases 12-18); requirements traceability filled
+last_updated: "2026-06-10"
+last_activity: 2026-06-10 — Milestone v0.24.0 created from doc ingest (partition-bloat-elimination)
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 11
-  completed_plans: 11
-  percent: 100
+  total_phases: 7
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-08)
+See: .planning/PROJECT.md (updated 2026-06-10)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integrations, on both SQLite and PostgreSQL, with operational guidance that maintainers can trust in production.
-**Current focus:** Phase 11 — parity-gated-tests-ci
+**Current focus:** Phase 12 — quick-wins (partial pending index, batched DELETE cleanup, Python 3.13 floor)
 
 ## Current Position
 
-Phase: Milestone v0.23.0 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-06-08 — Milestone v0.23.0 completed and archived
+Phase: 12 of 18 (quick-wins — first of 7 in v0.24.0; global numbering continues from v0.23.0's Phase 11)
+Plan: — (not yet planned)
+Status: Ready to plan Phase 12
+Last activity: 2026-06-10 — v0.24.0 milestone created from doc ingest; Phases 12–18 roadmapped, R1–R11 traced, phase context files written
+
+Progress: [░░░░░░░░░░] 0% (0/7 phases)
 
 ## Performance Metrics
 
@@ -56,11 +58,10 @@ Last activity: 2026-06-08 — Milestone v0.23.0 completed and archived
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
+Recent decisions affecting current work (all LOCKED via doc ingest 2026-06-10 — do not re-ask):
 
-- Scheduling = holding the per-queue lease: reuse the existing `sqlery_daemon_lease` scheme, no reserved `__scheduler__` key, no second table
-- Build a real standalone lease for parity: SQLModel + Alembic migration + SQLAlchemy methods matching Django semantics (Postgres `FOR UPDATE`, SQLite optimistic CAS)
-- Daemon stays authoritative and election is always-on (no config knob); reuse `check_interval` for cadence, lease TTL = `check_interval × 3`, jitter default off
+- D1–D10 ingested from GSD-CONTEXT.md/PLAN.md: daily RANGE partitions on `created_at` with fixed defaults; hand-rolled maintenance (no pg_partman); stop-the-world migration 0029; FK demotion to `BigIntegerField`; failed-job history destroyed by default (archive hook opt-in); SQLite keeps the batched DELETE path forever; verified literals (status `'queued'`, ordering `-priority, created_at`, index trailing column `created_at`); partitioning default-on for PG (only LISTEN/NOTIFY flagged); `pg_try_advisory_lock` per maintenance function; phase ordering fixed (only Phase 18 droppable)
+- Python floor raised to 3.13 (user resolution of the ingest warning) — ships in Phase 12 as R11
 
 ### Pending Todos
 
@@ -68,7 +69,8 @@ None yet.
 
 ### Blockers/Concerns
 
-- None — roadmap is complete with 100% requirement coverage. Phase 10 (cron hardening) can run parallel with Phase 9 but both depend on Phase 8's lease foundation.
+- Phase 15 (schema-cutover) is the HIGHEST-RISK phase; its verification gates Phases 16–18. Migration 0029 is stop-the-world with a rename-based rollback — the ≥1M-row round-trip test is mandatory before proceeding.
+- Index DDL byte-identity invariant: the 0028 partial index and the 0029 DDL must stay identical (`queue_name, priority DESC, created_at WHERE status='queued'`) or Phase 15 fails on a name collision.
 
 ## Deferred Items
 
@@ -92,10 +94,10 @@ Items acknowledged at v0.23.0 milestone close (all pre-existing from prior miles
 
 ## Session Continuity
 
-Last session: 2026-06-08
-Stopped at: Roadmap created for v0.23.0 (Phases 8–11); requirements traceability filled
+Last session: 2026-06-10
+Stopped at: Roadmap created for v0.24.0 (Phases 12–18); requirements traceability filled; phase context files written from ingest
 Resume file: None
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Plan the first phase with /gsd-plan-phase 12
