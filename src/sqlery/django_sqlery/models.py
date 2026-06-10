@@ -13,7 +13,7 @@ from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
-from django.db.models import F
+from django.db.models import F, Q
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
@@ -589,7 +589,12 @@ class QueuedJob(models.Model):
         verbose_name = "Job"
         verbose_name_plural = "Jobs"
         indexes = [
-            models.Index(fields=["queue_name", "status", "-priority", "created_at"]),
+            # Old: models.Index(fields=["queue_name", "status", "-priority", "created_at"]),
+            models.Index(
+                fields=["queue_name", "-priority", "created_at"],
+                name="sqlery_job_pending_idx",
+                condition=Q(status="queued"),
+            ),
             models.Index(fields=["task_path", "status"]),
             models.Index(fields=["-created_at"], name="sqlery_job_created_desc"),
             models.Index(fields=["-finished_at"], name="sqlery_job_finished_desc"),
