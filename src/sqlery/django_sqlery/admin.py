@@ -1,5 +1,6 @@
 """Django admin configuration for sqlery."""
 
+import html as _html
 import os
 import signal as sig
 from datetime import datetime
@@ -523,6 +524,14 @@ class QueuedJobAdmin(admin.ModelAdmin):
             message = error if error else output
             message = message[:500] + "..." if len(message) > 500 else message
 
+            # SEC-AUDIT 2026-05-28: escape all user-controllable values before
+            # interpolation into HTML (stored XSS via mark_safe).
+            attempt = _html.escape(str(attempt))
+            started = _html.escape(str(started))
+            finished = _html.escape(str(finished))
+            status = _html.escape(str(status))
+            message = _html.escape(message)
+
             html_parts.append(
                 f'<tr>'
                 f'<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">{attempt}</td>'
@@ -535,10 +544,6 @@ class QueuedJobAdmin(admin.ModelAdmin):
             )
 
         html_parts.append('</tbody></table>')
-        # REGRESSION 2026-05-25: format_html() with no args crashes on Django 6.0
-        # Root cause: Django 6.0 requires at least one format arg/kwarg in format_html()
-        # Fix: use mark_safe() since the HTML is pre-constructed (no interpolation needed)
-        # I wish I had the time to: escape user data (output/error) with html.escape() in the f-strings above
         return mark_safe(''.join(html_parts))
 
     runs_display.short_description = "Execution History"

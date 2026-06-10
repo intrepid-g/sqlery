@@ -3,8 +3,10 @@
 This backend uses SQLModel/SQLAlchemy for all database operations.
 """
 
+import logging
 import os
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
@@ -16,6 +18,12 @@ from sqlmodel import Session, select, func, delete
 from ..compat import DatabaseBackend
 from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker, DaemonLease
 from .database import get_session
+
+
+logger = logging.getLogger(__name__)
+
+CLEANUP_BATCH_SIZE = 500
+FINISHED_STATUSES = ("success", "failed", "archived")
 
 
 def determine_claim_strategy(dialect_name: str | None) -> str:
@@ -706,10 +714,39 @@ class SQLAlchemyBackend(DatabaseBackend):
                 count = session.exec(count_stmt).one()
                 return {"deleted": 0, "count": count}
 
-            result = session.exec(stmt)
-            session.commit()
+            # Old: unbounded delete that holds table lock for the full result set
+            # result = session.exec(stmt)
+            # session.commit()
+            # return {"deleted": result.rowcount, "count": result.rowcount}
 
-            return {"deleted": result.rowcount, "count": result.rowcount}
+            # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE,
+            # status re-check prevents deleting a row claimed mid-loop.
+            id_stmt = select(QueuedJob.id)
+            if status:
+                id_stmt = id_stmt.where(QueuedJob.status == status)
+            if queue_name:
+                id_stmt = id_stmt.where(QueuedJob.queue_name == queue_name)
+            if max_age_days:
+                cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+                id_stmt = id_stmt.where(QueuedJob.created_at < cutoff)
+            id_stmt = id_stmt.order_by(QueuedJob.id).limit(CLEANUP_BATCH_SIZE)
+
+            total_deleted = 0
+            while True:
+                ids = list(session.exec(id_stmt).all())
+                if not ids:
+                    break
+                batch_stmt = (
+                    delete(QueuedJob)
+                    .where(QueuedJob.id.in_(ids))
+                    .where(QueuedJob.status.in_(FINISHED_STATUSES))
+                )
+                result = session.exec(batch_stmt)
+                session.commit()
+                total_deleted += result.rowcount
+                time.sleep(0.1)
+
+            return {"deleted": total_deleted, "count": total_deleted}
 
     def cleanup_jobs_by_count(
         self,
