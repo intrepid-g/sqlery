@@ -6,6 +6,7 @@ This backend wraps Django ORM operations to implement the DatabaseBackend interf
 import logging
 import os
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -22,6 +23,9 @@ from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock,
 from sqlery.core.claiming import claim_next_job_with_queue_priority
 
 logger = logging.getLogger(__name__)
+
+CLEANUP_BATCH_SIZE = 500
+FINISHED_STATUSES = ("success", "failed", "archived")
 
 
 class DjangoBackend(DatabaseBackend):
@@ -473,11 +477,30 @@ class DjangoBackend(DatabaseBackend):
             cutoff = timezone.now() - timedelta(days=max_age_days)
             query = query.filter(created_at__lt=cutoff)
 
-        count = query.count()
-        if not dry_run:
-            query.delete()
+        if dry_run:
+            count = query.count()
+            return {"deleted": 0, "count": count}
 
-        return {"deleted": count, "count": count}
+        # Old: unbounded delete that holds table lock for the full result set
+        # count = query.count()
+        # if not dry_run:
+        #     query.delete()
+        # return {"deleted": count, "count": count}
+
+        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE,
+        # status re-check prevents deleting a row claimed mid-loop.
+        total_deleted = 0
+        while True:
+            ids = list(query.order_by("id").values_list("id", flat=True)[:CLEANUP_BATCH_SIZE])
+            if not ids:
+                break
+            deleted_count, _ = self.QueuedJob.objects.filter(
+                id__in=ids, status__in=FINISHED_STATUSES
+            ).delete()
+            total_deleted += deleted_count
+            time.sleep(0.1)
+
+        return {"deleted": total_deleted, "count": total_deleted}
 
     def cleanup_jobs_by_count(
         self,
