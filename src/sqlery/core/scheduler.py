@@ -8,7 +8,26 @@ from datetime import datetime, timedelta, timezone
 from ..compat import get_backend, get_config, is_django_mode
 from ..crontab import next_cron_occurrence
 
+try:
+    import psycopg
+    from psycopg import sql as pgsql
+    _PSYCOPG_AVAILABLE = True
+except ImportError:
+    psycopg = None
+    pgsql = None
+    _PSYCOPG_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Advisory-lock constant for the staging promotion DDL lock (D9, Phase 14).
+# Derived from the 8-char ASCII tag "SQLEPROM" — fits in signed PostgreSQL int8.
+# ---------------------------------------------------------------------------
+ADVISORY_LOCK_PROMOTE: int = int.from_bytes(b"SQLEPROM", "big")  # staging promotion DDL lock
+
+# How far ahead of scheduled_at to promote rows: 30 seconds covers two
+# default daemon ticks so jobs are never delayed by more than one tick.
+_PROMOTION_LOOKAHEAD_SECONDS: int = 30
 
 # Upper bound on the future-clamp loop in calculate_next_run. Guards against a
 # misbehaving cron expression spinning forever; 2,000,000 covers ~3.8 years of
@@ -360,3 +379,73 @@ class Scheduler:
             ScheduledTask instance or None
         """
         return self.backend.get_scheduled_task(task_id)
+
+
+# ---------------------------------------------------------------------------
+# Module-level staging promotion function (Phase 14, D9)
+# ---------------------------------------------------------------------------
+
+
+def promote_due_scheduled_jobs(cur) -> int:
+    """Atomically move due rows from sqlery_scheduled_job into sqlery_queued_job.
+
+    Single transaction: DELETE FROM sqlery_scheduled_job WHERE scheduled_at <=
+    now() + lookahead FOR UPDATE SKIP LOCKED RETURNING * then INSERT INTO
+    sqlery_queued_job. Wrapped in pg_try_advisory_lock (ADVISORY_LOCK_PROMOTE)
+    so concurrent daemons skip rather than race (D9).
+
+    Args:
+        cur: Raw psycopg cursor (autocommit or inside a transaction — caller's
+             choice). No Django or SQLAlchemy imports are used here.
+
+    Returns:
+        Number of rows promoted.
+    """
+    if not _PSYCOPG_AVAILABLE:
+        logger.warning(
+            "promote_due_scheduled_jobs: psycopg not available — staging promotion skipped"
+        )
+        return 0
+
+    # Step 1: Acquire advisory lock; skip tick if another daemon is running this.
+    cur.execute("SELECT pg_try_advisory_lock(%s)", [ADVISORY_LOCK_PROMOTE])
+    (lock_acquired,) = cur.fetchone()
+    if not lock_acquired:
+        return 0
+
+    try:
+        # Step 2a: DELETE rows that are due (within lookahead window) using
+        # FOR UPDATE SKIP LOCKED so concurrent workers never race on the same rows.
+        cur.execute(
+            "DELETE FROM sqlery_scheduled_job"
+            " WHERE scheduled_at <= now() + make_interval(secs => %s)"
+            " FOR UPDATE SKIP LOCKED"
+            " RETURNING id, queue_name, task_path, payload,"
+            "           scheduled_at, priority, max_retries, created_at",
+            [_PROMOTION_LOOKAHEAD_SECONDS],
+        )
+        rows = cur.fetchall()
+
+        # Step 2b: Nothing to promote this tick.
+        if not rows:
+            return 0
+
+        # Step 2c: INSERT each promoted row into sqlery_queued_job.
+        # payload column in staging maps to kwargs column in queued_job.
+        for row in rows:
+            (job_id, queue_name, task_path, payload,
+             scheduled_at, priority, max_retries, created_at) = row
+            cur.execute(
+                "INSERT INTO sqlery_queued_job"
+                " (id, queue_name, task_path, kwargs, scheduled_at,"
+                "  priority, max_retries, status, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s)",
+                [job_id, queue_name, task_path, payload,
+                 scheduled_at, priority, max_retries, created_at],
+            )
+
+        return len(rows)
+
+    finally:
+        # Step 3: Always release the advisory lock even if INSERT raised.
+        cur.execute("SELECT pg_advisory_unlock(%s)", [ADVISORY_LOCK_PROMOTE])
