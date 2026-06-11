@@ -1225,6 +1225,60 @@ class DaemonLease(models.Model):
         return f"DaemonLease({self.queue_name} → {self.daemon_id})"
 
 
+class ScheduledJob(models.Model):
+    """A staged far-future job in the scheduling table.
+
+    Far-future jobs (scheduled_at > now() + staging threshold) land here
+    instead of sqlery_queued_job so they cannot pin otherwise-drained partitions.
+    The daemon promotion loop moves rows from this table into sqlery_queued_job
+    once scheduled_at is within the lookahead window.
+
+    The id column shares sqlery_queued_job_id_seq on PostgreSQL (wired in
+    migration 0029) so ids are globally unique across both tables.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    queue_name = models.CharField(
+        max_length=50,
+        default="default",
+        help_text="Queue name for job routing",
+    )
+    task_path = models.CharField(
+        max_length=500,
+        help_text="Python path to callable",
+    )
+    payload = models.JSONField(
+        default=dict,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Serialised job kwargs dict",
+    )
+    scheduled_at = models.DateTimeField(
+        help_text="UTC datetime when this job becomes due for promotion",
+    )
+    priority = models.IntegerField(
+        default=0,
+        help_text="Priority for enqueued jobs (higher = sooner)",
+    )
+    max_retries = models.IntegerField(
+        default=0,
+        help_text="Max retry attempts after failure",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "sqlery_scheduled_job"
+        ordering = ["scheduled_at"]
+        verbose_name = "Staged scheduled job"
+        verbose_name_plural = "Staged scheduled jobs"
+        indexes = [
+            models.Index(fields=["scheduled_at"], name="sqlery_staged_job_sched_idx"),
+        ]
+
+    def __str__(self):
+        return f"ScheduledJob {self.id} → {self.task_path} at {self.scheduled_at}"
+
+
 # Backward compatibility alias
 TaskExecution = QueuedJob
 
