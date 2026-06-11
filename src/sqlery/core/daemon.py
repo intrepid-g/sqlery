@@ -15,7 +15,11 @@ from pathlib import Path
 
 from ..compat import get_backend, get_config, is_django_mode
 from .cleanup import CleanupManager
-from . import partitioning as _partitioning
+# Old: from . import partitioning as _partitioning
+try:
+    from . import partitioning as _partitioning
+except ImportError:
+    _partitioning = None  # psycopg not installed; partition maintenance unavailable
 from .log_config import is_debug_mode
 from .scheduler import Scheduler
 from .worker_pool import WorkerPoolManager
@@ -440,8 +444,15 @@ class DaemonManager:
         partition_archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
         partition_table = "sqlery_queued_job"  # literal table name (D1)
 
+        # Gate partition maintenance on psycopg availability (CR-01)
+        _partition_maint_available = _partitioning is not None
+        if not _partition_maint_available:
+            logger.info(
+                "psycopg not installed — partition maintenance unavailable (SQLite-only mode)"
+            )
+
         # Validate the maintenance interval invariant at startup
-        if partition_maintenance_enabled:
+        if partition_maintenance_enabled and _partition_maint_available:
             try:
                 _validate_partition_maintenance_interval(
                     partition_maintenance_interval, partition_interval_str
@@ -551,7 +562,7 @@ class DaemonManager:
                 # ensure_future_partitions and reclaim_drained_partitions each acquire
                 # pg_try_advisory_lock internally — if not acquired, they return 0 and
                 # skip the tick silently (D9, R8).
-                if partition_maintenance_enabled and _should_run_partition_maintenance(
+                if partition_maintenance_enabled and _partition_maint_available and _should_run_partition_maintenance(
                     last_partition_maintenance_at, partition_maintenance_interval
                 ):
                     try:
