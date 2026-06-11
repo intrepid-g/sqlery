@@ -1,6 +1,7 @@
 """Django-agnostic daemon process management."""
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from ..compat import get_backend, get_config, is_django_mode
 from .cleanup import CleanupManager
+from . import partitioning as _partitioning
 from .log_config import is_debug_mode
 from .scheduler import Scheduler
 from .worker_pool import WorkerPoolManager
@@ -43,6 +45,52 @@ def _should_run_cleanup(last_run: datetime | None, interval_hours: int = 6) -> b
         return True
     elapsed = (datetime.now(timezone.utc) - last_run).total_seconds()
     return elapsed >= interval_hours * 3600
+
+
+def _should_run_partition_maintenance(
+    last_run: datetime | None, interval_minutes: int
+) -> bool:
+    """Return True if enough time has passed since last partition maintenance run.
+
+    Args:
+        last_run: UTC datetime of the last successful maintenance tick, or None
+        interval_minutes: Minimum minutes between ticks (PARTITION_MAINTENANCE_INTERVAL_MINUTES)
+
+    Returns:
+        True if maintenance should run now
+    """
+    if last_run is None:
+        return True
+    elapsed = (datetime.now(timezone.utc) - last_run).total_seconds()
+    return elapsed >= interval_minutes * 60
+
+
+def _validate_partition_maintenance_interval(
+    interval_minutes: int, partition_interval_str: str
+) -> None:
+    """Raise ValueError if maintenance interval exceeds the partition interval.
+
+    Per D1/constraints.md: PARTITION_MAINTENANCE_INTERVAL_MINUTES must be <=
+    SQLERY_PARTITION_INTERVAL to ensure partitions are provisioned ahead of time.
+
+    Args:
+        interval_minutes: Configured PARTITION_MAINTENANCE_INTERVAL_MINUTES value
+        partition_interval_str: Configured SQLERY_PARTITION_INTERVAL string (e.g. '1 day')
+
+    Raises:
+        ValueError: If interval_minutes > partition_interval_str expressed in minutes
+    """
+    m = re.match(r'(\d+)\s*(day|hour|minute)', partition_interval_str, re.IGNORECASE)
+    if m is None:
+        return  # Unknown format — skip validation (fail safe)
+    count, unit = int(m.group(1)), m.group(2).lower()
+    partition_minutes = count * {'day': 1440, 'hour': 60, 'minute': 1}[unit]
+    if interval_minutes > partition_minutes:
+        raise ValueError(
+            f"PARTITION_MAINTENANCE_INTERVAL_MINUTES={interval_minutes} exceeds "
+            f"SQLERY_PARTITION_INTERVAL={partition_interval_str} "
+            f"({partition_minutes} min). Partitions would not be provisioned ahead of time."
+        )
 
 
 class DaemonManager:
@@ -383,6 +431,27 @@ class DaemonManager:
         auto_cleanup = get_config("AUTO_CLEANUP_JOBS", True)
         last_cleanup_at: datetime | None = None
 
+        # Partition maintenance config (D1, R8)
+        partition_maintenance_enabled = get_config("PARTITION_MAINTENANCE_ENABLED", True)
+        partition_maintenance_interval = get_config("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 5)
+        partition_interval_str = get_config("SQLERY_PARTITION_INTERVAL", "1 day")
+        partition_retention_str = get_config("SQLERY_PARTITION_RETENTION", "30 days")
+        partition_premake = get_config("SQLERY_PARTITION_PREMAKE", 7)
+        partition_archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
+        partition_table = "sqlery_queued_job"  # literal table name (D1)
+
+        # Validate the maintenance interval invariant at startup
+        if partition_maintenance_enabled:
+            try:
+                _validate_partition_maintenance_interval(
+                    partition_maintenance_interval, partition_interval_str
+                )
+            except ValueError as e:
+                logger.error(f"Partition maintenance config error: {e} — maintenance disabled")
+                partition_maintenance_enabled = False
+
+        last_partition_maintenance_at: datetime | None = None
+
         # Track shutdown state
         shutdown_requested = False
 
@@ -477,6 +546,40 @@ class DaemonManager:
                         logger.info("Periodic auto-cleanup completed")
                     except Exception as e:
                         logger.error(f"Auto-cleanup error: {e}", exc_info=True)
+
+                # Periodic partition maintenance (R3, R4, R8, R9)
+                # ensure_future_partitions and reclaim_drained_partitions each acquire
+                # pg_try_advisory_lock internally — if not acquired, they return 0 and
+                # skip the tick silently (D9, R8).
+                if partition_maintenance_enabled and _should_run_partition_maintenance(
+                    last_partition_maintenance_at, partition_maintenance_interval
+                ):
+                    try:
+                        # TODO(Phase 16): backend.get_raw_cursor() is wired in Phase 16;
+                        # until then, AttributeError is caught below and logged as an error.
+                        cur = backend.get_raw_cursor()
+                        made = _partitioning.ensure_future_partitions(
+                            cur, partition_table, partition_interval_str, partition_premake
+                        )
+                        dropped = _partitioning.reclaim_drained_partitions(
+                            cur, partition_table, partition_retention_str, partition_archive_hook
+                        )
+                        default_count = _partitioning.check_default_partition(
+                            cur, partition_table
+                        )
+                        if made > 0 or dropped > 0:
+                            logger.info(
+                                f"Partition maintenance: created={made}, dropped={dropped}, "
+                                f"default_rows={default_count}"
+                            )
+                        if default_count > 0:
+                            logger.warning(
+                                f"DEFAULT partition holds {default_count} rows — "
+                                "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
+                            )
+                        last_partition_maintenance_at = datetime.now(timezone.utc)
+                    except Exception as e:
+                        logger.error(f"Partition maintenance error: {e}", exc_info=True)
 
                 # One-shot mode: exit after a single cycle (used by tests
                 # and integration harnesses via `--once`).
