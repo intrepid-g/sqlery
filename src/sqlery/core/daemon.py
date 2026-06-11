@@ -21,7 +21,8 @@ try:
 except ImportError:
     _partitioning = None  # psycopg not installed; partition maintenance unavailable
 from .log_config import is_debug_mode
-from .scheduler import Scheduler
+# Old: from .scheduler import Scheduler
+from .scheduler import Scheduler, promote_due_scheduled_jobs
 from .worker_pool import WorkerPoolManager
 from sqlery.core.db_resilience import configure_connection_resilience
 
@@ -94,6 +95,33 @@ def _validate_partition_maintenance_interval(
             f"PARTITION_MAINTENANCE_INTERVAL_MINUTES={interval_minutes} exceeds "
             f"SQLERY_PARTITION_INTERVAL={partition_interval_str} "
             f"({partition_minutes} min). Partitions would not be provisioned ahead of time."
+        )
+
+
+def _validate_staging_config(threshold_days: int, retention_str: str) -> None:
+    """Raise ValueError if SQLERY_PARTITION_RETENTION <= staging threshold.
+
+    Config invariant (D1): the partition retention must exceed the staging
+    threshold so promoted jobs expire before the partition is reclaimed.
+
+    Args:
+        threshold_days: Configured SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS value.
+        retention_str: Configured SQLERY_PARTITION_RETENTION string (e.g. '30 days').
+
+    Raises:
+        ValueError: If retention_days <= threshold_days.
+    """
+    m = re.match(r'(\d+)\s*(day|hour|minute)', retention_str, re.IGNORECASE)
+    if m is None:
+        return  # Unknown format — skip validation (fail safe)
+    count, unit = int(m.group(1)), m.group(2).lower()
+    retention_days_value = count * {'day': 1, 'hour': 1 / 24, 'minute': 1 / 1440}[unit]
+    if retention_days_value <= threshold_days:
+        raise ValueError(
+            f"SQLERY_PARTITION_RETENTION={retention_str} ({retention_days_value:.4g} days) "
+            f"must be greater than SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS={threshold_days}. "
+            f"Retention must exceed the staging threshold to ensure promoted jobs expire "
+            f"before the partition is reclaimed."
         )
 
 
@@ -443,6 +471,9 @@ class DaemonManager:
         partition_premake = get_config("SQLERY_PARTITION_PREMAKE", 7)
         partition_archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
         partition_table = "sqlery_queued_job"  # literal table name (D1)
+        # Staging threshold (D1, Phase 14): jobs scheduled further out land in
+        # sqlery_scheduled_job; daemon promotes them once within the lookahead window.
+        staging_threshold_days = get_config("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 1)
 
         # Gate partition maintenance on psycopg availability (CR-01)
         _partition_maint_available = _partitioning is not None
@@ -460,6 +491,17 @@ class DaemonManager:
             except ValueError as e:
                 logger.error(f"Partition maintenance config error: {e} — maintenance disabled")
                 partition_maintenance_enabled = False
+
+            # Validate that partition retention exceeds the staging threshold (D1).
+            try:
+                _validate_staging_config(staging_threshold_days, partition_retention_str)
+            except ValueError as e:
+                logger.error(
+                    f"Staging config error: {e} — check SQLERY_PARTITION_RETENTION "
+                    f"and SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS"
+                )
+                # Do not disable partition_maintenance_enabled; this is a warning
+                # about staging consistency, not about partition maintenance itself.
 
         last_partition_maintenance_at: datetime | None = None
 
@@ -587,6 +629,19 @@ class DaemonManager:
                             logger.warning(
                                 f"DEFAULT partition holds {default_count} rows — "
                                 "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
+                            )
+                        # Promotion tick (Phase 14): move staged far-future jobs that
+                        # are now within the lookahead window into sqlery_queued_job.
+                        try:
+                            promoted = promote_due_scheduled_jobs(cur)
+                            if promoted > 0:
+                                logger.info(
+                                    f"Promotion tick: promoted {promoted} staged job(s)"
+                                    f" to sqlery_queued_job"
+                                )
+                        except Exception as promo_exc:
+                            logger.error(
+                                f"Promotion error: {promo_exc}", exc_info=True
                             )
                         last_partition_maintenance_at = datetime.now(timezone.utc)
                     except Exception as e:
