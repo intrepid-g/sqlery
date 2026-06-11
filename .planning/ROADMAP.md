@@ -71,7 +71,11 @@ Plans:
   1. A job scheduled 60 days out is invisible to claims, visible to status/cancel APIs, promoted within one daemon tick of `scheduled_at - lookahead`
   2. Two daemons never double-promote (test with concurrent promoters)
   3. Config validation rejects retention ≤ threshold
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 14-01-PLAN.md — ScheduledJob model + migration 0029_scheduled_job_staging (depends on 0028; shared id sequence)
+- [ ] 14-02-PLAN.md — Enqueue routing + promote_due_scheduled_jobs + daemon tick wiring + config validation
+- [ ] 14-03-PLAN.md — Dual-table API surface (get_job_by_id, cancel_job, get_staged_jobs) + full test suite (SC-1/2/3)
 
 ### Phase 15: schema-cutover
 **Goal**: The jobs table is partitioned — composite PK `(created_at, id)`, FKs demoted, and existing installs migrate through idempotent stop-the-world migration 0029 with a rename-based rollback
@@ -123,7 +127,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
 | 13. partition-core | 3/3 | Complete   | 2026-06-11 |
-| 14. scheduled-job-staging | 0/TBD | Not started | - |
+| 14. scheduled-job-staging | 0/3 | Not started | - |
 | 15. schema-cutover | 0/TBD | Not started | - |
 | 16. backend-wiring-pruning | 0/TBD | Not started | - |
 | 17. fastapi-parity | 0/TBD | Not started | - |
