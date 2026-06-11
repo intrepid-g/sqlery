@@ -287,10 +287,20 @@ def reclaim_drained_partitions(
                         exc,
                     )
 
-            cur.execute(
-                pgsql.SQL("DROP TABLE {name}").format(name=pgsql.Identifier(name))
-            )
-            dropped += 1
+            # Old: cur.execute(pgsql.SQL("DROP TABLE {name}").format(...))
+            # Wrap in its own try/except: if archive_hook aborted the transaction,
+            # DROP fails but we must log and continue rather than crash the loop (WR-02).
+            try:
+                cur.execute(
+                    pgsql.SQL("DROP TABLE {name}").format(name=pgsql.Identifier(name))
+                )
+                dropped += 1
+            except psycopg.DatabaseError as drop_exc:
+                logger.error(
+                    "DROP TABLE failed for detached partition %s: %s — manual cleanup required",
+                    name,
+                    drop_exc,
+                )
 
     finally:
         cur.execute("SELECT pg_advisory_unlock(%s)", [ADVISORY_LOCK_RECLAIM])
