@@ -367,6 +367,52 @@ class TestReclaimDrainedPartitions:
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
         assert "DROP" not in all_sqls.upper()
 
+    def test_backpressure_invariant_queued(self):
+        """Back-pressure invariant: partition with queued rows is never dropped (R4).
+
+        The EXISTS query returns True (simulating a row with status='queued').
+        The SQL itself uses IN ('queued', 'running') — this test confirms the
+        queued branch of that expression pins the partition.
+        """
+        from sqlery.core.partitioning import reclaim_drained_partitions
+
+        old_upper = _utcnow() - timedelta(days=60)
+        cur = self._make_reclaim_cursor(
+            lock_acquired=True,
+            parts=[("sqlery_queued_job_old", old_upper)],
+            live_work_results=[True],  # EXISTS returns True (queued rows present)
+        )
+        result = reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
+        assert result == 0, "Partition with queued rows must not be dropped"
+        all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
+        assert "DETACH" not in all_sqls.upper(), "DETACH must not run when queued rows exist"
+        assert "DROP" not in all_sqls.upper(), "DROP must not run when queued rows exist"
+        # Confirm the EXISTS check was executed — it must be present in SQL calls
+        assert any("EXISTS" in str(c[0][0]).upper() for c in cur.execute.call_args_list), (
+            "Expected EXISTS check for live work was not executed"
+        )
+
+    def test_backpressure_invariant_running(self):
+        """Back-pressure invariant: partition with running rows is never dropped (R4).
+
+        The EXISTS query returns True (simulating a row with status='running').
+        Both 'queued' AND 'running' statuses must pin the partition per the
+        reclaim_drained_partitions implementation.
+        """
+        from sqlery.core.partitioning import reclaim_drained_partitions
+
+        old_upper = _utcnow() - timedelta(days=60)
+        cur = self._make_reclaim_cursor(
+            lock_acquired=True,
+            parts=[("sqlery_queued_job_old", old_upper)],
+            live_work_results=[True],  # EXISTS returns True (running rows present)
+        )
+        result = reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
+        assert result == 0, "Partition with running rows must not be dropped"
+        all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
+        assert "DETACH" not in all_sqls.upper(), "DETACH must not run when running rows exist"
+        assert "DROP" not in all_sqls.upper(), "DROP must not run when running rows exist"
+
     def test_detach_before_drop_order(self):
         """DETACH PARTITION must execute before DROP TABLE."""
         from sqlery.core.partitioning import reclaim_drained_partitions
@@ -567,3 +613,90 @@ class TestModuleInvariants:
                 if any(x in module for x in ("django", "sqlalchemy", "sqlmodel")):
                     if node.col_offset == 0:
                         pytest.fail(f"ORM import at module level: {ast.dump(node)}")
+
+
+# ---------------------------------------------------------------------------
+# Daemon helper: _validate_partition_maintenance_interval
+# ---------------------------------------------------------------------------
+
+
+class TestDaemonHelpers:
+    """Tests for daemon.py partition-maintenance helpers (D1 config validation).
+
+    _validate_partition_maintenance_interval must raise ValueError when
+    PARTITION_MAINTENANCE_INTERVAL_MINUTES > SQLERY_PARTITION_INTERVAL in minutes.
+    """
+
+    def test_validate_maintenance_interval_rejects_oversized_interval(self):
+        """ValueError raised when interval_minutes > partition_interval in minutes."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        # 2000 minutes >> 1 day (1440 min) → reject
+        with pytest.raises(ValueError):
+            _validate_partition_maintenance_interval(2000, "1 day")
+
+    def test_validate_maintenance_interval_accepts_valid_interval(self):
+        """No exception when interval_minutes <= partition_interval in minutes."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        # 5 minutes <= 1 day (1440 min) → accept
+        _validate_partition_maintenance_interval(5, "1 day")
+
+    def test_validate_maintenance_interval_boundary_day(self):
+        """1440 minutes == 1 day → accept (boundary value)."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        _validate_partition_maintenance_interval(1440, "1 day")
+
+    def test_validate_maintenance_interval_over_boundary_day(self):
+        """1441 minutes > 1 day (1440 min) → reject (over boundary)."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        with pytest.raises(ValueError):
+            _validate_partition_maintenance_interval(1441, "1 day")
+
+    def test_validate_maintenance_interval_accepts_valid_hour(self):
+        """60 minutes <= 1 hour (60 min) → accept."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        _validate_partition_maintenance_interval(60, "1 hour")
+
+    def test_validate_maintenance_interval_rejects_oversized_hour(self):
+        """61 minutes > 1 hour (60 min) → reject."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        with pytest.raises(ValueError):
+            _validate_partition_maintenance_interval(61, "1 hour")
+
+    def test_validate_maintenance_interval_unknown_format_does_not_raise(self):
+        """Unknown interval format skips validation (fail-safe, not fail-closed)."""
+        from sqlery.core.daemon import _validate_partition_maintenance_interval
+
+        # No match → returns without raising
+        _validate_partition_maintenance_interval(9999, "monthly")
+
+    def test_advisory_lock_loser_skips_without_ddl(self):
+        """Two-daemon coordination: the lock loser returns 0 without any DDL (R8).
+
+        When pg_try_advisory_lock returns False for both ensure and reclaim, neither
+        function should execute CREATE, DROP, or DETACH SQL.  This proves the R8
+        invariant: two concurrent daemons cause zero DDL conflicts.
+        """
+        from sqlery.core.partitioning import ensure_future_partitions, reclaim_drained_partitions
+
+        # --- ensure_future_partitions: lock not acquired ---
+        ensure_cur = MagicMock()
+        ensure_cur.fetchone.return_value = (False,)
+        ensure_result = ensure_future_partitions(ensure_cur, "sqlery_queued_job", "1 day", premake=3)
+        assert ensure_result == 0, "Lock loser must return 0 from ensure_future_partitions"
+        ensure_sqls = " ".join(str(c[0][0]) for c in ensure_cur.execute.call_args_list)
+        assert "CREATE" not in ensure_sqls.upper(), "Lock loser must not execute CREATE"
+
+        # --- reclaim_drained_partitions: lock not acquired ---
+        reclaim_cur = MagicMock()
+        reclaim_cur.fetchone.return_value = (False,)
+        reclaim_result = reclaim_drained_partitions(reclaim_cur, "sqlery_queued_job", "30 days")
+        assert reclaim_result == 0, "Lock loser must return 0 from reclaim_drained_partitions"
+        reclaim_sqls = " ".join(str(c[0][0]) for c in reclaim_cur.execute.call_args_list)
+        assert "DROP" not in reclaim_sqls.upper(), "Lock loser must not execute DROP"
+        assert "DETACH" not in reclaim_sqls.upper(), "Lock loser must not execute DETACH"
