@@ -101,12 +101,25 @@ class Migration(migrations.Migration):
         ),
         _PgSequenceWiring(
             sql=[
+                # Detach the auto-created per-table sequence from the column so the
+                # ALTER COLUMN below can point id to the shared sqlery_queued_job_id_seq.
                 "ALTER SEQUENCE IF EXISTS sqlery_scheduled_job_id_seq OWNED BY NONE;",
-                "ALTER TABLE sqlery_scheduled_job ALTER COLUMN id SET DEFAULT nextval('sqlery_queued_job_id_seq'::regclass);",
+                # Drop the now-orphaned per-table sequence so it does not accumulate
+                # in repeated test/migration runs or survive a table drop (WR-03).
+                # Old: sequence was left dangling with OWNED BY NONE — leaked indefinitely.
+                "DROP SEQUENCE IF EXISTS sqlery_scheduled_job_id_seq;",
+                # Share the queued-job sequence so ids are globally unique across tables.
+                "ALTER TABLE sqlery_scheduled_job ALTER COLUMN id"
+                " SET DEFAULT nextval('sqlery_queued_job_id_seq'::regclass);",
             ],
             reverse_sql=[
-                "ALTER TABLE sqlery_scheduled_job ALTER COLUMN id DROP DEFAULT;",
-                "CREATE SEQUENCE IF NOT EXISTS sqlery_scheduled_job_id_seq OWNED BY sqlery_scheduled_job.id;",
+                # Recreate and own the sequence BEFORE dropping the shared default so
+                # no INSERT window exists without a sequence (WR-03 reverse ordering fix).
+                # Old: DROP DEFAULT first, then CREATE SEQUENCE — any INSERT in between failed.
+                "CREATE SEQUENCE IF NOT EXISTS sqlery_scheduled_job_id_seq"
+                " OWNED BY sqlery_scheduled_job.id;",
+                "ALTER TABLE sqlery_scheduled_job ALTER COLUMN id"
+                " SET DEFAULT nextval('sqlery_scheduled_job_id_seq'::regclass);",
             ],
         ),
     ]
