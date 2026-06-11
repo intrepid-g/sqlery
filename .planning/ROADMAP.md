@@ -21,7 +21,7 @@
 ## Phases
 
 - [x] **Phase 12: quick-wins** - Partial pending index + batched DELETE cleanup in both backends, plus the Python 3.13 floor raise; independently shippable (completed 2026-06-11)
-- [ ] **Phase 13: partition-core** - Hand-rolled partition maintenance (`core/partitioning.py`), cleanup routing, daemon tick with advisory locks and the DEFAULT-partition alert
+- [x] **Phase 13: partition-core** - Hand-rolled partition maintenance (`core/partitioning.py`), cleanup routing, daemon tick with advisory locks and the DEFAULT-partition alert (completed 2026-06-11)
 - [ ] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition
 - [ ] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0029 with rename-based rollback (highest risk; gates everything after)
 - [ ] **Phase 16: backend-wiring-pruning** - Route Django cleanup/vacuum to partition reclaim and prune all 11 id-only write paths to a single partition
@@ -58,9 +58,9 @@ Plans:
   4. Reference behavior matches `sql/pgwq.sql`
 **Plans**: 3 plans
 Plans:
-- [ ] 13-01-PLAN.md — Create core/partitioning.py: _list_partitions, ensure_future_partitions, reclaim_drained_partitions, check_default_partition (raw cursor, no ORM imports, advisory locks)
-- [ ] 13-02-PLAN.md — Wire cleanup.py routing seam and daemon.py partition maintenance tick with config validation
-- [ ] 13-03-PLAN.md — Unit tests: four skip-rules, advisory-lock coordination, DEFAULT alert, attach-conflict, DETACH-before-DROP order
+- [x] 13-01-PLAN.md — Create core/partitioning.py: _list_partitions, ensure_future_partitions, reclaim_drained_partitions, check_default_partition (raw cursor, no ORM imports, advisory locks)
+- [x] 13-02-PLAN.md — Wire cleanup.py routing seam and daemon.py partition maintenance tick with config validation
+- [x] 13-03-PLAN.md — Unit tests: four skip-rules, advisory-lock coordination, DEFAULT alert, attach-conflict, DETACH-before-DROP order
 
 ### Phase 14: scheduled-job-staging
 **Goal**: Far-future scheduled jobs live in a staging table and are promoted exactly-once, so no queued row can pin an otherwise-drained partition
@@ -122,7 +122,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
-| 13. partition-core | 0/3 | Not started | - |
+| 13. partition-core | 3/3 | Complete   | 2026-06-11 |
 | 14. scheduled-job-staging | 0/TBD | Not started | - |
 | 15. schema-cutover | 0/TBD | Not started | - |
 | 16. backend-wiring-pruning | 0/TBD | Not started | - |
