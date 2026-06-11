@@ -98,14 +98,15 @@ def _validate_partition_maintenance_interval(
         )
 
 
-def _validate_staging_config(threshold_days: int, retention_str: str) -> None:
+def _validate_staging_config(threshold_days: float, retention_str: str) -> None:
     """Raise ValueError if SQLERY_PARTITION_RETENTION <= staging threshold.
 
     Config invariant (D1): the partition retention must exceed the staging
     threshold so promoted jobs expire before the partition is reclaimed.
 
     Args:
-        threshold_days: Configured SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS value.
+        threshold_days: Configured SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS value
+            (accepts float so env-var strings coerced with float() work safely).
         retention_str: Configured SQLERY_PARTITION_RETENTION string (e.g. '30 days').
 
     Raises:
@@ -492,16 +493,19 @@ class DaemonManager:
                 logger.error(f"Partition maintenance config error: {e} — maintenance disabled")
                 partition_maintenance_enabled = False
 
-            # Validate that partition retention exceeds the staging threshold (D1).
-            try:
-                _validate_staging_config(staging_threshold_days, partition_retention_str)
-            except ValueError as e:
-                logger.error(
-                    f"Staging config error: {e} — check SQLERY_PARTITION_RETENTION "
-                    f"and SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS"
-                )
-                # Do not disable partition_maintenance_enabled; this is a warning
-                # about staging consistency, not about partition maintenance itself.
+        # Validate staging threshold vs partition retention unconditionally (WR-04).
+        # Old: nested inside the partition_maintenance_enabled and _partition_maint_available
+        #      block — never ran on SQLite; a string SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS
+        #      caused TypeError (float vs str comparison) on PostgreSQL.
+        try:
+            _validate_staging_config(float(staging_threshold_days), partition_retention_str)
+        except (ValueError, TypeError) as e:
+            logger.error(
+                f"Staging config error: {e} — check SQLERY_PARTITION_RETENTION "
+                f"and SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS"
+            )
+            # Not fatal: log and continue. Staging still works; only the invariant
+            # check is advisory.
 
         last_partition_maintenance_at: datetime | None = None
 
@@ -630,22 +634,31 @@ class DaemonManager:
                                 f"DEFAULT partition holds {default_count} rows — "
                                 "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
                             )
-                        # Promotion tick (Phase 14): move staged far-future jobs that
-                        # are now within the lookahead window into sqlery_queued_job.
-                        try:
-                            promoted = promote_due_scheduled_jobs(cur)
-                            if promoted > 0:
-                                logger.info(
-                                    f"Promotion tick: promoted {promoted} staged job(s)"
-                                    f" to sqlery_queued_job"
-                                )
-                        except Exception as promo_exc:
-                            logger.error(
-                                f"Promotion error: {promo_exc}", exc_info=True
-                            )
                         last_partition_maintenance_at = datetime.now(timezone.utc)
                     except Exception as e:
                         logger.error(f"Partition maintenance error: {e}", exc_info=True)
+
+                # Promotion tick (Phase 14): independent of partition maintenance so
+                # staged jobs are promoted on SQLite and when PARTITION_MAINTENANCE_ENABLED=False.
+                # Old: nested inside the partition maintenance block — never ran on SQLite or
+                #      when PARTITION_MAINTENANCE_ENABLED=False; AttributeError was swallowed
+                #      silently by the outer except clause.
+                if _partition_maint_available:
+                    try:
+                        # TODO(Phase 16): backend.get_raw_cursor() is wired in Phase 16.
+                        # Until then AttributeError is caught and skipped (not swallowed silently).
+                        cur = backend.get_raw_cursor()
+                        promoted = promote_due_scheduled_jobs(cur)
+                        if promoted > 0:
+                            logger.info(
+                                f"Promotion tick: promoted {promoted} staged job(s)"
+                                f" to sqlery_queued_job"
+                            )
+                    except AttributeError:
+                        # backend.get_raw_cursor() not yet wired — Phase 16 TODO.
+                        pass
+                    except Exception as promo_exc:
+                        logger.error(f"Promotion tick error: {promo_exc}", exc_info=True)
 
                 # One-shot mode: exit after a single cycle (used by tests
                 # and integration harnesses via `--once`).
