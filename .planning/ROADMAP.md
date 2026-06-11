@@ -20,7 +20,7 @@
 
 ## Phases
 
-- [ ] **Phase 12: quick-wins** - Partial pending index + batched DELETE cleanup in both backends, plus the Python 3.13 floor raise; independently shippable
+- [x] **Phase 12: quick-wins** - Partial pending index + batched DELETE cleanup in both backends, plus the Python 3.13 floor raise; independently shippable (completed 2026-06-11)
 - [ ] **Phase 13: partition-core** - Hand-rolled partition maintenance (`core/partitioning.py`), cleanup routing, daemon tick with advisory locks and the DEFAULT-partition alert
 - [ ] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition
 - [ ] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0029 with rename-based rollback (highest risk; gates everything after)
@@ -42,9 +42,9 @@
   4. `requires-python = ">=3.13"` in pyproject.toml; CI matrix updated accordingly (3.11/3.12 dropped); PROJECT.md constraint updated
 **Plans**: 3 plans
 Plans:
-- [ ] 12-01-PLAN.md — Partial pending index: update models.py Meta.indexes + migration 0028 with concurrent ops
-- [ ] 12-02-PLAN.md — Batched DELETE cleanup in both backends + behavioral tests
-- [ ] 12-03-PLAN.md — Python 3.13 floor: pyproject.toml, CI matrix, PROJECT.md
+- [x] 12-01-PLAN.md — Partial pending index: update models.py Meta.indexes + migration 0028 with concurrent ops
+- [x] 12-02-PLAN.md — Batched DELETE cleanup in both backends + behavioral tests
+- [x] 12-03-PLAN.md — Python 3.13 floor: pyproject.toml, CI matrix, PROJECT.md
 
 ### Phase 13: partition-core
 **Goal**: Partition maintenance machinery exists and is safe — future partitions provisioned ahead, drained partitions reclaimed by DROP under the back-pressure invariant, all DDL coordinated across daemons
@@ -117,7 +117,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 12. quick-wins | 0/3 | Not started | - |
+| 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
 | 13. partition-core | 0/TBD | Not started | - |
 | 14. scheduled-job-staging | 0/TBD | Not started | - |
 | 15. schema-cutover | 0/TBD | Not started | - |
