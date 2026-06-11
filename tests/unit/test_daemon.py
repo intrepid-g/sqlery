@@ -361,3 +361,134 @@ class TestNodeIdProperty:
     def test_node_id_returns_hostname(self, dm):
         nid = dm.node_id
         assert isinstance(nid, str) and nid
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteDueScheduledJobs (14-02) — mock cursor, no live DB
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteDueScheduledJobs:
+    """Tests for promote_due_scheduled_jobs with mock cursor (D9).
+
+    Uses a mock psycopg cursor so tests pass on SQLite without SKIP LOCKED.
+    The advisory-lock try/finally pattern mirrors partitioning.py.
+    """
+
+    def _make_cursor(self, lock_acquired=True, staged_rows=None):
+        """Build a mock psycopg cursor that mimics advisory lock + DELETE RETURNING."""
+        from unittest.mock import MagicMock, call
+        cursor = MagicMock()
+        fetch_sequence = []
+        # First fetchone: pg_try_advisory_lock result
+        fetch_sequence.append((lock_acquired,))
+        # fetchall: rows returned by DELETE ... FOR UPDATE SKIP LOCKED RETURNING
+        cursor.fetchall.return_value = staged_rows or []
+        # fetchone is consumed once for the advisory lock result
+        cursor.fetchone.side_effect = iter(fetch_sequence)
+        return cursor
+
+    def test_returns_zero_when_advisory_lock_not_acquired(self):
+        """Test 1: pg_try_advisory_lock returns False → return 0 immediately."""
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        cursor = self._make_cursor(lock_acquired=False)
+        result = promote_due_scheduled_jobs(cursor)
+        assert result == 0
+        # DELETE should NOT have been called
+        for call_args in cursor.execute.call_args_list:
+            sql = call_args[0][0] if call_args[0] else ""
+            assert "DELETE" not in str(sql).upper(), "DELETE must not run without advisory lock"
+
+    def test_promotes_rows_with_lock_acquired(self):
+        """Test 2: lock acquired → DELETE RETURNING + INSERT for each row → returns count."""
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        from datetime import datetime, timezone
+        import uuid
+        now = datetime.now(timezone.utc)
+        fake_rows = [
+            (1, "default", "myapp.tasks.hello", {"x": 1}, now, 0, 0, now),
+        ]
+        cursor = self._make_cursor(lock_acquired=True, staged_rows=fake_rows)
+        result = promote_due_scheduled_jobs(cursor)
+        assert result == 1
+        # Verify advisory unlock was called in finally
+        execute_sqls = [str(c[0][0]).upper() for c in cursor.execute.call_args_list if c[0]]
+        assert any("ADVISORY_UNLOCK" in s for s in execute_sqls), (
+            "pg_advisory_unlock must be called in finally block"
+        )
+
+    def test_releases_lock_in_finally_even_on_insert_error(self):
+        """Test 3: advisory lock released in finally block even if INSERT raises."""
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+        now = datetime.now(timezone.utc)
+        fake_rows = [
+            (1, "default", "myapp.tasks.hello", {"x": 1}, now, 0, 0, now),
+        ]
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = iter([(True,)])
+        cursor.fetchall.return_value = fake_rows
+        # Make INSERT raise on second execute call
+        call_count = {"n": 0}
+        original_execute = cursor.execute
+        def failing_execute(sql, params=None):
+            call_count["n"] += 1
+            sql_str = str(sql).upper()
+            if call_count["n"] >= 3 and "INSERT" in sql_str:
+                raise RuntimeError("simulated INSERT failure")
+        cursor.execute.side_effect = failing_execute
+        try:
+            promote_due_scheduled_jobs(cursor)
+        except RuntimeError:
+            pass
+        # Advisory unlock MUST still be called
+        unlock_calls = [
+            c for c in cursor.execute.call_args_list
+            if c[0] and "ADVISORY_UNLOCK" in str(c[0][0]).upper()
+        ]
+        assert len(unlock_calls) >= 1, "pg_advisory_unlock must fire even after INSERT error"
+
+    def test_returns_zero_when_no_rows_due(self):
+        """Test 4: DELETE RETURNING returns empty set → return 0 (still unlock in finally)."""
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        cursor = self._make_cursor(lock_acquired=True, staged_rows=[])
+        result = promote_due_scheduled_jobs(cursor)
+        assert result == 0
+        execute_sqls = [str(c[0][0]).upper() for c in cursor.execute.call_args_list if c[0]]
+        assert any("ADVISORY_UNLOCK" in s for s in execute_sqls), (
+            "pg_advisory_unlock must be called even when no rows are promoted"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestValidateStagingConfig (14-02)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateStagingConfig:
+    """Tests for _validate_staging_config (config invariant D1)."""
+
+    def test_raises_when_retention_equals_threshold(self):
+        """Test 5: retention_days == threshold_days raises ValueError."""
+        from sqlery.core.daemon import _validate_staging_config
+        with pytest.raises(ValueError, match="must be greater than"):
+            _validate_staging_config(30, "30 days")
+
+    def test_raises_when_retention_less_than_threshold(self):
+        """Test 5b: retention_days < threshold_days also raises ValueError."""
+        from sqlery.core.daemon import _validate_staging_config
+        with pytest.raises(ValueError, match="must be greater than"):
+            _validate_staging_config(30, "7 days")
+
+    def test_passes_when_retention_greater_than_threshold(self):
+        """Test 6: retention_days > threshold_days → no exception."""
+        from sqlery.core.daemon import _validate_staging_config
+        # Should not raise
+        _validate_staging_config(1, "30 days")
+
+    def test_passes_with_hour_unit(self):
+        """Test 6b: retention in hours (e.g., '48 hours') > 1-day threshold → OK."""
+        from sqlery.core.daemon import _validate_staging_config
+        # 48 hours = 2 days > 1 day threshold
+        _validate_staging_config(1, "48 hours")
