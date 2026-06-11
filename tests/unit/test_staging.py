@@ -183,16 +183,11 @@ class TestPromotion:
         now = datetime.now(timezone.utc)
         rows = [(101, "default", "m.f", {}, now, 0, 0, now)]
 
-        call_count = [0]
-        original_execute = MagicMock()
-
         def execute_side_effect(sql, params=None):
-            call_count[0] += 1
-            # First call: pg_try_advisory_lock — succeeds
-            # Second call: DELETE RETURNING — succeeds (fetchall returns rows)
-            # Third call: INSERT — raises RuntimeError
-            # Fourth call: pg_advisory_unlock — must still happen
-            if call_count[0] == 3 and "INSERT" in str(sql):
+            # Raise on any INSERT call — advisory_unlock must still fire via finally.
+            # Call sequence: (1) pg_try_advisory_lock, (2) BEGIN, (3) CTE DELETE,
+            # (4) INSERT ← raise here, (5) ROLLBACK, (6) pg_advisory_unlock.
+            if "INSERT" in str(sql):
                 raise RuntimeError("simulated INSERT failure")
 
         cur = _make_cursor(
@@ -212,6 +207,117 @@ class TestPromotion:
         assert len(unlock_calls) == 1, (
             "advisory_unlock must be called in finally, even when INSERT raises"
         )
+
+
+# ---------------------------------------------------------------------------
+# WR-01/WR-02: Round-trip payload fidelity — staged job carries all fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestPayloadFidelity:
+    """WR-01/WR-02: Full job-spec survives the staging→promotion round trip.
+
+    create_job stores kwargs + job_spec in payload. promote_due_scheduled_jobs
+    reads payload["job_spec"] to reconstruct every queued_job column.
+    """
+
+    @staticmethod
+    def _make_backend():
+        from sqlery.django_sqlery.backend import DjangoBackend
+        return DjangoBackend()
+
+    def test_staged_payload_contains_full_job_spec(self):
+        """Staging stores kwargs AND job_spec — not just kwargs — in payload."""
+        backend = self._make_backend()
+        job = backend.create_job(
+            task_path="tests.fake.staging_task",
+            kwargs={"x": 42},
+            queue_name="default",
+            priority=5,
+            scheduled_at=datetime.now(timezone.utc) + timedelta(days=60),
+            max_retries=3,
+            retry_backoff=2.5,
+            allow_parallel=True,
+            timeout_seconds=120,
+            retry_count=0,
+            job_name="my-unique-job",
+            dependencies=[7, 8],
+            on_success_path="my.module.on_success",
+            on_failure_path="my.module.on_failure",
+            ttl=3600,
+        )
+        payload = job.payload
+        assert "kwargs" in payload, "payload must contain 'kwargs' key"
+        assert "job_spec" in payload, "payload must contain 'job_spec' key"
+        assert payload["kwargs"] == {"x": 42}
+        spec = payload["job_spec"]
+        assert spec["retry_backoff"] == 2.5
+        assert spec["allow_parallel"] is True
+        assert spec["timeout_seconds"] == 120
+        assert spec["job_name"] == "my-unique-job"
+        assert spec["dependencies"] == [7, 8]
+        assert spec["on_success_path"] == "my.module.on_success"
+        assert spec["on_failure_path"] == "my.module.on_failure"
+        assert spec["ttl"] == 3600
+
+    def test_promotion_reconstructs_job_spec_fields(self):
+        """promote_due_scheduled_jobs issues INSERT with job_spec fields from payload."""
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+
+        now = datetime.now(timezone.utc)
+        full_payload = {
+            "kwargs": {"x": 99},
+            "job_spec": {
+                "retry_backoff": 3.0,
+                "allow_parallel": True,
+                "timeout_seconds": 300,
+                "retry_count": 0,
+                "scheduled_task_id": 42,
+                "job_name": "round-trip-job",
+                "retry_intervals": [10, 20, 40],
+                "meta": {"source": "test"},
+                "dependencies": [5, 6],
+                "on_success_path": "mod.success",
+                "on_failure_path": "mod.failure",
+                "ttl": 7200,
+                "result_ttl": 3600,
+                "failure_ttl": 1800,
+                "parent_job_id": 11,
+            },
+        }
+        rows = [(101, "default", "m.f", full_payload, now, 0, 0, now)]
+        cur = _make_cursor(
+            fetchone_sequence=[(True,)],
+            fetchall_sequence=[rows],
+        )
+        result = promote_due_scheduled_jobs(cur)
+        assert result == 1
+
+        # Find the INSERT call and verify field values are present in the params.
+        insert_calls = [
+            c for c in cur.execute.call_args_list
+            if "INSERT" in str(c.args[0])
+        ]
+        assert len(insert_calls) == 1, "Expected exactly one INSERT call"
+        params = insert_calls[0].args[1]
+        # params order: job_id, queue_name, task_path, kwargs_json, scheduled_at,
+        # priority, max_retries, retry_count, retry_backoff, allow_parallel,
+        # timeout_seconds, scheduled_task_id, job_name, retry_intervals_json,
+        # meta_json, dependencies_json, on_success_path, on_failure_path,
+        # ttl, result_ttl, failure_ttl, parent_job_id, created_at
+        import json
+        kwargs_idx = 3
+        assert json.loads(params[kwargs_idx]) == {"x": 99}
+        # retry_backoff at index 8 (after: id, queue, path, kwargs, sched_at, prio, max_ret, retry_cnt)
+        assert params[8] == 3.0, f"retry_backoff expected 3.0, got {params[8]}"
+        assert params[9] is True, f"allow_parallel expected True, got {params[9]}"
+        assert params[10] == 300, f"timeout_seconds expected 300, got {params[10]}"
+        assert params[11] == 42, f"scheduled_task_id expected 42, got {params[11]}"
+        assert params[12] == "round-trip-job", f"job_name expected 'round-trip-job', got {params[12]}"
+        assert params[16] == "mod.success", f"on_success_path expected 'mod.success', got {params[16]}"
+        assert params[17] == "mod.failure", f"on_failure_path expected 'mod.failure', got {params[17]}"
+        assert params[18] == 7200, f"ttl expected 7200, got {params[18]}"
 
 
 # ---------------------------------------------------------------------------

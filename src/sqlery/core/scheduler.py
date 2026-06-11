@@ -1,5 +1,6 @@
 """Django-agnostic scheduled task management."""
 
+import json
 import logging
 import random
 import time
@@ -162,8 +163,10 @@ class Scheduler:
                 )
                 return None
 
+            # IN-02: distinguish staged vs directly-queued jobs in log (no ORM import needed).
+            _verb = "Enqueued" if hasattr(job, "status") else "Staged"
             logger.info(
-                f"Enqueued job {job.id} for scheduled task '{task.name}' "
+                f"{_verb} job {job.id} for scheduled task '{task.name}' "
                 f"in queue '{task.queue_name}'"
             )
             return job
@@ -188,8 +191,11 @@ class Scheduler:
         elif schedule_type == "once":
             self.backend.update_scheduled_task(task.id, enabled=False, next_run_at=None)
 
+        # IN-02: "Staged" when create_job routed to sqlery_scheduled_job (no status attr).
+        # Old: f"Enqueued job {job.id} ..."  <-- misleading when job is actually staged
+        _verb = "Enqueued" if hasattr(job, "status") else "Staged"
         logger.info(
-            f"Enqueued job {job.id} for scheduled task '{task.name}' in queue '{task.queue_name}'"
+            f"{_verb} job {job.id} for scheduled task '{task.name}' in queue '{task.queue_name}'"
         )
 
         return job
@@ -389,14 +395,41 @@ class Scheduler:
 def promote_due_scheduled_jobs(cur) -> int:
     """Atomically move due rows from sqlery_scheduled_job into sqlery_queued_job.
 
-    Single transaction: DELETE FROM sqlery_scheduled_job WHERE scheduled_at <=
-    now() + lookahead FOR UPDATE SKIP LOCKED RETURNING * then INSERT INTO
-    sqlery_queued_job. Wrapped in pg_try_advisory_lock (ADVISORY_LOCK_PROMOTE)
-    so concurrent daemons skip rather than race (D9).
+    Single transaction: CTE locks due rows with SELECT FOR UPDATE SKIP LOCKED,
+    then DELETE WHERE id IN (locked ids) RETURNING *, then INSERT INTO
+    sqlery_queued_job for each row. Wrapped in pg_try_advisory_lock
+    (ADVISORY_LOCK_PROMOTE) so concurrent daemons skip rather than race (D9).
+
+    The payload column in sqlery_scheduled_job carries the full job-creation
+    spec as {"kwargs": {...}, "job_spec": {...all execution params...}} so the
+    promoted row is field-for-field identical to a directly-queued job.
+
+    Payload schema stored in sqlery_scheduled_job.payload:
+        {
+          "kwargs": dict,          # task function kwargs
+          "job_spec": {
+            "retry_backoff": float,
+            "allow_parallel": bool,
+            "timeout_seconds": int | None,
+            "retry_count": int,
+            "scheduled_task_id": int | None,
+            "job_name": str | None,
+            "retry_intervals": list | None,
+            "meta": dict | None,
+            "dependencies": list,
+            "on_success_path": str,
+            "on_failure_path": str,
+            "ttl": int | None,
+            "result_ttl": int | None,
+            "failure_ttl": int | None,
+            "parent_job_id": int | None,
+          }
+        }
 
     Args:
-        cur: Raw psycopg cursor (autocommit or inside a transaction — caller's
-             choice). No Django or SQLAlchemy imports are used here.
+        cur: Raw psycopg cursor (must NOT be in autocommit mode — this function
+             issues BEGIN/COMMIT/ROLLBACK explicitly to ensure the DELETE and
+             all INSERTs are atomic). No Django or SQLAlchemy imports used here.
 
     Returns:
         Number of rows promoted.
@@ -414,37 +447,115 @@ def promote_due_scheduled_jobs(cur) -> int:
         return 0
 
     try:
-        # Step 2a: DELETE rows that are due (within lookahead window) using
-        # FOR UPDATE SKIP LOCKED so concurrent workers never race on the same rows.
-        cur.execute(
-            "DELETE FROM sqlery_scheduled_job"
-            " WHERE scheduled_at <= now() + make_interval(secs => %s)"
-            " FOR UPDATE SKIP LOCKED"
-            " RETURNING id, queue_name, task_path, payload,"
-            "           scheduled_at, priority, max_retries, created_at",
-            [_PROMOTION_LOOKAHEAD_SECONDS],
-        )
-        rows = cur.fetchall()
-
-        # Step 2b: Nothing to promote this tick.
-        if not rows:
-            return 0
-
-        # Step 2c: INSERT each promoted row into sqlery_queued_job.
-        # payload column in staging maps to kwargs column in queued_job.
-        for row in rows:
-            (job_id, queue_name, task_path, payload,
-             scheduled_at, priority, max_retries, created_at) = row
+        # Step 2: Explicit transaction so DELETE and all INSERTs are atomic.
+        # If any INSERT fails the ROLLBACK returns all rows to sqlery_scheduled_job.
+        cur.execute("BEGIN")
+        try:
+            # Step 2a: CTE locks due rows with SKIP LOCKED (valid PG syntax) then
+            # DELETEs the locked ids — avoids the invalid DELETE ... FOR UPDATE form.
+            # Old: "DELETE FROM sqlery_scheduled_job"
+            #      " WHERE scheduled_at <= now() + make_interval(secs => %s)"
+            #      " FOR UPDATE SKIP LOCKED"   <-- invalid PostgreSQL syntax
+            #      " RETURNING id, queue_name, task_path, payload,"
+            #      "           scheduled_at, priority, max_retries, created_at"
             cur.execute(
-                "INSERT INTO sqlery_queued_job"
-                " (id, queue_name, task_path, kwargs, scheduled_at,"
-                "  priority, max_retries, status, created_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s)",
-                [job_id, queue_name, task_path, payload,
-                 scheduled_at, priority, max_retries, created_at],
+                "WITH locked AS ("
+                "  SELECT id FROM sqlery_scheduled_job"
+                "  WHERE scheduled_at <= now() + make_interval(secs => %s)"
+                "  FOR UPDATE SKIP LOCKED"
+                ")"
+                " DELETE FROM sqlery_scheduled_job"
+                " WHERE id IN (SELECT id FROM locked)"
+                " RETURNING id, queue_name, task_path, payload,"
+                "           scheduled_at, priority, max_retries, created_at",
+                [_PROMOTION_LOOKAHEAD_SECONDS],
             )
+            rows = cur.fetchall()
 
-        return len(rows)
+            # Step 2b: Nothing to promote this tick.
+            if not rows:
+                cur.execute("COMMIT")
+                return 0
+
+            # Step 2c: INSERT each promoted row into sqlery_queued_job with full
+            # field fidelity from payload["job_spec"] (WR-01/WR-02). All non-nullable
+            # JSON columns are supplied explicitly rather than relying on DB defaults.
+            # payload column in staging stores {"kwargs": {...}, "job_spec": {...}}.
+            for row in rows:
+                (job_id, queue_name, task_path, raw_payload,
+                 scheduled_at, priority, max_retries, created_at) = row
+
+                # Deserialise payload if the cursor returns bytes/str instead of dict.
+                if isinstance(raw_payload, (bytes, str)):
+                    payload_dict = json.loads(raw_payload)
+                else:
+                    payload_dict = raw_payload or {}
+
+                # Extract kwargs and job_spec with safe fallbacks for legacy rows
+                # that were staged before the full-fidelity payload format was introduced.
+                if isinstance(payload_dict, dict) and "kwargs" in payload_dict:
+                    kwargs = payload_dict.get("kwargs", {})
+                    spec = payload_dict.get("job_spec", {})
+                else:
+                    # Legacy staging row — payload IS the kwargs dict.
+                    kwargs = payload_dict
+                    spec = {}
+
+                retry_backoff = spec.get("retry_backoff", 1.0)
+                allow_parallel = spec.get("allow_parallel", False)
+                timeout_seconds = spec.get("timeout_seconds", None)
+                retry_count = spec.get("retry_count", 0)
+                scheduled_task_id = spec.get("scheduled_task_id", None)
+                job_name = spec.get("job_name", None)
+                retry_intervals = spec.get("retry_intervals", None)
+                meta = spec.get("meta", None)
+                dependencies = spec.get("dependencies", [])
+                on_success_path = spec.get("on_success_path", "")
+                on_failure_path = spec.get("on_failure_path", "")
+                ttl = spec.get("ttl", None)
+                result_ttl = spec.get("result_ttl", None)
+                failure_ttl = spec.get("failure_ttl", None)
+                parent_job_id = spec.get("parent_job_id", None)
+
+                cur.execute(
+                    "INSERT INTO sqlery_queued_job"
+                    " (id, queue_name, task_path, kwargs, scheduled_at,"
+                    "  priority, max_retries, status, version, retry_count,"
+                    "  retry_backoff, allow_parallel, timeout_seconds,"
+                    "  scheduled_task_id, job_name, retry_intervals, meta,"
+                    "  dependencies, on_success_path, on_failure_path,"
+                    "  ttl, result_ttl, failure_ttl, parent_job_id,"
+                    "  runs, tags, webhook_events, output, error, traceback,"
+                    "  termination_reason, created_at)"
+                    " VALUES (%s, %s, %s, %s::jsonb, %s,"
+                    "  %s, %s, 'queued', 0, %s,"
+                    "  %s, %s, %s,"
+                    "  %s, %s, %s::jsonb, %s::jsonb,"
+                    "  %s::jsonb, %s, %s,"
+                    "  %s, %s, %s, %s,"
+                    "  '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '', '', '',"
+                    "  '', %s)",
+                    [
+                        job_id, queue_name, task_path,
+                        json.dumps(kwargs), scheduled_at,
+                        priority, max_retries, retry_count,
+                        retry_backoff, allow_parallel, timeout_seconds,
+                        scheduled_task_id, job_name,
+                        json.dumps(retry_intervals) if retry_intervals is not None else None,
+                        json.dumps(meta) if meta is not None else None,
+                        json.dumps(dependencies),
+                        on_success_path, on_failure_path,
+                        ttl, result_ttl, failure_ttl, parent_job_id,
+                        created_at,
+                    ],
+                )
+
+            cur.execute("COMMIT")
+            return len(rows)
+
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     finally:
         # Step 3: Always release the advisory lock even if INSERT raised.
