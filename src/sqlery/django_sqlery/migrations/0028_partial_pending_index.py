@@ -8,8 +8,9 @@ atomic = False is required by AddIndexConcurrently and RemoveIndexConcurrently.
 SQLite note: AddIndexConcurrently / RemoveIndexConcurrently pass a `concurrently`
 keyword to the schema editor, which SQLite's backend (Django 6.x) does not accept.
 The custom SafeAddIndexConcurrently and SafeRemoveIndexConcurrently wrappers
-below guard the postgres-only operations behind a vendor check so SQLite CI
-rails stay clean.
+fall back to blocking (non-concurrent) index DDL on non-PostgreSQL vendors so that
+SQLite CI rails stay clean AND the actual schema change is applied (SQLite 3.8.9+
+supports partial indexes natively).
 """
 
 from django.contrib.postgres.operations import AddIndexConcurrently, RemoveIndexConcurrently
@@ -17,36 +18,64 @@ from django.db import migrations, models
 
 
 class SafeAddIndexConcurrently(AddIndexConcurrently):
-    """AddIndexConcurrently that skips silently on non-PostgreSQL databases.
+    """AddIndexConcurrently that falls back to blocking DDL on non-PostgreSQL databases.
 
     Django 6.x removed the implicit SQLite guard from postgres-specific
-    operations; this subclass restores safe behaviour for SQLite CI rails.
+    operations; this subclass restores safe behaviour for SQLite CI rails
+    while still applying the actual schema change (SQLite 3.8.9+ supports
+    partial indexes natively, so the skip is no longer appropriate).
     """
 
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         if schema_editor.connection.vendor != "postgresql":
+            # Old: return  # skipped entirely on SQLite — left schema diverged from ORM state
+            # Fall back to a regular (blocking) index create on non-PG vendors.
+            migrations.AddIndex(
+                model_name=self.model_name,
+                index=self.index,
+            ).database_forwards(app_label, schema_editor, from_state, to_state)
             return
         super().database_forwards(app_label, schema_editor, from_state, to_state)
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         if schema_editor.connection.vendor != "postgresql":
+            # Old: return  # skipped entirely on SQLite — left schema diverged from ORM state
+            # Fall back to a regular (blocking) index remove on non-PG vendors.
+            migrations.RemoveIndex(
+                model_name=self.model_name,
+                name=self.index.name,
+            ).database_forwards(app_label, schema_editor, from_state, to_state)
             return
         super().database_backwards(app_label, schema_editor, from_state, to_state)
 
 
 class SafeRemoveIndexConcurrently(RemoveIndexConcurrently):
-    """RemoveIndexConcurrently that skips silently on non-PostgreSQL databases.
+    """RemoveIndexConcurrently that falls back to blocking DDL on non-PostgreSQL databases.
 
     See SafeAddIndexConcurrently for rationale.
     """
 
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         if schema_editor.connection.vendor != "postgresql":
+            # Old: return  # skipped entirely on SQLite — left schema diverged from ORM state
+            # Fall back to a regular (blocking) index remove on non-PG vendors.
+            migrations.RemoveIndex(
+                model_name=self.model_name,
+                name=self.name,
+            ).database_forwards(app_label, schema_editor, from_state, to_state)
             return
         super().database_forwards(app_label, schema_editor, from_state, to_state)
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         if schema_editor.connection.vendor != "postgresql":
+            # Old: return  # skipped entirely on SQLite — left schema diverged from ORM state
+            # Fall back to a regular (blocking) index re-add on non-PG vendors.
+            # RemoveIndex.database_backwards looks up the index definition from
+            # to_state and calls schema_editor.add_index — no index object needed.
+            migrations.RemoveIndex(
+                model_name=self.model_name,
+                name=self.name,
+            ).database_backwards(app_label, schema_editor, from_state, to_state)
             return
         super().database_backwards(app_label, schema_editor, from_state, to_state)
 
