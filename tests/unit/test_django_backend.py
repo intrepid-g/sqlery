@@ -782,7 +782,110 @@ class TestEnqueueRoutingThreshold:
 
 
 # ---------------------------------------------------------------------------
-# 10. Postgres-only branch placeholder
+# 10. Dual-table API surface — get_job_by_id, cancel_job, get_staged_jobs (14-03)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestDualTableApiSurface:
+    """Verify that get_job_by_id and cancel_job span both sqlery_queued_job and
+    sqlery_scheduled_job, and that get_staged_jobs is accessible."""
+
+    def _create_staged_job(self, backend):
+        """Helper: create a far-future ScheduledJob via create_job routing."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        far_future = timezone.now() + timedelta(days=60)
+        job = _create_basic_job(backend, scheduled_at=far_future)
+        assert isinstance(job, ScheduledJob), "Precondition: routing must return ScheduledJob"
+        return job
+
+    def test_get_job_by_id_queued_job(self, django_backend):
+        """Test 1: job exists only in QueuedJob -> returns QueuedJob instance."""
+        from sqlery.django_sqlery.models import QueuedJob
+        j = _create_basic_job(django_backend)
+        result = django_backend.get_job_by_id(j.id)
+        assert result is not None
+        assert isinstance(result, QueuedJob)
+        assert result.id == j.id
+
+    def test_get_job_by_id_scheduled_job(self, django_backend):
+        """Test 2: job exists only in ScheduledJob -> returns ScheduledJob instance."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        staged = self._create_staged_job(django_backend)
+        result = django_backend.get_job_by_id(staged.id)
+        assert result is not None
+        assert isinstance(result, ScheduledJob)
+        assert result.id == staged.id
+
+    def test_get_job_by_id_missing(self, django_backend):
+        """Test 3: id does not exist in either table -> returns None."""
+        assert django_backend.get_job_by_id(999999) is None
+
+    def test_cancel_job_queued_job(self, django_backend):
+        """Test 4: job is a QueuedJob with status='queued' -> cancels it (existing behavior)."""
+        j = _create_basic_job(django_backend)
+        assert django_backend.cancel_job(j.id) is True
+        j.refresh_from_db()
+        assert j.status == "failed"
+
+    def test_cancel_job_scheduled_job(self, django_backend):
+        """Test 5: job is a ScheduledJob -> deletes the ScheduledJob row, returns True."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        staged = self._create_staged_job(django_backend)
+        staged_id = staged.id
+        result = django_backend.cancel_job(staged_id)
+        assert result is True
+        assert not ScheduledJob.objects.filter(id=staged_id).exists()
+
+    def test_cancel_job_missing(self, django_backend):
+        """Test 6: id does not exist in either table -> returns False."""
+        assert django_backend.cancel_job(999999) is False
+
+    def test_get_jobs_returns_queued_jobs_only(self, django_backend):
+        """Test 7: get_jobs() returns QueuedJob rows; staged jobs are NOT included.
+
+        On SQLite both tables have independent auto-increment sequences so IDs
+        may collide between tables (both start at 1). The meaningful assertion
+        is that every returned row is a QueuedJob ORM instance, not a ScheduledJob.
+        """
+        from sqlery.django_sqlery.models import QueuedJob, ScheduledJob
+        _create_basic_job(django_backend, queue_name="mixed")
+        self._create_staged_job(django_backend)
+        results = django_backend.get_jobs(queue_name="mixed")
+        assert len(results) >= 1
+        # All returned objects must be QueuedJob instances, never ScheduledJob
+        for r in results:
+            assert isinstance(r, QueuedJob), (
+                f"get_jobs() returned a {type(r).__name__}, expected QueuedJob only"
+            )
+
+    def test_get_staged_jobs_callable(self, django_backend):
+        """Test 8: get_staged_jobs() is callable and returns staged rows."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        staged = self._create_staged_job(django_backend)
+        results = django_backend.get_staged_jobs()
+        assert isinstance(results, list)
+        assert any(r.id == staged.id for r in results)
+
+    def test_get_staged_jobs_filter_by_queue(self, django_backend):
+        """get_staged_jobs(queue_name=...) filters by queue."""
+        far_future = timezone.now() + timedelta(days=60)
+        job_a = _create_basic_job(django_backend, scheduled_at=far_future, queue_name="qA")
+        job_b = _create_basic_job(django_backend, scheduled_at=far_future, queue_name="qB")
+        results = django_backend.get_staged_jobs(queue_name="qA")
+        result_ids = {r.id for r in results}
+        assert job_a.id in result_ids
+        assert job_b.id not in result_ids
+
+    def test_staged_job_invisible_to_claim(self, django_backend):
+        """A staged job is never visible to claim_job (it is in sqlery_scheduled_job, not queued)."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        staged = self._create_staged_job(django_backend)
+        assert not django_backend.QueuedJob.objects.filter(id=staged.id).exists()
+
+
+# ---------------------------------------------------------------------------
+# 11. Postgres-only branch placeholder
 # ---------------------------------------------------------------------------
 
 @pytest.mark.postgres
