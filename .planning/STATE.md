@@ -69,8 +69,9 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 15 (schema-cutover) is the HIGHEST-RISK phase; its verification gates Phases 16–18. Migration 0029 is stop-the-world with a rename-based rollback — the ≥1M-row round-trip test is mandatory before proceeding.
-- Index DDL byte-identity invariant: the 0028 partial index and the 0029 DDL must stay identical (`queue_name, priority DESC, created_at WHERE status='queued'`) or Phase 15 fails on a name collision.
+- MIGRATION RENUMBER DECISION (2026-06-11): The ingest's "0029=cutover / 0030=staging" labels were renumbered to match execution order. Phase 14 staging = `0029_scheduled_job_staging` (depends on 0028). Phase 15 cutover = `0030_partition_queued_job` (depends on 0029). Chain: 0028 → 0029(staging) → 0030(cutover). All references to "migration 0029 (cutover)" / "migration 0030 (staging)" in older docs now mean the SWAPPED numbers.
+- Phase 15 (schema-cutover) is the HIGHEST-RISK phase; its verification gates Phases 16–18. The cutover migration (now `0030_partition_queued_job`) is stop-the-world with a rename-based rollback — the ≥1M-row round-trip test is mandatory before proceeding.
+- Index DDL byte-identity invariant: the 0028 partial index and the cutover-migration DDL (now 0030) must stay identical (`queue_name, priority DESC, created_at WHERE status='queued'`) or Phase 15 fails on a name collision.
 
 ## Deferred Items
 
