@@ -719,8 +719,13 @@ class SQLAlchemyBackend(DatabaseBackend):
             # session.commit()
             # return {"deleted": result.rowcount, "count": result.rowcount}
 
-            # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE,
-            # status re-check prevents deleting a row claimed mid-loop.
+            # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE.
+            # The batch DELETE re-applies the SAME retention filters as the id
+            # SELECT (status/queue/age) restricted to the selected ids, so the
+            # deleted set is always a subset of the selected set — guaranteeing
+            # forward progress (no infinite re-selection) while still skipping any
+            # row claimed/changed mid-loop. (A divergent status.in_(FINISHED_STATUSES)
+            # DELETE filter would re-select non-finished rows forever and hang #12-02.)
             id_stmt = select(QueuedJob.id)
             if status:
                 id_stmt = id_stmt.where(QueuedJob.status == status)
@@ -736,13 +741,25 @@ class SQLAlchemyBackend(DatabaseBackend):
                 ids = list(session.exec(id_stmt).all())
                 if not ids:
                     break
-                batch_stmt = (
-                    delete(QueuedJob)
-                    .where(QueuedJob.id.in_(ids))
-                    .where(QueuedJob.status.in_(FINISHED_STATUSES))
-                )
+                # Old: status.in_(FINISHED_STATUSES) diverged from the SELECT filter and looped forever
+                # batch_stmt = (
+                #     delete(QueuedJob)
+                #     .where(QueuedJob.id.in_(ids))
+                #     .where(QueuedJob.status.in_(FINISHED_STATUSES))
+                # )
+                batch_stmt = delete(QueuedJob).where(QueuedJob.id.in_(ids))
+                if status:
+                    batch_stmt = batch_stmt.where(QueuedJob.status == status)
+                if queue_name:
+                    batch_stmt = batch_stmt.where(QueuedJob.queue_name == queue_name)
+                if max_age_days:
+                    batch_stmt = batch_stmt.where(QueuedJob.created_at < cutoff)
                 result = session.exec(batch_stmt)
                 session.commit()
+                if not result.rowcount:
+                    # No selected row was deletable (all changed mid-loop) — stop to
+                    # avoid re-selecting the same un-deletable ids indefinitely.
+                    break
                 total_deleted += result.rowcount
                 time.sleep(0.1)
 

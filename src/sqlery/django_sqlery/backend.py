@@ -487,16 +487,27 @@ class DjangoBackend(DatabaseBackend):
         #     query.delete()
         # return {"deleted": count, "count": count}
 
-        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE,
-        # status re-check prevents deleting a row claimed mid-loop.
+        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE.
+        # The DELETE re-applies the SAME retention filter (`query`) restricted to
+        # the selected ids, so the deleted set is always a subset of the selected
+        # set — guaranteeing forward progress (no infinite re-selection) while
+        # still skipping any row that was claimed/changed mid-loop so it no longer
+        # matches the filter. (A divergent status__in=FINISHED_STATUSES DELETE
+        # filter would re-select non-finished rows forever and hang #12-02.)
         total_deleted = 0
         while True:
             ids = list(query.order_by("id").values_list("id", flat=True)[:CLEANUP_BATCH_SIZE])
             if not ids:
                 break
-            deleted_count, _ = self.QueuedJob.objects.filter(
-                id__in=ids, status__in=FINISHED_STATUSES
-            ).delete()
+            # Old: status__in re-check diverged from the SELECT filter and looped forever
+            # deleted_count, _ = self.QueuedJob.objects.filter(
+            #     id__in=ids, status__in=FINISHED_STATUSES
+            # ).delete()
+            deleted_count, _ = query.filter(id__in=ids).delete()
+            if not deleted_count:
+                # No selected row was deletable (all changed mid-loop) — stop to
+                # avoid re-selecting the same un-deletable ids indefinitely.
+                break
             total_deleted += deleted_count
             time.sleep(0.1)
 
