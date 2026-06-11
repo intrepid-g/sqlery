@@ -127,21 +127,33 @@ class TestListPartitions:
 
 
 class TestEnsureFuturePartitions:
-    """ensure_future_partitions creates next N daily partitions with advisory lock guard."""
+    """ensure_future_partitions creates next N daily partitions with advisory lock guard.
 
-    def _make_ensure_cursor(self, lock_acquired=True, date_sequence=None, side_effects=None):
-        """Build a cursor whose execute() is a MagicMock and whose fetchone()
-        returns advisory-lock result first, then dates for the date_trunc calls.
+    Implementation call pattern per iteration (premake=N means N+1 iterations):
+      1. fetchone -> (lock_acquired,)           [advisory lock]
+      per iteration:
+        2. fetchone -> (lo,)                    [date_trunc call]
+        3. fetchone -> (hi,)                    [lo + interval call]
+        [4. execute CREATE TABLE ... (no fetchone)]
+      after loop:
+        5. execute pg_advisory_unlock           [no fetchone]
+    """
+
+    def _make_ensure_cursor(self, lock_acquired=True, date_pairs=None):
+        """Build a cursor for ensure_future_partitions tests.
+
+        date_pairs: list of (lo, hi) tuples, one per iteration.
+        Each iteration calls fetchone twice: once for lo, once for hi.
         """
         cur = MagicMock()
-        # Sequence: first fetchone = advisory lock result; rest = date rows
-        # Advisory lock returns (True,) or (False,)
-        date_sequence = date_sequence or []
-        responses = [(lock_acquired,)] + [(d,) for d in date_sequence]
+        date_pairs = date_pairs or []
+        # Build flat sequence: (lock,) + (lo,) (hi,) (lo,) (hi,) ...
+        responses = [(lock_acquired,)]
+        for lo, hi in date_pairs:
+            responses.append((lo,))
+            responses.append((hi,))
         _itr = iter(responses)
         cur.fetchone.side_effect = lambda: next(_itr)
-        if side_effects:
-            cur.execute.side_effect = side_effects
         return cur
 
     def test_returns_zero_if_advisory_lock_not_acquired(self):
@@ -154,11 +166,12 @@ class TestEnsureFuturePartitions:
     def test_calls_advisory_lock_before_ddl(self):
         from sqlery.core.partitioning import ensure_future_partitions
 
-        # Lock acquired but no date rows — premake=0 means only iteration 0
         now = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        hi = now + timedelta(days=1)
+        hi2 = now + timedelta(days=2)
         cur = self._make_ensure_cursor(
             lock_acquired=True,
-            date_sequence=[now, now + timedelta(days=1)],
+            date_pairs=[(now, hi), (hi, hi2)],
         )
         ensure_future_partitions(cur, "sqlery_queued_job", "1 day", premake=1)
         # First execute call must contain advisory lock
@@ -169,9 +182,9 @@ class TestEnsureFuturePartitions:
         from sqlery.core.partitioning import ensure_future_partitions
 
         now = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        cur = self._make_ensure_cursor(lock_acquired=True, date_sequence=[now])
+        hi = now + timedelta(days=1)
+        cur = self._make_ensure_cursor(lock_acquired=True, date_pairs=[(now, hi)])
         ensure_future_partitions(cur, "sqlery_queued_job", "1 day", premake=0)
-        # One of the execute calls should contain unlock
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
         assert "pg_advisory_unlock" in all_sqls
 
@@ -182,10 +195,16 @@ class TestEnsureFuturePartitions:
         from sqlery.core.partitioning import ensure_future_partitions
 
         now = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        # Two date rows for premake=1 (iterations 0 and 1)
-        date_responses = [(True,), (now,), (now + timedelta(days=1))]
-        _itr = iter(date_responses)
+        hi = now + timedelta(days=1)
+        hi2 = now + timedelta(days=2)
 
+        # Provide responses for both iterations
+        responses = [
+            (True,),       # advisory lock
+            (now,), (hi,), # iteration 0: lo, hi
+            (hi,), (hi2,), # iteration 1: lo, hi
+        ]
+        _itr = iter(responses)
         cur = MagicMock()
         cur.fetchone.side_effect = lambda: next(_itr)
 
@@ -195,7 +214,7 @@ class TestEnsureFuturePartitions:
             call_count[0] += 1
             sql_str = str(sql)
             # Raise on the first CREATE TABLE PARTITION OF call only
-            if "PARTITION OF" in sql_str and call_count[0] == 3:
+            if "PARTITION OF" in sql_str and call_count[0] == 4:
                 raise psycopg.errors.InvalidTableDefinition("attach conflict")
 
         cur.execute.side_effect = execute_side_effect
@@ -207,13 +226,14 @@ class TestEnsureFuturePartitions:
 
     def test_advisory_lock_released_even_on_error(self):
         """Advisory lock must be released even if an unexpected error occurs."""
-        import psycopg
-
         from sqlery.core.partitioning import ensure_future_partitions
 
+        now = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        hi = now + timedelta(days=1)
+
+        responses = [(True,), (now,), (hi,)]
+        _itr = iter(responses)
         cur = MagicMock()
-        date_responses = [(True,), (_utcnow().replace(hour=0, minute=0, second=0, microsecond=0),)]
-        _itr = iter(date_responses)
         cur.fetchone.side_effect = lambda: next(_itr)
 
         call_count = [0]
@@ -239,18 +259,44 @@ class TestEnsureFuturePartitions:
 
 
 class TestReclaimDrainedPartitions:
-    """reclaim_drained_partitions: four skip rules + DETACH→archive→DROP order."""
+    """reclaim_drained_partitions: four skip rules + DETACH→archive→DROP order.
 
-    def _list_parts_cursor(self, lock_acquired=True, parts=None, live_work_results=None):
-        """Build cursor for reclaim tests.
+    Implementation fetchone call sequence:
+      1. advisory lock → (bool,)
+      2. now() - retention → (cutoff_datetime,)
+      [fetchall for _list_partitions]
+      per partition that passes skip rules 1 & 2:
+        3. EXISTS(queued/running) → (bool,)
+      per dropped partition (not live):
+        [no fetchone — DETACH, DROP are execute-only]
+    """
 
-        Parts: list of (name, upper_bound_or_None).
-        live_work_results: list of booleans (one per non-skipped partition).
+    def _make_reclaim_cursor(
+        self,
+        lock_acquired=True,
+        cutoff=None,
+        parts=None,
+        live_work_results=None,
+    ):
+        """Build a properly sequenced cursor for reclaim tests.
+
+        Args:
+            lock_acquired: bool — advisory lock result.
+            cutoff: datetime — the result of (now - retention). Defaults to
+                    now() - 31 days (past a 30-day retention).
+            parts: list of (name, upper_bound | None) tuples.
+            live_work_results: list of booleans, one per partition that passes
+                    skip rules 1 (non-DEFAULT) and 2 (outside retention).
         """
         cur = MagicMock()
         parts = parts or []
         live_work_results = live_work_results or []
-        # Build the pg_inherits rows for _list_partitions
+        if cutoff is None:
+            # Default cutoff: 31 days ago (so 30-day retention allows reclaim
+            # of partitions older than that)
+            cutoff = _utcnow() - timedelta(days=31)
+
+        # Build pg_inherits rows (used by _list_partitions via fetchall)
         pg_rows = []
         for name, upper in parts:
             if upper is None:
@@ -258,26 +304,11 @@ class TestReclaimDrainedPartitions:
             else:
                 expr = f"FOR VALUES FROM ('...') TO ('{upper.strftime('%Y-%m-%d %H:%M:%S+00')}')"
             pg_rows.append((name, expr))
+        cur.fetchall.return_value = pg_rows
 
-        _itr_live = iter(live_work_results)
-
-        def fetchone_side():
-            # First call: advisory lock
-            return (lock_acquired,)
-
-        def fetchall_side():
-            # Called by _list_partitions
-            return pg_rows
-
-        cur.fetchone.side_effect = fetchone_side
-        cur.fetchall.return_value = pg_rows  # _list_partitions uses fetchall
-
-        def fetchone_for_exists():
-            return (next(_itr_live),)
-
-        # After the advisory lock fetchone, the EXISTS check calls fetchone
-        # We set side_effect to a sequence
-        responses = [(lock_acquired,)] + [(v,) for v in live_work_results]
+        # Build fetchone sequence:
+        # (lock,) → (cutoff,) → [(live_work,), ...]
+        responses = [(lock_acquired,), (cutoff,)] + [(v,) for v in live_work_results]
         _resp_itr = iter(responses)
         cur.fetchone.side_effect = lambda: next(_resp_itr)
         return cur
@@ -295,7 +326,7 @@ class TestReclaimDrainedPartitions:
         from sqlery.core.partitioning import reclaim_drained_partitions
 
         default_name = "sqlery_queued_job_default"
-        cur = self._list_parts_cursor(
+        cur = self._make_reclaim_cursor(
             lock_acquired=True,
             parts=[(default_name, None)],
             live_work_results=[],  # no EXISTS check expected
@@ -304,18 +335,18 @@ class TestReclaimDrainedPartitions:
         assert result == 0
         # DROP TABLE must never appear
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
-        assert "DROP" not in all_sqls.upper() or default_name not in all_sqls
+        assert "DROP" not in all_sqls.upper()
 
     def test_skip_rule_2_skips_inside_retention_window(self):
         """Partition whose upper_bound is within retention is not dropped."""
         from sqlery.core.partitioning import reclaim_drained_partitions
 
-        # upper_bound = yesterday → still inside 30-day retention
+        # cutoff = now - 31 days; upper_bound = yesterday → upper_bound > cutoff → skip
         yesterday = _utcnow() - timedelta(days=1)
-        cur = self._list_parts_cursor(
+        cur = self._make_reclaim_cursor(
             lock_acquired=True,
             parts=[("sqlery_queued_job_recent", yesterday)],
-            live_work_results=[],
+            live_work_results=[],  # never reaches EXISTS check
         )
         result = reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
         assert result == 0
@@ -324,11 +355,12 @@ class TestReclaimDrainedPartitions:
         """Partition with queued/running rows is not dropped (back-pressure invariant)."""
         from sqlery.core.partitioning import reclaim_drained_partitions
 
+        # upper_bound = 60 days ago → outside 30-day retention → only skip rule 3 applies
         old_upper = _utcnow() - timedelta(days=60)
-        cur = self._list_parts_cursor(
+        cur = self._make_reclaim_cursor(
             lock_acquired=True,
             parts=[("sqlery_queued_job_old", old_upper)],
-            live_work_results=[True],  # EXISTS returns True → live work
+            live_work_results=[True],  # EXISTS returns True → live work → skip
         )
         result = reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
         assert result == 0
@@ -340,10 +372,10 @@ class TestReclaimDrainedPartitions:
         from sqlery.core.partitioning import reclaim_drained_partitions
 
         old_upper = _utcnow() - timedelta(days=60)
-        cur = self._list_parts_cursor(
+        cur = self._make_reclaim_cursor(
             lock_acquired=True,
             parts=[("sqlery_queued_job_old", old_upper)],
-            live_work_results=[False],  # no live work
+            live_work_results=[False],  # no live work → proceed to drop
         )
         result = reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
         assert result == 1
@@ -362,11 +394,21 @@ class TestReclaimDrainedPartitions:
         from sqlery.core.partitioning import reclaim_drained_partitions
 
         old_upper = _utcnow() - timedelta(days=60)
-        cur = self._list_parts_cursor(
-            lock_acquired=True,
-            parts=[("sqlery_queued_job_old", old_upper)],
-            live_work_results=[False],
-        )
+        # Need a fresh cursor that tracks execute order but still returns
+        # the right fetchone/fetchall values.
+        cutoff = _utcnow() - timedelta(days=31)
+        pg_rows = [
+            (
+                "sqlery_queued_job_old",
+                f"FOR VALUES FROM ('...') TO ('{old_upper.strftime('%Y-%m-%d %H:%M:%S+00')}')",
+            )
+        ]
+        cur = MagicMock()
+        cur.fetchall.return_value = pg_rows
+
+        responses = [(True,), (cutoff,), (False,)]  # lock, cutoff, exists=False
+        _itr = iter(responses)
+        cur.fetchone.side_effect = lambda: next(_itr)
 
         call_order = []
 
@@ -401,7 +443,7 @@ class TestReclaimDrainedPartitions:
         from sqlery.core.partitioning import reclaim_drained_partitions
 
         old_upper = _utcnow() - timedelta(days=60)
-        cur = self._list_parts_cursor(
+        cur = self._make_reclaim_cursor(
             lock_acquired=True,
             parts=[("sqlery_queued_job_old", old_upper)],
             live_work_results=[False],
@@ -413,7 +455,6 @@ class TestReclaimDrainedPartitions:
         result = reclaim_drained_partitions(
             cur, "sqlery_queued_job", "30 days", archive_hook=failing_hook
         )
-        # DROP should still have been called
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
         assert "DROP" in all_sqls.upper()
         assert result == 1
@@ -421,7 +462,7 @@ class TestReclaimDrainedPartitions:
     def test_advisory_lock_released_after_reclaim(self):
         from sqlery.core.partitioning import reclaim_drained_partitions
 
-        cur = self._list_parts_cursor(lock_acquired=True, parts=[], live_work_results=[])
+        cur = self._make_reclaim_cursor(lock_acquired=True, parts=[], live_work_results=[])
         reclaim_drained_partitions(cur, "sqlery_queued_job", "30 days")
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
         assert "pg_advisory_unlock" in all_sqls
