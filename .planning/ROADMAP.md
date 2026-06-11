@@ -22,7 +22,7 @@
 
 - [x] **Phase 12: quick-wins** - Partial pending index + batched DELETE cleanup in both backends, plus the Python 3.13 floor raise; independently shippable (completed 2026-06-11)
 - [x] **Phase 13: partition-core** - Hand-rolled partition maintenance (`core/partitioning.py`), cleanup routing, daemon tick with advisory locks and the DEFAULT-partition alert (completed 2026-06-11)
-- [ ] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition
+- [x] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition (completed 2026-06-11)
 - [ ] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0029 with rename-based rollback (highest risk; gates everything after)
 - [ ] **Phase 16: backend-wiring-pruning** - Route Django cleanup/vacuum to partition reclaim and prune all 11 id-only write paths to a single partition
 - [ ] **Phase 17: fastapi-parity** - Mirror the partition stack in `fastapi_sqlery/` (DDL, config keys, sync + async backends); re-verify R1–R6 for SQLAlchemy
@@ -73,9 +73,9 @@ Plans:
   3. Config validation rejects retention ≤ threshold
 **Plans**: 3 plans
 Plans:
-- [ ] 14-01-PLAN.md — ScheduledJob model + migration 0029_scheduled_job_staging (depends on 0028; shared id sequence)
-- [ ] 14-02-PLAN.md — Enqueue routing + promote_due_scheduled_jobs + daemon tick wiring + config validation
-- [ ] 14-03-PLAN.md — Dual-table API surface (get_job_by_id, cancel_job, get_staged_jobs) + full test suite (SC-1/2/3)
+- [x] 14-01-PLAN.md — ScheduledJob model + migration 0029_scheduled_job_staging (depends on 0028; shared id sequence)
+- [x] 14-02-PLAN.md — Enqueue routing + promote_due_scheduled_jobs + daemon tick wiring + config validation
+- [x] 14-03-PLAN.md — Dual-table API surface (get_job_by_id, cancel_job, get_staged_jobs) + full test suite (SC-1/2/3)
 
 ### Phase 15: schema-cutover
 **Goal**: The jobs table is partitioned — composite PK `(created_at, id)`, FKs demoted, and existing installs migrate through idempotent stop-the-world migration 0029 with a rename-based rollback
@@ -127,7 +127,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
 | 13. partition-core | 3/3 | Complete   | 2026-06-11 |
-| 14. scheduled-job-staging | 0/3 | Not started | - |
+| 14. scheduled-job-staging | 3/3 | Complete   | 2026-06-11 |
 | 15. schema-cutover | 0/TBD | Not started | - |
 | 16. backend-wiring-pruning | 0/TBD | Not started | - |
 | 17. fastapi-parity | 0/TBD | Not started | - |

@@ -4,14 +4,14 @@ milestone: v0.24.0
 milestone_name: partition-bloat-elimination
 status: executing
 stopped_at: Roadmap created for v0.24.0 (Phases 12–18); requirements traceability filled; phase context files written from ingest
-last_updated: "2026-06-11T20:02:56.263Z"
-last_activity: 2026-06-11 -- Phase 13 execution started
+last_updated: "2026-06-11T21:07:37.180Z"
+last_activity: 2026-06-11 -- Phase 14 execution started
 progress:
   total_phases: 7
-  completed_phases: 1
-  total_plans: 6
-  completed_plans: 3
-  percent: 50
+  completed_phases: 2
+  total_plans: 9
+  completed_plans: 6
+  percent: 67
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-10)
 
 **Core value:** Every execution mode works reliably and is tested in CI across both Django and standalone integrations, on both SQLite and PostgreSQL, with operational guidance that maintainers can trust in production.
-**Current focus:** Phase 13 — partition-core
+**Current focus:** Phase 14 — scheduled-job-staging
 
 ## Current Position
 
-Phase: 13 (partition-core) — EXECUTING
+Phase: 14 (scheduled-job-staging) — EXECUTING
 Plan: 1 of 3
-Status: Executing Phase 13
-Last activity: 2026-06-11 -- Phase 13 execution started
+Status: Executing Phase 14
+Last activity: 2026-06-11 -- Phase 14 execution started
 
 Progress: [░░░░░░░░░░] 0% (0/7 phases)
 
