@@ -689,17 +689,17 @@ class SQLAlchemyBackend(DatabaseBackend):
     ) -> dict:
         """Clean up old jobs based on retention policy."""
         with self._get_session() as session:
-            stmt = delete(QueuedJob)
-
-            if status:
-                stmt = stmt.where(QueuedJob.status == status)
-
-            if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
-
-            if max_age_days:
-                cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
-                stmt = stmt.where(QueuedJob.created_at < cutoff)
+            # Old: stmt built here fed the now-removed unbounded-delete path (see commented-out
+            # block below). The live path uses batch_stmt inside the loop; dry_run uses count_stmt.
+            # Preserved as a comment so the filter intent is documented alongside the replacements.
+            # stmt = delete(QueuedJob)
+            # if status:
+            #     stmt = stmt.where(QueuedJob.status == status)
+            # if queue_name:
+            #     stmt = stmt.where(QueuedJob.queue_name == queue_name)
+            # if max_age_days:
+            #     cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+            #     stmt = stmt.where(QueuedJob.created_at < cutoff)
 
             if dry_run:
                 # Count without deleting
