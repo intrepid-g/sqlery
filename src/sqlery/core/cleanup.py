@@ -197,36 +197,50 @@ class CleanupManager:
             'actions': []
         }
 
-        # Cleanup jobs by age
-        for status in ['success', 'failed']:
-            max_age_key = f'{status}_max_age_days'
-            if max_age_key in self.retention_config:
-                result = self.cleanup_old_jobs(
-                    status=status,
-                    max_age_days=self.retention_config[max_age_key],
-                    dry_run=dry_run
-                )
-                results['actions'].append({
-                    'action': 'cleanup_by_age',
-                    'status': status,
-                    'result': result
-                })
+        # Partition routing seam (R3, Phase 13/16): when the backend is a partitioned
+        # PostgreSQL table, job-level retention is handled by the daemon partition tick
+        # (reclaim_drained_partitions). Skip job loops here; registry cleanup still runs.
+        # hasattr guard: _partitioned_pg() is wired in Phase 16; returns False until then.
+        _in_partition_mode = (
+            hasattr(self.backend, '_partitioned_pg') and self.backend._partitioned_pg()
+        )
+        if _in_partition_mode:
+            results['partition_mode'] = True
 
-        # Cleanup jobs by count
-        for status in ['success', 'failed']:
-            max_count_key = f'{status}_max_count'
-            if max_count_key in self.retention_config:
-                result = self.cleanup_by_count(
-                    status=status,
-                    keep_count=self.retention_config[max_count_key],
-                    dry_run=dry_run
-                )
-                if result.get('deleted', 0) > 0 or result.get('would_delete', 0) > 0:
+        # Cleanup jobs by age
+        # if _in_partition_mode, skip — partition reclaim handles age-based job removal.
+        if not _in_partition_mode:
+            for status in ['success', 'failed']:
+                max_age_key = f'{status}_max_age_days'
+                if max_age_key in self.retention_config:
+                    result = self.cleanup_old_jobs(
+                        status=status,
+                        max_age_days=self.retention_config[max_age_key],
+                        dry_run=dry_run
+                    )
                     results['actions'].append({
-                        'action': 'cleanup_by_count',
+                        'action': 'cleanup_by_age',
                         'status': status,
                         'result': result
                     })
+
+        # Cleanup jobs by count
+        # if _in_partition_mode, skip — partitions are whole-table drops, not per-count.
+        if not _in_partition_mode:
+            for status in ['success', 'failed']:
+                max_count_key = f'{status}_max_count'
+                if max_count_key in self.retention_config:
+                    result = self.cleanup_by_count(
+                        status=status,
+                        keep_count=self.retention_config[max_count_key],
+                        dry_run=dry_run
+                    )
+                    if result.get('deleted', 0) > 0 or result.get('would_delete', 0) > 0:
+                        results['actions'].append({
+                            'action': 'cleanup_by_count',
+                            'status': status,
+                            'result': result
+                        })
 
         # Cleanup old registries
         auto_cleanup_registries = get_config('AUTO_CLEANUP_REGISTRIES', True)
