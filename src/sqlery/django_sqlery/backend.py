@@ -19,7 +19,9 @@ from sqlery.core.db_resilience import retry_on_db_error
 
 from ..compat import DatabaseBackend
 from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
-from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+# Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker, ScheduledJob
+from .settings import get_setting
 from sqlery.core.claiming import claim_next_job_with_queue_priority
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class DjangoBackend(DatabaseBackend):
         self.ScheduledTask = ScheduledTask
         self.JobRegistry = JobRegistry
         self.Worker = Worker
+        self.ScheduledJob = ScheduledJob
 
     def create_job(
         self,
@@ -76,6 +79,24 @@ class DjangoBackend(DatabaseBackend):
                 if conflicting.status == "running":
                     conflicting.force_stop()
             self.QueuedJob.objects.filter(job_name=job_name).delete()
+
+        # Threshold routing (D1, Phase 14): jobs scheduled further out than the
+        # configured threshold go into sqlery_scheduled_job instead of
+        # sqlery_queued_job so they cannot pin otherwise-drained partitions.
+        threshold_days = get_setting("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 1)
+        staging_threshold = timedelta(days=threshold_days)
+        now_utc = timezone.now()
+        if scheduled_at is not None and scheduled_at > now_utc + staging_threshold:
+            return self.ScheduledJob.objects.create(
+                queue_name=queue_name,
+                task_path=task_path,
+                payload=kwargs,
+                scheduled_at=scheduled_at,
+                priority=priority,
+                max_retries=max_retries,
+            )
+
+        # Below threshold or immediate — insert into main queue.
         job = self.QueuedJob.objects.create(
             task_path=task_path,
             kwargs=kwargs,

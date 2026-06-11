@@ -104,6 +104,11 @@ DEFAULTS = {
     # Configured = enforce prefix-with-dot-boundary match before importlib.
     "ALLOWED_TASK_MODULES": None,
 
+    # Scheduled job staging threshold (D1 — Phase 14)
+    # Days ahead — jobs scheduled further out than this go to sqlery_scheduled_job
+    # instead of sqlery_queued_job (D1).
+    "SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS": 1,
+
     # DB resilience settings
     "DB_RETRY_MAX_ATTEMPTS": 3,       # Retries on transient DB errors
     "DB_RETRY_BACKOFF_BASE": 0.1,     # Base seconds for exponential backoff

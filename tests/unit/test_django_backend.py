@@ -713,7 +713,76 @@ class TestMiscMethods:
 
 
 # ---------------------------------------------------------------------------
-# 9. Postgres-only branch placeholder
+# 9. Enqueue routing — scheduled_at threshold (14-02)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestEnqueueRoutingThreshold:
+    """Verify create_job routes far-future jobs to sqlery_scheduled_job (D1).
+
+    Tests 1-4 mirror the four routing behaviors in the plan's <behavior> block.
+    """
+
+    def test_far_future_creates_scheduled_job_not_queued_job(self, django_backend):
+        """Test 1: scheduled_at = now+2days creates ScheduledJob, not QueuedJob (threshold=1day)."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        queued_before = django_backend.QueuedJob.objects.count()
+        staged_before = ScheduledJob.objects.count()
+        far_future = timezone.now() + timedelta(days=2)
+        result = _create_basic_job(django_backend, scheduled_at=far_future)
+        # Must be a ScheduledJob row
+        assert isinstance(result, ScheduledJob), (
+            f"Expected ScheduledJob, got {type(result).__name__}"
+        )
+        assert ScheduledJob.objects.count() == staged_before + 1, (
+            "Expected one new ScheduledJob row"
+        )
+        assert django_backend.QueuedJob.objects.count() == queued_before, (
+            "QueuedJob count must not change for far-future jobs"
+        )
+
+    def test_near_future_creates_queued_job(self, django_backend):
+        """Test 2: scheduled_at = now+12hrs creates QueuedJob (below 1-day threshold)."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        queued_before = django_backend.QueuedJob.objects.count()
+        staged_before = ScheduledJob.objects.count()
+        near_future = timezone.now() + timedelta(hours=12)
+        result = _create_basic_job(django_backend, scheduled_at=near_future)
+        assert result.__class__.__name__ == "QueuedJob", (
+            f"Expected QueuedJob, got {type(result).__name__}"
+        )
+        assert django_backend.QueuedJob.objects.count() == queued_before + 1
+        assert ScheduledJob.objects.count() == staged_before, (
+            "No ScheduledJob row should be created for near-future jobs"
+        )
+
+    def test_no_scheduled_at_creates_queued_job(self, django_backend):
+        """Test 3: scheduled_at=None creates QueuedJob immediately."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        queued_before = django_backend.QueuedJob.objects.count()
+        staged_before = ScheduledJob.objects.count()
+        result = _create_basic_job(django_backend, scheduled_at=None)
+        assert result.__class__.__name__ == "QueuedJob"
+        assert django_backend.QueuedJob.objects.count() == queued_before + 1
+        assert ScheduledJob.objects.count() == staged_before
+
+    def test_exact_threshold_boundary_creates_queued_job(self, django_backend):
+        """Test 4: scheduled_at = exactly now+1day creates QueuedJob (boundary is exclusive)."""
+        from sqlery.django_sqlery.models import ScheduledJob
+        queued_before = django_backend.QueuedJob.objects.count()
+        staged_before = ScheduledJob.objects.count()
+        # Exactly at threshold: not strictly greater, so goes to main queue
+        exact_boundary = timezone.now() + timedelta(days=1)
+        result = _create_basic_job(django_backend, scheduled_at=exact_boundary)
+        assert result.__class__.__name__ == "QueuedJob", (
+            "Exactly at threshold (not strictly greater) must go to QueuedJob"
+        )
+        assert django_backend.QueuedJob.objects.count() == queued_before + 1
+        assert ScheduledJob.objects.count() == staged_before
+
+
+# ---------------------------------------------------------------------------
+# 10. Postgres-only branch placeholder
 # ---------------------------------------------------------------------------
 
 @pytest.mark.postgres
