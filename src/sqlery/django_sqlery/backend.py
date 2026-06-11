@@ -315,12 +315,19 @@ class DjangoBackend(DatabaseBackend):
         return result
 
     def cancel_job(self, job_id: int) -> bool:
-        """Cancel a queued job."""
+        """Cancel a queued or staged job, spanning QueuedJob and ScheduledJob tables."""
+        # Old (single-table — staged jobs were uncancellable via this API):
+        # updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+        #     status="failed", error="Cancelled by user"
+        # )
+        # return updated > 0
         updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
             status="failed", error="Cancelled by user"
         )
-
-        return updated > 0
+        if updated > 0:
+            return True
+        deleted, _ = self.ScheduledJob.objects.filter(id=job_id).delete()
+        return deleted > 0
 
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
         """Retry failed jobs by resetting them to queued status."""
@@ -662,10 +669,19 @@ class DjangoBackend(DatabaseBackend):
         return {"deleted": count}
 
     def get_job_by_id(self, job_id: int):
-        """Get job by ID."""
+        """Get job by ID, spanning both sqlery_queued_job and sqlery_scheduled_job."""
+        # Old (single-table — staged jobs were invisible to status APIs):
+        # try:
+        #     return self.QueuedJob.objects.get(id=job_id)
+        # except self.QueuedJob.DoesNotExist:
+        #     return None
         try:
             return self.QueuedJob.objects.get(id=job_id)
         except self.QueuedJob.DoesNotExist:
+            pass
+        try:
+            return self.ScheduledJob.objects.get(id=job_id)
+        except self.ScheduledJob.DoesNotExist:
             return None
 
     def mark_job_success(self, job_id: int, output: str = ""):
@@ -963,7 +979,12 @@ class DjangoBackend(DatabaseBackend):
         limit: int = 100,
         offset: int = 0,
     ) -> list:
-        """Get jobs with optional filtering and pagination."""
+        """Get jobs with optional filtering and pagination.
+
+        Returns only rows from sqlery_queued_job (the executable queue).
+        Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
+        """
+        # Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
         query = self.QueuedJob.objects.all()
 
         if status:
@@ -976,6 +997,28 @@ class DjangoBackend(DatabaseBackend):
         query = query.order_by("-priority", "created_at")
 
         # Apply pagination
+        return list(query[offset : offset + limit])
+
+    def get_staged_jobs(
+        self,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list:
+        """Return staged (pre-promotion) jobs from sqlery_scheduled_job.
+
+        Args:
+            queue_name: Optional queue filter.
+            limit: Maximum number of results to return.
+            offset: Pagination offset.
+
+        Returns:
+            list of ScheduledJob instances ordered by scheduled_at ascending.
+        """
+        query = self.ScheduledJob.objects.all()
+        if queue_name:
+            query = query.filter(queue_name=queue_name)
+        query = query.order_by("scheduled_at")
         return list(query[offset : offset + limit])
 
     def count_jobs(
