@@ -252,6 +252,77 @@ class TestEnsureFuturePartitions:
         all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
         assert "pg_advisory_unlock" in all_sqls
 
+    def test_sub_daily_interval_uses_time_suffix_in_partition_name(self):
+        """Sub-daily interval must include HH%MM suffix to avoid same-day name collisions (WR-01).
+
+        Two iterations within the same calendar day must produce distinct partition names.
+        """
+        from sqlery.core.partitioning import ensure_future_partitions
+
+        # Two hourly partitions on the same day: 00:00 and 01:00
+        from datetime import datetime, timezone
+        day_start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        hour_1 = datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+        hour_2 = datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+
+        responses = [
+            (True,),            # advisory lock
+            (day_start,), (hour_1,),  # iteration 0: lo=00:00, hi=01:00
+            (hour_1,), (hour_2,),     # iteration 1: lo=01:00, hi=02:00
+        ]
+        _itr = iter(responses)
+        cur = MagicMock()
+        cur.fetchone.side_effect = lambda: next(_itr)
+
+        ensure_future_partitions(cur, "sqlery_queued_job", "1 hour", premake=1)
+
+        # Collect all identifiers from CREATE TABLE calls
+        create_calls = [
+            str(c[0][0])
+            for c in cur.execute.call_args_list
+            if "PARTITION OF" in str(c[0][0])
+        ]
+        assert len(create_calls) == 2, f"Expected 2 CREATE calls, got: {create_calls}"
+        # Names must be distinct (time suffix ensures this)
+        name_0 = create_calls[0]
+        name_1 = create_calls[1]
+        assert name_0 != name_1, "Hourly partitions on same day must have distinct names"
+        # Both names must contain HH:MM precision (_ separator before time)
+        assert "_0000" in name_0 or "_00_00" in name_0 or "0000" in name_0, (
+            f"First partition name missing time suffix: {name_0}"
+        )
+        assert "_0100" in name_1 or "0100" in name_1, (
+            f"Second partition name missing 01:00 time suffix: {name_1}"
+        )
+
+    def test_daily_interval_uses_date_only_suffix(self):
+        """Daily (and coarser) intervals must use date-only suffix %Y%m%d for backward compatibility."""
+        from sqlery.core.partitioning import ensure_future_partitions
+
+        from datetime import datetime, timezone, timedelta
+        day_start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+
+        responses = [(True,), (day_start,), (day_end,)]
+        _itr = iter(responses)
+        cur = MagicMock()
+        cur.fetchone.side_effect = lambda: next(_itr)
+
+        ensure_future_partitions(cur, "sqlery_queued_job", "1 day", premake=0)
+
+        create_calls = [
+            str(c[0][0])
+            for c in cur.execute.call_args_list
+            if "PARTITION OF" in str(c[0][0])
+        ]
+        assert len(create_calls) == 1
+        # Name must contain the date without time component (no underscore after date)
+        assert "20250101" in create_calls[0], f"Expected date-only suffix in: {create_calls[0]}"
+        # Must NOT contain time suffix (_HHMM)
+        assert "20250101_" not in create_calls[0], (
+            f"Daily partition must not have time suffix: {create_calls[0]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # reclaim_drained_partitions

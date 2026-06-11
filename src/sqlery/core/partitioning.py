@@ -34,10 +34,23 @@ ADVISORY_LOCK_RECLAIM: int = int.from_bytes(b"SQLERCLA", "big")  # partition rec
 # Regex to extract the TO ('...') timestamp from a partition bound expression.
 _BOUND_TO_RE = re.compile(r"TO \('([^']+)'\)")
 
+# Regex to detect sub-daily interval strings (hours or minutes).
+_SUB_DAILY_RE = re.compile(r'\b(hour|minute)s?\b', re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_sub_daily_interval(interval_str: str) -> bool:
+    """Return True if *interval_str* represents a sub-daily interval (hours or minutes).
+
+    Used to decide the partition name suffix precision: daily-or-coarser intervals
+    use ``%Y%m%d``; sub-daily intervals use ``%Y%m%d_%H%M`` to avoid name collisions
+    when multiple partitions fall on the same date.
+    """
+    return bool(_SUB_DAILY_RE.search(interval_str))
 
 
 def _list_partitions(cur, table: str) -> list[tuple[str, datetime | None]]:
@@ -155,7 +168,10 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
                 [lo, interval_str],
             )
             (hi,) = cur.fetchone()
-            name = "sqlery_queued_job_" + lo.strftime("%Y%m%d")
+            # Old: name = "sqlery_queued_job_" + lo.strftime("%Y%m%d")
+            # Sub-daily intervals need time precision to avoid same-day name collisions (WR-01).
+            _suffix_fmt = "%Y%m%d_%H%M" if _is_sub_daily_interval(interval_str) else "%Y%m%d"
+            name = table + "_" + lo.strftime(_suffix_fmt)
             try:
                 cur.execute(
                     pgsql.SQL(
