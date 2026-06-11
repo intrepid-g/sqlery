@@ -56,7 +56,11 @@ Plans:
   2. Two concurrent daemons cause zero DDL errors
   3. DEFAULT-partition row count is exposed and alerts > 0
   4. Reference behavior matches `sql/pgwq.sql`
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 13-01-PLAN.md — Create core/partitioning.py: _list_partitions, ensure_future_partitions, reclaim_drained_partitions, check_default_partition (raw cursor, no ORM imports, advisory locks)
+- [ ] 13-02-PLAN.md — Wire cleanup.py routing seam and daemon.py partition maintenance tick with config validation
+- [ ] 13-03-PLAN.md — Unit tests: four skip-rules, advisory-lock coordination, DEFAULT alert, attach-conflict, DETACH-before-DROP order
 
 ### Phase 14: scheduled-job-staging
 **Goal**: Far-future scheduled jobs live in a staging table and are promoted exactly-once, so no queued row can pin an otherwise-drained partition
@@ -118,7 +122,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
-| 13. partition-core | 0/TBD | Not started | - |
+| 13. partition-core | 0/3 | Not started | - |
 | 14. scheduled-job-staging | 0/TBD | Not started | - |
 | 15. schema-cutover | 0/TBD | Not started | - |
 | 16. backend-wiring-pruning | 0/TBD | Not started | - |
