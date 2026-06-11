@@ -87,10 +87,34 @@ class DjangoBackend(DatabaseBackend):
         staging_threshold = timedelta(days=threshold_days)
         now_utc = timezone.now()
         if scheduled_at is not None and scheduled_at > now_utc + staging_threshold:
+            # Store full job-creation spec in payload for lossless promotion (WR-01/WR-02).
+            # payload schema: {"kwargs": <task kwargs>, "job_spec": {<all execution params>}}
+            # Promotion reads job_spec to reconstruct every queued_job column identically.
+            # Old: payload=kwargs   <-- silently dropped 12 fields (retry_backoff, timeout, etc.)
+            full_payload = {
+                "kwargs": kwargs,
+                "job_spec": {
+                    "retry_backoff": retry_backoff,
+                    "allow_parallel": allow_parallel,
+                    "timeout_seconds": timeout_seconds,
+                    "retry_count": retry_count if retry_count is not None else 0,
+                    "scheduled_task_id": scheduled_task_id,
+                    "job_name": job_name,
+                    "retry_intervals": retry_intervals,
+                    "meta": meta,
+                    "dependencies": dependencies or [],
+                    "on_success_path": on_success_path,
+                    "on_failure_path": on_failure_path,
+                    "ttl": ttl,
+                    "result_ttl": result_ttl,
+                    "failure_ttl": failure_ttl,
+                    "parent_job_id": parent_job_id,
+                },
+            }
             return self.ScheduledJob.objects.create(
                 queue_name=queue_name,
                 task_path=task_path,
-                payload=kwargs,
+                payload=full_payload,
                 scheduled_at=scheduled_at,
                 priority=priority,
                 max_retries=max_retries,
