@@ -224,6 +224,34 @@ class TestEnsureFuturePartitions:
         # Returns an int (may be 0 or 1 depending on how errors are counted)
         assert isinstance(result, int)
 
+    def test_operational_error_propagates_not_swallowed_as_attach_conflict(self):
+        """psycopg.OperationalError (connection lost) must propagate — not be caught as attach-conflict (WR-03)."""
+        import psycopg
+
+        from sqlery.core.partitioning import ensure_future_partitions
+
+        now = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        hi = now + timedelta(days=1)
+
+        responses = [(True,), (now,), (hi,)]
+        _itr = iter(responses)
+        cur = MagicMock()
+        cur.fetchone.side_effect = lambda: next(_itr)
+
+        def side_effect(sql, params=None):
+            if "PARTITION OF" in str(sql):
+                raise psycopg.OperationalError("connection lost")
+
+        cur.execute.side_effect = side_effect
+
+        # OperationalError must propagate — advisory lock still released via finally
+        with pytest.raises(psycopg.OperationalError):
+            ensure_future_partitions(cur, "sqlery_queued_job", "1 day", premake=0)
+
+        # Advisory lock must still be released despite the error
+        all_sqls = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
+        assert "pg_advisory_unlock" in all_sqls
+
     def test_advisory_lock_released_even_on_error(self):
         """Advisory lock must be released even if an unexpected error occurs."""
         from sqlery.core.partitioning import ensure_future_partitions

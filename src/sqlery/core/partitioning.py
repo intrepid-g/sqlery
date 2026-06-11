@@ -185,13 +185,16 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
                     [lo, hi],
                 )
                 created += 1
-            except Exception as exc:
-                if not isinstance(exc, psycopg.DatabaseError):
-                    # Unexpected error (not a DB error): re-raise so the finally
-                    # block releases the advisory lock and the caller sees the error.
-                    raise
-                # Catch attach-conflict (InvalidTableDefinition, ExclusionViolation,
-                # or any DatabaseError) — rows in DEFAULT overlap the new range.
+            # Old: except Exception as exc: if not isinstance(exc, psycopg.DatabaseError): raise
+            # Re-raise connection-level errors so callers see real failures (WR-03).
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                raise
+            except (
+                psycopg.errors.InvalidTableDefinition,
+                psycopg.errors.CheckViolation,
+                psycopg.errors.ExclusionViolation,
+            ) as exc:
+                # Attach-conflict: rows in DEFAULT partition overlap the new range.
                 logger.warning(
                     "Partition attach conflict for %s: %s "
                     "— rows in DEFAULT partition, manual cleanup required",
