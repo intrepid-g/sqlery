@@ -709,16 +709,26 @@ class DjangoBackend(DatabaseBackend):
             return None
 
     def mark_job_success(self, job_id: int, output: str = ""):
-        """Mark job as successful."""
+        """Mark job as successful.
+
+        Staged ScheduledJob rows (not yet promoted) do not have mark_success;
+        the guard prevents AttributeError if an operator calls this for a staged id.
+        """
         job = self.get_job_by_id(job_id)
-        if job:
+        # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_success"):
             job.mark_success(output=output)
         return job
 
     def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
-        """Mark job as failed."""
+        """Mark job as failed.
+
+        Staged ScheduledJob rows do not have mark_failed; guard prevents
+        AttributeError if called for a staged job id (IN-01).
+        """
         job = self.get_job_by_id(job_id)
-        if job:
+        # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_failed"):
             job.mark_failed(error=error, traceback=traceback)
         return job
 
