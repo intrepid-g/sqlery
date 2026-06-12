@@ -237,11 +237,13 @@ class DjangoBackend(DatabaseBackend):
             worker_row = self._resolve_worker(worker_id)
             if worker_row:
                 worker_row.status = "idle"
-                worker_row.current_job = None
+                # Old: worker_row.current_job = None
+                worker_row.current_job_id = None
                 worker_row.jobs_processed = jobs_processed
                 worker_row.last_heartbeat = timezone.now()
+                # Old: update_fields=["status", "current_job", "jobs_processed", "last_heartbeat"]
                 worker_row.save(
-                    update_fields=["status", "current_job", "jobs_processed", "last_heartbeat"]
+                    update_fields=["status", "current_job_id", "jobs_processed", "last_heartbeat"]
                 )
 
         return job
@@ -659,18 +661,28 @@ class DjangoBackend(DatabaseBackend):
         limit: int | None = None,
     ) -> list:
         """Get jobs in a specific registry."""
+        # Old: .select_related("job") and filter(job__queue_name=queue_name)
+        # JobRegistry.job FK demoted to job_id (D4, Phase 15); select_related and FK traversal removed.
         query = self.JobRegistry.objects.filter(
             registry_type=registry_type,
             exited_at__isnull=True,
-        ).select_related("job")
+        )
 
         if queue_name:
-            query = query.filter(job__queue_name=queue_name)
+            # Old: query = query.filter(job__queue_name=queue_name)
+            # queue_name traversal via FK not possible after demotion — fetch job_ids then filter
+            job_ids = list(query.values_list("job_id", flat=True))
+            job_ids = list(
+                self.QueuedJob.objects.filter(id__in=job_ids, queue_name=queue_name).values_list("id", flat=True)
+            )
+            query = query.filter(job_id__in=job_ids)
 
         if limit:
             query = query[:limit]
 
-        return [entry.job for entry in query]
+        # Old: return [entry.job for entry in query]
+        job_ids = list(query.values_list("job_id", flat=True))
+        return list(self.QueuedJob.objects.filter(id__in=job_ids))
 
     def cleanup_registry(
         self,

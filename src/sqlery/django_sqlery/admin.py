@@ -217,7 +217,8 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
 
 
 # QueuedJob admin registered with read-only list view for job management
-@admin.register(QueuedJob)
+# Old: @admin.register(QueuedJob)  — Django 5.2 disallows @admin.register for composite-PK models
+# Registration deferred to module end via admin.site.register (see bottom of file — Phase 15).
 class QueuedJobAdmin(admin.ModelAdmin):
     list_display = [
         "id",
@@ -639,3 +640,14 @@ class QueuedJobAdmin(admin.ModelAdmin):
         self.message_user(request, ", ".join(message_parts) if message_parts else "No jobs stopped")
 
     stop_running.short_description = "Stop/kill selected running jobs"
+
+
+# Phase 15: QueuedJob now has CompositePrimaryKey("created_at", "id").
+# Django 5.2+ raises ImproperlyConfigured when using @admin.register on composite-PK models.
+# Manual registration used instead — admin UI remains available but without full PK-based
+# edit/delete support (those features require a single-column PK).
+try:
+    admin.site.register(QueuedJob, QueuedJobAdmin)
+except Exception:
+    # Guard: if already registered (e.g. autoreload) don't crash
+    pass

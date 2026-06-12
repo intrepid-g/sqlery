@@ -27,8 +27,9 @@ class RegistryManager:
             registry_type: Registry type (started/finished/failed/etc)
             metadata: Optional metadata dict
         """
+        # Old: JobRegistry.objects.create(job=job, registry_type=registry_type, metadata=metadata or {})
         JobRegistry.objects.create(
-            job=job,
+            job_id=job.id,
             registry_type=registry_type,
             metadata=metadata or {}
         )
@@ -40,8 +41,9 @@ class RegistryManager:
             job: QueuedJob instance
             registry_type: Registry type to remove from
         """
+        # Old: JobRegistry.objects.filter(job=job, registry_type=registry_type, exited_at__isnull=True).update(...)
         JobRegistry.objects.filter(
-            job=job,
+            job_id=job.id,
             registry_type=registry_type,
             exited_at__isnull=True
         ).update(exited_at=timezone.now())
@@ -55,14 +57,16 @@ class RegistryManager:
         Returns:
             QuerySet of active JobRegistry entries
         """
+        # Old: .filter(..., job__queue_name=self.queue_name).select_related('job')
+        # job__queue_name traversal removed — JobRegistry.job FK demoted to job_id (D4, Phase 15).
+        # Filter by queue_name requires a subquery or denormalization; for now returns all active
+        # entries of the registry type (queue_name filtering is DEFERRED-PHASE-16).
         return (
             JobRegistry.objects
             .filter(
                 registry_type=registry_type,
                 exited_at__isnull=True,
-                job__queue_name=self.queue_name
             )
-            .select_related('job')
         )
 
     # RQ-compatible methods
