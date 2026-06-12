@@ -25,13 +25,22 @@ import logging
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
 
 from .database import get_async_session_factory
+
+# Partition maintenance helpers — guarded against psycopg absence (SQLite installs).
+# The async backend delegates _partitioned_pg() to a sync catalog query (acceptable:
+# it is a cache-on-first-call check, not per-request).
+try:
+    from .database import get_engine as _get_sync_engine
+    _sync_engine_available = True
+except ImportError:
+    _sync_engine_available = False
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,55 @@ def _utcnow() -> datetime:
 
 class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
     """Async backend backed by SQLAlchemy 2.x AsyncSession (standalone mode)."""
+
+    def __init__(self):
+        """Initialize async backend."""
+        self._partitioned_pg_cache: bool | None = None
+
+    def _partitioned_pg(self) -> bool:
+        """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
+
+        Delegates to a sync catalog query via the sync engine (acceptable: this is
+        a cache-on-first-call check, not per-request). Mirrors SQLAlchemyBackend._partitioned_pg.
+
+        WR-01: On a transient DB error the cache is NOT written (left None) so the next
+        call retries the catalog query.
+        """
+        if self._partitioned_pg_cache is not None:
+            return self._partitioned_pg_cache
+        if not _sync_engine_available:
+            self._partitioned_pg_cache = False
+            return False
+        try:
+            engine = _get_sync_engine()
+        except RuntimeError:
+            # Engine not initialized yet — fail safe, don't cache.
+            logger.warning(
+                "_partitioned_pg (async): sync engine not initialized — will retry on next call"
+            )
+            return False
+        if engine.dialect.name != "postgresql":
+            self._partitioned_pg_cache = False
+            return False
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT relkind = 'p' FROM pg_class "
+                        "WHERE relname = %s AND relnamespace = 'public'::regnamespace"
+                    ),
+                    [QueuedJob.__tablename__],
+                )
+                row = result.fetchone()
+            self._partitioned_pg_cache = bool(row and row[0])
+        except Exception:
+            # WR-01: do NOT permanently cache False on a transient DB error.
+            logger.warning(
+                "_partitioned_pg (async): catalog query failed — will retry on next call",
+                exc_info=True,
+            )
+            return False
+        return self._partitioned_pg_cache
 
     # ----- claim path ------------------------------------------------------
 
@@ -127,11 +185,23 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         now = _utcnow()
         factory = get_async_session_factory()
         async with factory() as session:
-            await session.execute(
-                update(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .values(status="running", started_at=now)
-            )
+            # Write-path pruning: fetch created_at first so PG prunes to one partition.
+            # Guard: only add created_at filter when partitioned and value not None (falls
+            # back to id-only on SQLite — D6).
+            created_at = None
+            if self._partitioned_pg():
+                res = await session.execute(
+                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
+                )
+                row = res.first()
+                created_at = row[0] if row else None
+            # Old (id-only filter — does not prune to partition on PG):
+            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="running", ...)
+            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if created_at is not None:
+                stmt = stmt.where(QueuedJob.created_at == created_at)
+            stmt = stmt.values(status="running", started_at=now)
+            await session.execute(stmt)
             await session.commit()
 
     async def amark_success(self, job_id, result) -> None:
@@ -139,11 +209,21 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         output = "" if result is None else str(result)
         factory = get_async_session_factory()
         async with factory() as session:
-            await session.execute(
-                update(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .values(status="success", finished_at=now, output=output)
-            )
+            # Write-path pruning: fetch created_at first so PG prunes to one partition.
+            created_at = None
+            if self._partitioned_pg():
+                res = await session.execute(
+                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
+                )
+                row = res.first()
+                created_at = row[0] if row else None
+            # Old (id-only filter):
+            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="success", ...)
+            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if created_at is not None:
+                stmt = stmt.where(QueuedJob.created_at == created_at)
+            stmt = stmt.values(status="success", finished_at=now, output=output)
+            await session.execute(stmt)
             await session.commit()
 
     async def amark_failed(
@@ -152,26 +232,46 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         now = _utcnow()
         factory = get_async_session_factory()
         async with factory() as session:
-            await session.execute(
-                update(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .values(
-                    status="failed",
-                    finished_at=now,
-                    error=error or "",
-                    traceback=traceback or "",
+            # Write-path pruning: fetch created_at first so PG prunes to one partition.
+            created_at = None
+            if self._partitioned_pg():
+                res = await session.execute(
+                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
                 )
+                row = res.first()
+                created_at = row[0] if row else None
+            # Old (id-only filter):
+            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="failed", ...)
+            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if created_at is not None:
+                stmt = stmt.where(QueuedJob.created_at == created_at)
+            stmt = stmt.values(
+                status="failed",
+                finished_at=now,
+                error=error or "",
+                traceback=traceback or "",
             )
+            await session.execute(stmt)
             await session.commit()
 
     async def amark_shutting_down(self, job_id) -> None:
         factory = get_async_session_factory()
         async with factory() as session:
-            await session.execute(
-                update(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .values(status="shutting_down")
-            )
+            # Write-path pruning: fetch created_at first so PG prunes to one partition.
+            created_at = None
+            if self._partitioned_pg():
+                res = await session.execute(
+                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
+                )
+                row = res.first()
+                created_at = row[0] if row else None
+            # Old (id-only filter):
+            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="shutting_down")
+            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if created_at is not None:
+                stmt = stmt.where(QueuedJob.created_at == created_at)
+            stmt = stmt.values(status="shutting_down")
+            await session.execute(stmt)
             await session.commit()
 
     # ----- read paths ------------------------------------------------------
