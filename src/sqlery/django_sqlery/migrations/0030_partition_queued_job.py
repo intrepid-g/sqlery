@@ -50,9 +50,11 @@ class _VendorGuardedCutover(migrations.RunPython):
     directions return immediately without touching the database.
 
     Forward (S1–S9):
+      S0  Drop FK constraints referencing sqlery_queued_job (before rename; catalog query)
       S1  Idempotent rename of sqlery_queued_job → sqlery_queued_job_legacy
       S2  CREATE TABLE sqlery_queued_job LIKE legacy INCLUDING DEFAULTS PARTITION BY RANGE
       S3  ADD PRIMARY KEY (created_at, id)
+      S3b DROP CONSTRAINT IF EXISTS sqlery_queued_job_job_name_key (explicit guard)
       S4  (REMOVED) — id DEFAULT nextval('sqlery_job_id_seq') already copied by S2
       S5  CREATE DEFAULT partition
       S6  Recreate sqlery_job_pending_idx (byte-identical to 0028 — D7)
@@ -86,9 +88,47 @@ class _VendorGuardedCutover(migrations.RunPython):
 
     @staticmethod
     def _forward(_apps, schema_editor):
-        """Execute partition cutover SQL statements S1-S9 (PG only)."""
+        """Execute partition cutover SQL statements S0-S9 (PG only)."""
         connection = schema_editor.connection
         with connection.cursor() as cursor:
+            # S0 — Drop FK constraints referencing sqlery_queued_job BEFORE renaming it.
+            # JobRegistry.job_id and Worker.current_job_id were created as FK columns in
+            # migrations 0002/0003.  If we skip this, S1's rename causes PG to redirect the
+            # FK constraints to sqlery_queued_job_legacy.  Every post-cutover JobRegistry or
+            # Worker write referencing a new job id then raises IntegrityError.
+            # Constraint names are auto-generated, so we discover them from information_schema
+            # rather than hard-coding them.  The loop is idempotent: re-running after a crash
+            # is safe (DROP CONSTRAINT IF EXISTS is a no-op when the constraint is already gone,
+            # and the information_schema query simply returns no rows on the second run).
+            #
+            # Old (missing step — FK constraints were never dropped, causing IntegrityError on
+            # every post-cutover JobRegistry/Worker write with a new job id):
+            # (no S0 existed)
+            cursor.execute(
+                """
+                DO $$
+                DECLARE
+                    r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT tc.table_name, tc.constraint_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.referential_constraints rc
+                          ON tc.constraint_name = rc.constraint_name
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON rc.unique_constraint_name = ccu.constraint_name
+                        WHERE ccu.table_name = 'sqlery_queued_job'
+                          AND tc.constraint_type = 'FOREIGN KEY'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I',
+                            r.table_name, r.constraint_name
+                        );
+                    END LOOP;
+                END $$;
+                """
+            )
+
             # S1 — Idempotent rename: sqlery_queued_job → sqlery_queued_job_legacy
             cursor.execute(
                 """
@@ -126,6 +166,25 @@ class _VendorGuardedCutover(migrations.RunPython):
                 cursor.execute(
                     "ALTER TABLE sqlery_queued_job ADD PRIMARY KEY (created_at, id);"
                 )
+
+            # S3b — Drop the job_name unique constraint if it was inadvertently carried over.
+            # PostgreSQL partitioned tables cannot have a global single-column unique constraint
+            # (the partition key must be included in any unique constraint).  LIKE INCLUDING
+            # DEFAULTS does NOT copy constraints, so this step is a defensive explicit guard.
+            # job_name uniqueness is enforced at application level in backend.create_job
+            # (new job wins: stop conflicting running jobs, delete all rows with that name).
+            # The AlterField state_operation below removes unique=True from the ORM state to
+            # prevent makemigrations --check drift.
+            #
+            # Old (missing step — no explicit drop meant the constraint silently vanished and
+            # Django ORM state still declared unique=True, causing schema drift):
+            # (no S3b existed)
+            cursor.execute(
+                """
+                ALTER TABLE sqlery_queued_job
+                    DROP CONSTRAINT IF EXISTS sqlery_queued_job_job_name_key;
+                """
+            )
 
             # S4 — (REMOVED — SHARED-ID-SEQUENCE DECISION 2026-06-11)
             # The id column already has DEFAULT nextval('sqlery_job_id_seq') copied from
@@ -280,8 +339,17 @@ class _VendorGuardedCutover(migrations.RunPython):
         """
         connection = schema_editor.connection
         with connection.cursor() as cursor:
-            # Create unpartitioned rollback table (INCLUDING DEFAULTS copies the shared
+            # Step 1 — Create unpartitioned rollback table (INCLUDING DEFAULTS copies the shared
             # sequence default — id will default to nextval('sqlery_job_id_seq')).
+            # LIKE INCLUDING DEFAULTS does NOT copy constraints or indexes; the table is created
+            # without a PK.  We add one explicitly so the ON CONFLICT DO NOTHING in step 2 can
+            # actually detect duplicates on a re-run.
+            #
+            # Old (wrong — table created without PK, so ON CONFLICT DO NOTHING was a no-op:
+            # every re-run after a crash between steps 3 and 4 doubled all rows):
+            # CREATE TABLE IF NOT EXISTS sqlery_queued_job_unpartitioned (
+            #     LIKE sqlery_queued_job INCLUDING DEFAULTS INCLUDING STORAGE
+            # );
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sqlery_queued_job_unpartitioned (
@@ -289,8 +357,24 @@ class _VendorGuardedCutover(migrations.RunPython):
                 );
                 """
             )
+            # Add composite PK if not present (idempotency guard — safe on re-run).
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM pg_constraint
+                WHERE conrelid = 'sqlery_queued_job_unpartitioned'::regclass
+                  AND contype = 'p'
+                """
+            )
+            (rb_pk_count,) = cursor.fetchone()
+            if rb_pk_count == 0:
+                cursor.execute(
+                    "ALTER TABLE sqlery_queued_job_unpartitioned "
+                    "ADD PRIMARY KEY (created_at, id);"
+                )
 
-            # Copy rows back from the partitioned table
+            # Step 2 — Copy rows back from the partitioned table.
+            # ON CONFLICT DO NOTHING now actually fires on (created_at, id) duplicates
+            # because the PK was added in step 1.
             cursor.execute(
                 """
                 INSERT INTO sqlery_queued_job_unpartitioned
@@ -299,18 +383,30 @@ class _VendorGuardedCutover(migrations.RunPython):
                 """
             )
 
-            # Rename the partitioned table out of the way (idempotent guard)
+            # Step 3 — Rename the partitioned table out of the way.
+            # Guard both the source name AND the target name so a re-run after a crash
+            # between steps 3 and 4 does not fail with "relation already exists".
+            #
+            # Old (wrong — only guarded IF sqlery_queued_job IS NOT NULL; if the target
+            # sqlery_queued_job_partitioned_bak already existed from a prior partial run,
+            # RENAME would raise "relation already exists"):
+            # DO $$ BEGIN
+            #     IF to_regclass('public.sqlery_queued_job') IS NOT NULL THEN
+            #         ALTER TABLE sqlery_queued_job RENAME TO sqlery_queued_job_partitioned_bak;
+            #     END IF;
+            # END $$;
             cursor.execute(
                 """
                 DO $$ BEGIN
-                    IF to_regclass('public.sqlery_queued_job') IS NOT NULL THEN
+                    IF to_regclass('public.sqlery_queued_job') IS NOT NULL
+                       AND to_regclass('public.sqlery_queued_job_partitioned_bak') IS NULL THEN
                         ALTER TABLE sqlery_queued_job RENAME TO sqlery_queued_job_partitioned_bak;
                     END IF;
                 END $$;
                 """
             )
 
-            # Rename the unpartitioned copy back to sqlery_queued_job
+            # Step 4 — Rename the unpartitioned copy back to sqlery_queued_job
             cursor.execute(
                 "ALTER TABLE sqlery_queued_job_unpartitioned RENAME TO sqlery_queued_job;"
             )
@@ -401,6 +497,32 @@ class Migration(migrations.Migration):
                             "intentionally dropped)"
                         ),
                         null=True,
+                    ),
+                ),
+                # QueuedJob.job_name: remove unique=True from ORM state to match the physical
+                # schema after partitioning.  PG partitioned tables cannot carry a global
+                # single-column unique constraint (the partition key must be included in the
+                # unique set).  job_name uniqueness is enforced at application level in
+                # backend.create_job (new job always wins).  Without this AlterField, Django's
+                # ORM state reports unique=True while the DB has no such constraint — makemigrations
+                # --check would then produce spurious drift.
+                #
+                # Old (missing state_operation — ORM state still declared unique=True while the
+                # physical DB constraint was gone, causing silent schema drift and potential future
+                # makemigrations churn):
+                # (no AlterField for job_name existed)
+                migrations.AlterField(
+                    model_name="queuedjob",
+                    name="job_name",
+                    field=models.CharField(
+                        max_length=255,
+                        null=True,
+                        blank=True,
+                        db_index=True,
+                        # unique intentionally omitted: global uniqueness across partitions requires
+                        # the partition key in the constraint (D4 note).  App-level enforcement
+                        # in backend.create_job: named job always wins (stop + delete conflicts).
+                        help_text="Optional unique string identifier (e.g. 'send-invoice-123')",
                     ),
                 ),
             ],

@@ -501,11 +501,23 @@ class QueuedJob(models.Model):
     )
 
     # Optional unique string identifier (e.g. 'send-invoice-123')
+    # Old: unique=True — cannot exist on a PG partitioned table without including the
+    # partition key (created_at) in the constraint.  Uniqueness is enforced at application
+    # level in backend.create_job: named job always wins (stop + delete conflicts before
+    # insert).  unique=True removed by migration 0030 state_operations AlterField to keep
+    # ORM state in sync with the physical schema after the partitioned cutover.
+    # job_name = models.CharField(
+    #     max_length=255,
+    #     null=True,
+    #     blank=True,
+    #     unique=True,
+    #     db_index=True,
+    #     help_text="Optional unique string identifier (e.g. 'send-invoice-123')",
+    # )
     job_name = models.CharField(
         max_length=255,
         null=True,
         blank=True,
-        unique=True,
         db_index=True,
         help_text="Optional unique string identifier (e.g. 'send-invoice-123')",
     )
