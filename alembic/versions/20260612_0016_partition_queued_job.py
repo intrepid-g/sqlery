@@ -193,8 +193,15 @@ def upgrade() -> None:
     # Old (wrong — IF NOT EXISTS finds the name on legacy and silently skips):
     # CREATE INDEX IF NOT EXISTS sqlery_job_pending_idx ...
     bind.execute(text("DROP INDEX IF EXISTS sqlery_job_pending_idx;"))
+    # WR-02: add IF NOT EXISTS so a partial-failure re-run (crash between S6 and S9)
+    # does not hit "already exists" on the partitioned table. On the FIRST run the
+    # preceding DROP IF EXISTS removed the index from the legacy table, so IF NOT EXISTS
+    # correctly creates it fresh on the partitioned parent; on a re-run the index is
+    # already on the partitioned table and IF NOT EXISTS skips creation.
+    # Old (no guard — re-run fails with "already exists"):
+    # CREATE INDEX sqlery_job_pending_idx ...
     bind.execute(text("""
-        CREATE INDEX sqlery_job_pending_idx
+        CREATE INDEX IF NOT EXISTS sqlery_job_pending_idx
             ON sqlery_queued_job (queue_name, priority DESC, created_at)
             WHERE status = 'queued';
     """))
@@ -301,6 +308,18 @@ def downgrade() -> None:
     """))
 
     # Step 4 — Promote unpartitioned copy to sqlery_queued_job.
-    bind.execute(text(
-        "ALTER TABLE sqlery_queued_job_unpartitioned RENAME TO sqlery_queued_job;"
-    ))
+    # WR-01: wrap in an existence guard (mirrors Step 3's dual-guard) so a re-run
+    # after a crash between this rename and recording the new head does not fail
+    # because sqlery_queued_job_unpartitioned was already renamed away.
+    # Old (bare rename — not idempotent):
+    # bind.execute(text(
+    #     "ALTER TABLE sqlery_queued_job_unpartitioned RENAME TO sqlery_queued_job;"
+    # ))
+    bind.execute(text("""
+        DO $$ BEGIN
+            IF to_regclass('public.sqlery_queued_job_unpartitioned') IS NOT NULL
+               AND to_regclass('public.sqlery_queued_job') IS NULL THEN
+                ALTER TABLE sqlery_queued_job_unpartitioned RENAME TO sqlery_queued_job;
+            END IF;
+        END $$;
+    """))
