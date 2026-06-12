@@ -78,9 +78,18 @@ class DjangoBackend(DatabaseBackend):
                 row = cur.fetchone()
             self._partitioned_pg_cache = bool(row and row[0])
         except Exception:
-            # Fail safe: treat as non-partitioned so we never route to PG-only
-            # reclaim/promotion paths against a table that isn't partitioned.
-            self._partitioned_pg_cache = False
+            # Old: self._partitioned_pg_cache = False
+            # WR-01: do NOT permanently cache False on a transient DB error — a
+            # connection-pool warmup failure at startup would disable all partition
+            # routing for the lifetime of the process with no retry. Leave the cache
+            # unset (None) so the next call retries; only write the cache on a
+            # successful catalog query above. Return False for this call to fail safe
+            # (never route to PG-only paths against a potentially non-partitioned table).
+            logger.warning(
+                "_partitioned_pg: catalog query failed — will retry on next call",
+                exc_info=True,
+            )
+            return False
         return self._partitioned_pg_cache
 
     def get_raw_cursor(self):
