@@ -116,6 +116,11 @@ DEFAULTS = {
     "SQLITE_WAL_MODE": True,          # Enable WAL journal mode for SQLite
     "PG_STATEMENT_TIMEOUT_MS": 30000, # PostgreSQL statement_timeout (ms), 0=disabled
     "PG_LOCK_TIMEOUT_MS": 10000,      # PostgreSQL lock_timeout (ms), 0=disabled
+
+    # Opt-in PG LISTEN/NOTIFY dispatch (Phase 18 — D1/D8).
+    # Default False = byte-identical polling behaviour when off.
+    # This is the ONLY feature flag in the listen-notify milestone.
+    "SQLERY_PG_NOTIFY": False,
 }
 
 
