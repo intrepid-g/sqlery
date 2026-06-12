@@ -103,7 +103,12 @@ Plans:
   1. EXPLAIN on each of the 11 checklist write paths shows single-partition pruning
   2. Full claim → run → complete → reclaim lifecycle test passes on a partitioned table
   3. SQLite divergence matrix green
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 16-01-PLAN.md — Migration 0031 (secondary indexes) + _partitioned_pg() + get_raw_cursor() + SQLite staging gate in create_job
+- [ ] 16-02-PLAN.md — Write-path pruning items 1-6: created_at in CAS filters (db_compat.py + models.py mark_*)
+- [ ] 16-03-PLAN.md — cleanup_jobs routing + vacuum skip + write-path items 7-11 + 4 remaining metrics in daemon
+- [ ] 16-04-PLAN.md — EXPLAIN pruning tests (11 items) + lifecycle test + divergence matrix + staging test updates
 
 ### Phase 17: fastapi-parity
 **Goal**: The standalone/SQLAlchemy mode has full partition parity — fresh installs partition by default, config keys mirrored, sync + async backends route cleanup and prune writes
@@ -133,7 +138,7 @@ Plans:
 | 13. partition-core | 3/3 | Complete   | 2026-06-11 |
 | 14. scheduled-job-staging | 3/3 | Complete   | 2026-06-11 |
 | 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
-| 16. backend-wiring-pruning | 0/TBD | Not started | - |
+| 16. backend-wiring-pruning | 0/4 | Not started | - |
 | 17. fastapi-parity | 0/TBD | Not started | - |
 | 18. listen-notify (optional) | 0/TBD | Not started | - |
 
