@@ -612,6 +612,15 @@ class TestCleanup:
         result = sync_backend.cleanup_jobs(max_age_days=1)
         assert result["deleted"] >= 1
 
+    def test_cleanup_jobs_max_age_dry_run(self, sync_backend):
+        # CR-01 regression: on the SQLite/non-partitioned branch, the dry_run
+        # path referenced `cutoff` before it was assigned, raising
+        # NameError when called with max_age_days + dry_run together.
+        _create_basic_job(sync_backend)
+        result = sync_backend.cleanup_jobs(max_age_days=7, dry_run=True)
+        assert result["deleted"] == 0
+        assert "count" in result
+
     def test_cleanup_jobs_by_count(self, sync_backend):
         for _ in range(5):
             _create_basic_job(sync_backend)

@@ -912,6 +912,15 @@ class SQLAlchemyBackend(DatabaseBackend):
             #     cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
             #     stmt = stmt.where(QueuedJob.created_at < cutoff)
 
+            # CR-01: hoist `cutoff` ABOVE the dry_run fork. Previously `cutoff` was
+            # only assigned in the non-dry-run path (~line 946), so the dry_run path
+            # at line 924 referenced an undefined name and raised
+            # NameError: name 'cutoff' is not defined whenever
+            # cleanup_jobs(max_age_days=N, dry_run=True) was called.
+            cutoff = None
+            if max_age_days:
+                cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+
             if dry_run:
                 # Count without deleting
                 # from sqlmodel import select, func  # moved to top-level
@@ -920,7 +929,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                     count_stmt = count_stmt.where(QueuedJob.status == status)
                 if queue_name:
                     count_stmt = count_stmt.where(QueuedJob.queue_name == queue_name)
-                if max_age_days:
+                if max_age_days and cutoff is not None:
                     count_stmt = count_stmt.where(QueuedJob.created_at < cutoff)
                 count = session.exec(count_stmt).one()
                 return {"deleted": 0, "count": count}
@@ -943,7 +952,8 @@ class SQLAlchemyBackend(DatabaseBackend):
             if queue_name:
                 id_stmt = id_stmt.where(QueuedJob.queue_name == queue_name)
             if max_age_days:
-                cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+                # Old: cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+                # CR-01: cutoff is now computed above the dry_run fork; reuse it here.
                 id_stmt = id_stmt.where(QueuedJob.created_at < cutoff)
             id_stmt = id_stmt.order_by(QueuedJob.id).limit(CLEANUP_BATCH_SIZE)
 
