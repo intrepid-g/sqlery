@@ -25,7 +25,7 @@
 - [x] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition (completed 2026-06-11)
 - [x] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0030 with rename-based rollback (highest risk; gates everything after) (completed 2026-06-12)
 - [x] **Phase 16: backend-wiring-pruning** - Route Django cleanup/vacuum to partition reclaim and prune all 11 id-only write paths to a single partition (completed 2026-06-12)
-- [ ] **Phase 17: fastapi-parity** - Mirror the partition stack in `fastapi_sqlery/` (DDL, config keys, sync + async backends); re-verify R1–R6 for SQLAlchemy
+- [x] **Phase 17: fastapi-parity** - Mirror the partition stack in `fastapi_sqlery/` (DDL, config keys, sync + async backends); re-verify R1–R6 for SQLAlchemy (completed 2026-06-12)
 - [ ] **Phase 18: listen-notify** - Optional opt-in `SQLERY_PG_NOTIFY` sub-100 ms dispatch; may be deferred or dropped
 
 ## Phase Details
@@ -120,10 +120,10 @@ Plans:
   2. Fresh install via `database.py` creates a partitioned table by default
 **Plans**: 4 plans
 Plans:
-- [ ] 17-01-PLAN.md — QueuedJob composite PK + ScheduledJobStaging SQLModel + StandaloneConfig partition keys
-- [ ] 17-02-PLAN.md — database.py partitioned DDL (PG fresh install) + Alembic cutover revision 0016
-- [ ] 17-03-PLAN.md — backend.py + async_backend.py: _partitioned_pg, get_raw_cursor, cleanup routing, staging, write-path pruning
-- [ ] 17-04-PLAN.md — Standalone lifecycle test (SC-1 sync + async) + fresh-install test (SC-2) + divergence matrix
+- [x] 17-01-PLAN.md — QueuedJob composite PK + ScheduledJobStaging SQLModel + StandaloneConfig partition keys
+- [x] 17-02-PLAN.md — database.py partitioned DDL (PG fresh install) + Alembic cutover revision 0016
+- [x] 17-03-PLAN.md — backend.py + async_backend.py: _partitioned_pg, get_raw_cursor, cleanup routing, staging, write-path pruning
+- [x] 17-04-PLAN.md — Standalone lifecycle test (SC-1 sync + async) + fresh-install test (SC-2) + divergence matrix
 
 ### Phase 18: listen-notify
 **Goal**: Opt-in sub-100 ms worker dispatch via PG LISTEN/NOTIFY, byte-identical behavior when the flag is off — OPTIONAL: may be deferred or dropped without affecting milestone "done" (D10)
@@ -144,7 +144,7 @@ Plans:
 | 14. scheduled-job-staging | 3/3 | Complete   | 2026-06-11 |
 | 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
 | 16. backend-wiring-pruning | 4/4 | Complete   | 2026-06-12 |
-| 17. fastapi-parity | 0/4 | Not started | - |
+| 17. fastapi-parity | 4/4 | Complete   | 2026-06-12 |
 | 18. listen-notify (optional) | 0/TBD | Not started | - |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
