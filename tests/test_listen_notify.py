@@ -280,6 +280,67 @@ class TestForkSafety:
 
 
 # ===========================================================================
+# WR-01: CONNECTION LEAK ON ERROR / REOPEN (no PG needed, mocked)
+# ===========================================================================
+
+
+class TestOpenListenConnNoLeak:
+    """WR-01: a failed LISTEN setup or a reopen must not leak the psycopg conn."""
+
+    def test_listen_failure_closes_connection(self):
+        """If LISTEN raises, the opened connection is closed, not orphaned."""
+        worker = _make_worker_process(queues=["default"])
+
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("permission denied on channel")
+
+        with (
+            patch(
+                "sqlery.core.worker.get_config",
+                side_effect=lambda key, default=None: (
+                    True if key == "SQLERY_PG_NOTIFY"
+                    else "postgresql://u:p@h/db" if key == "DATABASE_URL"
+                    else default
+                ),
+            ),
+            patch("sqlery.core.worker._psycopg_available", True),
+            patch("sqlery.core.worker._psycopg") as mock_psycopg,
+        ):
+            mock_psycopg.connect.return_value = mock_conn
+            worker._open_listen_conn()
+
+        mock_conn.close.assert_called_once()
+        assert worker._listen_conn is None
+
+    def test_reopen_closes_previous_connection(self):
+        """Reopening closes the prior _listen_conn before opening a new one."""
+        worker = _make_worker_process(queues=["default"])
+
+        stale_conn = MagicMock()
+        worker._listen_conn = stale_conn
+
+        new_conn = MagicMock()
+
+        with (
+            patch(
+                "sqlery.core.worker.get_config",
+                side_effect=lambda key, default=None: (
+                    True if key == "SQLERY_PG_NOTIFY"
+                    else "postgresql://u:p@h/db" if key == "DATABASE_URL"
+                    else default
+                ),
+            ),
+            patch("sqlery.core.worker._psycopg_available", True),
+            patch("sqlery.core.worker._psycopg") as mock_psycopg,
+        ):
+            mock_psycopg.connect.return_value = new_conn
+            worker._open_listen_conn()
+
+        stale_conn.close.assert_called_once()
+        assert worker._listen_conn is new_conn
+
+
+# ===========================================================================
 # SC1: SUB-100MS LATENCY TEST (PG required)
 # ===========================================================================
 
