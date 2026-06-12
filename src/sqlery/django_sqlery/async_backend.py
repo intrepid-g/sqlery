@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 class DjangoAsyncBackend(AsyncDatabaseBackend):
     """Async backend backed by the Django ORM (native async, no thread offload)."""
 
+    def _partitioned_pg(self) -> bool:
+        """True iff on PostgreSQL AND sqlery_queued_job is partitioned.
+
+        Parity with DjangoBackend._partitioned_pg so async callers can branch on
+        partitioning (e.g. cleanup→reclaim routing). SQLite / non-partitioned PG
+        return False (D6 — unchanged path).
+        """
+        if connection.vendor != "postgresql":
+            return False
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT relkind = 'p' FROM pg_class "
+                    "WHERE relname = %s AND relnamespace = 'public'::regnamespace",
+                    [QueuedJob._meta.db_table],
+                )
+                row = cur.fetchone()
+            return bool(row and row[0])
+        except Exception:
+            return False
+
     # ----- claim path ------------------------------------------------------
 
     async def aclaim_job(self, queues: list[str], worker_id: str):
