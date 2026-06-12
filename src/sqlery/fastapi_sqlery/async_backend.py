@@ -101,12 +101,13 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             return False
         try:
             with engine.connect() as conn:
+                # Old: %s + [list] — SQLAlchemy text() needs :named binds (Bug-SA-01).
                 result = conn.execute(
                     text(
                         "SELECT relkind = 'p' FROM pg_class "
-                        "WHERE relname = %s AND relnamespace = 'public'::regnamespace"
+                        "WHERE relname = :name AND relnamespace = 'public'::regnamespace"
                     ),
-                    [QueuedJob.__tablename__],
+                    {"name": QueuedJob.__tablename__},
                 )
                 row = result.fetchone()
             self._partitioned_pg_cache = bool(row and row[0])

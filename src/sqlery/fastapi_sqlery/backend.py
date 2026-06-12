@@ -86,12 +86,16 @@ class SQLAlchemyBackend(DatabaseBackend):
             return False
         try:
             with engine.connect() as conn:
+                # Old: text("... relname = %s ...") + [list] — SQLAlchemy 2.x text()
+                # uses :named binds, NOT %s/positional; psycopg3 silently matched
+                # nothing so _partitioned_pg always returned False (Bug-SA-01),
+                # disabling ALL partition routing on PG.
                 result = conn.execute(
                     text(
                         "SELECT relkind = 'p' FROM pg_class "
-                        "WHERE relname = %s AND relnamespace = 'public'::regnamespace"
+                        "WHERE relname = :name AND relnamespace = 'public'::regnamespace"
                     ),
-                    [QueuedJob.__tablename__],
+                    {"name": QueuedJob.__tablename__},
                 )
                 row = result.fetchone()
             self._partitioned_pg_cache = bool(row and row[0])
