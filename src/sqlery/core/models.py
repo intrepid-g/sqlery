@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import Index, DateTime
+from sqlalchemy import BigInteger, Index, DateTime
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -56,12 +56,34 @@ class ScheduledTask(SQLModel, table=True):
 
 
 class QueuedJob(SQLModel, table=True):
-    """A job in the queue, waiting to be executed or already processed."""
+    """A job in the queue, waiting to be executed or already processed.
+
+    Schema note: composite primary key (created_at, id) mirrors the Django
+    model for partition parity. On PostgreSQL the id column draws from the
+    shared sqlery_job_id_seq sequence (wired in the Alembic migration in
+    plan 17-02). On SQLite the integer column draws from the implicit rowid.
+    """
 
     __tablename__ = "sqlery_queued_job"
 
-    # Primary key
-    id: int | None = Field(default=None, primary_key=True)
+    # Composite primary key — id first for SQLAlchemy ordering; created_at
+    # second so that partition pruning on created_at works for both backends.
+    #
+    # id assignment strategy (two-tier):
+    #   - SQLite (dev/test): Python-side default generates a 62-bit integer
+    #     from the lower bits of a UUID v7 (time-sortable, globally unique).
+    #   - PostgreSQL (production): the Alembic migration in plan 17-02 replaces
+    #     the column default with nextval('sqlery_job_id_seq') so the shared
+    #     sequence assigns ids instead of this Python default.
+    #
+    # Note: autoincrement=True is intentionally absent — SQLite does not
+    # support AUTOINCREMENT for composite primary keys and raises CompileError.
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, nullable=False),
+    )
+    # created_at is also part of the PK so partitioned tables can route rows
+    # by time range. default_factory ensures a value is always set on insert.
 
     # Task definition
     task_path: str = Field(max_length=500, description="Python path to callable (e.g., 'myapp.tasks.my_function')")
@@ -120,8 +142,12 @@ class QueuedJob(SQLModel, table=True):
     scheduled_task_id: int | None = Field(default=None, foreign_key="sqlery_scheduled_task.id")
     worker_id: UUID | None = Field(default=None, foreign_key="sqlery_worker.id")
 
-    # Timing
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="When job was enqueued")
+    # Timing — created_at is part of the composite PK (created_at, id)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        primary_key=True,
+        description="When job was enqueued (also part of composite PK for partitioning)",
+    )
     scheduled_at: datetime | None = Field(default=None, index=True, description="When job should run (NULL = run immediately)")
     started_at: datetime | None = Field(default=None, description="When execution began")
     finished_at: datetime | None = Field(default=None, description="When execution completed")
@@ -223,6 +249,69 @@ class QueuedJob(SQLModel, table=True):
         return self.retry_backoff * (2 ** self.retry_count)
 
 
+class ScheduledJob(SQLModel, table=True):
+    """Staging table for jobs that are scheduled to run at a future time.
+
+    Mirrors Django's ScheduledJob model shape for drop-in compatibility.
+    Rows are promoted to QueuedJob when their scheduled_at time arrives.
+    The id uses the shared sqlery_job_id_seq sequence on PostgreSQL (wired
+    in the Alembic migration in plan 17-02). On SQLite it is rowid-backed.
+    """
+
+    __tablename__ = "sqlery_scheduled_job"
+
+    # Composite primary key matching QueuedJob.
+    # id follows the same two-tier assignment strategy as QueuedJob.id.
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, nullable=False),
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        primary_key=True,
+        description="When the scheduled job was created (also part of composite PK)",
+    )
+
+    # Queue configuration
+    queue_name: str = Field(
+        default="default",
+        max_length=50,
+        index=True,
+        description="Queue name for job routing",
+    )
+
+    # Task definition
+    task_path: str = Field(
+        max_length=500,
+        description="Python path to callable (e.g., 'myapp.tasks.my_function')",
+    )
+    payload: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSON),
+        description="JSON payload (keyword arguments) to pass to the task function",
+    )
+
+    # Scheduling
+    scheduled_at: datetime = Field(
+        description="When the job should be promoted to QueuedJob and executed",
+    )
+
+    # Job configuration
+    priority: int = Field(
+        default=0,
+        description="Priority for the resulting QueuedJob (higher = sooner)",
+    )
+    max_retries: int = Field(
+        default=0,
+        description="Maximum number of retry attempts (0 = no retries)",
+    )
+
+    class Config:
+        """SQLModel configuration."""
+
+        table = True
+
+
 class JobRegistry(SQLModel, table=True):
     """Track job lifecycle in registries (RQ-compatible)."""
 
@@ -231,7 +320,7 @@ class JobRegistry(SQLModel, table=True):
     # Primary key
     id: int | None = Field(default=None, primary_key=True)
 
-    # Foreign key
+    # Foreign key — references sqlery_queued_job.id (not composite FK; id is sufficient)
     job_id: int = Field(foreign_key="sqlery_queued_job.id", description="Job being tracked")
 
     # Registry type
@@ -335,3 +424,42 @@ class DaemonLease(SQLModel, table=True):
     expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), index=True))
     # Optimistic locking (SQLite CAS) — mirrors QueuedJob.version (models.py:113-114)
     version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
+
+
+# ---------------------------------------------------------------------------
+# SQLite composite-PK id generation (event listener)
+# ---------------------------------------------------------------------------
+# SQLite does not support autoincrement for composite primary keys.  When id
+# is None before a flush we assign a 62-bit time-sortable integer derived from
+# a UUID v7.  On PostgreSQL, the Alembic migration in plan 17-02 replaces the
+# column default with nextval('sqlery_job_id_seq'), so this code path is never
+# reached there (PG inserts will always carry a server_default).
+#
+# The listener is registered on the SQLAlchemy Session class (not per-session)
+# so it applies to all sessions created from any engine.
+
+from sqlalchemy import event as _sa_event
+from sqlalchemy.orm import Session as _SASession
+
+
+def _generate_job_id_from_uuid7() -> int:
+    """Generate a 62-bit time-sortable integer from a UUID v7.
+
+    UUID v7 is a 128-bit time-ordered value.  We take the lower 62 bits
+    to stay within signed BigInteger range on all databases.
+    """
+    return uuid7().int & ((1 << 62) - 1)
+
+
+@_sa_event.listens_for(_SASession, "before_flush")
+def _assign_composite_pk_ids(session, flush_context, instances):
+    """Auto-assign id for QueuedJob/ScheduledJob rows that have id=None.
+
+    This hook fires before every flush.  It only acts on new objects
+    (session.new) whose id attribute is None, so it is safe to call
+    multiple times and does not overwrite ids supplied by the caller or
+    by a PostgreSQL sequence server_default.
+    """
+    for obj in session.new:
+        if isinstance(obj, (QueuedJob, ScheduledJob)) and obj.id is None:
+            obj.id = _generate_job_id_from_uuid7()
