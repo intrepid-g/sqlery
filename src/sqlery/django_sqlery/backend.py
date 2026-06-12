@@ -23,6 +23,11 @@ from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
 from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker, ScheduledJob
 from .settings import get_setting
 from sqlery.core.claiming import claim_next_job_with_queue_priority
+# Partition maintenance helpers — guarded against psycopg absence (standalone/SQLite installs)
+try:
+    from sqlery.core import partitioning as _partitioning
+except ImportError:
+    _partitioning = None  # psycopg not installed; partition reclaim path unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -401,9 +406,19 @@ class DjangoBackend(DatabaseBackend):
         #     status="failed", error="Cancelled by user"
         # )
         # return updated > 0
-        updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
-            status="failed", error="Cancelled by user"
-        )
+        # Item 7: Add created_at to filter so PG prunes to one partition (write-path pruning).
+        # SELECT created_at first (cancel_job receives only job_id, not the full job object).
+        # Old (id-only filter — does not prune to partition on PG):
+        # updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+        #     status="failed", error="Cancelled by user"
+        # )
+        row = self.QueuedJob.objects.filter(id=job_id, status="queued").values("created_at").first()
+        if row:
+            updated = self.QueuedJob.objects.filter(
+                id=job_id, created_at=row["created_at"], status="queued"
+            ).update(status="failed", error="Cancelled by user")
+        else:
+            updated = 0
         if updated > 0:
             return True
         deleted, _ = self.ScheduledJob.objects.filter(id=job_id).delete()
@@ -572,7 +587,55 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up old jobs based on retention policy."""
+        """Clean up old jobs based on retention policy.
+
+        On a partitioned PostgreSQL install (self._partitioned_pg() is True),
+        routes to reclaim_drained_partitions which drops entire drained partitions
+        instead of batched DELETEs (D5 — see loud comment below). Advisory lock
+        (pg_try_advisory_lock) is acquired inside reclaim_drained_partitions; if
+        not acquired the call returns 0 without error (T-16-09).
+
+        On SQLite or non-partitioned PG, keeps the Phase-12 keyset-batched DELETE
+        loop byte-for-byte unchanged (D6).
+        """
+        # --- D5: Partition reclaim path (PostgreSQL + partitioned table) ---
+        if self._partitioned_pg() and _partitioning is not None:
+            if dry_run:
+                # dry_run is not meaningful for partition-drop path; return estimate
+                query = self.QueuedJob.objects.all()
+                if status:
+                    query = query.filter(status=status)
+                if queue_name:
+                    query = query.filter(queue_name=queue_name)
+                if max_age_days:
+                    cutoff = timezone.now() - timedelta(days=max_age_days)
+                    query = query.filter(created_at__lt=cutoff)
+                count = query.count()
+                return {"deleted": 0, "count": count}
+
+            retention_str = get_setting("SQLERY_PARTITION_RETENTION", "30 days")
+            archive_hook = get_setting("SQLERY_PARTITION_ARCHIVE_HOOK", None)
+            cur = self.get_raw_cursor()
+            # D5: Partition reclaim destroys all jobs in drained partitions (beyond
+            # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
+            # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
+            # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
+            # to archive instead. The archive hook receives (cur, partition_name)
+            # and must not execute arbitrary SQL via string interpolation (T-16-07).
+            dropped = _partitioning.reclaim_drained_partitions(
+                cur, self.QueuedJob._meta.db_table, retention_str, archive_hook
+            )
+            return {
+                "deleted": 0,
+                "reclaimed_via_partition_drop": True,
+                "dropped_partitions": dropped,
+                "note": (
+                    "Partition reclaim: jobs beyond retention destroyed by default (D5). "
+                    "Set SQLERY_PARTITION_ARCHIVE_HOOK to archive instead."
+                ),
+            }
+
+        # --- SQLite or non-partitioned PG: Phase-12 batched DELETE loop (D6 — unchanged) ---
         query = self.QueuedJob.objects.all()
 
         if status:
@@ -669,7 +732,14 @@ class DjangoBackend(DatabaseBackend):
 
     @retry_on_db_error()
     def vacuum_database(self) -> dict:
-        """Run database vacuum/optimize (PostgreSQL VACUUM)."""
+        """Run database vacuum/optimize (PostgreSQL VACUUM).
+
+        On a partitioned PG install, VACUUM ANALYZE on the parent table
+        (sqlery_queued_job) is skipped — partition DROP leaves nothing to
+        vacuum on the parent and individual partitions are vacuumed by
+        autovacuum per-child (D5/R3). Other tables are always vacuumed.
+        SQLite path is unchanged.
+        """
         # from django.db import connection  # moved to top-level
 
         with connection.cursor() as cursor:
@@ -679,7 +749,11 @@ class DjangoBackend(DatabaseBackend):
                     cursor.execute("VACUUM")
                 else:
                     # PostgreSQL: per-table VACUUM ANALYZE
-                    cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # Old (unconditional): cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # Partition DROP leaves nothing to vacuum on parent table; skip when partitioned.
+                    if not self._partitioned_pg():
+                        cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
                     cursor.execute("VACUUM ANALYZE sqlery_scheduled_task")
                     cursor.execute("VACUUM ANALYZE sqlery_registry")
                     cursor.execute("VACUUM ANALYZE sqlery_worker")
@@ -765,6 +839,10 @@ class DjangoBackend(DatabaseBackend):
         #     return self.QueuedJob.objects.get(id=job_id)
         # except self.QueuedJob.DoesNotExist:
         #     return None
+        # Item 10: Verified — this is a full-row SELECT by id (not an UPDATE).
+        # PG index scan by id is acceptable; partition pruning on SELECT is less
+        # critical than on UPDATE. Full row returned including created_at — no
+        # .only() that would drop the field. No change needed; checklist item 10 verified.
         try:
             return self.QueuedJob.objects.get(id=job_id)
         except self.QueuedJob.DoesNotExist:
@@ -800,20 +878,41 @@ class DjangoBackend(DatabaseBackend):
 
     def mark_job_archived(self, job_id: int):
         """Mark a failed job as archived (a retry has been created for it)."""
-        self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
+        # Item 8: Add created_at to filter so PG prunes to one partition (write-path pruning).
+        # Old (id-only filter — does not prune to partition on PG):
+        # self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
+        row = self.QueuedJob.objects.filter(id=job_id, status="failed").values("created_at").first()
+        if row:
+            self.QueuedJob.objects.filter(
+                id=job_id, created_at=row["created_at"], status="failed"
+            ).update(status="archived")
 
     def cascade_ancestor_status(self, job_id: int, status: str):
         """Walk parent_job_id chain, set all ancestors to given status."""
         current_id = (
             self.QueuedJob.objects.filter(id=job_id).values_list("parent_job_id", flat=True).first()
         )
+        # Item 9: Add created_at to the UPDATE filter so PG prunes to one partition.
+        # Fetch created_at + parent_job_id together in one query per iteration.
         while current_id:
-            self.QueuedJob.objects.filter(id=current_id).update(status=status)
-            current_id = (
+            # Old (id-only filter — does not prune to partition on PG):
+            # self.QueuedJob.objects.filter(id=current_id).update(status=status)
+            # current_id = (
+            #     self.QueuedJob.objects.filter(id=current_id)
+            #     .values_list("parent_job_id", flat=True)
+            #     .first()
+            # )
+            job_row = (
                 self.QueuedJob.objects.filter(id=current_id)
-                .values_list("parent_job_id", flat=True)
+                .values("created_at", "parent_job_id")
                 .first()
             )
+            if not job_row:
+                break
+            self.QueuedJob.objects.filter(
+                id=current_id, created_at=job_row["created_at"]
+            ).update(status=status)
+            current_id = job_row["parent_job_id"]
 
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
         """Check if scheduled task has pending jobs."""
@@ -958,9 +1057,24 @@ class DjangoBackend(DatabaseBackend):
 
         return query.exists()
 
-    def update_job_child_pid(self, job_id: int, child_pid: int):
-        """Store the forked child PID on the job row."""
-        self.QueuedJob.objects.filter(id=job_id).update(child_pid=child_pid)
+    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None):
+        """Store the forked child PID on the job row.
+
+        Args:
+            job_id: QueuedJob primary key.
+            child_pid: PID of the forked child process.
+            created_at: Optional job creation timestamp. When provided, added to the
+                filter so PG prunes to one partition (write-path pruning, item 11).
+                Existing callers that omit it degrade gracefully to id-only filter.
+        """
+        # Item 11: When created_at is available from the caller (e.g. worker.py
+        # which holds the full job object), add it to the filter for partition pruning.
+        # Old (id-only — does not prune to partition on PG):
+        # self.QueuedJob.objects.filter(id=job_id).update(child_pid=child_pid)
+        filter_kwargs: dict = {"id": job_id}
+        if created_at is not None:
+            filter_kwargs["created_at"] = created_at
+        self.QueuedJob.objects.filter(**filter_kwargs).update(child_pid=child_pid)
 
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""

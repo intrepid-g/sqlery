@@ -170,40 +170,91 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         # Old: return await QueuedJob.objects.aget(pk=job.pk)
         return await QueuedJob.objects.aget(id=job.id)
 
+    # ----- cleanup routing (async mirror of DjangoBackend.cleanup_jobs) -----
+
+    async def acleanup_jobs(self, **kwargs) -> dict:
+        """Async cleanup routing — delegates reclaim to sync backend on PG+partitioned.
+
+        The partition reclaim path (reclaim_drained_partitions) requires a raw
+        synchronous psycopg cursor which is not available in the async backend.
+        On a partitioned PG install, log a warning and return a skip signal;
+        callers should invoke the sync backend.cleanup_jobs() from a daemon or
+        management command context instead.
+
+        On SQLite / non-partitioned PG, mirrors the sync batched-DELETE path
+        result format but is a no-op stub — the daemon always invokes the sync
+        backend for cleanup. Override in production if fully-async cleanup is needed.
+        """
+        if self._partitioned_pg():
+            # Partition reclaim is sync-only (psycopg cursor); defer to sync backend.
+            logger.warning(
+                "acleanup_jobs: Partition reclaim not yet available in async path — "
+                "call sync backend.cleanup_jobs() from a daemon or management command."
+            )
+            return {"skipped": True, "reason": "partition_reclaim_sync_only"}
+        # SQLite / non-partitioned PG: return stub — sync backend owns cleanup for now.
+        return {"skipped": True, "reason": "use_sync_cleanup_jobs"}
+
     # ----- terminal-status writes -----------------------------------------
 
     async def amark_running(self, job_id, worker_id) -> None:
         now = timezone.now()
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
         # pk is now a composite (created_at, id); filter by id only.
-        await QueuedJob.objects.filter(id=job_id).aupdate(
-            status="running", started_at=now
-        )
+        # Add created_at to filter for partition pruning (write-path item, async mirror).
+        # Old (id-only — does not prune to partition on PG):
+        # await QueuedJob.objects.filter(id=job_id).aupdate(status="running", started_at=now)
+        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
+        if job:
+            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
+                status="running", started_at=now
+            )
 
     async def amark_success(self, job_id, result) -> None:
         now = timezone.now()
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
-        await QueuedJob.objects.filter(id=job_id).aupdate(
-            status="success",
-            finished_at=now,
-            output="" if result is None else str(result),
-        )
+        # Add created_at to filter for partition pruning (write-path item, async mirror).
+        # Old (id-only — does not prune to partition on PG):
+        # await QueuedJob.objects.filter(id=job_id).aupdate(
+        #     status="success", finished_at=now, output=...
+        # )
+        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
+        if job:
+            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
+                status="success",
+                finished_at=now,
+                output="" if result is None else str(result),
+            )
 
     async def amark_failed(
         self, job_id, error: str, traceback: str | None = None
     ) -> None:
         now = timezone.now()
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
-        await QueuedJob.objects.filter(id=job_id).aupdate(
-            status="failed",
-            finished_at=now,
-            error=error or "",
-            traceback=traceback or "",
-        )
+        # Add created_at to filter for partition pruning (write-path item, async mirror).
+        # Old (id-only — does not prune to partition on PG):
+        # await QueuedJob.objects.filter(id=job_id).aupdate(
+        #     status="failed", finished_at=now, error=error or "", traceback=traceback or ""
+        # )
+        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
+        if job:
+            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
+                status="failed",
+                finished_at=now,
+                error=error or "",
+                traceback=traceback or "",
+            )
 
     async def amark_shutting_down(self, job_id) -> None:
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(status="shutting_down")
-        await QueuedJob.objects.filter(id=job_id).aupdate(status="shutting_down")
+        # Add created_at to filter for partition pruning (write-path item, async mirror).
+        # Old (id-only — does not prune to partition on PG):
+        # await QueuedJob.objects.filter(id=job_id).aupdate(status="shutting_down")
+        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
+        if job:
+            await QueuedJob.objects.filter(
+                id=job_id, created_at=job["created_at"]
+            ).aupdate(status="shutting_down")
 
     # ----- read paths ------------------------------------------------------
 
