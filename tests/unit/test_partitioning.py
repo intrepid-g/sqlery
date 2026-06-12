@@ -799,3 +799,56 @@ class TestDaemonHelpers:
         reclaim_sqls = " ".join(str(c[0][0]) for c in reclaim_cur.execute.call_args_list)
         assert "DROP" not in reclaim_sqls.upper(), "Lock loser must not execute DROP"
         assert "DETACH" not in reclaim_sqls.upper(), "Lock loser must not execute DETACH"
+
+
+# ---------------------------------------------------------------------------
+# CR-02: StandaloneConfig partition-key reconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestStandalonePartitionConfigKeys:
+    """CR-02: StandaloneConfig must store partition keys under the SQLERY_-prefixed
+    names the consumers (backend.py / daemon.py) request, with PG-interval STRING
+    types for interval/retention — not unprefixed keys with int months.
+    """
+
+    def test_retention_default_is_interval_string(self):
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+
+        cfg = StandaloneConfig()
+        # Consumers do get_config("SQLERY_PARTITION_RETENTION", "30 days").
+        assert cfg.get("SQLERY_PARTITION_RETENTION") == "30 days"
+        assert isinstance(cfg.get("SQLERY_PARTITION_RETENTION"), str)
+
+    def test_user_set_retention_is_honored_not_fallback(self):
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+
+        cfg = StandaloneConfig()
+        cfg.set("SQLERY_PARTITION_RETENTION", "90 days")
+        # The reclaim path reads exactly this key — must surface the user value,
+        # never the silent "30 days" fallback (the CR-02 bug).
+        assert cfg.get("SQLERY_PARTITION_RETENTION", "30 days") == "90 days"
+
+    def test_env_retention_loads_as_string(self, monkeypatch):
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+
+        monkeypatch.setenv("SQLERY_PARTITION_RETENTION", "60 days")
+        cfg = StandaloneConfig()
+        assert cfg.get("SQLERY_PARTITION_RETENTION") == "60 days"
+
+    def test_interval_and_premake_keys_prefixed(self):
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+
+        cfg = StandaloneConfig()
+        assert cfg.get("SQLERY_PARTITION_INTERVAL") == "1 day"
+        assert cfg.get("SQLERY_PARTITION_PREMAKE") == 7
+
+    def test_maintenance_interval_bound_tracks_partition_interval(self):
+        # IN-02: a maintenance cadence larger than the partition interval (in minutes)
+        # must be rejected at config write time, matching the daemon startup check.
+        from sqlery.fastapi_sqlery.config import StandaloneConfig
+
+        cfg = StandaloneConfig()
+        with pytest.raises(ValueError):
+            # interval is '1 day' (1440 min); 2000 min maintenance must fail.
+            cfg.set("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 2000)
