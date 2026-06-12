@@ -537,6 +537,15 @@ class WorkerProcess:
             f"{sorted(owned_queues) or 'none yet'}"
         )
 
+        # Phase 18: open LISTEN connection (no-op when SQLERY_PG_NOTIFY=False or SQLite).
+        self._open_listen_conn()
+        # FORK-SAFETY: _close_listen_conn runs as pre_fork hook in ForkSafeExecutor.fork()
+        # before os.fork() so the LISTEN connection is never inherited by child processes.
+        # _open_listen_conn re-opens in the parent via post_fork_parent so LISTEN resumes
+        # after each fork without blocking the child.
+        self._fork_ctx.register_pre_fork(self._close_listen_conn)
+        self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+
         try:
             while not self.shutdown_requested:
                 try:
@@ -587,11 +596,12 @@ class WorkerProcess:
                     if not job:
                         self._heartbeat('idle')
                         logger.info(".")
-                        elapsed = 0
-                        while elapsed < self.poll_interval and not self.shutdown_requested:
-                            time.sleep(1)
-                            elapsed += 1
-                            self._check_heartbeat()
+                        # elapsed = 0
+                        # while elapsed < self.poll_interval and not self.shutdown_requested:
+                        #     time.sleep(1)
+                        #     elapsed += 1
+                        #     self._check_heartbeat()
+                        self._wait_for_notify()
                         continue
 
                     # Check concurrency
@@ -605,11 +615,12 @@ class WorkerProcess:
                         # Sleep before retrying — without this the worker spins
                         # in a tight loop claiming and releasing the same job
                         # when a zombie running job blocks the queue.
-                        elapsed = 0
-                        while elapsed < self.poll_interval and not self.shutdown_requested:
-                            time.sleep(1)
-                            elapsed += 1
-                            self._check_heartbeat()
+                        # elapsed = 0
+                        # while elapsed < self.poll_interval and not self.shutdown_requested:
+                        #     time.sleep(1)
+                        #     elapsed += 1
+                        #     self._check_heartbeat()
+                        self._wait_for_notify()
                         continue
 
                     # Fork and execute
@@ -649,6 +660,8 @@ class WorkerProcess:
         except KeyboardInterrupt:
             logger.info(f"Worker {self.worker_id} interrupted")
         finally:
+            # Phase 18: close LISTEN connection on graceful shutdown.
+            self._close_listen_conn()
             try:
                 self.backend.update_worker_heartbeat(
                     worker_id=self.worker_id,
