@@ -28,6 +28,19 @@ class DatabaseBackend(ABC):
     Implementations provide database operations for either Django ORM or SQLAlchemy.
     """
 
+    def get_raw_cursor(self):
+        """Return a raw DB-API cursor for the daemon's PG-only maintenance loop.
+
+        Partition maintenance (promote_due_scheduled_jobs / reclaim_drained_
+        partitions / ensure_future_partitions) needs a live psycopg cursor.
+        Concrete backends override this to return a real cursor on partitioned
+        PostgreSQL. The default returns None so any backend that does not
+        implement it (or runs on SQLite / non-partitioned PG) causes the daemon
+        to skip PG-only maintenance cleanly instead of raising AttributeError.
+        Callers must close the cursor (and its underlying connection) themselves.
+        """
+        return None
+
     @abstractmethod
     def create_job(
         self,
