@@ -1,0 +1,122 @@
+"""PG LISTEN/NOTIFY helpers for sqlery Phase 18 opt-in dispatch."""
+
+import logging
+import re
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Phase 18: guard-import Django transaction at module level.
+# Set _django_transaction = None if Django is not installed.
+try:
+    from django.db import transaction as _django_transaction
+except ImportError:
+    _django_transaction = None  # type: ignore[assignment]
+
+# Phase 18: guard-import SQLAlchemy text() at module level.
+# Set _sa_text = None if SQLAlchemy is not installed.
+try:
+    from sqlalchemy import text as _sa_text
+except ImportError:
+    _sa_text = None  # type: ignore[assignment]
+
+__all__ = ["sanitize_queue_name_to_channel", "notify_queue_django", "notify_queue_sqlalchemy"]
+
+
+def sanitize_queue_name_to_channel(queue_name: str) -> str:
+    """Sanitize a queue name into a safe PostgreSQL NOTIFY channel identifier.
+
+    Replaces any character outside [a-zA-Z0-9_] with underscore, prepends
+    'sqlery_job_', and truncates the result to 63 characters (the PostgreSQL
+    identifier length limit).
+
+    Security: the re.sub guarantee ensures the channel is composed only of
+    alphanumeric chars and underscores before being passed to pg_notify via a
+    parameterized query — no injection risk even from untrusted queue names.
+
+    Args:
+        queue_name: Raw queue name from application code.
+
+    Returns:
+        A safe channel string matching pattern sqlery_job_<sanitized_queue>.
+
+    Raises:
+        ValueError: If queue_name is empty or whitespace-only.
+    """
+    if not queue_name or not queue_name.strip():
+        raise ValueError("queue_name must be non-empty")
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", queue_name)
+    channel = f"sqlery_job_{sanitized}"
+    return channel[:63]
+
+
+def _fire_django_notify(channel: str) -> None:
+    """Execute pg_notify on the active Django DB connection.
+
+    Called inside transaction.on_commit so it fires after the INSERT commits.
+    Wrapped in try/except so a NOTIFY failure never crashes the enqueue call.
+
+    Args:
+        channel: Pre-sanitized PG channel name.
+    """
+    try:
+        from django.db import connection  # noqa: PLC0415 — guarded import
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_notify(%s, '')", [channel])
+    except Exception:
+        logger.warning("pg_notify fire failed for channel %r", channel, exc_info=True)
+
+
+def notify_queue_django(queue_name: str) -> None:
+    """Emit pg_notify after Django transaction commits. No-op on SQLite or non-PG.
+
+    Schedules a pg_notify('sqlery_job_<sanitized_queue>', '') via
+    transaction.on_commit so the notification fires only after the job INSERT
+    has been committed to the database.
+
+    Args:
+        queue_name: Queue name to notify on.
+    """
+    if _django_transaction is None:
+        return
+    try:
+        from django.db import connection  # noqa: PLC0415 — guarded import
+        if connection.vendor != "postgresql":
+            return
+    except Exception:
+        return
+    channel = sanitize_queue_name_to_channel(queue_name)
+    _django_transaction.on_commit(lambda: _fire_django_notify(channel))
+
+
+def notify_queue_sqlalchemy(queue_name: str, session: Any) -> None:
+    """Emit pg_notify after SQLAlchemy session.commit(). No-op on SQLite.
+
+    Executes SELECT pg_notify(:ch, '') inside the currently open session
+    (after session.commit() but before the 'with' block exits), so the
+    notification fires in the same transaction round-trip.
+
+    Args:
+        queue_name: Queue name to notify on.
+        session: Open SQLAlchemy/SQLModel session (still active after commit).
+    """
+    if _sa_text is None:
+        return
+    try:
+        # Support both session.get_bind().dialect.name and session.bind.dialect.name
+        try:
+            dialect_name = session.get_bind().dialect.name
+        except Exception:
+            bind = getattr(session, "bind", None)
+            if bind is None:
+                return
+            dialect_name = bind.dialect.name
+        if dialect_name != "postgresql":
+            return
+    except Exception:
+        return
+    channel = sanitize_queue_name_to_channel(queue_name)
+    try:
+        session.execute(_sa_text("SELECT pg_notify(:ch, '')"), {"ch": channel})
+    except Exception:
+        logger.warning("pg_notify fire failed for channel %r", channel, exc_info=True)
