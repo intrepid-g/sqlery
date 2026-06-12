@@ -187,7 +187,8 @@ class TestSQLiteNoOp:
                 "sqlery.core.pg_notify._django_transaction",
                 mock_transaction,
             ),
-            patch("django.db.connection", mock_connection),
+            # Phase 18 (IN-01): code now reads the module-level _django_connection.
+            patch("sqlery.core.pg_notify._django_connection", mock_connection),
         ):
             notify_queue_django("default")
 
