@@ -335,19 +335,25 @@ class SQLAlchemyBackend(DatabaseBackend):
             session.add(job)
             session.commit()
             session.refresh(job)
-            # Phase 18 (D1): emit pg_notify inside the open session after commit.
-            # The session is still usable here; SELECT pg_notify fires in the same
-            # connection round-trip. No-op when SQLERY_PG_NOTIFY=False (default) or
-            # SQLite. Any NOTIFY failure is caught + logged inside notify_queue_sqlalchemy
-            # — never crashes enqueue. Staging path (ScheduledJob) does NOT reach here.
-            if (
-                _notify_queue_sqlalchemy is not None
-                and get_config("SQLERY_PG_NOTIFY", False)
-                and get_engine().dialect.name == "postgresql"
-            ):
-                _notify_queue_sqlalchemy(queue_name, session)
 
-        # Old: return job — moved here so the with-block can call notify before closing
+        # Phase 18 (D1) + CR-01: emit pg_notify on a separate AUTOCOMMIT
+        # connection AFTER the session-with-block has committed and closed.
+        # Old: notify was called inside the with-block through the session,
+        #      which SA2 put in an implicit transaction that session.close()
+        #      rolled back — NOTIFY was never dispatched (CR-01).
+        # Old (inside the with-block):
+        #     if (... and get_engine().dialect.name == "postgresql"):
+        #         _notify_queue_sqlalchemy(queue_name, session)
+        # No-op when SQLERY_PG_NOTIFY=False (default) or on SQLite. Any NOTIFY
+        # failure is caught + logged inside notify_queue_sqlalchemy — never
+        # crashes enqueue. Staging path (ScheduledJob) does NOT reach here.
+        if (
+            _notify_queue_sqlalchemy is not None
+            and get_config("SQLERY_PG_NOTIFY", False)
+            and get_engine().dialect.name == "postgresql"
+        ):
+            _notify_queue_sqlalchemy(queue_name, get_engine())
+
         return job
 
     def claim_job(self, queues: list[str], worker_id: str):

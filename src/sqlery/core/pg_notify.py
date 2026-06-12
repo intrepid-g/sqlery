@@ -111,34 +111,41 @@ def notify_queue_django(queue_name: str) -> None:
     _django_transaction.on_commit(lambda: _fire_django_notify(channel))
 
 
-def notify_queue_sqlalchemy(queue_name: str, session: Any) -> None:
-    """Emit pg_notify after SQLAlchemy session.commit(). No-op on SQLite.
+def notify_queue_sqlalchemy(queue_name: str, engine: Any) -> None:
+    """Emit pg_notify on a dedicated AUTOCOMMIT connection. No-op on SQLite.
 
-    Executes SELECT pg_notify(:ch, '') inside the currently open session
-    (after session.commit() but before the 'with' block exits), so the
-    notification fires in the same transaction round-trip.
+    CR-01 fix: the previous implementation called ``session.execute(SELECT
+    pg_notify(...))`` AFTER ``session.commit()``. SQLAlchemy 2's autobegin
+    semantics opened a fresh implicit transaction for that execute, which
+    ``get_session()``'s ``finally: session.close()`` then ROLLED BACK — so
+    PostgreSQL never dispatched the NOTIFY (it only dispatches on COMMIT).
+    Firing on a separate AUTOCOMMIT connection means there is no transaction
+    to roll back; the notification is delivered immediately.
+
+    Any NOTIFY failure is caught and logged — never crashes the enqueue call.
 
     Args:
         queue_name: Queue name to notify on.
-        session: Open SQLAlchemy/SQLModel session (still active after commit).
+        engine: SQLAlchemy Engine (e.g. from get_engine()).
     """
-    if _sa_text is None:
+    # Old: fired through the Session in a rolled-back SA2 implicit transaction
+    #      — notification was silently suppressed (CR-01).
+    # def notify_queue_sqlalchemy(queue_name: str, session: Any) -> None:
+    #     ...
+    #     session.execute(_sa_text("SELECT pg_notify(:ch, '')"), {"ch": channel})
+    if _sa_text is None or engine is None:
         return
     try:
-        # Support both session.get_bind().dialect.name and session.bind.dialect.name
-        try:
-            dialect_name = session.get_bind().dialect.name
-        except Exception:
-            bind = getattr(session, "bind", None)
-            if bind is None:
-                return
-            dialect_name = bind.dialect.name
-        if dialect_name != "postgresql":
-            return
+        dialect_name = engine.dialect.name
     except Exception:
+        return
+    if dialect_name != "postgresql":
         return
     channel = sanitize_queue_name_to_channel(queue_name)
     try:
-        session.execute(_sa_text("SELECT pg_notify(:ch, '')"), {"ch": channel})
+        with engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn:
+            conn.execute(_sa_text("SELECT pg_notify(:ch, '')"), {"ch": channel})
     except Exception:
         logger.warning("pg_notify fire failed for channel %r", channel, exc_info=True)

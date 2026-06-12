@@ -190,80 +190,85 @@ def test_fire_django_notify_swallows_exceptions() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _make_autocommit_engine(dialect_name: str):
+    """Build a mock engine whose .connect().execution_options() yields a conn.
+
+    Returns (engine, conn) so tests can assert on conn.execute. The connection
+    is a context manager (engine.connect() ... `with ... as conn`).
+    """
+    mock_conn = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.dialect.name = dialect_name
+    # engine.connect() returns a Connection; .execution_options() returns a
+    # Connection that is used as a context manager yielding itself.
+    exec_opts_conn = MagicMock()
+    exec_opts_conn.__enter__.return_value = mock_conn
+    exec_opts_conn.__exit__.return_value = False
+    mock_engine.connect.return_value.execution_options.return_value = exec_opts_conn
+    return mock_engine, mock_conn
+
+
 def test_notify_queue_sqlalchemy_noop_when_not_postgresql() -> None:
     """notify_queue_sqlalchemy does nothing when dialect is not postgresql."""
-    mock_session = MagicMock()
-    mock_bind = MagicMock()
-    mock_bind.dialect.name = "sqlite"
-    mock_session.get_bind.return_value = mock_bind
+    # CR-01: signature now takes an engine, not a session.
+    mock_engine, mock_conn = _make_autocommit_engine("sqlite")
 
-    notify_queue_sqlalchemy("default", mock_session)
+    notify_queue_sqlalchemy("default", mock_engine)
 
-    mock_session.execute.assert_not_called()
+    mock_engine.connect.assert_not_called()
+    mock_conn.execute.assert_not_called()
 
 
 def test_notify_queue_sqlalchemy_noop_when_sa_text_unavailable() -> None:
     """notify_queue_sqlalchemy is a no-op when _sa_text is None."""
-    mock_session = MagicMock()
+    mock_engine, mock_conn = _make_autocommit_engine("postgresql")
 
     with patch("sqlery.core.pg_notify._sa_text", None):
-        notify_queue_sqlalchemy("default", mock_session)
+        notify_queue_sqlalchemy("default", mock_engine)
 
-    mock_session.execute.assert_not_called()
+    mock_conn.execute.assert_not_called()
+
+
+def test_notify_queue_sqlalchemy_noop_when_engine_none() -> None:
+    """notify_queue_sqlalchemy is a no-op when engine is None."""
+    # Must not raise.
+    notify_queue_sqlalchemy("default", None)
 
 
 def test_notify_queue_sqlalchemy_executes_pg_notify_for_postgresql() -> None:
-    """notify_queue_sqlalchemy executes SELECT pg_notify(:ch, '') for postgresql."""
-    from sqlalchemy import text
+    """notify_queue_sqlalchemy executes SELECT pg_notify on an AUTOCOMMIT conn."""
+    mock_engine, mock_conn = _make_autocommit_engine("postgresql")
 
-    mock_session = MagicMock()
-    mock_bind = MagicMock()
-    mock_bind.dialect.name = "postgresql"
-    mock_session.get_bind.return_value = mock_bind
+    notify_queue_sqlalchemy("my-queue", mock_engine)
 
-    notify_queue_sqlalchemy("my-queue", mock_session)
-
-    mock_session.execute.assert_called_once()
-    call_args = mock_session.execute.call_args
-    # First arg is the text() clause; second arg is the parameter dict
+    # AUTOCOMMIT isolation level must be requested.
+    mock_engine.connect.return_value.execution_options.assert_called_once_with(
+        isolation_level="AUTOCOMMIT"
+    )
+    mock_conn.execute.assert_called_once()
+    call_args = mock_conn.execute.call_args
     sql_clause = call_args[0][0]
     params = call_args[0][1]
     assert "pg_notify" in str(sql_clause)
     assert params == {"ch": "sqlery_job_my_queue"}
 
 
-def test_notify_queue_sqlalchemy_uses_session_bind_fallback() -> None:
-    """notify_queue_sqlalchemy falls back to session.bind when get_bind() raises."""
-    mock_session = MagicMock()
-    mock_session.get_bind.side_effect = Exception("no bind")
-    mock_bind = MagicMock()
-    mock_bind.dialect.name = "postgresql"
-    mock_session.bind = mock_bind
-
-    notify_queue_sqlalchemy("default", mock_session)
-
-    mock_session.execute.assert_called_once()
-
-
 def test_notify_queue_sqlalchemy_swallows_execute_exceptions() -> None:
     """notify_queue_sqlalchemy logs and swallows execute exceptions."""
-    mock_session = MagicMock()
-    mock_bind = MagicMock()
-    mock_bind.dialect.name = "postgresql"
-    mock_session.get_bind.return_value = mock_bind
-    mock_session.execute.side_effect = Exception("PG error")
+    mock_engine, mock_conn = _make_autocommit_engine("postgresql")
+    mock_conn.execute.side_effect = Exception("PG error")
 
     # Must not raise
-    notify_queue_sqlalchemy("default", mock_session)
+    notify_queue_sqlalchemy("default", mock_engine)
 
 
-def test_notify_queue_sqlalchemy_noop_when_bind_missing() -> None:
-    """notify_queue_sqlalchemy does nothing when both get_bind and bind fail."""
-    mock_session = MagicMock()
-    mock_session.get_bind.side_effect = Exception("no bind")
-    # session.bind returns None (no bind attribute)
-    mock_session.bind = None
+def test_notify_queue_sqlalchemy_noop_when_dialect_access_fails() -> None:
+    """notify_queue_sqlalchemy does nothing when reading engine.dialect raises."""
+    mock_engine = MagicMock()
+    type(mock_engine).dialect = property(
+        lambda self: (_ for _ in ()).throw(Exception("no dialect"))
+    )
 
-    # Must not raise, and must not execute
-    notify_queue_sqlalchemy("default", mock_session)
-    mock_session.execute.assert_not_called()
+    # Must not raise, and must not attempt to connect.
+    notify_queue_sqlalchemy("default", mock_engine)
+    mock_engine.connect.assert_not_called()
