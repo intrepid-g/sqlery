@@ -46,6 +46,51 @@ class DjangoBackend(DatabaseBackend):
         self.JobRegistry = JobRegistry
         self.Worker = Worker
         self.ScheduledJob = ScheduledJob
+        self._partitioned_pg_cache: bool | None = None
+
+    def _partitioned_pg(self) -> bool:
+        """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
+
+        Used by the cleanup→reclaim routing (Phase 13 seam), the far-future
+        staging gate (Phase 14), and the write-path pruning logic. SQLite and a
+        non-partitioned PG install both return False — they keep the Phase-12
+        batched DELETE path and the in-queue scheduling path unchanged (D6).
+        Cached per-process: the table's partition status does not change at
+        runtime (only via the stop-the-world cutover migration).
+        """
+        if self._partitioned_pg_cache is not None:
+            return self._partitioned_pg_cache
+        if connection.vendor != "postgresql":
+            self._partitioned_pg_cache = False
+            return False
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT relkind = 'p' FROM pg_class "
+                    "WHERE relname = %s AND relnamespace = 'public'::regnamespace",
+                    [self.QueuedJob._meta.db_table],
+                )
+                row = cur.fetchone()
+            self._partitioned_pg_cache = bool(row and row[0])
+        except Exception:
+            # Fail safe: treat as non-partitioned so we never route to PG-only
+            # reclaim/promotion paths against a table that isn't partitioned.
+            self._partitioned_pg_cache = False
+        return self._partitioned_pg_cache
+
+    def get_raw_cursor(self):
+        """Return a raw DB-API cursor for the daemon's PG-only maintenance loop.
+
+        promote_due_scheduled_jobs / reclaim_drained_partitions / ensure_future_
+        partitions need a live psycopg cursor (not the Django ORM). Returns the
+        Django connection's cursor on PostgreSQL; returns None on SQLite (and any
+        non-partitioned install) so the daemon skips PG-only maintenance cleanly.
+        The caller owns the cursor lifecycle (commit/rollback handled inside the
+        maintenance functions).
+        """
+        if not self._partitioned_pg():
+            return None
+        return connection.cursor()
 
     def create_job(
         self,
@@ -86,7 +131,16 @@ class DjangoBackend(DatabaseBackend):
         threshold_days = get_setting("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 1)
         staging_threshold = timedelta(days=threshold_days)
         now_utc = timezone.now()
-        if scheduled_at is not None and scheduled_at > now_utc + staging_threshold:
+        # Staging only protects partitions, which exist only on partitioned PG.
+        # On SQLite / non-partitioned PG, far-future jobs stay in sqlery_queued_job
+        # (D6 — SQLite path unchanged) since the PG-only promotion loop can't drain
+        # a staging table there. (Phase 16 carry-forward: gate routing on partitioning.)
+        # Old: if scheduled_at is not None and scheduled_at > now_utc + staging_threshold:
+        if (
+            self._partitioned_pg()
+            and scheduled_at is not None
+            and scheduled_at > now_utc + staging_threshold
+        ):
             # Store full job-creation spec in payload for lossless promotion (WR-01/WR-02).
             # payload schema: {"kwargs": <task kwargs>, "job_spec": {<all execution params>}}
             # Promotion reads job_spec to reconstruct every queued_job column identically.
