@@ -59,9 +59,14 @@ class QueuedJob(SQLModel, table=True):
     """A job in the queue, waiting to be executed or already processed.
 
     Schema note: composite primary key (created_at, id) mirrors the Django
-    model for partition parity. On PostgreSQL the id column draws from the
-    shared sqlery_job_id_seq sequence (wired in the Alembic migration in
-    plan 17-02). On SQLite the integer column draws from the implicit rowid.
+    model for partition parity. In standalone mode the id is assigned by the
+    `before_flush` listener below (a 62-bit UUID-v7-derived integer) on BOTH
+    SQLite and PostgreSQL — this guarantees no id collision between QueuedJob
+    and ScheduledJob via UUID-v7 global uniqueness. A `sqlery_job_id_seq`
+    DEFAULT also exists on the PG column (created by database.py DDL) as a
+    fallback, but the listener assigns the id before insert so the sequence is
+    not normally exercised in standalone mode. (Django mode draws ids from the
+    shared sequence directly — see migration 0029.)
     """
 
     __tablename__ = "sqlery_queued_job"
@@ -69,12 +74,13 @@ class QueuedJob(SQLModel, table=True):
     # Composite primary key — id first for SQLAlchemy ordering; created_at
     # second so that partition pruning on created_at works for both backends.
     #
-    # id assignment strategy (two-tier):
-    #   - SQLite (dev/test): Python-side default generates a 62-bit integer
-    #     from the lower bits of a UUID v7 (time-sortable, globally unique).
-    #   - PostgreSQL (production): the Alembic migration in plan 17-02 replaces
-    #     the column default with nextval('sqlery_job_id_seq') so the shared
-    #     sequence assigns ids instead of this Python default.
+    # id assignment strategy (standalone mode):
+    #   The `before_flush` listener below assigns a 62-bit UUID-v7-derived
+    #   integer (time-sortable, globally unique) whenever id is None — on BOTH
+    #   SQLite and PostgreSQL. PG additionally carries a nextval('sqlery_job_id_seq')
+    #   column DEFAULT (from database.py DDL) as a safety fallback, but the
+    #   listener pre-empts it. UUID-v7 uniqueness — not the sequence — is what
+    #   guarantees QueuedJob/ScheduledJob ids never collide in standalone mode.
     #
     # Note: autoincrement=True is intentionally absent — SQLite does not
     # support AUTOINCREMENT for composite primary keys and raises CompileError.
@@ -254,8 +260,10 @@ class ScheduledJob(SQLModel, table=True):
 
     Mirrors Django's ScheduledJob model shape for drop-in compatibility.
     Rows are promoted to QueuedJob when their scheduled_at time arrives.
-    The id uses the shared sqlery_job_id_seq sequence on PostgreSQL (wired
-    in the Alembic migration in plan 17-02). On SQLite it is rowid-backed.
+    The id is assigned by the same `before_flush` UUID-v7 listener as
+    QueuedJob (see QueuedJob docstring) on both SQLite and PostgreSQL, which
+    guarantees ids never collide with QueuedJob. (Django mode draws ScheduledJob
+    ids from the shared sqlery_job_id_seq — see migration 0029.)
     """
 
     __tablename__ = "sqlery_scheduled_job"
@@ -427,13 +435,16 @@ class DaemonLease(SQLModel, table=True):
 
 
 # ---------------------------------------------------------------------------
-# SQLite composite-PK id generation (event listener)
+# Composite-PK id generation (event listener) — standalone mode
 # ---------------------------------------------------------------------------
-# SQLite does not support autoincrement for composite primary keys.  When id
-# is None before a flush we assign a 62-bit time-sortable integer derived from
-# a UUID v7.  On PostgreSQL, the Alembic migration in plan 17-02 replaces the
-# column default with nextval('sqlery_job_id_seq'), so this code path is never
-# reached there (PG inserts will always carry a server_default).
+# Composite primary keys cannot use SQLite AUTOINCREMENT. When id is None
+# before a flush we assign a 62-bit time-sortable integer derived from a UUID
+# v7. This fires on BOTH SQLite and PostgreSQL in standalone mode — so even
+# though PG carries a nextval('sqlery_job_id_seq') column DEFAULT (created by
+# database.py DDL), the listener assigns the id first and the sequence default
+# is not normally exercised. UUID-v7 global uniqueness is what guarantees
+# QueuedJob and ScheduledJob ids never collide in standalone mode. (Django mode
+# uses the shared sequence directly via migration 0029; it has no listener.)
 #
 # The listener is registered on the SQLAlchemy Session class (not per-session)
 # so it applies to all sessions created from any engine.
