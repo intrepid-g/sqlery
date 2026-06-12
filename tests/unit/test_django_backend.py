@@ -724,22 +724,42 @@ class TestEnqueueRoutingThreshold:
     """
 
     def test_far_future_creates_scheduled_job_not_queued_job(self, django_backend):
-        """Test 1: scheduled_at = now+2days creates ScheduledJob, not QueuedJob (threshold=1day)."""
+        """Test 1: far-future job routing is vendor-conditional (Phase 16, plan 16-01).
+
+        PG (partitioned): scheduled_at = now+2days → ScheduledJob (staging routing active).
+        SQLite: scheduled_at = now+2days → QueuedJob (D6 — R10, SQLite path unchanged;
+                _partitioned_pg() is False so staging gate is not triggered).
+        """
+        from django.db import connection
         from sqlery.django_sqlery.models import ScheduledJob
         queued_before = django_backend.QueuedJob.objects.count()
         staged_before = ScheduledJob.objects.count()
         far_future = timezone.now() + timedelta(days=2)
         result = _create_basic_job(django_backend, scheduled_at=far_future)
-        # Must be a ScheduledJob row
-        assert isinstance(result, ScheduledJob), (
-            f"Expected ScheduledJob, got {type(result).__name__}"
-        )
-        assert ScheduledJob.objects.count() == staged_before + 1, (
-            "Expected one new ScheduledJob row"
-        )
-        assert django_backend.QueuedJob.objects.count() == queued_before, (
-            "QueuedJob count must not change for far-future jobs"
-        )
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future stays in QueuedJob (D6 — R10)
+            assert result.__class__.__name__ == "QueuedJob", (
+                f"SQLite: far-future job must go to QueuedJob (D6 — R10), got {type(result).__name__}"
+            )
+            assert django_backend.QueuedJob.objects.count() == queued_before + 1
+            assert ScheduledJob.objects.count() == staged_before, (
+                "SQLite: ScheduledJob count must not change (D6 — R10)"
+            )
+        else:
+            # PG (partitioned): staging is active, far-future goes to ScheduledJob
+            # Old (unconditional — only correct on partitioned PG):
+            # assert isinstance(result, ScheduledJob), (
+            #     f"Expected ScheduledJob, got {type(result).__name__}"
+            # )
+            assert isinstance(result, ScheduledJob), (
+                f"PG: Expected ScheduledJob, got {type(result).__name__}"
+            )
+            assert ScheduledJob.objects.count() == staged_before + 1, (
+                "PG: Expected one new ScheduledJob row"
+            )
+            assert django_backend.QueuedJob.objects.count() == queued_before, (
+                "PG: QueuedJob count must not change for far-future jobs"
+            )
 
     def test_near_future_creates_queued_job(self, django_backend):
         """Test 2: scheduled_at = now+12hrs creates QueuedJob (below 1-day threshold)."""
@@ -792,12 +812,36 @@ class TestDualTableApiSurface:
     sqlery_scheduled_job, and that get_staged_jobs is accessible."""
 
     def _create_staged_job(self, backend):
-        """Helper: create a far-future ScheduledJob via create_job routing."""
+        """Helper: create a far-future job via create_job routing.
+
+        On partitioned PG: returns a ScheduledJob (staging routing active).
+        On SQLite: _partitioned_pg() is False so far-future stays in QueuedJob (D6 — R10).
+        Tests that require a ScheduledJob must skip on SQLite via _require_staged_job_is_scheduled.
+        """
         from sqlery.django_sqlery.models import ScheduledJob
         far_future = timezone.now() + timedelta(days=60)
         job = _create_basic_job(backend, scheduled_at=far_future)
-        assert isinstance(job, ScheduledJob), "Precondition: routing must return ScheduledJob"
+        # Old (unconditional — fails on SQLite because routing is gated on _partitioned_pg()):
+        # assert isinstance(job, ScheduledJob), "Precondition: routing must return ScheduledJob"
         return job
+
+    def _require_staged_job_is_scheduled(self, job):
+        """Skip the test on SQLite if staging didn't route to ScheduledJob.
+
+        Call this at the start of tests that require job to be a ScheduledJob.
+        SQLite: _partitioned_pg() is False, so far-future stays in QueuedJob (D6 — R10).
+        """
+        from sqlery.django_sqlery.models import ScheduledJob
+        from django.db import connection
+        if not isinstance(job, ScheduledJob):
+            # SQLite: _partitioned_pg() is False → far-future goes to QueuedJob (D6 — R10)
+            assert connection.vendor == "sqlite", (
+                f"Expected ScheduledJob on PG, got {type(job).__name__}"
+            )
+            pytest.skip(
+                "SQLite: _partitioned_pg() is False — far-future goes to QueuedJob (D6 — R10); "
+                "staging-specific behavior tested only on partitioned PG"
+            )
 
     def test_get_job_by_id_queued_job(self, django_backend):
         """Test 1: job exists only in QueuedJob -> returns QueuedJob instance."""
@@ -809,9 +853,14 @@ class TestDualTableApiSurface:
         assert result.id == j.id
 
     def test_get_job_by_id_scheduled_job(self, django_backend):
-        """Test 2: job exists only in ScheduledJob -> returns ScheduledJob instance."""
+        """Test 2: job exists only in ScheduledJob -> returns ScheduledJob instance (PG only).
+
+        Skips on SQLite because _partitioned_pg() is False — far-future jobs stay in
+        QueuedJob and there is no ScheduledJob to query (D6 — R10).
+        """
         from sqlery.django_sqlery.models import ScheduledJob
         staged = self._create_staged_job(django_backend)
+        self._require_staged_job_is_scheduled(staged)
         result = django_backend.get_job_by_id(staged.id)
         assert result is not None
         assert isinstance(result, ScheduledJob)
@@ -829,9 +878,14 @@ class TestDualTableApiSurface:
         assert j.status == "failed"
 
     def test_cancel_job_scheduled_job(self, django_backend):
-        """Test 5: job is a ScheduledJob -> deletes the ScheduledJob row, returns True."""
+        """Test 5: job is a ScheduledJob -> deletes the ScheduledJob row, returns True (PG only).
+
+        Skips on SQLite because _partitioned_pg() is False — far-future jobs stay in
+        QueuedJob and there is no ScheduledJob to cancel (D6 — R10).
+        """
         from sqlery.django_sqlery.models import ScheduledJob
         staged = self._create_staged_job(django_backend)
+        self._require_staged_job_is_scheduled(staged)
         staged_id = staged.id
         result = django_backend.cancel_job(staged_id)
         assert result is True
@@ -844,9 +898,11 @@ class TestDualTableApiSurface:
     def test_get_jobs_returns_queued_jobs_only(self, django_backend):
         """Test 7: get_jobs() returns QueuedJob rows; staged jobs are NOT included.
 
-        On SQLite both tables have independent auto-increment sequences so IDs
-        may collide between tables (both start at 1). The meaningful assertion
-        is that every returned row is a QueuedJob ORM instance, not a ScheduledJob.
+        On SQLite: _create_staged_job returns a QueuedJob (D6 — R10), so get_jobs(queue_name="mixed")
+        returns both the regular job and the far-future job (both are QueuedJob). Still correct:
+        every row returned is a QueuedJob.
+        On PG (partitioned): the staged job is a ScheduledJob not in QueuedJob table, so get_jobs
+        returns only the regular job. The meaningful assertion is all returned rows are QueuedJob.
         """
         from sqlery.django_sqlery.models import QueuedJob, ScheduledJob
         _create_basic_job(django_backend, queue_name="mixed")
@@ -860,15 +916,32 @@ class TestDualTableApiSurface:
             )
 
     def test_get_staged_jobs_callable(self, django_backend):
-        """Test 8: get_staged_jobs() is callable and returns staged rows."""
+        """Test 8: get_staged_jobs() is callable and returns staged rows (PG only).
+
+        On SQLite: _partitioned_pg() is False — far-future job stays in QueuedJob.
+        get_staged_jobs() queries sqlery_scheduled_job, which has no rows, so no match.
+        Skip on SQLite and test only on partitioned PG where staging is active (D6 — R10).
+        """
         from sqlery.django_sqlery.models import ScheduledJob
         staged = self._create_staged_job(django_backend)
+        self._require_staged_job_is_scheduled(staged)
         results = django_backend.get_staged_jobs()
         assert isinstance(results, list)
         assert any(r.id == staged.id for r in results)
 
     def test_get_staged_jobs_filter_by_queue(self, django_backend):
-        """get_staged_jobs(queue_name=...) filters by queue."""
+        """get_staged_jobs(queue_name=...) filters by queue (PG only).
+
+        On SQLite: far-future jobs stay in QueuedJob (D6 — R10); get_staged_jobs()
+        queries sqlery_scheduled_job which has no rows. Skip on SQLite.
+        """
+        from django.db import connection
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future goes to QueuedJob (D6 — R10)
+            pytest.skip(
+                "SQLite: far-future jobs stay in QueuedJob — get_staged_jobs() tests "
+                "require partitioned PG (D6 — R10)"
+            )
         far_future = timezone.now() + timedelta(days=60)
         job_a = _create_basic_job(django_backend, scheduled_at=far_future, queue_name="qA")
         job_b = _create_basic_job(django_backend, scheduled_at=far_future, queue_name="qB")
@@ -878,10 +951,28 @@ class TestDualTableApiSurface:
         assert job_b.id not in result_ids
 
     def test_staged_job_invisible_to_claim(self, django_backend):
-        """A staged job is never visible to claim_job (it is in sqlery_scheduled_job, not queued)."""
+        """Staged job visibility to claim_job is vendor-conditional (Phase 16, plan 16-01).
+
+        PG (partitioned): staged far-future job is in ScheduledJob, NOT in QueuedJob — invisible to claim.
+        SQLite: far-future job is in QueuedJob (D6 — R10) — it IS in QueuedJob but has a future
+        scheduled_at so it won't be claimed until its scheduled_at is reached.
+        """
+        from django.db import connection
         from sqlery.django_sqlery.models import ScheduledJob
         staged = self._create_staged_job(django_backend)
-        assert not django_backend.QueuedJob.objects.filter(id=staged.id).exists()
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future stays in QueuedJob (D6 — R10)
+            # The job IS in QueuedJob but has a future scheduled_at so it can't be claimed.
+            assert django_backend.QueuedJob.objects.filter(id=staged.id).exists(), (
+                "SQLite: far-future job must be in QueuedJob (D6 — R10)"
+            )
+        else:
+            # PG (partitioned): staged job is in ScheduledJob, NOT in QueuedJob
+            # Old (unconditional — only correct on partitioned PG):
+            # assert not django_backend.QueuedJob.objects.filter(id=staged.id).exists()
+            assert not django_backend.QueuedJob.objects.filter(id=staged.id).exists(), (
+                "PG: staged job must NOT be visible in QueuedJob table"
+            )
 
 
 # ---------------------------------------------------------------------------

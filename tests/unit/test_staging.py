@@ -63,30 +63,82 @@ class TestStagingRouting:
         )
 
     def test_far_future_job_goes_to_staging(self):
-        """A job 60 days out is routed to ScheduledJob, not QueuedJob."""
-        from sqlery.django_sqlery.models import ScheduledJob
+        """A job 60 days out is routed to ScheduledJob on partitioned PG (QueuedJob on SQLite).
+
+        Routing is gated on _partitioned_pg() (Phase 16, plan 16-01):
+        - SQLite: _partitioned_pg() is False → far-future goes to QueuedJob (D6 — R10)
+        - PG (partitioned): _partitioned_pg() is True → far-future goes to ScheduledJob
+        """
+        from django.db import connection
+        from sqlery.django_sqlery.models import QueuedJob, ScheduledJob
+
         backend = self._make_backend()
         result = self._create_far_future_job(backend)
-        assert isinstance(result, ScheduledJob), (
-            f"Expected ScheduledJob, got {type(result).__name__}"
-        )
+        # Old (unconditional — only correct on partitioned PG):
+        # assert isinstance(result, ScheduledJob), (
+        #     f"Expected ScheduledJob, got {type(result).__name__}"
+        # )
+        # SQLite: _partitioned_pg() is False → far-future goes to QueuedJob (D6 — R10)
+        if connection.vendor == "sqlite":
+            assert isinstance(result, QueuedJob), (
+                f"SQLite: far-future jobs must go to QueuedJob (D6 — R10), got {type(result).__name__}"
+            )
+        else:
+            # PG (partitioned): far-future jobs go to ScheduledJob
+            assert isinstance(result, ScheduledJob), (
+                f"PG: far-future jobs must go to ScheduledJob, got {type(result).__name__}"
+            )
 
     def test_far_future_job_invisible_to_claim_queue(self):
-        """A staged job never appears in sqlery_queued_job (cannot be claimed)."""
+        """A staged far-future job: on PG it is absent from sqlery_queued_job;
+        on SQLite it is present there (D6 — R10, SQLite path unchanged).
+
+        Routing is gated on _partitioned_pg() (Phase 16, plan 16-01).
+        """
+        from django.db import connection
         from sqlery.django_sqlery.models import QueuedJob
         backend = self._make_backend()
         job = self._create_far_future_job(backend)
-        assert not QueuedJob.objects.filter(id=job.id).exists()
+        # Old (unconditional — only correct on partitioned PG where staging is active):
+        # assert not QueuedJob.objects.filter(id=job.id).exists()
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future stays in QueuedJob (D6 — R10)
+            assert QueuedJob.objects.filter(id=job.id).exists(), (
+                "SQLite: far-future job must be in QueuedJob (D6 — R10)"
+            )
+        else:
+            # PG (partitioned): far-future job is in ScheduledJob, not QueuedJob
+            assert not QueuedJob.objects.filter(id=job.id).exists(), (
+                "PG: staged far-future job must NOT be visible in QueuedJob"
+            )
 
     def test_far_future_job_visible_to_get_job_by_id(self):
-        """get_job_by_id returns the staged job — status API can find it."""
-        from sqlery.django_sqlery.models import ScheduledJob
+        """get_job_by_id returns the far-future job regardless of routing vendor.
+
+        On PG (partitioned): returns ScheduledJob.
+        On SQLite: returns QueuedJob (D6 — R10, SQLite path unchanged).
+        """
+        from django.db import connection
+        from sqlery.django_sqlery.models import QueuedJob, ScheduledJob
         backend = self._make_backend()
         job = self._create_far_future_job(backend)
         result = backend.get_job_by_id(job.id)
         assert result is not None
-        assert isinstance(result, ScheduledJob)
         assert result.id == job.id
+        # Old (unconditional — only correct on partitioned PG):
+        # assert isinstance(result, ScheduledJob)
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future is in QueuedJob (D6 — R10)
+            assert isinstance(result, QueuedJob), (
+                f"SQLite: get_job_by_id must return QueuedJob for far-future job (D6 — R10), "
+                f"got {type(result).__name__}"
+            )
+        else:
+            # PG (partitioned): far-future job is a ScheduledJob
+            assert isinstance(result, ScheduledJob), (
+                f"PG: get_job_by_id must return ScheduledJob for far-future job, "
+                f"got {type(result).__name__}"
+            )
 
     def test_far_future_job_cancellable(self):
         """cancel_job returns True and removes the staged job — cancel API works."""
@@ -228,7 +280,17 @@ class TestPayloadFidelity:
         return DjangoBackend()
 
     def test_staged_payload_contains_full_job_spec(self):
-        """Staging stores kwargs AND job_spec — not just kwargs — in payload."""
+        """Staging stores kwargs AND job_spec in payload when routing to ScheduledJob.
+
+        On partitioned PG: far-future create_job returns a ScheduledJob with the full
+        payload. On SQLite: _partitioned_pg() is False so far-future jobs stay in
+        QueuedJob — no payload column. On SQLite, this test asserts the QueuedJob was
+        created correctly (kwargs are stored directly, not in a payload wrapper).
+        (D6 — R10: SQLite path unchanged)
+        """
+        from django.db import connection
+        from sqlery.django_sqlery.models import QueuedJob, ScheduledJob
+
         backend = self._make_backend()
         job = backend.create_job(
             task_path="tests.fake.staging_task",
@@ -247,19 +309,37 @@ class TestPayloadFidelity:
             on_failure_path="my.module.on_failure",
             ttl=3600,
         )
-        payload = job.payload
-        assert "kwargs" in payload, "payload must contain 'kwargs' key"
-        assert "job_spec" in payload, "payload must contain 'job_spec' key"
-        assert payload["kwargs"] == {"x": 42}
-        spec = payload["job_spec"]
-        assert spec["retry_backoff"] == 2.5
-        assert spec["allow_parallel"] is True
-        assert spec["timeout_seconds"] == 120
-        assert spec["job_name"] == "my-unique-job"
-        assert spec["dependencies"] == [7, 8]
-        assert spec["on_success_path"] == "my.module.on_success"
-        assert spec["on_failure_path"] == "my.module.on_failure"
-        assert spec["ttl"] == 3600
+        if connection.vendor == "sqlite":
+            # SQLite: _partitioned_pg() is False → far-future goes to QueuedJob (D6 — R10)
+            assert isinstance(job, QueuedJob), (
+                f"SQLite: far-future job must be QueuedJob (D6 — R10), got {type(job).__name__}"
+            )
+            # QueuedJob stores kwargs directly; verify kwargs were preserved correctly
+            assert job.kwargs == {"x": 42}, (
+                f"SQLite: QueuedJob.kwargs must be {{'x': 42}}, got {job.kwargs}"
+            )
+        else:
+            # PG (partitioned): far-future job goes to ScheduledJob with full payload
+            # Old (unconditional — only correct on partitioned PG):
+            # payload = job.payload
+            # assert "kwargs" in payload, "payload must contain 'kwargs' key"
+            # ...
+            assert isinstance(job, ScheduledJob), (
+                f"PG: far-future job must be ScheduledJob, got {type(job).__name__}"
+            )
+            payload = job.payload
+            assert "kwargs" in payload, "payload must contain 'kwargs' key"
+            assert "job_spec" in payload, "payload must contain 'job_spec' key"
+            assert payload["kwargs"] == {"x": 42}
+            spec = payload["job_spec"]
+            assert spec["retry_backoff"] == 2.5
+            assert spec["allow_parallel"] is True
+            assert spec["timeout_seconds"] == 120
+            assert spec["job_name"] == "my-unique-job"
+            assert spec["dependencies"] == [7, 8]
+            assert spec["on_success_path"] == "my.module.on_success"
+            assert spec["on_failure_path"] == "my.module.on_failure"
+            assert spec["ttl"] == 3600
 
     def test_promotion_reconstructs_job_spec_fields(self):
         """promote_due_scheduled_jobs issues INSERT with job_spec fields from payload."""
