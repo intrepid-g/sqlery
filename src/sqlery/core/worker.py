@@ -27,6 +27,26 @@ except ImportError:
     connections = None
     close_old_connections = None
 
+# Phase 18: guard-import psycopg3 for LISTEN/NOTIFY wake-up (PG-only, opt-in).
+# psycopg is already a declared dependency; this guard is for environments
+# where the standalone mode is used without psycopg installed.
+try:
+    import psycopg as _psycopg
+    import psycopg.sql as _psycopg_sql
+    _psycopg_available = True
+except ImportError:
+    _psycopg = None  # type: ignore[assignment]
+    _psycopg_sql = None  # type: ignore[assignment]
+    _psycopg_available = False
+
+# Phase 18: guard-import sanitize_queue_name_to_channel for channel naming.
+try:
+    from sqlery.core.pg_notify import sanitize_queue_name_to_channel
+    _pg_notify_import_ok = True
+except ImportError:
+    sanitize_queue_name_to_channel = None  # type: ignore[assignment]
+    _pg_notify_import_ok = False
+
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
 
 logger = logging.getLogger(__name__)
@@ -431,6 +451,9 @@ class WorkerProcess:
         # from ..compat import get_config  # moved to top-level
         self.poll_interval = get_config('WORKER_POLL_INTERVAL', 5)
         self.heartbeat_interval = get_config('WORKER_HEARTBEAT_INTERVAL', 5)
+        # Phase 18: dedicated psycopg3 AUTOCOMMIT connection for LISTEN/NOTIFY
+        # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
+        self._listen_conn = None
 
     def run(self):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
@@ -810,6 +833,119 @@ class WorkerProcess:
             os.waitpid(pid, 0)
         except (OSError, ProcessLookupError):
             pass
+
+    def _open_listen_conn(self) -> None:
+        """Open a dedicated AUTOCOMMIT psycopg3 connection and LISTEN on all queue channels.
+
+        No-op when SQLERY_PG_NOTIFY is False, when on SQLite, or when psycopg3
+        is unavailable. Any failure is caught and logged — the worker falls back
+        to pure polling. Never called from a signal handler.
+        """
+        if not get_config('SQLERY_PG_NOTIFY', False):
+            return
+        if not _psycopg_available or sanitize_queue_name_to_channel is None:
+            return
+        try:
+            # Detect PG DSN: standalone mode exposes DATABASE_URL via get_config;
+            # Django mode reads from connections['default'].settings_dict.
+            database_url = get_config('DATABASE_URL', None)
+            if database_url:
+                if 'postgresql' not in database_url and 'postgres' not in database_url:
+                    return
+                dsn = database_url
+            elif connections is not None:
+                # Django mode: build DSN from connection settings dict.
+                try:
+                    db_settings = connections['default'].settings_dict
+                except Exception:
+                    return
+                if db_settings.get('ENGINE', '').find('postgresql') == -1 and \
+                        db_settings.get('ENGINE', '').find('psycopg') == -1:
+                    return
+                dsn = _psycopg.conninfo.make_conninfo(
+                    dbname=db_settings.get('NAME', ''),
+                    host=db_settings.get('HOST', '') or None,
+                    port=db_settings.get('PORT', '') or None,
+                    user=db_settings.get('USER', '') or None,
+                    password=db_settings.get('PASSWORD', '') or None,
+                )
+            else:
+                return
+
+            self._listen_conn = _psycopg.connect(dsn, autocommit=True)
+            channels = []
+            for queue in self.queues:
+                channel = sanitize_queue_name_to_channel(queue)
+                self._listen_conn.execute(
+                    _psycopg_sql.SQL("LISTEN {}").format(
+                        _psycopg_sql.Identifier(channel)
+                    )
+                )
+                channels.append(channel)
+            logger.info(
+                f"Worker {self.worker_id}: LISTEN connection open on channels {channels}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Worker {self.worker_id}: failed to open LISTEN connection: {e}; "
+                f"falling back to polling"
+            )
+            self._listen_conn = None
+
+    def _close_listen_conn(self) -> None:
+        """Close the LISTEN connection. Safe to call when connection is None.
+
+        Registered as a pre_fork hook on ForkSafeExecutor so it runs before
+        every os.fork(), ensuring the child never inherits the LISTEN connection.
+        Also called in run() finally on graceful shutdown.
+        """
+        if self._listen_conn is None:
+            return
+        try:
+            self._listen_conn.close()
+        except Exception:
+            pass
+        self._listen_conn = None
+        logger.debug(f"Worker {self.worker_id}: LISTEN connection closed")
+
+    def _wait_for_notify(self) -> None:
+        """Block up to poll_interval for a NOTIFY, in <=1s slices.
+
+        Falls back to plain time.sleep slices if no LISTEN connection is open
+        (flag-off path, SQLite, or after a LISTEN connection error). Heartbeat
+        is checked between slices so the worker stays responsive to SIGUSR1.
+
+        Mirrors the pgwq reference Worker._wait() pattern exactly.
+        """
+        if self._listen_conn is None:
+            # Flag-off / SQLite / no connection — original 1s-slice sleep loop
+            elapsed = 0
+            while elapsed < self.poll_interval and not self.shutdown_requested:
+                time.sleep(1)
+                elapsed += 1
+                self._check_heartbeat()
+            return
+        # Flag-on + PG: wait for NOTIFY with poll_interval timeout, in 1s slices
+        end = time.monotonic() + self.poll_interval
+        while not self.shutdown_requested:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                for _ in self._listen_conn.notifies(
+                    timeout=min(remaining, 1.0), stop_after=1
+                ):
+                    return  # NOTIFY received — wake up to claim immediately
+            except Exception as e:
+                logger.warning(
+                    f"Worker {self.worker_id}: LISTEN connection error: {e}; "
+                    f"closing, falling back to polling"
+                )
+                self._close_listen_conn()
+                return
+            self._check_heartbeat()
+            if self.shutdown_requested:
+                return
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""
