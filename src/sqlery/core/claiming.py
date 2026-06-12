@@ -255,10 +255,12 @@ def claim_next_job_with_queue_priority(
         # Successfully claimed! Update worker status
         if hasattr(worker, 'status'):
             worker.status = "busy"
-        if hasattr(worker, 'current_job'):
-            worker.current_job = job
+        # Old: if hasattr(worker, 'current_job'): worker.current_job = job
+        if hasattr(worker, 'current_job_id'):
+            worker.current_job_id = job.id
         if hasattr(worker, 'save'):
-            worker.save(update_fields=["status", "current_job"])
+            # Old: worker.save(update_fields=["status", "current_job"])
+            worker.save(update_fields=["status", "current_job_id"])
 
         # Track in registry
         if enable_registries:
@@ -326,15 +328,19 @@ def release_job(worker, job, status, **kwargs):
             job.refresh_from_db()
         except QueuedJob.DoesNotExist:
             worker.status = "idle"
-            worker.current_job = None
+            # Old: worker.current_job = None
+            worker.current_job_id = None
             worker.jobs_processed += 1
-            worker.save(update_fields=["status", "current_job", "jobs_processed"])
+            # Old: worker.save(update_fields=["status", "current_job", "jobs_processed"])
+            worker.save(update_fields=["status", "current_job_id", "jobs_processed"])
             return
 
         if get_setting('ENABLE_REGISTRIES', True):
             track_job_finish(job, status=status)
 
         worker.status = "idle"
-        worker.current_job = None
+        # Old: worker.current_job = None
+        worker.current_job_id = None
         worker.jobs_processed += 1
-        worker.save(update_fields=["status", "current_job", "jobs_processed"])
+        # Old: worker.save(update_fields=["status", "current_job", "jobs_processed"])
+        worker.save(update_fields=["status", "current_job_id", "jobs_processed"])

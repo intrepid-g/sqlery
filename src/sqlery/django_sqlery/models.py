@@ -356,6 +356,13 @@ class QueuedJob(models.Model):
         ("shutting_down", "Shutting Down"),
     ]
 
+    # Django 5.2 composite PK — partition key (created_at) must be first.
+    # id stays globally unique (shared IDENTITY sequence with sqlery_scheduled_job).
+    # FKs from JobRegistry and Worker demoted to BigIntegerField per D4 (Phase 15):
+    # orphans on partition drop are an accepted, documented trade-off.
+    pk = models.CompositePrimaryKey("created_at", "id")
+    id = models.BigAutoField(primary_key=False)
+
     # Task definition
     task_path = models.CharField(
         max_length=500,
@@ -761,11 +768,14 @@ class QueuedJob(models.Model):
             pass
 
         # Reset worker state so it shows idle immediately on the dashboard
-        worker = Worker.objects.filter(current_job=self, status="busy").first()
+        # Old: worker = Worker.objects.filter(current_job=self, status="busy").first()
+        worker = Worker.objects.filter(current_job_id=self.id, status="busy").first()
         if worker:
             worker.status = "idle"
-            worker.current_job = None
-            worker.save(update_fields=["status", "current_job", "last_heartbeat"])
+            # Old: worker.current_job = None
+            worker.current_job_id = None
+            # Old: worker.save(update_fields=["status", "current_job", "last_heartbeat"])
+            worker.save(update_fields=["status", "current_job_id", "last_heartbeat"])
 
         return True
 
@@ -783,7 +793,8 @@ class QueuedJob(models.Model):
             Worker = apps.get_model("sqlery", "Worker")
             Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
                 status="idle",
-                current_job=None,
+                # Old: current_job=None,
+                current_job_id=None,
                 last_heartbeat=timezone.now(),
             )
         except Exception:
@@ -825,7 +836,8 @@ class QueuedJob(models.Model):
 
     def save_meta(self) -> None:
         """Persist the in-memory meta dict to the database."""
-        QueuedJob.objects.filter(pk=self.pk).update(meta=self.meta)
+        # Old: QueuedJob.objects.filter(pk=self.pk).update(meta=self.meta)
+        QueuedJob.objects.filter(id=self.id, created_at=self.created_at).update(meta=self.meta)
 
     def refresh_meta(self) -> None:
         """Reload meta from the database into this instance."""
@@ -978,11 +990,11 @@ class JobRegistry(models.Model):
         ("canceled", "Canceled"),
     ]
 
-    job = models.ForeignKey(
-        QueuedJob,
-        on_delete=models.CASCADE,
-        related_name="registry_entries",
-        help_text="Job being tracked",
+    # Old: job = models.ForeignKey(QueuedJob, on_delete=models.CASCADE, related_name="registry_entries", help_text="Job being tracked")
+    # #CLEANUP: Remove after soak — rename job_id back to job if FK ever restored
+    job_id = models.BigIntegerField(
+        db_index=True,
+        help_text="ID of the QueuedJob being tracked (FK demoted — D4: referential integrity to partitioned table intentionally dropped)",
     )
     registry_type = models.CharField(
         max_length=20,
@@ -1011,13 +1023,15 @@ class JobRegistry(models.Model):
         ordering = ["-entered_at"]
         indexes = [
             models.Index(fields=["registry_type", "entered_at"]),
-            models.Index(fields=["job", "registry_type"]),
+            # Old: models.Index(fields=["job", "registry_type"]),
+            models.Index(fields=["job_id", "registry_type"]),
             models.Index(fields=["registry_type", "exited_at"]),
         ]
         verbose_name_plural = "Job registries"
 
     def __str__(self):
-        return f"{self.job.id} in {self.registry_type} registry"
+        # Old: return f"{self.job.id} in {self.registry_type} registry"
+        return f"{self.job_id} in {self.registry_type} registry"
 
 
 class Worker(models.Model):
@@ -1049,13 +1063,13 @@ class Worker(models.Model):
         default="idle",
         db_index=True,
     )
-    current_job = models.ForeignKey(
-        QueuedJob,
+    # Old: current_job = models.ForeignKey(QueuedJob, null=True, blank=True, on_delete=models.SET_NULL, related_name="current_worker", help_text="Job currently being processed")
+    # #CLEANUP: Remove after soak — rename current_job_id back to current_job if FK ever restored
+    current_job_id = models.BigIntegerField(
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="current_worker",
-        help_text="Job currently being processed",
+        db_index=True,
+        help_text="ID of the QueuedJob currently being processed (FK demoted — D4: referential integrity to partitioned table intentionally dropped)",
     )
 
     # Configuration
