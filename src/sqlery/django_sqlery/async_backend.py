@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 class DjangoAsyncBackend(AsyncDatabaseBackend):
     """Async backend backed by the Django ORM (native async, no thread offload)."""
 
+    def __init__(self):
+        """Initialize async backend with per-instance partition cache."""
+        # WR-02: mirror DjangoBackend._partitioned_pg_cache so async callers don't
+        # issue a pg_class roundtrip on every invocation.
+        self._partitioned_pg_cache: bool | None = None
+
     def _partitioned_pg(self) -> bool:
         """True iff on PostgreSQL AND sqlery_queued_job is partitioned.
 
@@ -58,7 +64,11 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         partitioning (e.g. cleanup→reclaim routing). SQLite / non-partitioned PG
         return False (D6 — unchanged path).
         """
+        # WR-02: use per-instance cache to avoid a pg_class roundtrip on every call.
+        if self._partitioned_pg_cache is not None:
+            return self._partitioned_pg_cache
         if connection.vendor != "postgresql":
+            self._partitioned_pg_cache = False
             return False
         try:
             with connection.cursor() as cur:
@@ -68,9 +78,17 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                     [QueuedJob._meta.db_table],
                 )
                 row = cur.fetchone()
-            return bool(row and row[0])
+            self._partitioned_pg_cache = bool(row and row[0])
         except Exception:
+            # Fail open: leave cache as None so the next call retries (mirrors WR-01 fix
+            # in DjangoBackend — transient DB error at startup must not permanently
+            # disable partition routing for the lifetime of the process).
+            logger.warning(
+                "_partitioned_pg (async): catalog query failed — will retry on next call",
+                exc_info=True,
+            )
             return False
+        return self._partitioned_pg_cache
 
     # ----- claim path ------------------------------------------------------
 
