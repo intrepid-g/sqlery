@@ -615,16 +615,23 @@ class DjangoBackend(DatabaseBackend):
 
             retention_str = get_setting("SQLERY_PARTITION_RETENTION", "30 days")
             archive_hook = get_setting("SQLERY_PARTITION_ARCHIVE_HOOK", None)
+            # Old: cur = self.get_raw_cursor()
+            # CR-02: cursor was never closed, leaking a CursorWrapper on every cleanup_jobs call.
+            # Use try/finally to ensure close() is called even if reclaim raises.
             cur = self.get_raw_cursor()
-            # D5: Partition reclaim destroys all jobs in drained partitions (beyond
-            # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
-            # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
-            # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
-            # to archive instead. The archive hook receives (cur, partition_name)
-            # and must not execute arbitrary SQL via string interpolation (T-16-07).
-            dropped = _partitioning.reclaim_drained_partitions(
-                cur, self.QueuedJob._meta.db_table, retention_str, archive_hook
-            )
+            try:
+                # D5: Partition reclaim destroys all jobs in drained partitions (beyond
+                # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
+                # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
+                # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
+                # to archive instead. The archive hook receives (cur, partition_name)
+                # and must not execute arbitrary SQL via string interpolation (T-16-07).
+                dropped = _partitioning.reclaim_drained_partitions(
+                    cur, self.QueuedJob._meta.db_table, retention_str, archive_hook
+                )
+            finally:
+                if cur is not None:
+                    cur.close()
             return {
                 "deleted": 0,
                 "reclaimed_via_partition_drop": True,
