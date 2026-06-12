@@ -8,6 +8,7 @@ import sys
 import time
 import signal
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,6 +46,29 @@ except Exception:
     ScheduledJob = None
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _nullable_cursor_cm(cur):
+    """Fallback context manager for backends exposing only get_raw_cursor() (WR-03).
+
+    Wraps a raw cursor (or None) so the daemon's `with ... as cur` blocks release the
+    underlying pooled connection on exit even for backends that predate the
+    SQLAlchemyBackend.raw_cursor() context manager (e.g. DjangoBackend). On exit it
+    closes the cursor and its connection; if cur is None it is a no-op.
+    """
+    try:
+        yield cur
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                cur.connection.close()
+            except Exception:
+                pass
 
 
 def _should_run_cleanup(last_run: datetime | None, interval_hours: int = 6) -> bool:
@@ -621,78 +645,91 @@ class DaemonManager:
                     # R9: measure wall-clock duration of the maintenance tick.
                     tick_start = time.monotonic()
                     try:
-                        cur = backend.get_raw_cursor()
-                        # CR-01: guard against non-partitioned PG / SQLite — get_raw_cursor()
-                        # returns None when _partitioned_pg() is False; passing None to the
-                        # partitioning helpers raises AttributeError on cur.execute().
-                        # Advance the timestamp so we don't busy-loop on every cycle.
-                        if cur is None:
-                            logger.debug(
-                                "Partition maintenance skipped: table is not partitioned "
-                                "(non-partitioned PG or SQLite)"
-                            )
-                            last_partition_maintenance_at = datetime.now(timezone.utc)
+                        # WR-03: use raw_cursor() context manager when available so the
+                        # pooled connection is released after the tick. The old code called
+                        # backend.get_raw_cursor() and never closed the cursor OR the
+                        # underlying connection, leaking a pool connection every maintenance
+                        # cycle. Fall back to get_raw_cursor() only if the backend predates
+                        # the context manager (e.g. Django backend).
+                        # Old (leaked pool connection — no close anywhere):
+                        # cur = backend.get_raw_cursor()
+                        _raw_cursor_cm = getattr(backend, "raw_cursor", None)
+                        if _raw_cursor_cm is not None:
+                            _cursor_ctx = _raw_cursor_cm()
                         else:
-                            made = _partitioning.ensure_future_partitions(
-                                cur, partition_table, partition_interval_str, partition_premake
-                            )
-                            dropped = _partitioning.reclaim_drained_partitions(
-                                cur, partition_table, partition_retention_str, partition_archive_hook
-                            )
-                            default_count = _partitioning.check_default_partition(
-                                cur, partition_table
-                            )
-                            # R9 metric 1: partition_count — number of non-DEFAULT child partitions.
-                            partitions = _partitioning._list_partitions(cur, partition_table)
-                            partition_count = len([p for p in partitions if p[1] is not None])
-                            # R9 metric 2: oldest_undrained_partition_age_days — age in days of the
-                            # oldest non-DEFAULT partition whose upper_bound is in the past (past
-                            # retention cutoff but not yet reclaimed). None if none exist.
-                            now_utc = datetime.now(timezone.utc)
-                            past_upper_bounds = [
-                                p[1] for p in partitions if p[1] is not None and p[1] < now_utc
-                            ]
-                            oldest_undrained_age_days: int | None = (
-                                max((now_utc - ub).days for ub in past_upper_bounds)
-                                if past_upper_bounds
-                                else None
-                            )
-                            # R9 metric 3: staging_depth — count of rows in sqlery_scheduled_job.
-                            # Guard with ScheduledJob is not None for standalone-mode compatibility.
-                            staging_depth: int | None = (
-                                ScheduledJob.objects.count() if ScheduledJob is not None else None
-                            )
-                            # R9 metric 4: maintenance_tick_duration_seconds.
-                            tick_duration = time.monotonic() - tick_start
-
-                            # Old (missing 4 metrics):
-                            # if made > 0 or dropped > 0:
-                            #     logger.info(
-                            #         f"Partition maintenance: created={made}, dropped={dropped}, "
-                            #         f"default_rows={default_count}"
-                            #     )
-                            logger.info(
-                                f"Partition maintenance: created={made}, dropped={dropped}, "
-                                f"partition_count={partition_count}, default_rows={default_count}, "
-                                f"oldest_undrained_days={oldest_undrained_age_days}, "
-                                f"staging_depth={staging_depth}, "
-                                f"tick_duration_s={tick_duration:.2f}"
-                            )
-                            if default_count > 0:
-                                logger.warning(
-                                    f"DEFAULT partition holds {default_count} rows — "
-                                    "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
+                            _cursor_ctx = _nullable_cursor_cm(backend.get_raw_cursor())
+                        with _cursor_ctx as cur:
+                            # CR-01: guard against non-partitioned PG / SQLite — the cursor
+                            # is None when _partitioned_pg() is False; passing None to the
+                            # partitioning helpers raises AttributeError on cur.execute().
+                            # Advance the timestamp so we don't busy-loop on every cycle.
+                            if cur is None:
+                                logger.debug(
+                                    "Partition maintenance skipped: table is not partitioned "
+                                    "(non-partitioned PG or SQLite)"
                                 )
-                            # Expose all 5 metrics for operator queries (R9 complete).
-                            self._last_partition_stats = {
-                                "partition_count": partition_count,
-                                "default_rows": default_count,
-                                "oldest_undrained_age_days": oldest_undrained_age_days,
-                                "staging_depth": staging_depth,
-                                "last_tick_duration_s": tick_duration,
-                                "last_tick_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            last_partition_maintenance_at = datetime.now(timezone.utc)
+                                last_partition_maintenance_at = datetime.now(timezone.utc)
+                            else:
+                                made = _partitioning.ensure_future_partitions(
+                                    cur, partition_table, partition_interval_str, partition_premake
+                                )
+                                dropped = _partitioning.reclaim_drained_partitions(
+                                    cur, partition_table, partition_retention_str, partition_archive_hook
+                                )
+                                default_count = _partitioning.check_default_partition(
+                                    cur, partition_table
+                                )
+                                # R9 metric 1: partition_count — number of non-DEFAULT child partitions.
+                                partitions = _partitioning._list_partitions(cur, partition_table)
+                                partition_count = len([p for p in partitions if p[1] is not None])
+                                # R9 metric 2: oldest_undrained_partition_age_days — age in days of the
+                                # oldest non-DEFAULT partition whose upper_bound is in the past (past
+                                # retention cutoff but not yet reclaimed). None if none exist.
+                                now_utc = datetime.now(timezone.utc)
+                                past_upper_bounds = [
+                                    p[1] for p in partitions if p[1] is not None and p[1] < now_utc
+                                ]
+                                oldest_undrained_age_days: int | None = (
+                                    max((now_utc - ub).days for ub in past_upper_bounds)
+                                    if past_upper_bounds
+                                    else None
+                                )
+                                # R9 metric 3: staging_depth — count of rows in sqlery_scheduled_job.
+                                # Guard with ScheduledJob is not None for standalone-mode compatibility.
+                                staging_depth: int | None = (
+                                    ScheduledJob.objects.count() if ScheduledJob is not None else None
+                                )
+                                # R9 metric 4: maintenance_tick_duration_seconds.
+                                tick_duration = time.monotonic() - tick_start
+
+                                # Old (missing 4 metrics):
+                                # if made > 0 or dropped > 0:
+                                #     logger.info(
+                                #         f"Partition maintenance: created={made}, dropped={dropped}, "
+                                #         f"default_rows={default_count}"
+                                #     )
+                                logger.info(
+                                    f"Partition maintenance: created={made}, dropped={dropped}, "
+                                    f"partition_count={partition_count}, default_rows={default_count}, "
+                                    f"oldest_undrained_days={oldest_undrained_age_days}, "
+                                    f"staging_depth={staging_depth}, "
+                                    f"tick_duration_s={tick_duration:.2f}"
+                                )
+                                if default_count > 0:
+                                    logger.warning(
+                                        f"DEFAULT partition holds {default_count} rows — "
+                                        "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
+                                    )
+                                # Expose all 5 metrics for operator queries (R9 complete).
+                                self._last_partition_stats = {
+                                    "partition_count": partition_count,
+                                    "default_rows": default_count,
+                                    "oldest_undrained_age_days": oldest_undrained_age_days,
+                                    "staging_depth": staging_depth,
+                                    "last_tick_duration_s": tick_duration,
+                                    "last_tick_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                last_partition_maintenance_at = datetime.now(timezone.utc)
                     except Exception as e:
                         logger.error(f"Partition maintenance error: {e}", exc_info=True)
 
@@ -703,21 +740,29 @@ class DaemonManager:
                 #      silently by the outer except clause.
                 if _partition_maint_available:
                     try:
-                        # Old: TODO(Phase 16): backend.get_raw_cursor() is wired in Phase 16.
-                        # Old: Until then AttributeError is caught and skipped (not swallowed silently).
-                        cur = backend.get_raw_cursor()
-                        # CR-03/IN-01: get_raw_cursor() returns None on non-partitioned PG/SQLite.
-                        # The old AttributeError guard was masking a real bug: promotion never ran
-                        # on non-partitioned PG. Explicit null check replaces the except guard.
-                        if cur is None:
-                            pass  # Non-partitioned PG or SQLite — promotion not available this tick
+                        # WR-03: use raw_cursor() context manager so the pooled connection is
+                        # released after the promotion tick. The old code called
+                        # backend.get_raw_cursor() and never closed the cursor/connection,
+                        # leaking a pool connection every cycle.
+                        # Old: cur = backend.get_raw_cursor()  (never closed)
+                        _raw_cursor_cm = getattr(backend, "raw_cursor", None)
+                        if _raw_cursor_cm is not None:
+                            _promo_ctx = _raw_cursor_cm()
                         else:
-                            promoted = promote_due_scheduled_jobs(cur)
-                            if promoted > 0:
-                                logger.info(
-                                    f"Promotion tick: promoted {promoted} staged job(s)"
-                                    f" to sqlery_queued_job"
-                                )
+                            _promo_ctx = _nullable_cursor_cm(backend.get_raw_cursor())
+                        with _promo_ctx as cur:
+                            # CR-03/IN-01: cursor is None on non-partitioned PG/SQLite.
+                            # The old AttributeError guard was masking a real bug: promotion
+                            # never ran on non-partitioned PG. Explicit null check instead.
+                            if cur is None:
+                                pass  # Non-partitioned PG or SQLite — promotion not available this tick
+                            else:
+                                promoted = promote_due_scheduled_jobs(cur)
+                                if promoted > 0:
+                                    logger.info(
+                                        f"Promotion tick: promoted {promoted} staged job(s)"
+                                        f" to sqlery_queued_job"
+                                    )
                     # Old: except AttributeError:
                     # Old:     # backend.get_raw_cursor() not yet wired — Phase 16 TODO.
                     # Old:     pass

@@ -8,6 +8,7 @@ import os
 import socket
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone as dt_timezone, UTC
 from typing import Any
 
@@ -122,9 +123,16 @@ class SQLAlchemyBackend(DatabaseBackend):
         engine.raw_connection() on partitioned PostgreSQL; returns None on SQLite (and
         any non-partitioned install) so the daemon skips PG-only maintenance cleanly.
 
-        CALLER OWNS THE CURSOR LIFECYCLE: the caller must call cursor.close() and
-        close/rollback the underlying raw connection. Wrap in try/finally to avoid the
-        CR-02 leak. The archive hook receives (cur, partition_name) and must not execute
+        WR-03 — POOL-CONNECTION LEAK WARNING: engine.raw_connection() checks out a
+        POOLED connection. Calling only ``cursor.close()`` does NOT return that
+        connection to the pool — it leaks for the lifetime of the process. The caller
+        MUST also close the underlying connection via ``cur.connection.close()``.
+        Prefer the ``raw_cursor()`` context manager below, which owns and releases both
+        the cursor AND the connection automatically; only use this lower-level method
+        if you cannot use the context manager, and always wrap it in try/finally that
+        closes the cursor and then ``cur.connection.close()``.
+
+        The archive hook receives (cur, partition_name) and must not execute
         arbitrary SQL via string interpolation (T-17-09).
         """
         if not self._partitioned_pg():
@@ -132,6 +140,34 @@ class SQLAlchemyBackend(DatabaseBackend):
         engine = get_engine()
         raw_conn = engine.raw_connection()
         return raw_conn.cursor()
+
+    @contextmanager
+    def raw_cursor(self):
+        """Context manager yielding a raw psycopg cursor and releasing the pool conn.
+
+        WR-03: wraps get_raw_cursor()'s connection lifecycle so callers cannot leak the
+        pooled connection. Yields a live psycopg cursor on partitioned PostgreSQL, or
+        None on SQLite / any non-partitioned install (so the daemon skips PG-only
+        maintenance cleanly). On exit it closes the cursor AND the underlying
+        raw_connection, returning it to the pool — even if the body raises.
+        """
+        if not self._partitioned_pg():
+            yield None
+            return
+        engine = get_engine()
+        raw_conn = engine.raw_connection()
+        cur = raw_conn.cursor()
+        try:
+            yield cur
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
 
     def _resolve_worker(self, worker_id):
         """Resolve a worker_id (UUID or "worker_<node>_<pid>" string) to a Worker.
@@ -869,11 +905,22 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             retention_str = get_config("SQLERY_PARTITION_RETENTION", "30 days")
             archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
-            # Old: cur = self.get_raw_cursor()
-            # CR-02: cursor was never closed, leaking a raw connection on every cleanup_jobs call.
-            # Use try/finally to ensure close() is called even if reclaim raises.
-            cur = self.get_raw_cursor()
-            try:
+            # WR-03: use the raw_cursor() context manager so the pooled connection is
+            # always released — the previous manual try/finally lived only here, but the
+            # daemon call sites only closed the cursor and leaked the connection.
+            # Old (manual, easy to get wrong / not shared with daemon):
+            # cur = self.get_raw_cursor()
+            # try:
+            #     dropped = _partitioning.reclaim_drained_partitions(
+            #         cur, QueuedJob.__tablename__, retention_str, archive_hook)
+            # finally:
+            #     if cur is not None:
+            #         cur.close()
+            #         try:
+            #             cur.connection.close()
+            #         except Exception:
+            #             pass
+            with self.raw_cursor() as cur:
                 # D5: Partition reclaim destroys all jobs in drained partitions (beyond
                 # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
                 # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
@@ -883,14 +930,6 @@ class SQLAlchemyBackend(DatabaseBackend):
                 dropped = _partitioning.reclaim_drained_partitions(
                     cur, QueuedJob.__tablename__, retention_str, archive_hook
                 )
-            finally:
-                if cur is not None:
-                    cur.close()
-                    # Also close the underlying raw connection (avoid leaking pooled conn)
-                    try:
-                        cur.connection.close()
-                    except Exception:
-                        pass
             return {
                 "deleted": 0,
                 "reclaimed_via_partition_drop": True,
