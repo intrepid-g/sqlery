@@ -216,7 +216,10 @@ class SQLAlchemyBackend(DatabaseBackend):
         # Staging only protects partitions, which exist only on partitioned PG.
         # On SQLite / non-partitioned PG, far-future jobs stay in sqlery_queued_job
         # (D6 — SQLite path unchanged).
-        threshold_days = get_config("SCHEDULED_JOB_THRESHOLD_DAYS", 1)
+        # CR-02: use the SQLERY_-prefixed key so the lookup hits StandaloneConfig's
+        # stored value (and matches daemon.py's SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS read).
+        # Old: threshold_days = get_config("SCHEDULED_JOB_THRESHOLD_DAYS", 1)
+        threshold_days = get_config("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 1)
         staging_threshold = timedelta(days=threshold_days)
         now_utc = datetime.now(UTC)
         if (
