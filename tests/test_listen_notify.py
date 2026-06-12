@@ -35,6 +35,22 @@ _SKIP_NO_PG = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+def _reset_pg_schema(dsn: str) -> None:
+    """Drop and recreate the public schema on a PG database via psycopg3.
+
+    Used instead of SQLModel.metadata.drop_all() which cannot topo-sort the
+    circular queued_job<->worker foreign keys.
+    """
+    import psycopg
+
+    conn = psycopg.connect(dsn, autocommit=True)
+    try:
+        conn.execute("DROP SCHEMA public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+    finally:
+        conn.close()
+
+
 def _make_worker_process(queues=None):
     """Create a WorkerProcess with a mocked backend (avoids Django DB calls)."""
     from sqlery.core.worker import WorkerProcess
@@ -373,9 +389,13 @@ class TestListenNotifyLatencyPG:
         worker.poll_interval = 5  # would block 5s without NOTIFY
 
         # Open the LISTEN connection.
+        # Old: listen_conn.execute(f"LISTEN {channel}")  # IN-02: raw f-string
+        # Use the same Identifier-quoted form production uses (worker.py).
+        import psycopg.sql as _sql
+
         listen_conn = psycopg.connect(pg_url, autocommit=True)
         listen_conn.execute(
-            f"LISTEN {channel}"
+            _sql.SQL("LISTEN {}").format(_sql.Identifier(channel))
         )
         worker._listen_conn = listen_conn
 
@@ -488,3 +508,152 @@ class TestListenNotifyLatencyPG:
                 )
 
         sentinel.assert_not_called()
+
+
+# ===========================================================================
+# IN-03 / CR-01: STANDALONE (SQLAlchemy) create_job -> NOTIFY INTEGRATION
+# ===========================================================================
+
+
+class TestSQLAlchemyNotifyFlagOff:
+    """SC2 for standalone mode: no notify emitted when SQLERY_PG_NOTIFY=False."""
+
+    def test_sqlalchemy_no_notify_emitted_when_flag_off(self, tmp_path, monkeypatch):
+        """SQLAlchemyBackend.create_job must NOT call _notify_queue_sqlalchemy off."""
+        from sqlalchemy import create_engine
+        from sqlmodel import SQLModel
+
+        from sqlery.fastapi_sqlery import database as db_mod
+        from sqlery.core import models as _core_models  # noqa: F401
+
+        db_path = tmp_path / "flagoff.db"
+        engine = create_engine(f"sqlite:///{db_path}", future=True)
+        SQLModel.metadata.create_all(engine)
+        monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+        from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+        sentinel = MagicMock()
+        with (
+            patch(
+                "sqlery.fastapi_sqlery.backend.get_config",
+                side_effect=lambda key, default=None: (
+                    False if key == "SQLERY_PG_NOTIFY" else default
+                ),
+            ),
+            patch(
+                "sqlery.fastapi_sqlery.backend._notify_queue_sqlalchemy",
+                sentinel,
+            ),
+        ):
+            backend = SQLAlchemyBackend()
+            backend.create_job(
+                task_path="myapp.tasks.noop",
+                kwargs={},
+                queue_name="default",
+                priority=0,
+                scheduled_at=None,
+                max_retries=0,
+                retry_backoff=1.0,
+                allow_parallel=True,
+                timeout_seconds=None,
+            )
+
+        sentinel.assert_not_called()
+        engine.dispose()
+
+
+class TestSQLAlchemyNotifyDeliveryPG:
+    """CR-01 verification: a real NOTIFY must reach a LISTENing connection.
+
+    This test FAILS on the pre-CR-01 code (notify fired in a rolled-back SA2
+    implicit transaction, so the listener never received it) and PASSES with
+    the AUTOCOMMIT-connection fix.
+    """
+
+    @_SKIP_NO_PG
+    def test_create_job_delivers_notify_to_listener_pg(self, monkeypatch):
+        """create_job (flag on, real PG) delivers NOTIFY to a LISTEN conn."""
+        try:
+            import psycopg
+            import psycopg.sql as _sql
+        except ImportError:
+            pytest.skip("psycopg not installed -- cannot test real NOTIFY delivery")
+
+        from sqlery.fastapi_sqlery import database as db_mod
+        from sqlery.core import models as _core_models  # noqa: F401
+
+        pg_url = os.environ["SQLERY_TEST_PG_URL"]
+        # SQLAlchemy defaults bare postgresql:// to psycopg2 (not installed);
+        # sqlery uses psycopg3. Force the psycopg3 driver for init_database.
+        sa_url = pg_url
+        if sa_url.startswith("postgresql://"):
+            sa_url = "postgresql+psycopg://" + sa_url[len("postgresql://"):]
+        # psycopg.connect() wants a libpq DSN, not the SQLAlchemy +psycopg form.
+        listen_dsn = pg_url
+        if listen_dsn.startswith("postgresql+psycopg://"):
+            listen_dsn = "postgresql://" + listen_dsn[len("postgresql+psycopg://"):]
+
+        # Reset to an empty schema, then let init_database() build the real
+        # (partitioned) schema and set the module-level _engine that
+        # SQLAlchemyBackend / get_engine() use.
+        _reset_pg_schema(listen_dsn)
+        prev_engine = getattr(db_mod, "_engine", None)
+        monkeypatch.setattr(db_mod, "_engine", None, raising=False)
+        db_mod.init_database(sa_url)
+        engine = db_mod.get_engine()
+
+        def _restore_engine():
+            db_mod._engine = prev_engine
+
+        monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+        from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+        channel = sanitize_queue_name_to_channel("default")
+
+        # Open a real LISTEN connection BEFORE enqueueing.
+        listen_conn = psycopg.connect(listen_dsn, autocommit=True)
+        listen_conn.execute(_sql.SQL("LISTEN {}").format(_sql.Identifier(channel)))
+
+        try:
+            with patch(
+                "sqlery.fastapi_sqlery.backend.get_config",
+                side_effect=lambda key, default=None: (
+                    True if key == "SQLERY_PG_NOTIFY" else default
+                ),
+            ):
+                backend = SQLAlchemyBackend()
+                backend.create_job(
+                    task_path="myapp.tasks.noop",
+                    kwargs={},
+                    queue_name="default",
+                    priority=0,
+                    scheduled_at=None,
+                    max_retries=0,
+                    retry_backoff=1.0,
+                    allow_parallel=True,
+                    timeout_seconds=None,
+                )
+
+            # Poll for the notification (generous timeout for slow CI).
+            deadline = time.monotonic() + 2.0
+            notifications = []
+            while time.monotonic() < deadline:
+                for note in listen_conn.notifies(timeout=0.2):
+                    notifications.append(note)
+                if notifications:
+                    break
+
+            channels = [n.channel for n in notifications]
+            assert channel in channels, (
+                f"Expected NOTIFY on channel {channel!r} after create_job, "
+                f"got {channels!r}. Pre-CR-01 the notify fired in a "
+                f"rolled-back transaction and was never delivered."
+            )
+        finally:
+            try:
+                listen_conn.close()
+            finally:
+                _reset_pg_schema(listen_dsn)
+                engine.dispose()
