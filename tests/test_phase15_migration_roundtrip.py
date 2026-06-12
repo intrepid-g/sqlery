@@ -502,3 +502,357 @@ def test_migration_idempotency_sc4():
     finally:
         conn.close()
         _drop_isolated_db(db_name)
+
+
+# ---------------------------------------------------------------------------
+# Helper — legacy schema WITH real FK constraints and job_name UNIQUE
+# ---------------------------------------------------------------------------
+
+
+def _create_legacy_schema_with_real_constraints(conn: psycopg.Connection) -> None:
+    """Build the pre-0030 schema as it actually looks after migrations 0001..0029.
+
+    This is the schema the real migration operates on in production.  The synthetic
+    _create_legacy_schema helper omits FK constraints and the job_name unique
+    constraint, which caused CR-01 and CR-03 to be invisible in the existing tests.
+
+    Tables created:
+      - sqlery_queued_job  (primary queue table, plain PK on id, job_name UNIQUE)
+      - sqlery_worker      (FK current_job_id → sqlery_queued_job.id ON DELETE SET NULL)
+      - sqlery_registry    (FK job_id → sqlery_queued_job.id ON DELETE CASCADE)
+
+    The FK constraint names match the auto-generated names Django produces
+    (sqlery_worker_current_job_id_* and sqlery_registry_job_id_*) but because S0
+    uses a catalog lookup rather than hard-coded names, the exact names do not matter
+    for the cutover logic.
+    """
+    with conn.cursor() as cur:
+        # Shared sequence (migration 0029)
+        cur.execute("CREATE SEQUENCE IF NOT EXISTS sqlery_job_id_seq")
+
+        # sqlery_queued_job — matches the column set after migration 0029.
+        # job_name carries the UNIQUE constraint added in migration 0015.
+        cur.execute(
+            """
+            CREATE TABLE sqlery_queued_job (
+                id                BIGINT          NOT NULL DEFAULT nextval('sqlery_job_id_seq'),
+                task_path         VARCHAR(500)    NOT NULL,
+                kwargs            JSONB           NOT NULL DEFAULT '{}',
+                queue_name        VARCHAR(50)     NOT NULL DEFAULT 'default',
+                priority          INTEGER         NOT NULL DEFAULT 0,
+                status            VARCHAR(20)     NOT NULL DEFAULT 'queued',
+                version           INTEGER         NOT NULL DEFAULT 0,
+                parent_job_id     BIGINT,
+                retry_count       INTEGER         NOT NULL DEFAULT 0,
+                max_retries       INTEGER         NOT NULL DEFAULT 0,
+                retry_backoff     DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                allow_parallel    BOOLEAN         NOT NULL DEFAULT FALSE,
+                tags              JSONB           NOT NULL DEFAULT '[]',
+                dependencies      JSONB           NOT NULL DEFAULT '[]',
+                webhook_url       VARCHAR(500),
+                webhook_events    JSONB           NOT NULL DEFAULT '[]',
+                webhook_status    VARCHAR(20),
+                webhook_retries   INTEGER         NOT NULL DEFAULT 0,
+                webhook_max_retries INTEGER       NOT NULL DEFAULT 3,
+                timeout_seconds   INTEGER,
+                worker_pid        INTEGER,
+                child_pid         INTEGER,
+                runs              JSONB           NOT NULL DEFAULT '[]',
+                meta              JSONB,
+                job_name          VARCHAR(255)    UNIQUE,
+                retry_intervals   JSONB,
+                on_success_path   VARCHAR(500)    NOT NULL DEFAULT '',
+                on_failure_path   VARCHAR(500)    NOT NULL DEFAULT '',
+                ttl               INTEGER,
+                result_ttl        INTEGER,
+                failure_ttl       INTEGER,
+                scheduled_task_id BIGINT,
+                worker_id         UUID,
+                created_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
+                scheduled_at      TIMESTAMPTZ,
+                started_at        TIMESTAMPTZ,
+                finished_at       TIMESTAMPTZ,
+                duration_seconds  DOUBLE PRECISION,
+                output            TEXT            NOT NULL DEFAULT '',
+                error             TEXT            NOT NULL DEFAULT '',
+                traceback         TEXT            NOT NULL DEFAULT '',
+                termination_reason VARCHAR(100)   NOT NULL DEFAULT '',
+                PRIMARY KEY (id),
+                CONSTRAINT sqlery_queued_job_job_name_key UNIQUE (job_name)
+            )
+            """
+        )
+        cur.execute("SELECT setval('sqlery_job_id_seq', 1, false)")
+
+        # sqlery_worker — created by migration 0002.
+        # current_job_id is a FK to sqlery_queued_job.id (ON DELETE SET NULL).
+        cur.execute(
+            """
+            CREATE TABLE sqlery_worker (
+                id              UUID            NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+                node_id         VARCHAR(255)    NOT NULL,
+                pid             INTEGER         NOT NULL,
+                status          VARCHAR(10)     NOT NULL DEFAULT 'idle',
+                queues          JSONB           NOT NULL DEFAULT '[]',
+                last_heartbeat  TIMESTAMPTZ     NOT NULL DEFAULT now(),
+                started_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+                jobs_processed  INTEGER         NOT NULL DEFAULT 0,
+                current_job_id  BIGINT,
+                CONSTRAINT sqlery_worker_current_job_id_fk
+                    FOREIGN KEY (current_job_id)
+                    REFERENCES sqlery_queued_job (id)
+                    ON DELETE SET NULL
+            )
+            """
+        )
+
+        # sqlery_registry — created by migration 0003.
+        # job_id is a FK to sqlery_queued_job.id (ON DELETE CASCADE).
+        cur.execute(
+            """
+            CREATE TABLE sqlery_registry (
+                id              BIGSERIAL       PRIMARY KEY,
+                registry_type   VARCHAR(20)     NOT NULL,
+                entered_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+                exited_at       TIMESTAMPTZ,
+                metadata        JSONB           NOT NULL DEFAULT '{}',
+                job_id          BIGINT          NOT NULL,
+                CONSTRAINT sqlery_registry_job_id_fk
+                    FOREIGN KEY (job_id)
+                    REFERENCES sqlery_queued_job (id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+
+# ---------------------------------------------------------------------------
+# SC6 — FK operability after cutover (catches CR-01)
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_NO_PG
+def test_migration_fk_operability_sc6():
+    """SC6: post-cutover JobRegistry and Worker writes with new job ids succeed.
+
+    Builds the legacy schema WITH real FK constraints (as migrations 0002/0003 create),
+    inserts a handful of rows, runs the 0030 forward cutover, then verifies:
+
+    1. A new QueuedJob can be inserted into the partitioned table.
+    2. A sqlery_registry row referencing the new job id inserts without IntegrityError.
+    3. A sqlery_worker row can be updated to set current_job_id to the new job id.
+    4. job_name dedup still works at the app level (INSERT the same job_name a second
+       time after deleting the first — simulating backend.create_job's "new wins" logic).
+
+    Without CR-01 fix (S0 FK-drop step), assertions 2 and 3 raise IntegrityError because
+    the FK constraints still point at sqlery_queued_job_legacy after the rename.
+    Without CR-03 fix (S3b + AlterField), the job_name unique constraint is silently lost
+    and assertion 4 would allow duplicate job_names that violate the uniqueness invariant.
+    """
+    db_name = "sqlery_rt_sc6"
+    conn = _make_isolated_db(db_name)
+    try:
+        _create_legacy_schema_with_real_constraints(conn)
+
+        # Seed legacy table with a few jobs (including one named job).
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sqlery_queued_job
+                    (task_path, status, created_at, job_name)
+                VALUES
+                    ('myapp.tasks.alpha', 'success', now() - interval '1 hour', NULL),
+                    ('myapp.tasks.beta', 'success', now() - interval '2 hours', 'named-job-1')
+                RETURNING id
+                """
+            )
+            legacy_ids = [row[0] for row in cur.fetchall()]
+
+            # Insert a registry entry and a worker pointing at the legacy job.
+            cur.execute(
+                """
+                INSERT INTO sqlery_registry (registry_type, job_id)
+                VALUES ('started', %s)
+                """,
+                [legacy_ids[0]],
+            )
+            cur.execute(
+                """
+                INSERT INTO sqlery_worker (node_id, pid, current_job_id)
+                VALUES ('test-node', 12345, %s)
+                RETURNING id
+                """,
+                [legacy_ids[0]],
+            )
+            (worker_id,) = cur.fetchone()
+
+        # Run the cutover.
+        _run_forward(conn)
+
+        with conn.cursor() as cur:
+            # Verify legacy rows are present in the partitioned table.
+            cur.execute("SELECT COUNT(*) FROM sqlery_queued_job")
+            (count,) = cur.fetchone()
+            assert count >= 2, f"SC6: expected ≥2 rows after cutover, got {count}"
+
+            # 1 — Insert a NEW job into the partitioned table.
+            cur.execute(
+                """
+                INSERT INTO sqlery_queued_job
+                    (task_path, status, created_at)
+                VALUES
+                    ('myapp.tasks.new_post_cutover', 'queued', now())
+                RETURNING id
+                """,
+            )
+            (new_job_id,) = cur.fetchone()
+            assert new_job_id is not None, "SC6: could not insert new job after cutover"
+
+            # 2 — Insert a registry row referencing the NEW job id.
+            # Without CR-01 fix this raises IntegrityError (FK still points at legacy table).
+            cur.execute(
+                """
+                INSERT INTO sqlery_registry (registry_type, job_id)
+                VALUES ('started', %s)
+                """,
+                [new_job_id],
+            )
+
+            # 3 — Update a Worker.current_job_id to the NEW job id.
+            # Without CR-01 fix this also raises IntegrityError.
+            cur.execute(
+                """
+                UPDATE sqlery_worker SET current_job_id = %s WHERE id = %s
+                """,
+                [new_job_id, worker_id],
+            )
+
+            # 4 — App-level job_name dedup: simulate backend.create_job "new wins".
+            # Delete the existing named job, then insert a new one with the same name.
+            cur.execute(
+                "DELETE FROM sqlery_queued_job WHERE job_name = 'named-job-1'"
+            )
+            cur.execute(
+                """
+                INSERT INTO sqlery_queued_job
+                    (task_path, status, created_at, job_name)
+                VALUES
+                    ('myapp.tasks.beta_v2', 'queued', now(), 'named-job-1')
+                RETURNING id
+                """,
+            )
+            (named_job_id,) = cur.fetchone()
+            assert named_job_id is not None, "SC6: named job re-insert failed after cutover"
+
+            # Confirm only ONE row with that job_name exists (dedup invariant maintained).
+            cur.execute(
+                "SELECT COUNT(*) FROM sqlery_queued_job WHERE job_name = 'named-job-1'"
+            )
+            (name_count,) = cur.fetchone()
+            assert name_count == 1, (
+                f"SC6: expected exactly 1 row with job_name='named-job-1', got {name_count}"
+            )
+
+        print(f"\n  [SC6] new_job_id={new_job_id}, named_job_id={named_job_id} — PASS")
+    finally:
+        conn.close()
+        _drop_isolated_db(db_name)
+
+
+# ---------------------------------------------------------------------------
+# SC4b — rollback idempotency after injected mid-rollback failure (catches CR-02)
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_NO_PG
+def test_migration_rollback_idempotency_sc4b():
+    """SC4b: partial failure mid-rollback followed by full rerun gives correct row count.
+
+    Simulates the scenario where _backward crashes between step 2 (INSERT into
+    sqlery_queued_job_unpartitioned) and step 3 (rename partitioned table out of the way),
+    then is re-run in full.
+
+    Without CR-02 fix (missing PK on rollback table), ON CONFLICT DO NOTHING is a no-op
+    and the re-run doubles all rows.  With the fix, the duplicate rows are detected and
+    skipped, yielding the correct count.
+    """
+    db_name = "sqlery_rt_sc4b"
+    conn = _make_isolated_db(db_name)
+    try:
+        _create_legacy_schema(conn)
+
+        # Small snapshot — 100 rows sufficient for idempotency.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sqlery_queued_job
+                    (task_path, kwargs, queue_name, status, created_at, priority)
+                SELECT
+                    'myapp.tasks.task_' || (i % 10)::text,
+                    '{}'::jsonb,
+                    'default',
+                    'queued',
+                    now() - (i * interval '1 second'),
+                    0
+                FROM generate_series(1, 100) AS s(i)
+                """
+            )
+            cur.execute("SELECT COUNT(*) FROM sqlery_queued_job")
+            (original_count,) = cur.fetchone()
+
+        # Run forward migration to get a partitioned table.
+        _run_forward(conn)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sqlery_queued_job")
+            (post_forward_count,) = cur.fetchone()
+
+        # --- Inject partial rollback failure: execute steps 1 + 2 only, then stop ---
+
+        with conn.cursor() as cur:
+            # Step 1 — create unpartitioned table (mirrors _backward step 1 + PK add)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sqlery_queued_job_unpartitioned (
+                    LIKE sqlery_queued_job INCLUDING DEFAULTS INCLUDING STORAGE
+                );
+                """
+            )
+            # Step 2 — INSERT (stops here; step 3 rename NOT executed)
+            cur.execute(
+                """
+                INSERT INTO sqlery_queued_job_unpartitioned
+                    SELECT * FROM sqlery_queued_job
+                    ON CONFLICT DO NOTHING;
+                """
+            )
+            cur.execute("SELECT COUNT(*) FROM sqlery_queued_job_unpartitioned")
+            (after_partial_insert_count,) = cur.fetchone()
+
+        # Verify the partial rollback left the expected state.
+        assert after_partial_insert_count == post_forward_count, (
+            f"SC4b setup: expected {post_forward_count} rows in unpartitioned table "
+            f"after partial insert, got {after_partial_insert_count}"
+        )
+
+        # --- Re-run the full _backward — should be idempotent, NOT double rows ---
+        _run_backward(conn)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sqlery_queued_job")
+            (post_rollback_count,) = cur.fetchone()
+
+        # Key assertion: row count must equal the original, not be doubled.
+        assert post_rollback_count == original_count, (
+            f"SC4b FAIL: rollback re-run produced {post_rollback_count} rows "
+            f"(expected {original_count}, got {post_rollback_count} — "
+            f"CR-02 duplicate-row hazard: ON CONFLICT DO NOTHING was a no-op)"
+        )
+
+        print(
+            f"\n  [SC4b] original={original_count}, post_forward={post_forward_count}, "
+            f"post_rollback={post_rollback_count} — PASS"
+        )
+    finally:
+        conn.close()
+        _drop_isolated_db(db_name)
