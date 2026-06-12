@@ -13,6 +13,14 @@ try:
 except ImportError:
     _django_transaction = None  # type: ignore[assignment]
 
+# Phase 18 (IN-01): guard-import Django connection at module level so the
+# inline `from django.db import connection` inside functions can be removed
+# (project convention: imports at top of file, ORM imports guarded in core/).
+try:
+    from django.db import connection as _django_connection
+except ImportError:
+    _django_connection = None  # type: ignore[assignment]
+
 # Phase 18: guard-import SQLAlchemy text() at module level.
 # Set _sa_text = None if SQLAlchemy is not installed.
 try:
@@ -60,8 +68,11 @@ def _fire_django_notify(channel: str) -> None:
         channel: Pre-sanitized PG channel name.
     """
     try:
-        from django.db import connection  # noqa: PLC0415 — guarded import
-        with connection.cursor() as cur:
+        # Old: from django.db import connection  # noqa: PLC0415 — guarded import
+        # Phase 18 (IN-01): use the module-level guarded _django_connection.
+        if _django_connection is None:
+            return
+        with _django_connection.cursor() as cur:
             cur.execute("SELECT pg_notify(%s, '')", [channel])
     except Exception:
         logger.warning("pg_notify fire failed for channel %r", channel, exc_info=True)
@@ -80,8 +91,11 @@ def notify_queue_django(queue_name: str) -> None:
     if _django_transaction is None:
         return
     try:
-        from django.db import connection  # noqa: PLC0415 — guarded import
-        if connection.vendor != "postgresql":
+        # Old: from django.db import connection  # noqa: PLC0415 — guarded import
+        # Phase 18 (IN-01): use the module-level guarded _django_connection.
+        if _django_connection is None:
+            return
+        if _django_connection.vendor != "postgresql":
             return
     except Exception:
         return

@@ -94,8 +94,8 @@ def test_notify_queue_django_noop_when_not_postgresql() -> None:
 
     with (
         patch("sqlery.core.pg_notify._django_transaction", mock_transaction),
-        patch("sqlery.core.pg_notify.connection", mock_connection, create=True),
-        patch("django.db.connection", mock_connection),
+        # Phase 18 (IN-01): code now reads the module-level _django_connection.
+        patch("sqlery.core.pg_notify._django_connection", mock_connection),
     ):
         notify_queue_django("default")
         # on_commit must NOT have been scheduled
@@ -117,7 +117,8 @@ def test_notify_queue_django_schedules_on_commit_for_postgresql() -> None:
 
     with (
         patch("sqlery.core.pg_notify._django_transaction", mock_transaction),
-        patch("django.db.connection", mock_connection),
+        # Phase 18 (IN-01): code now reads the module-level _django_connection.
+        patch("sqlery.core.pg_notify._django_connection", mock_connection),
     ):
         notify_queue_django("my-queue")
         mock_transaction.on_commit.assert_called_once()
@@ -138,7 +139,7 @@ def test_fire_django_notify_executes_correct_sql() -> None:
     mock_connection.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
     mock_connection.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-    with patch("django.db.connection", mock_connection):
+    with patch("sqlery.core.pg_notify._django_connection", mock_connection):
         _fire_django_notify("sqlery_job_default")
 
     mock_cursor.execute.assert_called_once_with(
@@ -151,7 +152,7 @@ def test_fire_django_notify_swallows_exceptions() -> None:
     mock_connection = MagicMock()
     mock_connection.cursor.side_effect = Exception("DB down")
 
-    with patch("django.db.connection", mock_connection):
+    with patch("sqlery.core.pg_notify._django_connection", mock_connection):
         # Must not raise
         _fire_django_notify("sqlery_job_default")
 
