@@ -133,7 +133,12 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. With flag on, dispatch latency < 100 ms in test
   2. With flag off (default), behavior is byte-identical to before
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 18-01-PLAN.md — SQLERY_PG_NOTIFY=False flag in Django DEFAULTS + StandaloneConfig env-var load
+- [ ] 18-02-PLAN.md — core/pg_notify.py (channel sanitizer + helpers) + pg_notify wired into both backends' create_job
+- [ ] 18-03-PLAN.md — Worker LISTEN wake-up: _open/_close_listen_conn + _wait_for_notify in poll loop; fork-safe pre/post hooks
+- [ ] 18-04-PLAN.md — Tests: SC1 latency <100ms (PG), SC2 flag-off byte-identical, fork-safety assertion, SQLite no-op
 
 ## Progress
 
@@ -145,7 +150,7 @@ Plans:
 | 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
 | 16. backend-wiring-pruning | 4/4 | Complete   | 2026-06-12 |
 | 17. fastapi-parity | 4/4 | Complete   | 2026-06-12 |
-| 18. listen-notify (optional) | 0/TBD | Not started | - |
+| 18. listen-notify (optional) | 0/4 | Not started | - |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
 
