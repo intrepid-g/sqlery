@@ -22,15 +22,15 @@ Auditor: Phase 15 executor (15-01)
 | 7 | `src/sqlery/django_sqlery/models.py` | 676 | `self.refresh_from_db()` (mark_success) | ACCEPTABLE | Same as #6 — QueuedJob.mark_success(); immutable-PK refresh is safe. |
 | 8 | `src/sqlery/django_sqlery/models.py` | 729 | `self.refresh_from_db()` (mark_failed) | ACCEPTABLE | Same as #6 — QueuedJob.mark_failed(); immutable-PK refresh is safe. |
 | 9 | `src/sqlery/django_sqlery/models.py` | 832 | `self.refresh_from_db(fields=["meta"])` (refresh_meta) | ACCEPTABLE | Fields-specific refresh; only fetches `meta` column. Django constructs a WHERE clause using the composite PK value, which is correct. No side-effect on tuple pk. |
-| 10 | `src/sqlery/django_sqlery/async_backend.py` | 102 | `await QueuedJob.objects.aget(pk=job_id)` | DEFERRED-PHASE-16 | async_backend.aclaim_job — `job_id` is the integer id; after composite PK, `pk=` lookup with a plain int will fail (pk expects a tuple). Must be rewritten as `aget(id=job_id)` or with both partition fields. |
-| 11 | `src/sqlery/django_sqlery/async_backend.py` | 134 | `QueuedJob.objects.filter(pk=job.pk, version=job.version)` | DEFERRED-PHASE-16 | async_backend CAS claim — `.pk` becomes a tuple; the filter must use `id=job.id, created_at=job.created_at, version=job.version` after composite PK is live. Part of the 11-item write-path pruning. |
-| 12 | `src/sqlery/django_sqlery/async_backend.py` | 145 | `await QueuedJob.objects.aget(pk=job.pk)` | DEFERRED-PHASE-16 | async_backend re-fetch after claim — `.pk` is a tuple; must use `aget(id=job.id, created_at=job.created_at)`. Part of the write-path pruning. |
-| 13 | `src/sqlery/django_sqlery/async_backend.py` | 151 | `await QueuedJob.objects.filter(pk=job_id).aupdate(...)` | DEFERRED-PHASE-16 | async_backend.amark_running — `job_id` is an int; after composite PK, filter must include `created_at`. Part of write-path pruning (missing created_at). |
-| 14 | `src/sqlery/django_sqlery/async_backend.py` | 157 | `await QueuedJob.objects.filter(pk=job_id).aupdate(...)` | DEFERRED-PHASE-16 | async_backend.amark_success — same as #13. |
-| 15 | `src/sqlery/django_sqlery/async_backend.py` | 167 | `await QueuedJob.objects.filter(pk=job_id).aupdate(...)` | DEFERRED-PHASE-16 | async_backend.amark_failed — same as #13. |
-| 16 | `src/sqlery/django_sqlery/async_backend.py` | 175 | `await QueuedJob.objects.filter(pk=job_id).aupdate(status="shutting_down")` | DEFERRED-PHASE-16 | async_backend.amark_shutting_down — same as #13. |
-| 17 | `src/sqlery/django_sqlery/async_backend.py` | 181 | `job = await QueuedJob.objects.only("status").aget(pk=job_id)` | DEFERRED-PHASE-16 | async_backend.aget_job_status — `pk=job_id` where job_id is int; must use `id=job_id`. |
-| 18 | `src/sqlery/django_sqlery/async_backend.py` | 188 | `return await QueuedJob.objects.aget(pk=job_id)` | DEFERRED-PHASE-16 | async_backend.aget_job — same as #17. |
+| 10 | `src/sqlery/django_sqlery/async_backend.py` | 104 | `return await QueuedJob.objects.aget(id=job_id)` | FIXED-15-03 | async_backend.aclaim_job — rewritten from `aget(pk=job_id)` to `aget(id=job_id)`. Verified in Phase 15 code review (WR-01). |
+| 11 | `src/sqlery/django_sqlery/async_backend.py` | 138 | `QueuedJob.objects.filter(id=job.id, version=job.version)` | FIXED-15-03 | async_backend CAS claim — rewritten from `filter(pk=job.pk, ...)` to `filter(id=job.id, ...)`. Verified in Phase 15 code review (WR-01). |
+| 12 | `src/sqlery/django_sqlery/async_backend.py` | 150 | `return await QueuedJob.objects.aget(id=job.id)` | FIXED-15-03 | async_backend re-fetch after claim — rewritten from `aget(pk=job.pk)` to `aget(id=job.id)`. Verified in Phase 15 code review (WR-01). |
+| 13 | `src/sqlery/django_sqlery/async_backend.py` | 158 | `await QueuedJob.objects.filter(id=job_id).aupdate(...)` | FIXED-15-03 | async_backend.amark_running — rewritten from `filter(pk=job_id)` to `filter(id=job_id)`. Verified in Phase 15 code review (WR-01). |
+| 14 | `src/sqlery/django_sqlery/async_backend.py` | 165 | `await QueuedJob.objects.filter(id=job_id).aupdate(...)` | FIXED-15-03 | async_backend.amark_success — same fix as #13. Verified in Phase 15 code review (WR-01). |
+| 15 | `src/sqlery/django_sqlery/async_backend.py` | 176 | `await QueuedJob.objects.filter(id=job_id).aupdate(...)` | FIXED-15-03 | async_backend.amark_failed — same fix as #13. Verified in Phase 15 code review (WR-01). |
+| 16 | `src/sqlery/django_sqlery/async_backend.py` | 185 | `await QueuedJob.objects.filter(id=job_id).aupdate(status="shutting_down")` | FIXED-15-03 | async_backend.amark_shutting_down — same fix as #13. Verified in Phase 15 code review (WR-01). |
+| 17 | `src/sqlery/django_sqlery/async_backend.py` | 193 | `job = await QueuedJob.objects.only("status").aget(id=job_id)` | FIXED-15-03 | async_backend.aget_status — rewritten from `aget(pk=job_id)` to `aget(id=job_id)`. Verified in Phase 15 code review (WR-01). |
+| 18 | `src/sqlery/django_sqlery/async_backend.py` | 201 | `return await QueuedJob.objects.aget(id=job_id)` | FIXED-15-03 | async_backend.aget_job — rewritten from `aget(pk=job_id)` to `aget(id=job_id)`. Verified in Phase 15 code review (WR-01). |
 | 19 | `src/sqlery/django_sqlery/async_backend.py` | 196 | `await Worker.objects.filter(pk=worker_id).aupdate(last_heartbeat=now)` | ACCEPTABLE | Worker pk is UUID (not composite); not a QueuedJob pk access. |
 | 20 | `src/sqlery/django_sqlery/async_backend.py` | 205 | `await Worker.objects.aupdate_or_create(pk=worker_id, defaults=defaults)` | ACCEPTABLE | Worker pk (UUID) — not QueuedJob. |
 | 21 | `src/sqlery/django_sqlery/async_backend.py` | 208 | `await Worker.objects.filter(pk=worker_id).adelete()` | ACCEPTABLE | Worker pk (UUID) — not QueuedJob. |
@@ -115,7 +115,8 @@ Auditor: Phase 15 executor (15-01)
 
 - Total hits: 86
 - FIXED-HERE: 23 (models.py save_meta + JobRegistry.job FK + Worker.current_job FK + all downstream FK traversal callers — completed in 15-01 Task 2)
-- DEFERRED-PHASE-16: 22 (async_backend pk= id-only filters; rq.py/scheduler.py .pk usages on QueuedJob; test-side pk= QueuedJob lookups — Phase 16 write-path pruning)
+- FIXED-15-03: 9 (async_backend.py items 10–18 — confirmed already fixed in Phase 15 execution; updated from DEFERRED-PHASE-16 per Phase 15 code review WR-01)
+- DEFERRED-PHASE-16: 13 (rq.py/scheduler.py .pk usages on QueuedJob; test-side pk= QueuedJob lookups; replay_job.py; scheduler_tasks.py; _executor_impl.py — Phase 16 write-path pruning)
 - N/A: 28 (ScheduledTask pk accesses; Worker UUID pk accesses; non-QueuedJob model operations)
 - ACCEPTABLE: 13 (refresh_from_db on QueuedJob with fully-loaded instances; Worker UUID pk; `current_job_id` direct int field already correct)
 - UNADDRESSED: 0  ← must be zero to pass acceptance
