@@ -40,8 +40,10 @@ def _create_worker(status="idle", heartbeat_age_seconds=0, current_job=None, pid
         Worker.objects.filter(id=w.id).update(last_heartbeat=stale_time)
         w.refresh_from_db()
     if current_job:
-        w.current_job = current_job
-        w.save(update_fields=["current_job"])
+        # Old: w.current_job = current_job
+        # Old: w.save(update_fields=["current_job"])
+        w.current_job_id = current_job.id
+        w.save(update_fields=["current_job_id"])
     return w
 
 
@@ -282,8 +284,10 @@ class TestRebuildDeadlines:
 
         worker = _create_worker(status="busy", pid=12345)
         job = _create_running_job(started_seconds_ago=60, timeout_seconds=300, worker=worker)
-        worker.current_job = job
-        worker.save(update_fields=["current_job"])
+        # Old: worker.current_job = job
+        # Old: worker.save(update_fields=["current_job"])
+        worker.current_job_id = job.id
+        worker.save(update_fields=["current_job_id"])
 
         rebuilt = rebuild_deadlines()
         assert rebuilt == 1
@@ -299,8 +303,10 @@ class TestRebuildDeadlines:
 
         worker = _create_worker(status="busy", pid=12345)
         job = _create_running_job(started_seconds_ago=60, timeout_seconds=300, worker=worker)
-        worker.current_job = job
-        worker.save(update_fields=["current_job"])
+        # Old: worker.current_job = job
+        # Old: worker.save(update_fields=["current_job"])
+        worker.current_job_id = job.id
+        worker.save(update_fields=["current_job_id"])
 
         # Pre-create the deadline file
         self.deadline_dir.mkdir(parents=True, exist_ok=True)
@@ -415,8 +421,10 @@ class TestDiagnoseSystemHealth:
         # Job started 120s ago with 60s timeout → 60s overdue
         worker = _create_worker(status="busy", heartbeat_age_seconds=5)
         job = _create_running_job(started_seconds_ago=120, timeout_seconds=60, worker=worker)
-        worker.current_job = job
-        worker.save(update_fields=["current_job"])
+        # Old: worker.current_job = job
+        # Old: worker.save(update_fields=["current_job"])
+        worker.current_job_id = job.id
+        worker.save(update_fields=["current_job_id"])
 
         problems = diagnose_system_health(check_os=False)
         kinds = [p['kind'] for p in problems]
@@ -428,8 +436,10 @@ class TestDiagnoseSystemHealth:
 
         worker = _create_worker(status="busy", heartbeat_age_seconds=5)
         job = _create_running_job(started_seconds_ago=30, timeout_seconds=3600, worker=worker)
-        worker.current_job = job
-        worker.save(update_fields=["current_job"])
+        # Old: worker.current_job = job
+        # Old: worker.save(update_fields=["current_job"])
+        worker.current_job_id = job.id
+        worker.save(update_fields=["current_job_id"])
 
         problems = diagnose_system_health(check_os=False)
         kinds = [p['kind'] for p in problems]

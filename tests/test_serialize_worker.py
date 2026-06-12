@@ -106,7 +106,8 @@ class TestSerializeWorkerCurrentJob:
             node_id="test-node",
             pid=3000,
             status="busy",
-            current_job=job,
+            # Old: current_job=job,
+            current_job_id=job.id,
         )
 
         result = _serialize_worker(worker, now)
@@ -127,7 +128,8 @@ class TestSerializeWorkerCurrentJob:
             node_id="test-node",
             pid=3001,
             status="busy",
-            current_job=job,
+            # Old: current_job=job,
+            current_job_id=job.id,
         )
 
         result = _serialize_worker(worker, now)

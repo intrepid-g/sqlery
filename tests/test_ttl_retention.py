@@ -104,15 +104,19 @@ class TestExpireTTLJobs:
         backend = DjangoBackend()
         job = _create_job(ttl=60)
 
-        # Backdate created_at so the job is past its TTL
+        # Backdate created_at so the job is past its TTL.
+        # Re-fetch after update because created_at is part of the composite PK —
+        # changing it makes the in-memory object's PK stale.
         QueuedJob.objects.filter(id=job.id).update(
             created_at=timezone.now() - timedelta(seconds=120)
         )
+        job = QueuedJob.objects.get(id=job.id)
 
         expired_count = expire_ttl_jobs(backend)
 
         assert expired_count == 1
-        job.refresh_from_db()
+        job = QueuedJob.objects.filter(id=job.id).first()
+        assert job is not None
         assert job.status == "failed"
         assert "expired" in job.error.lower()
         assert job.termination_reason == "expired"
@@ -134,10 +138,12 @@ class TestExpireTTLJobs:
         backend = DjangoBackend()
         job = _create_job(ttl=None)
 
-        # Backdate created_at far into the past
+        # Backdate created_at far into the past.
+        # Re-fetch after update because created_at is part of the composite PK.
         QueuedJob.objects.filter(id=job.id).update(
             created_at=timezone.now() - timedelta(days=30)
         )
+        job = QueuedJob.objects.get(id=job.id)
 
         expired_count = expire_ttl_jobs(backend)
 
@@ -153,12 +159,15 @@ class TestExpireTTLJobs:
 
         running_job = _create_job(ttl=60, status="queued")
         running_job.mark_running()
+        # Re-fetch after update because created_at is part of the composite PK.
         QueuedJob.objects.filter(id=running_job.id).update(created_at=past_time)
+        running_job = QueuedJob.objects.get(id=running_job.id)
 
         success_job = _create_job(ttl=60, status="queued")
         success_job.mark_running()
         success_job.mark_success(output="done")
         QueuedJob.objects.filter(id=success_job.id).update(created_at=past_time)
+        success_job = QueuedJob.objects.get(id=success_job.id)
 
         expired_count = expire_ttl_jobs(backend)
 
@@ -174,9 +183,10 @@ class TestExpireTTLJobs:
         past_time = timezone.now() - timedelta(seconds=120)
 
         jobs = [_create_job(ttl=60) for _ in range(5)]
-        QueuedJob.objects.filter(id__in=[j.id for j in jobs]).update(
-            created_at=past_time
-        )
+        job_ids = [j.id for j in jobs]
+        # Re-fetch after update because created_at is part of the composite PK.
+        QueuedJob.objects.filter(id__in=job_ids).update(created_at=past_time)
+        jobs = list(QueuedJob.objects.filter(id__in=job_ids))
 
         expired_count = expire_ttl_jobs(backend)
 
@@ -191,9 +201,12 @@ class TestExpireTTLJobs:
         backend = DjangoBackend()
 
         expired_job = _create_job(ttl=60)
-        QueuedJob.objects.filter(id=expired_job.id).update(
+        expired_job_id = expired_job.id
+        # Re-fetch after update because created_at is part of the composite PK.
+        QueuedJob.objects.filter(id=expired_job_id).update(
             created_at=timezone.now() - timedelta(seconds=120)
         )
+        expired_job = QueuedJob.objects.get(id=expired_job_id)
 
         fresh_job = _create_job(ttl=60)
         # fresh_job keeps its default created_at (just now)
@@ -201,7 +214,8 @@ class TestExpireTTLJobs:
         expired_count = expire_ttl_jobs(backend)
 
         assert expired_count == 1
-        expired_job.refresh_from_db()
+        expired_job = QueuedJob.objects.filter(id=expired_job_id).first()
+        assert expired_job is not None
         assert expired_job.status == "failed"
         fresh_job.refresh_from_db()
         assert fresh_job.status == "queued"
@@ -209,11 +223,14 @@ class TestExpireTTLJobs:
     def test_boundary_ttl_not_yet_expired(self):
         """A job exactly at its TTL boundary should not be expired yet."""
         backend = DjangoBackend()
-        # Set created_at to 59 seconds ago with a 60-second TTL
+        # Set created_at to 59 seconds ago with a 60-second TTL.
+        # Re-fetch after update because created_at is part of the composite PK.
         job = _create_job(ttl=60)
-        QueuedJob.objects.filter(id=job.id).update(
+        job_id = job.id
+        QueuedJob.objects.filter(id=job_id).update(
             created_at=timezone.now() - timedelta(seconds=59)
         )
+        job = QueuedJob.objects.get(id=job_id)
 
         expired_count = expire_ttl_jobs(backend)
 
