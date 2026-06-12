@@ -81,6 +81,34 @@ def test_sanitize_queue_name_to_channel_short_name_not_truncated() -> None:
     assert len(result) < 63
 
 
+def test_sanitize_queue_name_to_channel_prefix_never_truncated() -> None:
+    """WR-02: the 'sqlery_job_' prefix is always intact, only the suffix is cut."""
+    long_queue = "z" * 200
+    result = sanitize_queue_name_to_channel(long_queue)
+    assert result.startswith("sqlery_job_")
+    # Suffix is truncated to 52 chars; prefix (11) + 52 == 63.
+    assert result == "sqlery_job_" + "z" * 52
+
+
+def test_sanitize_queue_name_to_channel_no_collision_on_52_char_prefix() -> None:
+    """WR-02: queues differing only past 52 sanitized chars still collide.
+
+    This documents the residual limitation: truncation makes the cut visible
+    in the suffix, but two adversarial names sharing the same 52-char prefix
+    still map to the same channel. The fix prevents the prefix from being
+    mangled, not all collisions.
+    """
+    base = "a" * 52
+    ch_x = sanitize_queue_name_to_channel(base + "X")
+    ch_y = sanitize_queue_name_to_channel(base + "Y")
+    # Both truncate to the same 52-char suffix — still a collision by design.
+    assert ch_x == ch_y == "sqlery_job_" + base
+    # But names that differ WITHIN the first 52 chars do NOT collide.
+    ch_a = sanitize_queue_name_to_channel("a" * 51 + "b")
+    ch_c = sanitize_queue_name_to_channel("a" * 51 + "c")
+    assert ch_a != ch_c
+
+
 # ---------------------------------------------------------------------------
 # notify_queue_django — no-op paths
 # ---------------------------------------------------------------------------
