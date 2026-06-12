@@ -15,9 +15,15 @@ from sqlalchemy import and_, or_, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, func, delete
 
-from ..compat import DatabaseBackend
-from ..core.models import QueuedJob, ScheduledTask, JobRegistry, Worker, DaemonLease
-from .database import get_session
+from ..compat import DatabaseBackend, get_config
+from ..core.models import QueuedJob, ScheduledJob, ScheduledTask, JobRegistry, Worker, DaemonLease
+from .database import get_engine, get_session
+
+# Partition maintenance helpers — guarded against psycopg absence (SQLite installs)
+try:
+    from sqlery.core import partitioning as _partitioning
+except ImportError:
+    _partitioning = None  # psycopg not installed; partition reclaim path unavailable
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,70 @@ class SQLAlchemyBackend(DatabaseBackend):
         # from .database import get_session  # moved to top-level
 
         self._get_session = get_session
+        self._partitioned_pg_cache: bool | None = None
+
+    def _partitioned_pg(self) -> bool:
+        """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
+
+        Used by the cleanup→reclaim routing, the far-future staging gate, and the
+        write-path pruning logic. SQLite and a non-partitioned PG install both return
+        False — they keep the Phase-12 batched DELETE path and the in-queue scheduling
+        path unchanged (D6). Cached per-process: the table's partition status does not
+        change at runtime (only via the stop-the-world cutover migration).
+
+        WR-01: On a transient DB error the cache is NOT written (left None) so the next
+        call retries the catalog query. Only a successful query writes the cache.
+        """
+        if self._partitioned_pg_cache is not None:
+            return self._partitioned_pg_cache
+        engine = get_engine()
+        if engine.dialect.name != "postgresql":
+            self._partitioned_pg_cache = False
+            return False
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT relkind = 'p' FROM pg_class "
+                        "WHERE relname = %s AND relnamespace = 'public'::regnamespace"
+                    ),
+                    [QueuedJob.__tablename__],
+                )
+                row = result.fetchone()
+            self._partitioned_pg_cache = bool(row and row[0])
+        except Exception:
+            # Old: self._partitioned_pg_cache = False
+            # WR-01: do NOT permanently cache False on a transient DB error — a
+            # connection-pool warmup failure at startup would disable all partition
+            # routing for the lifetime of the process with no retry. Leave the cache
+            # unset (None) so the next call retries; only write the cache on a
+            # successful catalog query above. Return False for this call to fail safe
+            # (never route to PG-only paths against a potentially non-partitioned table).
+            logger.warning(
+                "_partitioned_pg: catalog query failed — will retry on next call",
+                exc_info=True,
+            )
+            return False
+        return self._partitioned_pg_cache
+
+    def get_raw_cursor(self):
+        """Return a raw psycopg DBAPI cursor for the daemon's PG-only maintenance loop.
+
+        reclaim_drained_partitions / ensure_future_partitions / check_default_partition
+        need a live psycopg cursor (not a SQLAlchemy session). Returns a cursor from
+        engine.raw_connection() on partitioned PostgreSQL; returns None on SQLite (and
+        any non-partitioned install) so the daemon skips PG-only maintenance cleanly.
+
+        CALLER OWNS THE CURSOR LIFECYCLE: the caller must call cursor.close() and
+        close/rollback the underlying raw connection. Wrap in try/finally to avoid the
+        CR-02 leak. The archive hook receives (cur, partition_name) and must not execute
+        arbitrary SQL via string interpolation (T-17-09).
+        """
+        if not self._partitioned_pg():
+            return None
+        engine = get_engine()
+        raw_conn = engine.raw_connection()
+        return raw_conn.cursor()
 
     def _resolve_worker(self, worker_id):
         """Resolve a worker_id (UUID or "worker_<node>_<pid>" string) to a Worker.
@@ -136,6 +206,57 @@ class SQLAlchemyBackend(DatabaseBackend):
                     session.delete(conflicting)
                 session.commit()
 
+        # Threshold routing (Phase 14/17): jobs scheduled further out than the configured
+        # threshold go into sqlery_scheduled_job instead of sqlery_queued_job so they
+        # cannot pin otherwise-drained partitions.
+        # Staging only protects partitions, which exist only on partitioned PG.
+        # On SQLite / non-partitioned PG, far-future jobs stay in sqlery_queued_job
+        # (D6 — SQLite path unchanged).
+        threshold_days = get_config("SCHEDULED_JOB_THRESHOLD_DAYS", 1)
+        staging_threshold = timedelta(days=threshold_days)
+        now_utc = datetime.now(UTC)
+        if (
+            self._partitioned_pg()
+            and scheduled_at is not None
+            and scheduled_at > now_utc + staging_threshold
+        ):
+            # Store full job-creation spec in payload for lossless promotion (WR-01/WR-02).
+            # payload schema: {"kwargs": <task kwargs>, "job_spec": {<all execution params>}}
+            full_payload = {
+                "kwargs": kwargs,
+                "job_spec": {
+                    "retry_backoff": retry_backoff,
+                    "allow_parallel": allow_parallel,
+                    "timeout_seconds": timeout_seconds,
+                    "retry_count": retry_count if retry_count is not None else 0,
+                    "scheduled_task_id": scheduled_task_id,
+                    "job_name": job_name,
+                    "retry_intervals": retry_intervals,
+                    "meta": meta,
+                    "dependencies": dependencies or [],
+                    "on_success_path": on_success_path,
+                    "on_failure_path": on_failure_path,
+                    "ttl": ttl,
+                    "result_ttl": result_ttl,
+                    "failure_ttl": failure_ttl,
+                    "parent_job_id": parent_job_id,
+                },
+            }
+            staging_row = ScheduledJob(
+                queue_name=queue_name,
+                task_path=task_path,
+                payload=full_payload,
+                scheduled_at=scheduled_at,
+                priority=priority,
+                max_retries=max_retries,
+            )
+            with self._get_session() as session:
+                session.add(staging_row)
+                session.commit()
+                session.refresh(staging_row)
+            return staging_row
+
+        # Below threshold or immediate — insert into main queue.
         job = QueuedJob(
             task_path=task_path,
             kwargs=kwargs,
@@ -535,17 +656,44 @@ class SQLAlchemyBackend(DatabaseBackend):
             return stats
 
     def cancel_job(self, job_id: int) -> bool:
-        """Cancel a queued job."""
-        with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires full (created_at, id) tuple
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        """Cancel a queued or staged job, spanning QueuedJob and ScheduledJob tables.
 
-            if job and job.status == "queued":
-                job.status = "failed"
-                job.error = "Cancelled by user"
-                session.add(job)
+        Write-path pruning: fetches created_at first so PG can prune to one partition.
+        On SQLite the id-only fallback is used (D6).
+        """
+        with self._get_session() as session:
+            # Fetch created_at for partition pruning (write-path pruning, mirrors DjangoBackend)
+            # Old (id-only filter — does not prune to partition on PG):
+            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            # SQLModel exec() returns scalars for single-column selects
+            created_at_val = session.exec(
+                select(QueuedJob.created_at).where(
+                    and_(QueuedJob.id == job_id, QueuedJob.status == "queued")
+                )
+            ).first()
+            if created_at_val is not None:
+                updated = session.exec(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at_val)
+                    .where(QueuedJob.status == "queued")
+                    .values(status="failed", error="Cancelled by user")
+                    .execution_options(synchronize_session=False)
+                )
                 session.commit()
-                return True
+                if updated.rowcount > 0:
+                    return True
+
+            # Old: return False here — staged jobs uncancellable.
+            # Fall through to ScheduledJob staging table on partitioned PG.
+            if self._partitioned_pg():
+                staged = session.exec(
+                    select(ScheduledJob).where(ScheduledJob.id == job_id)
+                ).first()
+                if staged:
+                    session.delete(staged)
+                    session.commit()
+                    return True
 
             return False
 
@@ -688,7 +836,65 @@ class SQLAlchemyBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up old jobs based on retention policy."""
+        """Clean up old jobs based on retention policy.
+
+        On a partitioned PostgreSQL install (self._partitioned_pg() is True),
+        routes to reclaim_drained_partitions which drops entire drained partitions
+        instead of batched DELETEs (D5 — see loud comment below). Advisory lock
+        (pg_try_advisory_lock) is acquired inside reclaim_drained_partitions; if
+        not acquired the call returns 0 without error.
+
+        On SQLite or non-partitioned PG, keeps the Phase-12 keyset-batched DELETE
+        loop byte-for-byte unchanged (D6).
+        """
+        # --- D5: Partition reclaim path (PostgreSQL + partitioned table) ---
+        if self._partitioned_pg() and _partitioning is not None:
+            if dry_run:
+                # dry_run is not meaningful for partition-drop path; return estimate
+                with self._get_session() as session:
+                    count_stmt = select(func.count(QueuedJob.id))
+                    if status:
+                        count_stmt = count_stmt.where(QueuedJob.status == status)
+                    if queue_name:
+                        count_stmt = count_stmt.where(QueuedJob.queue_name == queue_name)
+                    count = session.exec(count_stmt).one()
+                return {"deleted": 0, "count": count}
+
+            retention_str = get_config("SQLERY_PARTITION_RETENTION", "30 days")
+            archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
+            # Old: cur = self.get_raw_cursor()
+            # CR-02: cursor was never closed, leaking a raw connection on every cleanup_jobs call.
+            # Use try/finally to ensure close() is called even if reclaim raises.
+            cur = self.get_raw_cursor()
+            try:
+                # D5: Partition reclaim destroys all jobs in drained partitions (beyond
+                # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
+                # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
+                # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
+                # to archive instead. The archive hook receives (cur, partition_name)
+                # and must not execute arbitrary SQL via string interpolation (T-17-09).
+                dropped = _partitioning.reclaim_drained_partitions(
+                    cur, QueuedJob.__tablename__, retention_str, archive_hook
+                )
+            finally:
+                if cur is not None:
+                    cur.close()
+                    # Also close the underlying raw connection (avoid leaking pooled conn)
+                    try:
+                        cur.connection.close()
+                    except Exception:
+                        pass
+            return {
+                "deleted": 0,
+                "reclaimed_via_partition_drop": True,
+                "dropped_partitions": dropped,
+                "note": (
+                    "Partition reclaim: jobs beyond retention destroyed by default (D5). "
+                    "Set SQLERY_PARTITION_ARCHIVE_HOOK to archive instead."
+                ),
+            }
+
+        # --- SQLite or non-partitioned PG: Phase-12 batched DELETE loop (D6 — unchanged) ---
         with self._get_session() as session:
             # Old: stmt built here fed the now-removed unbounded-delete path (see commented-out
             # block below). The live path uses batch_stmt inside the loop; dry_run uses count_stmt.
@@ -857,12 +1063,25 @@ class SQLAlchemyBackend(DatabaseBackend):
             return stats
 
     def vacuum_database(self) -> dict:
-        """Run database vacuum/optimize (PostgreSQL VACUUM)."""
+        """Run database vacuum/optimize (PostgreSQL VACUUM).
+
+        On a partitioned PG install, VACUUM ANALYZE on the parent table
+        (sqlery_queued_job) is skipped — partition DROP leaves nothing to
+        vacuum on the parent and individual partitions are vacuumed by
+        autovacuum per-child (D5/R3). Other tables are always vacuumed.
+        SQLite uses a single whole-database VACUUM.
+
+        Mirrors DjangoBackend.vacuum_database (Phase 16 carry-forward).
+        """
         # from sqlalchemy import text  # moved to top-level
 
         try:
             with self._get_session() as session:
-                session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
+                # Old (unconditional): session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
+                # Partition DROP leaves nothing to vacuum on parent table; skip when partitioned.
+                if not self._partitioned_pg():
+                    session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
+                # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
                 session.exec(text("VACUUM ANALYZE sqlery_scheduled_task"))
                 session.exec(text("VACUUM ANALYZE sqlery_registry"))
                 session.exec(text("VACUUM ANALYZE sqlery_worker"))
@@ -964,63 +1183,137 @@ class SQLAlchemyBackend(DatabaseBackend):
             return {"deleted": result.rowcount}
 
     def get_job_by_id(self, job_id: int):
-        """Get job by ID."""
+        """Get job by ID, spanning both sqlery_queued_job and sqlery_scheduled_job.
+
+        On partitioned PG, falls back to ScheduledJob when not found in QueuedJob.
+        On SQLite single-table lookup is unchanged (D6).
+        """
         with self._get_session() as session:
             # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            return session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            if job is not None:
+                return job
+            # Fall back to staging table on partitioned PG (D6 gate)
+            if self._partitioned_pg():
+                staged = session.exec(
+                    select(ScheduledJob).where(ScheduledJob.id == job_id)
+                ).first()
+                return staged
+            return None
 
     def mark_job_success(self, job_id: int, output: str = ""):
-        """Mark job as successful."""
-        with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        """Mark job as successful.
 
-            if job:
-                job.mark_success(output=output)
-                session.add(job)
-                session.commit()
-                session.refresh(job)
-
-            return job
+        Staged ScheduledJob rows (not yet promoted) do not have mark_success;
+        the guard prevents AttributeError if an operator calls this for a staged id.
+        """
+        # Old (single-table only):
+        # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        job = self.get_job_by_id(job_id)
+        # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_success"):
+            with self._get_session() as session:
+                db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+                if db_job:
+                    db_job.mark_success(output=output)
+                    session.add(db_job)
+                    session.commit()
+                    session.refresh(db_job)
+                    return db_job
+        return job
 
     def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
-        """Mark job as failed."""
-        with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        """Mark job as failed.
 
-            if job:
-                job.mark_failed(error=error, traceback=traceback)
-                session.add(job)
-                session.commit()
-                session.refresh(job)
-
-            return job
+        Staged ScheduledJob rows do not have mark_failed; guard prevents
+        AttributeError if called for a staged job id (IN-01).
+        """
+        # Old (single-table only):
+        # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        job = self.get_job_by_id(job_id)
+        # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_failed"):
+            with self._get_session() as session:
+                db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+                if db_job:
+                    db_job.mark_failed(error=error, traceback=traceback)
+                    session.add(db_job)
+                    session.commit()
+                    session.refresh(db_job)
+                    return db_job
+        return job
 
     def mark_job_archived(self, job_id: int):
-        """Mark a failed job as archived (a retry has been created for it)."""
+        """Mark a failed job as archived (a retry has been created for it).
+
+        Write-path pruning: fetches created_at first so PG can prune to one partition.
+        Mirrors DjangoBackend.mark_job_archived (Phase 16 item 8).
+        """
         with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            if job and job.status == "failed":
-                job.status = "archived"
-                session.add(job)
+            # Item 8: Add created_at to filter so PG prunes to one partition.
+            # Old (id-only filter — does not prune to partition on PG):
+            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            # if job and job.status == "failed":
+            #     job.status = "archived"
+            # SQLModel exec() returns scalars for single-column selects
+            created_at_val = session.exec(
+                select(QueuedJob.created_at).where(
+                    and_(QueuedJob.id == job_id, QueuedJob.status == "failed")
+                )
+            ).first()
+            if created_at_val is not None:
+                session.exec(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at_val)
+                    .where(QueuedJob.status == "failed")
+                    .values(status="archived")
+                    .execution_options(synchronize_session=False)
+                )
                 session.commit()
 
     def cascade_ancestor_status(self, job_id: int, status: str):
-        """Walk parent_job_id chain, set all ancestors to given status."""
+        """Walk parent_job_id chain, set all ancestors to given status.
+
+        Write-path pruning: fetches (created_at, parent_job_id) per iteration and
+        uses (id, created_at) filter on UPDATE so PG prunes to one partition (item 9).
+        WR-03: excludes terminal-status ancestors so a completed or archived parent is
+        never overwritten by a child's cascaded status change.
+        """
         with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            current_id = job.parent_job_id if job else None
+            # Item 9: fetch created_at + parent_job_id together in one query per iteration.
+            # Old (id-only — does not prune to partition on PG):
+            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            # current_id = job.parent_job_id if job else None
+            # while current_id:
+            #     ancestor = session.exec(select(QueuedJob).where(QueuedJob.id == current_id)).first()
+            #     if not ancestor: break
+            #     ancestor.status = status
+            #     current_id = ancestor.parent_job_id
+            start_row = session.exec(
+                select(QueuedJob.parent_job_id).where(QueuedJob.id == job_id)
+            ).first()
+            # SQLModel exec() returns scalars for single-column selects
+            current_id = start_row if start_row is not None else None
             while current_id:
-                # session.get(QueuedJob, current_id)  # Replaced: composite PK requires (created_at, id)
-                ancestor = session.exec(select(QueuedJob).where(QueuedJob.id == current_id)).first()
-                if not ancestor:
+                job_row = session.exec(
+                    select(QueuedJob.created_at, QueuedJob.parent_job_id).where(
+                        QueuedJob.id == current_id
+                    )
+                ).first()
+                if not job_row:
                     break
-                ancestor.status = status
-                session.add(ancestor)
-                current_id = ancestor.parent_job_id
+                # WR-03: exclude terminal-status ancestors
+                row_created_at, next_parent_id = job_row
+                session.exec(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == current_id)
+                    .where(QueuedJob.created_at == row_created_at)
+                    .where(QueuedJob.status.not_in(("success", "archived")))
+                    .values(status=status)
+                    .execution_options(synchronize_session=False)
+                )
+                current_id = next_parent_id
             session.commit()
 
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
@@ -1305,15 +1598,30 @@ class SQLAlchemyBackend(DatabaseBackend):
             count = session.exec(stmt).one()
             return count > 0
 
-    def update_job_child_pid(self, job_id: int, child_pid: int):
-        """Store the forked child PID on the job row."""
+    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None):
+        """Store the forked child PID on the job row.
+
+        Args:
+            job_id: QueuedJob primary key.
+            child_pid: PID of the forked child process.
+            created_at: Optional job creation timestamp. When provided, added to the
+                filter so PG prunes to one partition (write-path pruning, item 11).
+                Existing callers that omit it degrade gracefully to id-only filter.
+        """
         with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            if job:
-                job.child_pid = child_pid
-                session.add(job)
-                session.commit()
+            # Item 11: When created_at is available from the caller (e.g. worker.py
+            # which holds the full job object), add it to the filter for partition pruning.
+            # Old (id-only — does not prune to partition on PG):
+            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            # if job: job.child_pid = child_pid
+            filter_stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if created_at is not None:
+                filter_stmt = filter_stmt.where(QueuedJob.created_at == created_at)
+            filter_stmt = filter_stmt.values(child_pid=child_pid).execution_options(
+                synchronize_session=False
+            )
+            session.exec(filter_stmt)
+            session.commit()
 
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete stale Worker row from a previous crash."""
@@ -1328,10 +1636,23 @@ class SQLAlchemyBackend(DatabaseBackend):
     def release_claimed_job(
         self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
     ):
-        """Release a job after processing and update worker state."""
+        """Release a job after processing and update worker state.
+
+        Write-path pruning: uses job.created_at if the caller passes the full job object
+        so PG can prune to one partition (item 10). Falls back to id-only for SQLite.
+        """
         with self._get_session() as session:
-            # session.get(QueuedJob, job.id)  # Replaced: composite PK requires (created_at, id)
-            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
+            # Item 10: if the job object has created_at (caller passes full job), use it for pruning.
+            # Old (id-only — does not prune to partition on PG):
+            # db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
+            if hasattr(job, "created_at") and job.created_at is not None:
+                db_job = session.exec(
+                    select(QueuedJob)
+                    .where(QueuedJob.id == job.id)
+                    .where(QueuedJob.created_at == job.created_at)
+                ).first()
+            else:
+                db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             if db_job:
                 db_job.status = status
                 db_job.finished_at = datetime.now(UTC)
@@ -1527,6 +1848,33 @@ class SQLAlchemyBackend(DatabaseBackend):
             # Apply pagination
             stmt = stmt.limit(limit).offset(offset)
 
+            return list(session.exec(stmt).all())
+
+    def get_staged_jobs(
+        self,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list:
+        """Return staged (pre-promotion) jobs from sqlery_scheduled_job.
+
+        Returns [] on SQLite / non-partitioned PG (D6).
+
+        Args:
+            queue_name: Optional queue filter.
+            limit: Maximum number of results to return.
+            offset: Pagination offset.
+
+        Returns:
+            list of ScheduledJob instances ordered by scheduled_at ascending.
+        """
+        if not self._partitioned_pg():
+            return []
+        with self._get_session() as session:
+            stmt = select(ScheduledJob)
+            if queue_name:
+                stmt = stmt.where(ScheduledJob.queue_name == queue_name)
+            stmt = stmt.order_by(ScheduledJob.scheduled_at).limit(limit).offset(offset)
             return list(session.exec(stmt).all())
 
     def count_jobs(

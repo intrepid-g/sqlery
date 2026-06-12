@@ -370,12 +370,13 @@ class TestWritePathPruning:
         job = _create_basic_job(sync_backend)
         # Manually set job to failed so it can be archived
         from sqlery.fastapi_sqlery import database as db_mod
-        from sqlmodel import Session
+        from sqlmodel import Session, select as sqlmodel_select
 
         with Session(db_mod._engine) as session:
             from sqlery.core.models import QueuedJob
-            from sqlalchemy import select
-            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
+            db_job = session.exec(
+                sqlmodel_select(QueuedJob).where(QueuedJob.id == job.id)
+            ).first()
             db_job.status = "failed"
             session.add(db_job)
             session.commit()
