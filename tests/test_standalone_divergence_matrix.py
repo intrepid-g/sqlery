@@ -211,13 +211,19 @@ class TestStandaloneDivergenceMatrixSQLite:
         )
 
     def test_vacuum_runs_on_sqlite(self):
-        """vacuum_database returns a dict on SQLite (VACUUM may fail inside transaction)."""
+        """vacuum_database succeeds on SQLite.
+
+        CR-03: VACUUM now runs on an AUTOCOMMIT connection (outside the ORM
+        transaction) and SQLite uses a plain whole-DB VACUUM, so success must be True
+        rather than silently failing inside a transaction block.
+        """
         backend = _make_sqlite_backend()
         result = backend.vacuum_database()
         assert isinstance(result, dict), f"vacuum_database must return a dict. Got {type(result)}"
         assert "success" in result, (
             f"vacuum_database must return a dict with 'success' key. Got: {result}"
         )
+        assert result["success"] is True, f"vacuum must succeed on SQLite. Got: {result}"
 
     def test_create_job_immediate_returns_queued_job_on_sqlite(self):
         """create_job without scheduled_at returns QueuedJob on SQLite."""

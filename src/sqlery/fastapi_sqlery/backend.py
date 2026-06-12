@@ -1092,17 +1092,44 @@ class SQLAlchemyBackend(DatabaseBackend):
         """
         # from sqlalchemy import text  # moved to top-level
 
+        # CR-03: VACUUM cannot run inside a transaction block on PostgreSQL. The old
+        # implementation issued VACUUM via session.exec() inside get_session(), which
+        # SQLAlchemy wraps in a transaction, so PG raised
+        # "VACUUM cannot run inside a transaction block"; the except caught it and
+        # silently returned success:False on every call. Run VACUUM on a raw connection
+        # with isolation_level="AUTOCOMMIT" instead (mirrors the Django backend, which
+        # uses connection.cursor() outside the ORM transaction).
+        #
+        # Old (broken — transaction-wrapped):
+        # try:
+        #     with self._get_session() as session:
+        #         if not self._partitioned_pg():
+        #             session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
+        #         session.exec(text("VACUUM ANALYZE sqlery_scheduled_task"))
+        #         session.exec(text("VACUUM ANALYZE sqlery_registry"))
+        #         session.exec(text("VACUUM ANALYZE sqlery_worker"))
+        #         session.commit()
+        #     return {"success": True, "message": "Database vacuumed successfully"}
+        # except Exception as e:
+        #     return {"success": False, "error": str(e)}
         try:
-            with self._get_session() as session:
-                # Old (unconditional): session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
-                # Partition DROP leaves nothing to vacuum on parent table; skip when partitioned.
-                if not self._partitioned_pg():
-                    session.exec(text("VACUUM ANALYZE sqlery_queued_job"))
-                # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
-                session.exec(text("VACUUM ANALYZE sqlery_scheduled_task"))
-                session.exec(text("VACUUM ANALYZE sqlery_registry"))
-                session.exec(text("VACUUM ANALYZE sqlery_worker"))
-                session.commit()
+            engine = get_engine()
+            is_sqlite = engine.dialect.name == "sqlite"
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                if is_sqlite:
+                    # SQLite: single whole-database VACUUM (no per-table / ANALYZE),
+                    # mirroring DjangoBackend.vacuum_database's SQLite branch.
+                    conn.execute(text("VACUUM"))
+                else:
+                    # PostgreSQL: per-table VACUUM ANALYZE.
+                    # Partition DROP leaves nothing to vacuum on the parent table;
+                    # skip the parent when partitioned (D5/R3).
+                    if not self._partitioned_pg():
+                        conn.execute(text("VACUUM ANALYZE sqlery_queued_job"))
+                    # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
+                    conn.execute(text("VACUUM ANALYZE sqlery_scheduled_task"))
+                    conn.execute(text("VACUUM ANALYZE sqlery_registry"))
+                    conn.execute(text("VACUUM ANALYZE sqlery_worker"))
 
             return {"success": True, "message": "Database vacuumed successfully"}
         except Exception as e:
