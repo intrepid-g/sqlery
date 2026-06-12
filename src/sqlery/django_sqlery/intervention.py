@@ -361,8 +361,10 @@ def do_manual_intervention(payload: dict | None = None) -> dict:
             )
             result['jobs_failed'] += 1
         w.status = 'dead'
-        w.current_job = None
-        w.save(update_fields=['status', 'current_job'])
+        # Old: w.current_job = None
+        w.current_job_id = None
+        # Old: w.save(update_fields=['status', 'current_job'])
+        w.save(update_fields=['status', 'current_job_id'])
         result['stale_workers_cleaned'] += 1
 
     # Kill stuck workers (alive but stale heartbeat).
@@ -384,8 +386,10 @@ def do_manual_intervention(payload: dict | None = None) -> dict:
             )
             result['jobs_failed'] += 1
         w.status = 'dead'
-        w.current_job = None
-        w.save(update_fields=['status', 'current_job'])
+        # Old: w.current_job = None
+        w.current_job_id = None
+        # Old: w.save(update_fields=['status', 'current_job'])
+        w.save(update_fields=['status', 'current_job_id'])
         result['workers_killed'] += 1
 
     # Fail ghost jobs
@@ -457,7 +461,8 @@ def do_manual_intervention_direct() -> dict:
             result['jobs_failed'] += 1
         result['stale_workers_cleaned'] += 1
 
-    stale.update(status='dead', current_job=None)
+    # Old: stale.update(status='dead', current_job=None)
+    stale.update(status='dead', current_job_id=None)
 
     # Fail ghost running jobs
     active_job_ids = Worker.objects.filter(

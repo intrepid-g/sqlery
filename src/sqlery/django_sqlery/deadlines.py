@@ -257,8 +257,9 @@ def _reconcile_overdue_job(QueuedJob, Worker, job_id, pid, timeout, process_aliv
         finished_at=django_tz.now(),
         version=F('version') + 1,
     )
+    # Old: Worker.objects.filter(...).update(status='dead', current_job=None)
     Worker.objects.filter(pid=pid, status__in=['idle', 'busy']).update(
-        status='dead', current_job=None,
+        status='dead', current_job_id=None,
     )
 
     if updated:

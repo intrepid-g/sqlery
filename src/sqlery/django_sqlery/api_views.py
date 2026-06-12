@@ -515,7 +515,9 @@ def api_worker_detail(request, worker_id):
 
     try:
         worker_uuid = uuid.UUID(worker_id)
-        worker = Worker.objects.select_related('current_job', 'current_job__scheduled_task').get(id=worker_uuid)
+        # Old: Worker.objects.select_related('current_job', 'current_job__scheduled_task').get(...)
+        # current_job FK demoted to current_job_id (D4, Phase 15)
+        worker = Worker.objects.get(id=worker_uuid)
     except (ValueError, Worker.DoesNotExist):
         return JsonResponse({'error': 'Worker not found'}, status=404)
 
@@ -523,18 +525,23 @@ def api_worker_detail(request, worker_id):
 
     # Current job
     current_job = None
-    if worker.current_job:
-        j = worker.current_job
-        elapsed = (now - j.started_at).total_seconds() if j.started_at else None
-        current_job = {
-            'id': j.id,
-            'task_path': j.task_path,
-            'task_name': _job_display_name(j),
-            'status': j.status,
-            'queue_name': j.queue_name,
-            'started_at': j.started_at.isoformat() if j.started_at else None,
-            'elapsed_seconds': elapsed,
-        }
+    # Old: if worker.current_job:  (FK demoted — use current_job_id)
+    if worker.current_job_id:
+        try:
+            j = QueuedJob.objects.select_related('scheduled_task').get(id=worker.current_job_id)
+        except QueuedJob.DoesNotExist:
+            j = None
+        if j:
+            elapsed = (now - j.started_at).total_seconds() if j.started_at else None
+            current_job = {
+                'id': j.id,
+                'task_path': j.task_path,
+                'task_name': _job_display_name(j),
+                'status': j.status,
+                'queue_name': j.queue_name,
+                'started_at': j.started_at.isoformat() if j.started_at else None,
+                'elapsed_seconds': elapsed,
+            }
 
     # Job history — query by worker FK (persisted after completion)
     recent_jobs = QueuedJob.objects.filter(
