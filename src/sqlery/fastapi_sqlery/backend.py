@@ -26,6 +26,12 @@ try:
 except ImportError:
     _partitioning = None  # psycopg not installed; partition reclaim path unavailable
 
+# Phase 18: pg_notify hook — guarded so SQLAlchemy backend works without core.pg_notify
+try:
+    from sqlery.core.pg_notify import notify_queue_sqlalchemy as _notify_queue_sqlalchemy
+except ImportError:
+    _notify_queue_sqlalchemy = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +335,19 @@ class SQLAlchemyBackend(DatabaseBackend):
             session.add(job)
             session.commit()
             session.refresh(job)
+            # Phase 18 (D1): emit pg_notify inside the open session after commit.
+            # The session is still usable here; SELECT pg_notify fires in the same
+            # connection round-trip. No-op when SQLERY_PG_NOTIFY=False (default) or
+            # SQLite. Any NOTIFY failure is caught + logged inside notify_queue_sqlalchemy
+            # — never crashes enqueue. Staging path (ScheduledJob) does NOT reach here.
+            if (
+                _notify_queue_sqlalchemy is not None
+                and get_config("SQLERY_PG_NOTIFY", False)
+                and get_engine().dialect.name == "postgresql"
+            ):
+                _notify_queue_sqlalchemy(queue_name, session)
 
+        # Old: return job — moved here so the with-block can call notify before closing
         return job
 
     def claim_job(self, queues: list[str], worker_id: str):

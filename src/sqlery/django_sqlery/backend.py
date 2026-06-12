@@ -29,6 +29,12 @@ try:
 except ImportError:
     _partitioning = None  # psycopg not installed; partition reclaim path unavailable
 
+# Phase 18: pg_notify hook — guarded so Django backend works without core.pg_notify
+try:
+    from sqlery.core.pg_notify import notify_queue_django as _notify_queue_django
+except ImportError:
+    _notify_queue_django = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 CLEANUP_BATCH_SIZE = 500
@@ -213,6 +219,17 @@ class DjangoBackend(DatabaseBackend):
             parent_job_id=parent_job_id,
             status="queued",
         )
+        # Phase 18 (D1): emit pg_notify after commit when flag is on + PG.
+        # No-op when SQLERY_PG_NOTIFY=False (default) or on SQLite.
+        # notify_queue_django handles the vendor check and on_commit scheduling
+        # internally; any NOTIFY failure is caught + logged, never crashes enqueue.
+        # Old: return job
+        if (
+            _notify_queue_django is not None
+            and get_setting("SQLERY_PG_NOTIFY", False)
+            and connection.vendor == "postgresql"
+        ):
+            _notify_queue_django(queue_name)
         return job
 
     @retry_on_db_error()
