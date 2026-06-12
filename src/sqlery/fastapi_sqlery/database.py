@@ -12,7 +12,10 @@ from sqlalchemy.pool import QueuePool, StaticPool
 from sqlmodel import Session, create_engine, SQLModel
 
 from ..core import models as _models  # noqa: F401  # ensures SQLModel.metadata is populated
-from ..tables import QUEUED_JOB
+# IN-01: unused — the table name "sqlery_queued_job" is interpolated inline in the
+# partition DDL builders, never via this constant. Commented out (not deleted) per
+# project convention; remove in a future cleanup pass.
+# from ..tables import QUEUED_JOB
 
 # Global engine instance
 _engine = None
