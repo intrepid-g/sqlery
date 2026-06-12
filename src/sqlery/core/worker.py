@@ -858,6 +858,14 @@ class WorkerProcess:
             return
         if not _psycopg_available or sanitize_queue_name_to_channel is None:
             return
+        # WR-01: close any existing LISTEN connection before reopening so a
+        # reopen never leaks the previous connection.
+        if self._listen_conn is not None:
+            try:
+                self._listen_conn.close()
+            except Exception:
+                pass
+            self._listen_conn = None
         try:
             # Detect PG DSN: standalone mode exposes DATABASE_URL via get_config;
             # Django mode reads from connections['default'].settings_dict.
@@ -903,6 +911,14 @@ class WorkerProcess:
                 f"Worker {self.worker_id}: failed to open LISTEN connection: {e}; "
                 f"falling back to polling"
             )
+            # WR-01: close the orphaned connection (opened above) before
+            # clearing the reference, otherwise it leaks until GC/idle timeout.
+            # Old: self._listen_conn = None
+            if self._listen_conn is not None:
+                try:
+                    self._listen_conn.close()
+                except Exception:
+                    pass
             self._listen_conn = None
 
     def _close_listen_conn(self) -> None:
