@@ -118,7 +118,12 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. Same lifecycle test as Phase 16 (ingest Phase 5) passes against the FastAPI backend
   2. Fresh install via `database.py` creates a partitioned table by default
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 17-01-PLAN.md — QueuedJob composite PK + ScheduledJobStaging SQLModel + StandaloneConfig partition keys
+- [ ] 17-02-PLAN.md — database.py partitioned DDL (PG fresh install) + Alembic cutover revision 0016
+- [ ] 17-03-PLAN.md — backend.py + async_backend.py: _partitioned_pg, get_raw_cursor, cleanup routing, staging, write-path pruning
+- [ ] 17-04-PLAN.md — Standalone lifecycle test (SC-1 sync + async) + fresh-install test (SC-2) + divergence matrix
 
 ### Phase 18: listen-notify
 **Goal**: Opt-in sub-100 ms worker dispatch via PG LISTEN/NOTIFY, byte-identical behavior when the flag is off — OPTIONAL: may be deferred or dropped without affecting milestone "done" (D10)
@@ -139,7 +144,7 @@ Plans:
 | 14. scheduled-job-staging | 3/3 | Complete   | 2026-06-11 |
 | 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
 | 16. backend-wiring-pruning | 4/4 | Complete   | 2026-06-12 |
-| 17. fastapi-parity | 0/TBD | Not started | - |
+| 17. fastapi-parity | 0/4 | Not started | - |
 | 18. listen-notify (optional) | 0/TBD | Not started | - |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
