@@ -925,8 +925,15 @@ class DjangoBackend(DatabaseBackend):
             )
             if not job_row:
                 break
+            # Old: self.QueuedJob.objects.filter(
+            # Old:     id=current_id, created_at=job_row["created_at"]
+            # Old: ).update(status=status)
+            # WR-03: exclude terminal-status ancestors so a completed or archived
+            # parent is never overwritten by a child's cascaded status change.
             self.QueuedJob.objects.filter(
                 id=current_id, created_at=job_row["created_at"]
+            ).exclude(
+                status__in=("success", "archived")
             ).update(status=status)
             current_id = job_row["parent_job_id"]
 
