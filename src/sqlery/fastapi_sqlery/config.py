@@ -72,6 +72,12 @@ class StandaloneConfig(Config):
             # Loaded from SQLERY_INTERNAL_ALLOWED_IPS as a comma-separated list.
             'INTERNAL_ALLOWED_IPS': ['127.0.0.1', '::1'],
 
+            # Opt-in PG LISTEN/NOTIFY dispatch (Phase 18 — D1/D8).
+            # Default False = byte-identical polling behaviour when off.
+            # This is the ONLY feature flag in the listen-notify milestone.
+            # Loaded from SQLERY_PG_NOTIFY env var (true/1/yes → True).
+            'SQLERY_PG_NOTIFY': False,
+
             # ---------------------------------------------------------------
             # Partition configuration (PostgreSQL range-partitioned tables).
             # These settings mirror the Django DEFAULTS in django_sqlery/settings.py
@@ -178,6 +184,11 @@ class StandaloneConfig(Config):
         if raw_ips is not None:
             parsed_ips = [item.strip() for item in raw_ips.split(",") if item.strip()]
             self._config["INTERNAL_ALLOWED_IPS"] = parsed_ips
+
+        # Phase 18 (D1/D8): opt-in PG LISTEN/NOTIFY dispatch. Absent = False (no-op).
+        raw_pg_notify = os.getenv("SQLERY_PG_NOTIFY")
+        if raw_pg_notify is not None:
+            self._config["SQLERY_PG_NOTIFY"] = raw_pg_notify.lower() in ("true", "1", "yes")
 
         # ---------------------------------------------------------------
         # Partition configuration env-var loading.
