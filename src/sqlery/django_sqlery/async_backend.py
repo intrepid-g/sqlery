@@ -99,7 +99,9 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             except Exception:
                 await cur.execute("ROLLBACK")
                 raise
-        return await QueuedJob.objects.aget(pk=job_id)
+        # Old: return await QueuedJob.objects.aget(pk=job_id)
+        # pk is now a composite (created_at, id); look up by id only.
+        return await QueuedJob.objects.aget(id=job_id)
 
     async def _aclaim_job_sqlite(
         self, queues: list[str], worker_id: str, now
@@ -131,7 +133,9 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             return None
 
         rowcount = await QueuedJob.objects.filter(
-            pk=job.pk, version=job.version
+            # Old: pk=job.pk, version=job.version
+            # pk is now a composite (created_at, id); filter by id for clarity.
+            id=job.id, version=job.version
         ).aupdate(
             status="running",
             version=(job.version or 0) + 1,
@@ -142,19 +146,23 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             # caller's poll loop will retry on the next tick.
             return None
         # Re-fetch to return current state.
-        return await QueuedJob.objects.aget(pk=job.pk)
+        # Old: return await QueuedJob.objects.aget(pk=job.pk)
+        return await QueuedJob.objects.aget(id=job.id)
 
     # ----- terminal-status writes -----------------------------------------
 
     async def amark_running(self, job_id, worker_id) -> None:
         now = timezone.now()
-        await QueuedJob.objects.filter(pk=job_id).aupdate(
+        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
+        # pk is now a composite (created_at, id); filter by id only.
+        await QueuedJob.objects.filter(id=job_id).aupdate(
             status="running", started_at=now
         )
 
     async def amark_success(self, job_id, result) -> None:
         now = timezone.now()
-        await QueuedJob.objects.filter(pk=job_id).aupdate(
+        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
+        await QueuedJob.objects.filter(id=job_id).aupdate(
             status="success",
             finished_at=now,
             output="" if result is None else str(result),
@@ -164,7 +172,8 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         self, job_id, error: str, traceback: str | None = None
     ) -> None:
         now = timezone.now()
-        await QueuedJob.objects.filter(pk=job_id).aupdate(
+        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
+        await QueuedJob.objects.filter(id=job_id).aupdate(
             status="failed",
             finished_at=now,
             error=error or "",
@@ -172,20 +181,24 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         )
 
     async def amark_shutting_down(self, job_id) -> None:
-        await QueuedJob.objects.filter(pk=job_id).aupdate(status="shutting_down")
+        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(status="shutting_down")
+        await QueuedJob.objects.filter(id=job_id).aupdate(status="shutting_down")
 
     # ----- read paths ------------------------------------------------------
 
     async def aget_status(self, job_id) -> str | None:
         try:
-            job = await QueuedJob.objects.only("status").aget(pk=job_id)
+            # Old: job = await QueuedJob.objects.only("status").aget(pk=job_id)
+            # pk is now a composite (created_at, id); look up by id only.
+            job = await QueuedJob.objects.only("status").aget(id=job_id)
         except QueuedJob.DoesNotExist:
             return None
         return job.status
 
     async def aget_job(self, job_id):
         try:
-            return await QueuedJob.objects.aget(pk=job_id)
+            # Old: return await QueuedJob.objects.aget(pk=job_id)
+            return await QueuedJob.objects.aget(id=job_id)
         except QueuedJob.DoesNotExist:
             return None
 

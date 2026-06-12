@@ -468,7 +468,8 @@ def do_manual_intervention_direct() -> dict:
     active_job_ids = Worker.objects.filter(
         status__in=['idle', 'busy']
     ).exclude(
-        current_job__isnull=True
+        # Old: current_job__isnull=True
+        current_job_id__isnull=True
     ).values_list('current_job_id', flat=True)
 
     ghost_count = QueuedJob.objects.filter(
