@@ -53,9 +53,17 @@ def sanitize_queue_name_to_channel(queue_name: str) -> str:
     """
     if not queue_name or not queue_name.strip():
         raise ValueError("queue_name must be non-empty")
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", queue_name)
-    channel = f"sqlery_job_{sanitized}"
-    return channel[:63]
+    # Old: truncate AFTER prefixing — two long distinct queue names sharing the
+    # first 52 chars collapsed to the same channel (WR-02). Truncate the
+    # sanitized suffix FIRST so the visible suffix is cut, never the prefix.
+    # sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", queue_name)
+    # channel = f"sqlery_job_{sanitized}"
+    # return channel[:63]
+    _PREFIX = "sqlery_job_"
+    _max_suffix = 63 - len(_PREFIX)  # 52 chars of sanitized queue suffix
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", queue_name)[:_max_suffix]
+    channel = f"{_PREFIX}{sanitized}"
+    return channel
 
 
 def _fire_django_notify(channel: str) -> None:
