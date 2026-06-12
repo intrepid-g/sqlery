@@ -23,7 +23,7 @@
 - [x] **Phase 12: quick-wins** - Partial pending index + batched DELETE cleanup in both backends, plus the Python 3.13 floor raise; independently shippable (completed 2026-06-11)
 - [x] **Phase 13: partition-core** - Hand-rolled partition maintenance (`core/partitioning.py`), cleanup routing, daemon tick with advisory locks and the DEFAULT-partition alert (completed 2026-06-11)
 - [x] **Phase 14: scheduled-job-staging** - `ScheduledJob` staging table + exactly-once promotion so far-future jobs never pin a partition (completed 2026-06-11)
-- [ ] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0030 with rename-based rollback (highest risk; gates everything after)
+- [x] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0030 with rename-based rollback (highest risk; gates everything after) (completed 2026-06-12)
 - [ ] **Phase 16: backend-wiring-pruning** - Route Django cleanup/vacuum to partition reclaim and prune all 11 id-only write paths to a single partition
 - [ ] **Phase 17: fastapi-parity** - Mirror the partition stack in `fastapi_sqlery/` (DDL, config keys, sync + async backends); re-verify R1–R6 for SQLAlchemy
 - [ ] **Phase 18: listen-notify** - Optional opt-in `SQLERY_PG_NOTIFY` sub-100 ms dispatch; may be deferred or dropped
@@ -90,9 +90,9 @@ Plans:
   5. The `.pk` audit has zero unaddressed hits
 **Plans**: 3 plans
 Plans:
-- [ ] 15-01-PLAN.md — Blast-radius .pk audit artifact + Step-7 model changes (CompositePK, FK demotion, save_meta rewrite)
-- [ ] 15-02-PLAN.md — Migration 0030_partition_queued_job (atomic=False, PG-only, idempotent DDL, rename-based rollback)
-- [ ] 15-03-PLAN.md — Snapshot generator + round-trip test + SC2/SC3/SC4/SC5 gating tests on SQLERY_TEST_PG_URL
+- [x] 15-01-PLAN.md — Blast-radius .pk audit artifact + Step-7 model changes (CompositePK, FK demotion, save_meta rewrite)
+- [x] 15-02-PLAN.md — Migration 0030_partition_queued_job (atomic=False, PG-only, idempotent DDL, rename-based rollback)
+- [x] 15-03-PLAN.md — Snapshot generator + round-trip test + SC2/SC3/SC4/SC5 gating tests on SQLERY_TEST_PG_URL
 
 ### Phase 16: backend-wiring-pruning
 **Goal**: The Django backend actually uses the partition machinery — cleanup routes to reclaim, vacuum skips the partitioned table, and every hot write path prunes to a single partition
@@ -132,7 +132,7 @@ Plans:
 | 12. quick-wins | 3/3 | Complete   | 2026-06-11 |
 | 13. partition-core | 3/3 | Complete   | 2026-06-11 |
 | 14. scheduled-job-staging | 3/3 | Complete   | 2026-06-11 |
-| 15. schema-cutover | 0/3 | Planned | - |
+| 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
 | 16. backend-wiring-pruning | 0/TBD | Not started | - |
 | 17. fastapi-parity | 0/TBD | Not started | - |
 | 18. listen-notify (optional) | 0/TBD | Not started | - |
