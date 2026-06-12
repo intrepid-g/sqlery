@@ -644,7 +644,10 @@ class QueuedJob(models.Model):
 
         expected_version = self.version
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 3
+        ).update(
             status="running",
             started_at=timezone.now(),
             worker_pid=os.getpid(),
@@ -677,7 +680,10 @@ class QueuedJob(models.Model):
         # Record this run in history (update in-memory only)
         self._record_run(status="success", output=str(output))
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 4
+        ).update(
             status="success",
             finished_at=self.finished_at,
             duration_seconds=self.duration_seconds,
@@ -728,7 +734,10 @@ class QueuedJob(models.Model):
         # Record this run in history (update in-memory only)
         self._record_run(status="failed", error=str(error))
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
+        ).update(
             status="failed",
             finished_at=self.finished_at,
             duration_seconds=self.duration_seconds,
@@ -849,6 +858,7 @@ class QueuedJob(models.Model):
     def save_meta(self) -> None:
         """Persist the in-memory meta dict to the database."""
         # Old: QueuedJob.objects.filter(pk=self.pk).update(meta=self.meta)
+        # created_at already present per Phase 15 — checklist item 6 verified
         QueuedJob.objects.filter(id=self.id, created_at=self.created_at).update(meta=self.meta)
 
     def refresh_meta(self) -> None:
