@@ -37,9 +37,12 @@ except ImportError:
     django_timezone = None
 
 try:
-    from ..django_sqlery.models import QueuedJob
+    # Old: from ..django_sqlery.models import QueuedJob
+    # Add ScheduledJob for staging_depth metric (Task 2, plan 16-03).
+    from ..django_sqlery.models import QueuedJob, ScheduledJob
 except Exception:
     QueuedJob = None
+    ScheduledJob = None
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,10 @@ class DaemonManager:
 
         self.pid_file = self.pid_dir / "sqlery_daemon.pid"
         self.heartbeat_file = self.pid_dir / "sqlery_daemon.heartbeat"
+        # Operator metrics dict: populated after each successful partition maintenance
+        # tick. Keys: partition_count, default_rows, oldest_undrained_age_days,
+        # staging_depth, last_tick_duration_s, last_tick_at. Empty until first tick.
+        self._last_partition_stats: dict = {}
 
     def _get_default_pid_dir(self) -> Path:
         """Get default PID directory based on mode."""
@@ -611,9 +618,9 @@ class DaemonManager:
                 if partition_maintenance_enabled and _partition_maint_available and _should_run_partition_maintenance(
                     last_partition_maintenance_at, partition_maintenance_interval
                 ):
+                    # R9: measure wall-clock duration of the maintenance tick.
+                    tick_start = time.monotonic()
                     try:
-                        # TODO(Phase 16): backend.get_raw_cursor() is wired in Phase 16;
-                        # until then, AttributeError is caught below and logged as an error.
                         cur = backend.get_raw_cursor()
                         made = _partitioning.ensure_future_partitions(
                             cur, partition_table, partition_interval_str, partition_premake
@@ -624,16 +631,56 @@ class DaemonManager:
                         default_count = _partitioning.check_default_partition(
                             cur, partition_table
                         )
-                        if made > 0 or dropped > 0:
-                            logger.info(
-                                f"Partition maintenance: created={made}, dropped={dropped}, "
-                                f"default_rows={default_count}"
-                            )
+                        # R9 metric 1: partition_count — number of non-DEFAULT child partitions.
+                        partitions = _partitioning._list_partitions(cur, partition_table)
+                        partition_count = len([p for p in partitions if p[1] is not None])
+                        # R9 metric 2: oldest_undrained_partition_age_days — age in days of the
+                        # oldest non-DEFAULT partition whose upper_bound is in the past (past
+                        # retention cutoff but not yet reclaimed). None if none exist.
+                        now_utc = datetime.now(timezone.utc)
+                        past_upper_bounds = [
+                            p[1] for p in partitions if p[1] is not None and p[1] < now_utc
+                        ]
+                        oldest_undrained_age_days: int | None = (
+                            max((now_utc - ub).days for ub in past_upper_bounds)
+                            if past_upper_bounds
+                            else None
+                        )
+                        # R9 metric 3: staging_depth — count of rows in sqlery_scheduled_job.
+                        # Guard with ScheduledJob is not None for standalone-mode compatibility.
+                        staging_depth: int | None = (
+                            ScheduledJob.objects.count() if ScheduledJob is not None else None
+                        )
+                        # R9 metric 4: maintenance_tick_duration_seconds.
+                        tick_duration = time.monotonic() - tick_start
+
+                        # Old (missing 4 metrics):
+                        # if made > 0 or dropped > 0:
+                        #     logger.info(
+                        #         f"Partition maintenance: created={made}, dropped={dropped}, "
+                        #         f"default_rows={default_count}"
+                        #     )
+                        logger.info(
+                            f"Partition maintenance: created={made}, dropped={dropped}, "
+                            f"partition_count={partition_count}, default_rows={default_count}, "
+                            f"oldest_undrained_days={oldest_undrained_age_days}, "
+                            f"staging_depth={staging_depth}, "
+                            f"tick_duration_s={tick_duration:.2f}"
+                        )
                         if default_count > 0:
                             logger.warning(
                                 f"DEFAULT partition holds {default_count} rows — "
                                 "manual re-insert or SQLERY_PARTITION_ARCHIVE_HOOK required"
                             )
+                        # Expose all 5 metrics for operator queries (R9 complete).
+                        self._last_partition_stats = {
+                            "partition_count": partition_count,
+                            "default_rows": default_count,
+                            "oldest_undrained_age_days": oldest_undrained_age_days,
+                            "staging_depth": staging_depth,
+                            "last_tick_duration_s": tick_duration,
+                            "last_tick_at": datetime.now(timezone.utc).isoformat(),
+                        }
                         last_partition_maintenance_at = datetime.now(timezone.utc)
                     except Exception as e:
                         logger.error(f"Partition maintenance error: {e}", exc_info=True)
