@@ -70,8 +70,10 @@ def _build_running_job(worker_kwargs: dict | None = None, job_kwargs: dict | Non
     }
     jk.update(job_kwargs or {})
     job = QueuedJob.objects.create(**jk)
-    worker.current_job = job
-    worker.save(update_fields=["current_job"])
+    # Old: worker.current_job = job  (FK demoted to current_job_id BigIntegerField in Phase 15)
+    # Old: worker.save(update_fields=["current_job"])
+    worker.current_job_id = job.id
+    worker.save(update_fields=["current_job_id"])
     return worker, job
 
 
@@ -122,8 +124,10 @@ class TestZombie5CheckSequence:
                 queue_name="default",
                 status="running",
             )
-            worker.current_job = other
-            worker.save(update_fields=["current_job"])
+            # Old: worker.current_job = other  (FK demoted in Phase 15)
+            # Old: worker.save(update_fields=["current_job"])
+            worker.current_job_id = other.id
+            worker.save(update_fields=["current_job_id"])
         elif case == "heartbeat_stale":
             # Push heartbeat well past 3 * WORKER_ALIVE_TIMEOUT (default 30s).
             # last_heartbeat is auto_now=True so save() resets it — use update().
