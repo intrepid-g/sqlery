@@ -537,7 +537,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def cancel_job(self, job_id: int) -> bool:
         """Cancel a queued job."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires full (created_at, id) tuple
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
             if job and job.status == "queued":
                 job.status = "failed"
@@ -932,9 +933,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             entries = session.exec(stmt).all()
 
             # Fetch jobs for entries
+            # session.get(QueuedJob, entry.job_id)  # Replaced: composite PK requires (created_at, id)
             jobs = []
             for entry in entries:
-                job = session.get(QueuedJob, entry.job_id)
+                job = session.exec(select(QueuedJob).where(QueuedJob.id == entry.job_id)).first()
                 if job:
                     jobs.append(job)
 
@@ -964,12 +966,14 @@ class SQLAlchemyBackend(DatabaseBackend):
     def get_job_by_id(self, job_id: int):
         """Get job by ID."""
         with self._get_session() as session:
-            return session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            return session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
     def mark_job_success(self, job_id: int, output: str = ""):
         """Mark job as successful."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
             if job:
                 job.mark_success(output=output)
@@ -982,7 +986,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
         """Mark job as failed."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
             if job:
                 job.mark_failed(error=error, traceback=traceback)
@@ -995,7 +1000,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def mark_job_archived(self, job_id: int):
         """Mark a failed job as archived (a retry has been created for it)."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job and job.status == "failed":
                 job.status = "archived"
                 session.add(job)
@@ -1004,10 +1010,12 @@ class SQLAlchemyBackend(DatabaseBackend):
     def cascade_ancestor_status(self, job_id: int, status: str):
         """Walk parent_job_id chain, set all ancestors to given status."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             current_id = job.parent_job_id if job else None
             while current_id:
-                ancestor = session.get(QueuedJob, current_id)
+                # session.get(QueuedJob, current_id)  # Replaced: composite PK requires (created_at, id)
+                ancestor = session.exec(select(QueuedJob).where(QueuedJob.id == current_id)).first()
                 if not ancestor:
                     break
                 ancestor.status = status
@@ -1275,7 +1283,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def fail_zombie_job(self, job_id: int, reason: str) -> bool:
         """Mark a running job failed with termination_reason='zombie_job'."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job is None:
                 return False
             job.mark_failed(error=reason, termination_reason="zombie_job")
@@ -1299,7 +1308,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def update_job_child_pid(self, job_id: int, child_pid: int):
         """Store the forked child PID on the job row."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job:
                 job.child_pid = child_pid
                 session.add(job)
@@ -1320,7 +1330,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     ):
         """Release a job after processing and update worker state."""
         with self._get_session() as session:
-            db_job = session.get(QueuedJob, job.id)
+            # session.get(QueuedJob, job.id)  # Replaced: composite PK requires (created_at, id)
+            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             if db_job:
                 db_job.status = status
                 db_job.finished_at = datetime.now(UTC)
@@ -1433,7 +1444,8 @@ class SQLAlchemyBackend(DatabaseBackend):
             strategy = determine_claim_strategy(dialect)
 
             if strategy == "skip_locked":
-                db_job = session.get(QueuedJob, job.id)
+                # session.get(QueuedJob, job.id)  # Replaced: composite PK requires (created_at, id)
+                db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
                 if db_job and db_job.status == "queued":
                     db_job.mark_running()
                     db_job.version = (db_job.version or 0) + 1
@@ -1482,7 +1494,8 @@ class SQLAlchemyBackend(DatabaseBackend):
     def release_job(self, job_id: int):
         """Release a claimed job back to queued status."""
         with self._get_session() as session:
-            job = session.get(QueuedJob, job_id)
+            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
             if job:
                 job.status = "queued"

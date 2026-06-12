@@ -262,7 +262,9 @@ class TestRetryAndTTL:
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
 
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
             session.add(row)
             session.commit()
@@ -601,7 +603,9 @@ class TestCleanup:
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
 
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.created_at = datetime.now(UTC) - timedelta(days=30)
             session.add(row)
             session.commit()
@@ -741,7 +745,9 @@ class TestMiscMethods:
         from sqlery.core.models import QueuedJob
 
         with sync_backend._get_session() as session:
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.tags = ["acme"]
             row.status = "running"
             session.add(row)

@@ -71,6 +71,48 @@ class StandaloneConfig(Config):
             # disables the check for deployments that need external access.
             # Loaded from SQLERY_INTERNAL_ALLOWED_IPS as a comma-separated list.
             'INTERNAL_ALLOWED_IPS': ['127.0.0.1', '::1'],
+
+            # ---------------------------------------------------------------
+            # Partition configuration (PostgreSQL range-partitioned tables).
+            # These settings mirror the Django DEFAULTS in django_sqlery/settings.py
+            # and are validated together on first access.
+            # ---------------------------------------------------------------
+
+            # Partition granularity: 'monthly' or 'weekly'. Controls how the
+            # Alembic helpers create new child partitions. Default: 'monthly'.
+            # Loaded from SQLERY_PARTITION_INTERVAL.
+            'PARTITION_INTERVAL': 'monthly',
+
+            # Number of future partitions to create in advance. Must be >= 1.
+            # Default: 3 (create three partitions ahead of current period).
+            # Loaded from SQLERY_PARTITION_PREMAKE.
+            'PARTITION_PREMAKE': 3,
+
+            # Partition retention: drop child partitions older than this many
+            # months. Must be strictly greater than SCHEDULED_JOB_THRESHOLD_DAYS
+            # (converted to months) so the archive window is never narrower than
+            # the promotion window.  Default: 24 months.
+            # Loaded from SQLERY_PARTITION_RETENTION.
+            'PARTITION_RETENTION': 24,
+
+            # Optional Python import path to a callable invoked before a
+            # partition is dropped. Signature: hook(table_name, partition_name).
+            # None disables the hook. Loaded from SQLERY_PARTITION_ARCHIVE_HOOK.
+            'PARTITION_ARCHIVE_HOOK': None,
+
+            # How often the partition maintenance task runs (minutes).
+            # Must be <= 43200 (one month in minutes) so maintenance never
+            # runs less frequently than the partition interval.  Default: 1440
+            # (once per day).
+            # Loaded from SQLERY_PARTITION_MAINTENANCE_INTERVAL_MINUTES.
+            'PARTITION_MAINTENANCE_INTERVAL_MINUTES': 1440,
+
+            # Scheduled jobs older than this many days in the staging table
+            # are considered overdue for promotion or expiry. Must be less than
+            # PARTITION_RETENTION * 30 (so the retention window covers the
+            # threshold).  Default: 7 days.
+            # Loaded from SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS.
+            'SCHEDULED_JOB_THRESHOLD_DAYS': 7,
         }
 
         # Load from environment variables
@@ -122,13 +164,112 @@ class StandaloneConfig(Config):
             parsed_ips = [item.strip() for item in raw_ips.split(",") if item.strip()]
             self._config["INTERNAL_ALLOWED_IPS"] = parsed_ips
 
+        # ---------------------------------------------------------------
+        # Partition configuration env-var loading.
+        # ---------------------------------------------------------------
+        raw_interval = os.getenv("SQLERY_PARTITION_INTERVAL")
+        if raw_interval is not None:
+            self._config["PARTITION_INTERVAL"] = raw_interval.strip()
+
+        raw_premake = os.getenv("SQLERY_PARTITION_PREMAKE")
+        if raw_premake is not None:
+            self._config["PARTITION_PREMAKE"] = int(raw_premake)
+
+        raw_retention = os.getenv("SQLERY_PARTITION_RETENTION")
+        if raw_retention is not None:
+            self._config["PARTITION_RETENTION"] = int(raw_retention)
+
+        raw_hook = os.getenv("SQLERY_PARTITION_ARCHIVE_HOOK")
+        if raw_hook is not None:
+            self._config["PARTITION_ARCHIVE_HOOK"] = raw_hook.strip() or None
+
+        raw_maint = os.getenv("SQLERY_PARTITION_MAINTENANCE_INTERVAL_MINUTES")
+        if raw_maint is not None:
+            self._config["PARTITION_MAINTENANCE_INTERVAL_MINUTES"] = int(raw_maint)
+
+        raw_threshold = os.getenv("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS")
+        if raw_threshold is not None:
+            self._config["SCHEDULED_JOB_THRESHOLD_DAYS"] = int(raw_threshold)
+
+        # Validate partition invariants after loading all values.
+        self._validate_partition_config()
+
+    # Partition config keys — re-validate when any of these is mutated via set().
+    _PARTITION_KEYS = frozenset(
+        {
+            "PARTITION_INTERVAL",
+            "PARTITION_PREMAKE",
+            "PARTITION_RETENTION",
+            "PARTITION_MAINTENANCE_INTERVAL_MINUTES",
+            "SCHEDULED_JOB_THRESHOLD_DAYS",
+        }
+    )
+
+    def _validate_partition_config(self):
+        """Validate partition configuration invariants.
+
+        Raises:
+            ValueError: If any invariant is violated.
+        """
+        interval = self._config.get("PARTITION_INTERVAL", "monthly")
+        premake = self._config.get("PARTITION_PREMAKE", 3)
+        retention = self._config.get("PARTITION_RETENTION", 24)
+        maint_mins = self._config.get("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 1440)
+        threshold_days = self._config.get("SCHEDULED_JOB_THRESHOLD_DAYS", 7)
+
+        # PARTITION_INTERVAL must be a recognised granularity.
+        valid_intervals = {"monthly", "weekly"}
+        if interval not in valid_intervals:
+            raise ValueError(
+                f"PARTITION_INTERVAL must be one of {valid_intervals!r}, got {interval!r}"
+            )
+
+        # PARTITION_PREMAKE must be >= 1.
+        if premake < 1:
+            raise ValueError(f"PARTITION_PREMAKE must be >= 1, got {premake!r}")
+
+        # PARTITION_RETENTION must be >= 1 month.
+        if retention < 1:
+            raise ValueError(f"PARTITION_RETENTION must be >= 1, got {retention!r}")
+
+        # PARTITION_MAINTENANCE_INTERVAL_MINUTES must be <= 43200 (30 days).
+        # This ensures maintenance never runs less frequently than one month.
+        max_maint_mins = 43200
+        if maint_mins < 1 or maint_mins > max_maint_mins:
+            raise ValueError(
+                f"PARTITION_MAINTENANCE_INTERVAL_MINUTES must be in [1, {max_maint_mins}],"
+                f" got {maint_mins!r}"
+            )
+
+        # SCHEDULED_JOB_THRESHOLD_DAYS must be at least 1.
+        if threshold_days < 1:
+            raise ValueError(
+                f"SCHEDULED_JOB_THRESHOLD_DAYS must be >= 1, got {threshold_days!r}"
+            )
+
+        # Retention (months) must exceed threshold (days) when converted to months.
+        # retention_days = retention * 30; retention_days must be > threshold_days.
+        retention_days = retention * 30
+        if retention_days <= threshold_days:
+            raise ValueError(
+                f"PARTITION_RETENTION ({retention} months = {retention_days} days) must be"
+                f" strictly greater than SCHEDULED_JOB_THRESHOLD_DAYS ({threshold_days} days)"
+            )
+
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
         return self._config.get(key, default)
 
     def set(self, key: str, value: Any):
-        """Set configuration value."""
+        """Set configuration value.
+
+        Re-validates partition invariants whenever a partition-related key is
+        updated so that misconfigurations are caught at write time rather than
+        at maintenance time.
+        """
         self._config[key] = value
+        if key in self._PARTITION_KEYS:
+            self._validate_partition_config()
 
     def all(self) -> dict:
         """Get all configuration values."""
