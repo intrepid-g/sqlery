@@ -26,7 +26,7 @@
 - [x] **Phase 15: schema-cutover** - Composite PK + FK demotion + stop-the-world migration 0030 with rename-based rollback (highest risk; gates everything after) (completed 2026-06-12)
 - [x] **Phase 16: backend-wiring-pruning** - Route Django cleanup/vacuum to partition reclaim and prune all 11 id-only write paths to a single partition (completed 2026-06-12)
 - [x] **Phase 17: fastapi-parity** - Mirror the partition stack in `fastapi_sqlery/` (DDL, config keys, sync + async backends); re-verify R1–R6 for SQLAlchemy (completed 2026-06-12)
-- [ ] **Phase 18: listen-notify** - Optional opt-in `SQLERY_PG_NOTIFY` sub-100 ms dispatch; may be deferred or dropped
+- [x] **Phase 18: listen-notify** - Optional opt-in `SQLERY_PG_NOTIFY` sub-100 ms dispatch; may be deferred or dropped (completed 2026-06-12)
 
 ## Phase Details
 
@@ -135,10 +135,10 @@ Plans:
   2. With flag off (default), behavior is byte-identical to before
 **Plans**: 4 plans
 Plans:
-- [ ] 18-01-PLAN.md — SQLERY_PG_NOTIFY=False flag in Django DEFAULTS + StandaloneConfig env-var load
-- [ ] 18-02-PLAN.md — core/pg_notify.py (channel sanitizer + helpers) + pg_notify wired into both backends' create_job
-- [ ] 18-03-PLAN.md — Worker LISTEN wake-up: _open/_close_listen_conn + _wait_for_notify in poll loop; fork-safe pre/post hooks
-- [ ] 18-04-PLAN.md — Tests: SC1 latency <100ms (PG), SC2 flag-off byte-identical, fork-safety assertion, SQLite no-op
+- [x] 18-01-PLAN.md — SQLERY_PG_NOTIFY=False flag in Django DEFAULTS + StandaloneConfig env-var load
+- [x] 18-02-PLAN.md — core/pg_notify.py (channel sanitizer + helpers) + pg_notify wired into both backends' create_job
+- [x] 18-03-PLAN.md — Worker LISTEN wake-up: _open/_close_listen_conn + _wait_for_notify in poll loop; fork-safe pre/post hooks
+- [x] 18-04-PLAN.md — Tests: SC1 latency <100ms (PG), SC2 flag-off byte-identical, fork-safety assertion, SQLite no-op
 
 ## Progress
 
@@ -150,7 +150,7 @@ Plans:
 | 15. schema-cutover | 3/3 | Complete   | 2026-06-12 |
 | 16. backend-wiring-pruning | 4/4 | Complete   | 2026-06-12 |
 | 17. fastapi-parity | 4/4 | Complete   | 2026-06-12 |
-| 18. listen-notify (optional) | 0/4 | Not started | - |
+| 18. listen-notify (optional) | 4/4 | Complete   | 2026-06-12 |
 
 ## Lower-priority / [FOLLOWUP] carry-forward
 
