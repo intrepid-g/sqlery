@@ -78,3 +78,9 @@ Use this file to:
 **Inline comment:** `# REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/_executor_impl.py:318`, `src/sqlery/core/worker.py:88`, `src/sqlery/core/worker.py:170`
 
 **Validation:** Regression test passes; all 16 executor tests pass; direct validation confirms coroutine is detected and run to completion.
+
+## 2026-06-14 — `select_for_update cannot be used outside of a transaction` (PG worker)
+- **Broke:** `run_jobs` worker crashed after one job on PostgreSQL. `run_queue_workers` called `get_queued_jobs(...).exists()` to decide whether to spawn the next worker, but that queryset carries `SELECT ... FOR UPDATE SKIP LOCKED`; `.exists()` outside a transaction raises `TransactionManagementError` on PG (SQLite silently allows it). Surfaced via the partitioned sample project.
+- **Fix:** added a non-locking `_executor_impl.TaskExecutor._has_more_queued_jobs()` existence probe and used it at the spawn-decision site (the lock is only needed when actually claiming).
+- **Test:** `tests/test_more_jobs_probe_regression.py`.
+- Prior related: 2026-05-18 (same class of bug in `backend.py` claim path).
