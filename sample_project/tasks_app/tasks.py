@@ -2,7 +2,57 @@
 
 import time
 import random
+from datetime import timedelta
+from pathlib import Path
+
+from django.utils import timezone
+
 from sqlery import job
+
+# Simple file-backed counter so the demo needs no extra model/migration.
+_COUNTER_FILE = Path(__file__).resolve().parent / "hourly_counter.txt"
+
+
+def _bump_counter() -> int:
+    n = int(_COUNTER_FILE.read_text()) if _COUNTER_FILE.exists() else 0
+    n += 1
+    _COUNTER_FILE.write_text(str(n))
+    return n
+
+
+@job(queue="default")
+def hourly_counter_task():
+    """Increment a counter, then self-schedule the next run at now + 2 seconds.
+
+    Registered as an hourly cron (see register_hourly_counter), AND each run
+    also enqueues itself 2 seconds out via enqueue_at — so after the first cron
+    fire it keeps ticking every 2s independently of the hourly schedule.
+    """
+    count = _bump_counter()
+    print(f"⏲️  hourly_counter_task run #{count} at {timezone.now().isoformat()}")
+    next_run = timezone.now() + timedelta(seconds=2)
+    hourly_counter_task.enqueue_at(next_run)  # schedule next run now + 2s
+    return {"count": count, "next_run": next_run.isoformat()}
+
+
+def register_hourly_counter():
+    """Idempotently register hourly_counter_task as an hourly cron ScheduledTask.
+
+    Call once (e.g. from a manage.py shell or a data migration):
+        from tasks_app.tasks import register_hourly_counter
+        register_hourly_counter()
+    """
+    from sqlery.django_sqlery.models import ScheduledTask
+
+    task, _ = ScheduledTask.objects.update_or_create(
+        name="hourly_counter",
+        defaults={
+            "task_path": "tasks_app.tasks.hourly_counter_task",
+            "cron_expression": "0 * * * *",  # top of every hour
+            "enabled": True,
+        },
+    )
+    return task
 
 
 @job
