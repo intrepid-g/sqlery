@@ -20,6 +20,15 @@ from django.utils import timezone
 from uuid6 import uuid7
 
 from .db_compat import is_sqlite
+
+
+def _generate_job_id() -> int:
+    """62-bit time-sortable id from a UUID v7 (default for QueuedJob.id).
+
+    Resolves fields.E100 (BigAutoField under a CompositePrimaryKey) while keeping
+    id assignment working on both SQLite and PostgreSQL without an AutoField.
+    """
+    return uuid7().int & ((1 << 62) - 1)
 from .friendly_name import uuid_to_friendly
 from .settings import get_setting
 from .utils import calculate_next_run, validate_cron_expression
@@ -361,7 +370,16 @@ class QueuedJob(models.Model):
     # FKs from JobRegistry and Worker demoted to BigIntegerField per D4 (Phase 15):
     # orphans on partition drop are an accepted, documented trade-off.
     pk = models.CompositePrimaryKey("created_at", "id")
-    id = models.BigAutoField(primary_key=False)
+    # Old: id = models.BigAutoField(primary_key=False)
+    #   BigAutoField under a CompositePrimaryKey raises fields.E100 ("AutoFields
+    #   must set primary_key=True"), which blocks `manage.py check`/`migrate` in
+    #   real Django apps. The id value is DB-assigned — nextval('sqlery_job_id_seq')
+    #   on Postgres (migrations 0029-0030) and an autoincrement rowid on SQLite —
+    #   so a plain BigIntegerField carries the column without the AutoField check.
+    #   A 62-bit UUID-v7-derived default assigns the id on insert for BOTH backends
+    #   (mirrors the standalone SQLModel listener) — globally unique, time-sortable,
+    #   no collision with the Postgres sequence (which still backs raw-SQL inserts).
+    id = models.BigIntegerField(default=_generate_job_id, editable=False)
 
     # Task definition
     task_path = models.CharField(
