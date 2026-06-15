@@ -20,6 +20,14 @@ PIP_VENV := $(VENV_BIN)/pip
 DJANGO_MANAGE := uv run sample_project/manage.py
 UV := uv
 
+# Postgres for the sample project (override on the CLI, e.g.
+#   make sample-project-postgres POSTGRES_PORT=5555)
+POSTGRES_PORT ?= 55433
+POSTGRES_DB ?= sqlery_test
+POSTGRES_USER ?= sqlery
+PG_CONTAINER ?= sqlery-sample-pg
+PG_ENV := env -u VIRTUAL_ENV USE_POSTGRES=1 POSTGRES_PORT=$(POSTGRES_PORT) POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER)
+
 # Project paths
 SAMPLE_PROJECT := sample_project
 CONFIG_DIR := .makefile-configs
@@ -303,6 +311,41 @@ db-shell: ## Open Django database shell
 # =============================================================================
 # Single Worker
 # =============================================================================
+
+.PHONY: sample-project-postgres
+sample-project-postgres: ## Run the sample project on Django + Postgres FROM SCRATCH (fresh PG, migrate, server)
+	@command -v docker >/dev/null || { echo "$(RED)docker not found$(NC)"; exit 1; }
+	@echo "$(BLUE)→ Fresh start: stopping any old server + Postgres...$(NC)"
+	@[ -f $(LOG_DIR)/sample-server.pid ] && kill $$(cat $(LOG_DIR)/sample-server.pid) 2>/dev/null; rm -f $(LOG_DIR)/sample-server.pid
+	@pkill -f "runserver --noreload 127.0.0.1:8000" 2>/dev/null; true
+	@docker rm -f $(PG_CONTAINER) >/dev/null 2>&1; true
+	@docker run -d --name $(PG_CONTAINER) \
+		-e POSTGRES_USER=$(POSTGRES_USER) -e POSTGRES_DB=$(POSTGRES_DB) \
+		-e POSTGRES_HOST_AUTH_METHOD=trust -p $(POSTGRES_PORT):5432 postgres:15 >/dev/null
+	@echo "$(BLUE)→ Waiting for Postgres on :$(POSTGRES_PORT)...$(NC)"
+	@until docker exec $(PG_CONTAINER) pg_isready -U $(POSTGRES_USER) >/dev/null 2>&1; do sleep 1; done
+	@echo "$(BLUE)→ Migrating (from scratch)...$(NC)"; $(PG_ENV) $(DJANGO_MANAGE) migrate --no-input
+	@$(PG_ENV) $(DJANGO_MANAGE) shell -c "from django.contrib.auth import get_user_model as G; U=G(); U.objects.filter(username='admin').exists() or U.objects.create_superuser('admin','admin@example.com','admin')" >/dev/null 2>&1
+	@mkdir -p $(LOG_DIR)
+	@$(PG_ENV) $(DJANGO_MANAGE) runserver --noreload 127.0.0.1:8000 > $(LOG_DIR)/sample-server.log 2>&1 & echo $$! > $(LOG_DIR)/sample-server.pid
+	@n=0; until grep -qE "Starting development server|Error|that port is already" $(LOG_DIR)/sample-server.log 2>/dev/null || [ $$n -ge 15 ]; do sleep 1; n=$$((n+1)); done
+	@grep -q "Starting development server" $(LOG_DIR)/sample-server.log 2>/dev/null || { echo "$(RED)✗ server failed to start — see $(LOG_DIR)/sample-server.log$(NC)"; tail -5 $(LOG_DIR)/sample-server.log; exit 1; }
+	@echo ""
+	@echo "$(GREEN)✓ Sample project is up (Django + Postgres on :$(POSTGRES_PORT))$(NC)"
+	@echo "  Dashboard : $(BLUE)http://127.0.0.1:8000/$(NC)"
+	@echo "  Admin     : $(BLUE)http://127.0.0.1:8000/admin/$(NC)"
+	@echo "  Login     : admin / admin"
+	@echo "  Server PID: $$(cat $(LOG_DIR)/sample-server.pid)  ·  logs: $(LOG_DIR)/sample-server.log"
+	@echo "  Process jobs: $(BLUE)make sample-worker-postgres$(NC)   ·  Stop all: $(BLUE)make sample-project-postgres-stop$(NC)"
+
+.PHONY: sample-worker-postgres
+sample-worker-postgres: ## Run a worker against the sample Postgres (process queued jobs)
+	@$(PG_ENV) $(DJANGO_MANAGE) run_jobs --verbosity=2
+
+.PHONY: sample-project-postgres-stop
+sample-project-postgres-stop: ## Stop the sample dev server and remove the Postgres container
+	@[ -f $(LOG_DIR)/sample-server.pid ] && kill $$(cat $(LOG_DIR)/sample-server.pid) 2>/dev/null && rm -f $(LOG_DIR)/sample-server.pid && echo "$(GREEN)✓ stopped dev server$(NC)" || true
+	@docker rm -f $(PG_CONTAINER) >/dev/null 2>&1 && echo "$(GREEN)✓ removed $(PG_CONTAINER)$(NC)" || echo "no container"
 
 .PHONY: worker
 worker: ## Start single worker (default queue)
