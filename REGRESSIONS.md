@@ -84,3 +84,11 @@ Use this file to:
 - **Fix:** added a non-locking `_executor_impl.TaskExecutor._has_more_queued_jobs()` existence probe and used it at the spawn-decision site (the lock is only needed when actually claiming).
 - **Test:** `tests/test_more_jobs_probe_regression.py`.
 - Prior related: 2026-05-18 (same class of bug in `backend.py` claim path).
+
+## 2026-06-16 — `NoReverseMatch` for `admin:sqlery_queuedjob_changelist` (unified dashboard)
+- **Broke:** `GET /admin/sqlery/` crashed (HTTP 500) rendering `unified_dashboard.html` — `Reverse for 'sqlery_queuedjob_changelist' not found`. Hit on Django 6.0 with the partitioned QueuedJob.
+- **Root cause:** Phase 15 gave `QueuedJob` a composite primary key. Django 5.2+/6.0 raises `ImproperlyConfigured` for composite-PK models in admin, so `admin.site.register(QueuedJob, ...)` always fails and the changelist URL never exists. A bare `except Exception: pass` in `admin.py` swallowed the failure silently, while the dashboard template hard-reversed the (now nonexistent) URL.
+- **Fix:** template (`unified_dashboard.html`) resolves the QueuedJob admin URLs via `{% url ... as var %}` (empty string on failure) and degrades the Success/Failed stat cards to plain `<div>` when absent; `admin.py` stops swallowing — it now catches `AlreadyRegistered` (autoreload guard) and logs the expected `ImproperlyConfigured` composite-PK case at INFO instead of `except Exception: pass`.
+- **Test:** `test_unified_dashboard_renders_without_queuedjob_admin` in `tests/test_admin.py` (uses test URLconf `tests/urls_dashboard.py` mounting admin + sqlery; fails with `NoReverseMatch` pre-fix, 200 post-fix).
+- **Validation:** reproduced the exact `NoReverseMatch` by registering `QueuedJob` directly (confirmed `ImproperlyConfigured: composite primary key`); test fails on unfixed template, passes after; full `tests/test_admin.py` green (13 passed).
+- **Inline comment:** `REGRESSION 2026-06-16` at `templates/admin/sqlery/unified_dashboard.html` (stat cards + JS url block) and `django_sqlery/admin.py` registration block.
