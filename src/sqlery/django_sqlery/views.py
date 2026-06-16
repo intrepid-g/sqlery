@@ -771,12 +771,19 @@ def dashboard_stats(request):
         }
 
         # Get active workers list with current job info
+        # REGRESSION 2026-06-16: stale workers (heartbeat 100s of hours old) never disappeared from the dashboard.
+        # Root cause: the query filtered on status in ('idle','busy') but had no upper bound on heartbeat age,
+        #   so a worker that died without updating its status row stayed 'idle' and rendered forever.
+        # Fix: exclude workers whose last_heartbeat is older than 24h from the dashboard listing.
         workers_list = []
         try:
+            stale_cutoff = now - timedelta(hours=24)
+            # I wish I had the time to: make the 24h dashboard cutoff configurable via DJANGO_SQL_JOBS settings.
             # Old: .select_related('current_job', 'current_job__scheduled_task')  — FK demoted (D4, Phase 15)
             workers_queryset = (
                 Worker.objects.filter(status__in=['idle', 'busy'])
                 .exclude(pid=0)
+                .exclude(last_heartbeat__lt=stale_cutoff)
                 .order_by('-last_heartbeat')
             )
             _active_workers_list = list(workers_queryset)

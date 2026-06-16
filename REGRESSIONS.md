@@ -92,3 +92,13 @@ Use this file to:
 - **Test:** `test_unified_dashboard_renders_without_queuedjob_admin` in `tests/test_admin.py` (uses test URLconf `tests/urls_dashboard.py` mounting admin + sqlery; fails with `NoReverseMatch` pre-fix, 200 post-fix).
 - **Validation:** reproduced the exact `NoReverseMatch` by registering `QueuedJob` directly (confirmed `ImproperlyConfigured: composite primary key`); test fails on unfixed template, passes after; full `tests/test_admin.py` green (13 passed).
 - **Inline comment:** `REGRESSION 2026-06-16` at `templates/admin/sqlery/unified_dashboard.html` (stat cards + JS url block) and `django_sqlery/admin.py` registration block.
+
+## 2026-06-16 — Dead workers never leave the dashboard (heartbeat 100s of hours stale)
+
+- **What broke:** A worker whose `last_heartbeat` was hundreds of hours old (e.g. `418h17m ago`) kept appearing in the admin dashboard workers table, marked `idle`, with no way to age out. The user expects workers inactive for >24h to disappear.
+- **Root cause:** `dashboard_stats()` (`src/sqlery/django_sqlery/views.py`) built the workers list with `Worker.objects.filter(status__in=['idle','busy'])` and had **no upper bound on heartbeat age**. A worker that died without flipping its status row stayed `idle` and rendered forever; the JS only colored the heartbeat cell red but never removed the row.
+- **Fix:** added `.exclude(last_heartbeat__lt=now - timedelta(hours=24))` to the dashboard worker queryset so workers inactive >24h are omitted from the listing. (`views.py` ~line 777.)
+- **Regression test:** `test_dashboard_excludes_workers_idle_more_than_24h` in `tests/test_dashboard_stale_workers.py` — creates a fresh idle worker and a 418h-stale idle worker, calls `dashboard_stats` as a staff user, asserts the stale one is absent and the fresh one present. Fails pre-fix (`stale-node` present), passes post-fix.
+- **Inline comment:** `REGRESSION 2026-06-16` at `src/sqlery/django_sqlery/views.py` (dashboard workers queryset).
+- **Validation:** confirmed the test fails against the unfixed query (removed the `.exclude(...)` line → `stale-node` reappears) and passes with the fix; `tests/test_serialize_worker.py` + `tests/test_admin.py` remain green (22 passed).
+- **Note:** The 60s/30s heartbeat thresholds elsewhere (`get_worker_heartbeats`, `Worker.is_alive`) are separate liveness concerns and were intentionally left unchanged — the dashboard cutoff is a display concern (left a wish comment to make the 24h value configurable).
