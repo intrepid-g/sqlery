@@ -51,7 +51,15 @@ except Exception as e:
 
 
 # Version info
-__version__ = "0.11.0"  # Will become 1.0.0 when extracted to fastapi-sqlery
+# Old: __version__ = "0.11.0"  # Will become 1.0.0 when extracted to fastapi-sqlery
+# Until extracted, this ships as part of sqlery — derive from the single source (pyproject.toml)
+# so it cannot drift. Revisit and pin independently when split into a standalone fastapi-sqlery package.
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("sqlery")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 
 # Future migration note
