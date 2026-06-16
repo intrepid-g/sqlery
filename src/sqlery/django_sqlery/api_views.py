@@ -16,6 +16,10 @@ from django.http import JsonResponse
 from django.utils import timezone
 
 from ..compat import get_backend
+from sqlery.core.worker_admin import (
+    is_worker_deletable,
+    worker_delete_staleness_threshold_seconds,
+)
 from .intervention import diagnose_system_health, do_manual_intervention_direct
 from .models import DaemonCommand, QueuedJob, ScheduledTask, Worker
 from .utils import enqueue_task
@@ -446,6 +450,23 @@ def api_worker_action(request, worker_id):
                 'pid': worker.pid,
                 'msg': 'Worker will be replaced by the daemon within ~10 seconds.',
             })
+
+        elif action == 'delete':
+            # Only stale (non-beating) workers may be removed. Re-validate server-side —
+            # never trust the client's notion of staleness.
+            deletable = is_worker_deletable(
+                worker.status,
+                worker.last_heartbeat,
+                timezone.now(),
+                worker_delete_staleness_threshold_seconds(),
+            )
+            if not deletable:
+                return JsonResponse(
+                    {'error': 'Worker is still active (beating) and cannot be deleted'},
+                    status=409,
+                )
+            worker.delete()
+            return JsonResponse({'success': True, 'worker_id': worker_id})
 
         else:
             return JsonResponse({'error': f'Invalid action: {action}'}, status=400)
