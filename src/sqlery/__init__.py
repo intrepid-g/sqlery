@@ -19,7 +19,16 @@ For standalone projects (FastAPI, Flask, etc.):
     from sqlery.core import Queue, Worker
 """
 
-__version__ = "0.22.1"
+# Old: __version__ = "0.22.1"  — drifted from pyproject.toml; version now has a single source of truth.
+# Single source of truth: pyproject.toml [project].version. Read it from installed package metadata
+# so there is exactly one place to bump. Fallback to "0.0.0+unknown" when running from a source tree
+# that has not been installed (no dist metadata available).
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("sqlery")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 # Re-exports for backward compatibility
 from .core.job_queue import (
