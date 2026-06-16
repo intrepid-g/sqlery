@@ -20,6 +20,10 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from sqlery.core.worker_admin import (
+    is_worker_deletable,
+    worker_delete_staleness_threshold_seconds,
+)
 from .models import QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .signature import verify_signature
@@ -111,6 +115,14 @@ def _serialize_worker(worker, now) -> dict:
     else:
         worker_data['heartbeat_age_seconds'] = None
         worker_data['is_stalled'] = True
+
+    # Whether the user may delete this worker (only non-beating/stale ones).
+    worker_data['is_deletable'] = is_worker_deletable(
+        worker.status,
+        worker.last_heartbeat,
+        now,
+        worker_delete_staleness_threshold_seconds(),
+    )
 
     if worker.current_job_id:
         # try:
