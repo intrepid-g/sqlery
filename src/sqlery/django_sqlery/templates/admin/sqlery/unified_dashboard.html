@@ -32,18 +32,23 @@ Task Queue Management{% endblock %} {% block extrahead %}
             <div class="stat-value" id="stat-workers">-</div>
             <div class="stat-label">Active Workers</div>
         </div>
+        {# REGRESSION 2026-06-16: dashboard crashed with NoReverseMatch on admin:sqlery_queuedjob_changelist. #}
+        {# Root cause: Phase 15 gave QueuedJob a composite PK; Django 5.2+/6.0 forbids registering composite-PK #}
+        {#   models in admin, so the changelist URL never exists — yet this template hard-reversed it. #}
+        {# Fix: resolve via {% url ... as %} (empty on failure) and degrade the stat card to a plain div. #}
+        {% url 'admin:sqlery_queuedjob_changelist' as queuedjob_changelist_url %}
         <div class="stat-card">
-            <a href="{% url 'admin:sqlery_queuedjob_changelist' %}?status__exact=success" class="stat-link">
+            {% if queuedjob_changelist_url %}<a href="{{ queuedjob_changelist_url }}?status__exact=success" class="stat-link">{% else %}<div class="stat-link">{% endif %}
                 <div class="stat-value" id="stat-success">-</div>
                 <div class="stat-label">Success (24h)</div>
-            </a>
+            {% if queuedjob_changelist_url %}</a>{% else %}</div>{% endif %}
             <button class="stat-clear-btn" onclick="event.preventDefault(); event.stopPropagation(); clearJobsByStatus('success')" title="Delete all successful jobs">Clear</button>
         </div>
         <div class="stat-card">
-            <a href="{% url 'admin:sqlery_queuedjob_changelist' %}?status__exact=failed" class="stat-link">
+            {% if queuedjob_changelist_url %}<a href="{{ queuedjob_changelist_url }}?status__exact=failed" class="stat-link">{% else %}<div class="stat-link">{% endif %}
                 <div class="stat-value" id="stat-failed">-</div>
                 <div class="stat-label">Failed (24h)</div>
-            </a>
+            {% if queuedjob_changelist_url %}</a>{% else %}</div>{% endif %}
             <button class="stat-clear-btn" onclick="event.preventDefault(); event.stopPropagation(); clearJobsByStatus('failed')" title="Delete all failed jobs">Clear</button>
         </div>
         <div class="stat-card">
@@ -270,8 +275,12 @@ Task Queue Management{% endblock %} {% block extrahead %}
         stopJobUrl: '{% url "sqlery:api_stop_job" job_id=0 %}',
         enqueueJobNowUrl: '{% url "sqlery:api_enqueue_job_now" job_id=0 %}',
         archiveScheduledJobsUrl: '{% url "sqlery:api_archive_scheduled_jobs" %}',
-        queuedJobChangeUrl: '{% url "admin:sqlery_queuedjob_change" 0 %}',
-        queuedJobChangelistUrl: '{% url "admin:sqlery_queuedjob_changelist" %}',
+        {# REGRESSION 2026-06-16: QueuedJob composite PK cannot be registered in admin (Django 6.0), so these #}
+        {#   admin URLs may not resolve — use {% url ... as %} (empty string on failure) instead of hard reverse. #}
+        {% url "admin:sqlery_queuedjob_change" 0 as queuedjob_change_url %}
+        {% url "admin:sqlery_queuedjob_changelist" as queuedjob_changelist_url_js %}
+        queuedJobChangeUrl: '{{ queuedjob_change_url }}',
+        queuedJobChangelistUrl: '{{ queuedjob_changelist_url_js }}',
         scheduledTaskAddUrl: '{% url "admin:sqlery_scheduledtask_add" %}',
         scheduledTaskChangelistUrl: '{% url "admin:sqlery_scheduledtask_changelist" %}',
         taskDetailUrl: '{% url "sqlery:task_detail" task_id=0 %}',
