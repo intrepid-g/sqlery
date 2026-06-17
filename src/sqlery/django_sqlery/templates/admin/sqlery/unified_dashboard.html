@@ -287,5 +287,8 @@ Task Queue Management{% endblock %} {% block extrahead %}
         adminIndexUrl: '{% url "admin:index" %}',
     };
 </script>
+<footer style="text-align:center; padding:12px 0; margin-top:16px; font-size:11px; color:#888;">
+    Sqlery v{{ sqlery_version }}
+</footer>
 <script src="{% static 'sqlery/js/dashboard.js' %}"></script>
 {% endblock %}
