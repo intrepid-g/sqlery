@@ -102,8 +102,10 @@ class QueuedJob(SQLModel, table=True):
     # Status
     status: str = Field(default="queued", max_length=20, index=True, description="Job status (queued/running/success/failed/archived/shutting_down)")
 
-    # Retry chain linkage
-    parent_job_id: int | None = Field(default=None, index=True, description="ID of the failed job this retry was created from (links retry chain)")
+    # Retry chain linkage. BigInteger (matching the raw DDL in
+    # fastapi_sqlery/database.py) because it stores a 64-bit QueuedJob id — a
+    # plain Integer column overflows once a failed job spawns a retry.
+    parent_job_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True, nullable=True), description="ID of the failed job this retry was created from (links retry chain)")
 
     # Retry configuration
     retry_count: int = Field(default=0, description="Current retry attempt number (0 = first attempt)")
