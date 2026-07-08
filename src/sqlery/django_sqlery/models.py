@@ -415,8 +415,10 @@ class QueuedJob(models.Model):
         help_text="Optimistic locking version for atomic job claiming (increments on each update)",
     )
 
-    # Retry chain linkage
-    parent_job_id = models.IntegerField(
+    # Retry chain linkage. BigIntegerField (not IntegerField) because it stores a
+    # QueuedJob id, which is a 64-bit _generate_job_id() value — an int4 column
+    # overflows ("integer out of range") the moment a failed job spawns a retry.
+    parent_job_id = models.BigIntegerField(
         null=True,
         blank=True,
         db_index=True,
