@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.24.5] - 2026-07-08
+
+### Fixed
+
+- `QueuedJob.parent_job_id` widened from `IntegerField` (int4) to `BigIntegerField` (int8). It stores a 64-bit `_generate_job_id()` value, so when a failed job spawned a retry the INSERT raised `integer out of range` — swallowed by the worker's mark-failed handler, silently preventing retries. Postgres migration `0033` runs the real `ALTER COLUMN … TYPE bigint` (cascades across partitions); SQLite is state-only. SQLModel `parent_job_id` aligned to `BigInteger` for parity (the fastapi raw DDL was already `BIGINT`).
+
 ## [0.22.0] - 2026-05-25
 
 ### Added
