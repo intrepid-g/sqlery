@@ -6,6 +6,7 @@ This backend wraps Django ORM operations to implement the DatabaseBackend interf
 import logging
 import os
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -18,10 +19,26 @@ from sqlery.core.db_resilience import retry_on_db_error
 
 from ..compat import DatabaseBackend
 from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
-from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+# Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker, ScheduledJob
+from .settings import get_setting
 from sqlery.core.claiming import claim_next_job_with_queue_priority
+# Partition maintenance helpers — guarded against psycopg absence (standalone/SQLite installs)
+try:
+    from sqlery.core import partitioning as _partitioning
+except ImportError:
+    _partitioning = None  # psycopg not installed; partition reclaim path unavailable
+
+# Phase 18: pg_notify hook — guarded so Django backend works without core.pg_notify
+try:
+    from sqlery.core.pg_notify import notify_queue_django as _notify_queue_django
+except ImportError:
+    _notify_queue_django = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+CLEANUP_BATCH_SIZE = 500
+FINISHED_STATUSES = ("success", "failed", "archived")
 
 
 class DjangoBackend(DatabaseBackend):
@@ -39,6 +56,61 @@ class DjangoBackend(DatabaseBackend):
         self.ScheduledTask = ScheduledTask
         self.JobRegistry = JobRegistry
         self.Worker = Worker
+        self.ScheduledJob = ScheduledJob
+        self._partitioned_pg_cache: bool | None = None
+
+    def _partitioned_pg(self) -> bool:
+        """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
+
+        Used by the cleanup→reclaim routing (Phase 13 seam), the far-future
+        staging gate (Phase 14), and the write-path pruning logic. SQLite and a
+        non-partitioned PG install both return False — they keep the Phase-12
+        batched DELETE path and the in-queue scheduling path unchanged (D6).
+        Cached per-process: the table's partition status does not change at
+        runtime (only via the stop-the-world cutover migration).
+        """
+        if self._partitioned_pg_cache is not None:
+            return self._partitioned_pg_cache
+        if connection.vendor != "postgresql":
+            self._partitioned_pg_cache = False
+            return False
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT relkind = 'p' FROM pg_class "
+                    "WHERE relname = %s AND relnamespace = 'public'::regnamespace",
+                    [self.QueuedJob._meta.db_table],
+                )
+                row = cur.fetchone()
+            self._partitioned_pg_cache = bool(row and row[0])
+        except Exception:
+            # Old: self._partitioned_pg_cache = False
+            # WR-01: do NOT permanently cache False on a transient DB error — a
+            # connection-pool warmup failure at startup would disable all partition
+            # routing for the lifetime of the process with no retry. Leave the cache
+            # unset (None) so the next call retries; only write the cache on a
+            # successful catalog query above. Return False for this call to fail safe
+            # (never route to PG-only paths against a potentially non-partitioned table).
+            logger.warning(
+                "_partitioned_pg: catalog query failed — will retry on next call",
+                exc_info=True,
+            )
+            return False
+        return self._partitioned_pg_cache
+
+    def get_raw_cursor(self):
+        """Return a raw DB-API cursor for the daemon's PG-only maintenance loop.
+
+        promote_due_scheduled_jobs / reclaim_drained_partitions / ensure_future_
+        partitions need a live psycopg cursor (not the Django ORM). Returns the
+        Django connection's cursor on PostgreSQL; returns None on SQLite (and any
+        non-partitioned install) so the daemon skips PG-only maintenance cleanly.
+        The caller owns the cursor lifecycle (commit/rollback handled inside the
+        maintenance functions).
+        """
+        if not self._partitioned_pg():
+            return None
+        return connection.cursor()
 
     def create_job(
         self,
@@ -72,6 +144,57 @@ class DjangoBackend(DatabaseBackend):
                 if conflicting.status == "running":
                     conflicting.force_stop()
             self.QueuedJob.objects.filter(job_name=job_name).delete()
+
+        # Threshold routing (D1, Phase 14): jobs scheduled further out than the
+        # configured threshold go into sqlery_scheduled_job instead of
+        # sqlery_queued_job so they cannot pin otherwise-drained partitions.
+        threshold_days = get_setting("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 1)
+        staging_threshold = timedelta(days=threshold_days)
+        now_utc = timezone.now()
+        # Staging only protects partitions, which exist only on partitioned PG.
+        # On SQLite / non-partitioned PG, far-future jobs stay in sqlery_queued_job
+        # (D6 — SQLite path unchanged) since the PG-only promotion loop can't drain
+        # a staging table there. (Phase 16 carry-forward: gate routing on partitioning.)
+        # Old: if scheduled_at is not None and scheduled_at > now_utc + staging_threshold:
+        if (
+            self._partitioned_pg()
+            and scheduled_at is not None
+            and scheduled_at > now_utc + staging_threshold
+        ):
+            # Store full job-creation spec in payload for lossless promotion (WR-01/WR-02).
+            # payload schema: {"kwargs": <task kwargs>, "job_spec": {<all execution params>}}
+            # Promotion reads job_spec to reconstruct every queued_job column identically.
+            # Old: payload=kwargs   <-- silently dropped 12 fields (retry_backoff, timeout, etc.)
+            full_payload = {
+                "kwargs": kwargs,
+                "job_spec": {
+                    "retry_backoff": retry_backoff,
+                    "allow_parallel": allow_parallel,
+                    "timeout_seconds": timeout_seconds,
+                    "retry_count": retry_count if retry_count is not None else 0,
+                    "scheduled_task_id": scheduled_task_id,
+                    "job_name": job_name,
+                    "retry_intervals": retry_intervals,
+                    "meta": meta,
+                    "dependencies": dependencies or [],
+                    "on_success_path": on_success_path,
+                    "on_failure_path": on_failure_path,
+                    "ttl": ttl,
+                    "result_ttl": result_ttl,
+                    "failure_ttl": failure_ttl,
+                    "parent_job_id": parent_job_id,
+                },
+            }
+            return self.ScheduledJob.objects.create(
+                queue_name=queue_name,
+                task_path=task_path,
+                payload=full_payload,
+                scheduled_at=scheduled_at,
+                priority=priority,
+                max_retries=max_retries,
+            )
+
+        # Below threshold or immediate — insert into main queue.
         job = self.QueuedJob.objects.create(
             task_path=task_path,
             kwargs=kwargs,
@@ -96,6 +219,17 @@ class DjangoBackend(DatabaseBackend):
             parent_job_id=parent_job_id,
             status="queued",
         )
+        # Phase 18 (D1): emit pg_notify after commit when flag is on + PG.
+        # No-op when SQLERY_PG_NOTIFY=False (default) or on SQLite.
+        # notify_queue_django handles the vendor check and on_commit scheduling
+        # internally; any NOTIFY failure is caught + logged, never crashes enqueue.
+        # Old: return job
+        if (
+            _notify_queue_django is not None
+            and get_setting("SQLERY_PG_NOTIFY", False)
+            and connection.vendor == "postgresql"
+        ):
+            _notify_queue_django(queue_name)
         return job
 
     @retry_on_db_error()
@@ -188,11 +322,13 @@ class DjangoBackend(DatabaseBackend):
             worker_row = self._resolve_worker(worker_id)
             if worker_row:
                 worker_row.status = "idle"
-                worker_row.current_job = None
+                # Old: worker_row.current_job = None
+                worker_row.current_job_id = None
                 worker_row.jobs_processed = jobs_processed
                 worker_row.last_heartbeat = timezone.now()
+                # Old: update_fields=["status", "current_job", "jobs_processed", "last_heartbeat"]
                 worker_row.save(
-                    update_fields=["status", "current_job", "jobs_processed", "last_heartbeat"]
+                    update_fields=["status", "current_job_id", "jobs_processed", "last_heartbeat"]
                 )
 
         return job
@@ -290,12 +426,29 @@ class DjangoBackend(DatabaseBackend):
         return result
 
     def cancel_job(self, job_id: int) -> bool:
-        """Cancel a queued job."""
-        updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
-            status="failed", error="Cancelled by user"
-        )
-
-        return updated > 0
+        """Cancel a queued or staged job, spanning QueuedJob and ScheduledJob tables."""
+        # Old (single-table — staged jobs were uncancellable via this API):
+        # updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+        #     status="failed", error="Cancelled by user"
+        # )
+        # return updated > 0
+        # Item 7: Add created_at to filter so PG prunes to one partition (write-path pruning).
+        # SELECT created_at first (cancel_job receives only job_id, not the full job object).
+        # Old (id-only filter — does not prune to partition on PG):
+        # updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+        #     status="failed", error="Cancelled by user"
+        # )
+        row = self.QueuedJob.objects.filter(id=job_id, status="queued").values("created_at").first()
+        if row:
+            updated = self.QueuedJob.objects.filter(
+                id=job_id, created_at=row["created_at"], status="queued"
+            ).update(status="failed", error="Cancelled by user")
+        else:
+            updated = 0
+        if updated > 0:
+            return True
+        deleted, _ = self.ScheduledJob.objects.filter(id=job_id).delete()
+        return deleted > 0
 
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
         """Retry failed jobs by resetting them to queued status."""
@@ -460,7 +613,62 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up old jobs based on retention policy."""
+        """Clean up old jobs based on retention policy.
+
+        On a partitioned PostgreSQL install (self._partitioned_pg() is True),
+        routes to reclaim_drained_partitions which drops entire drained partitions
+        instead of batched DELETEs (D5 — see loud comment below). Advisory lock
+        (pg_try_advisory_lock) is acquired inside reclaim_drained_partitions; if
+        not acquired the call returns 0 without error (T-16-09).
+
+        On SQLite or non-partitioned PG, keeps the Phase-12 keyset-batched DELETE
+        loop byte-for-byte unchanged (D6).
+        """
+        # --- D5: Partition reclaim path (PostgreSQL + partitioned table) ---
+        if self._partitioned_pg() and _partitioning is not None:
+            if dry_run:
+                # dry_run is not meaningful for partition-drop path; return estimate
+                query = self.QueuedJob.objects.all()
+                if status:
+                    query = query.filter(status=status)
+                if queue_name:
+                    query = query.filter(queue_name=queue_name)
+                if max_age_days:
+                    cutoff = timezone.now() - timedelta(days=max_age_days)
+                    query = query.filter(created_at__lt=cutoff)
+                count = query.count()
+                return {"deleted": 0, "count": count}
+
+            retention_str = get_setting("SQLERY_PARTITION_RETENTION", "30 days")
+            archive_hook = get_setting("SQLERY_PARTITION_ARCHIVE_HOOK", None)
+            # Old: cur = self.get_raw_cursor()
+            # CR-02: cursor was never closed, leaking a CursorWrapper on every cleanup_jobs call.
+            # Use try/finally to ensure close() is called even if reclaim raises.
+            cur = self.get_raw_cursor()
+            try:
+                # D5: Partition reclaim destroys all jobs in drained partitions (beyond
+                # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
+                # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
+                # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
+                # to archive instead. The archive hook receives (cur, partition_name)
+                # and must not execute arbitrary SQL via string interpolation (T-16-07).
+                dropped = _partitioning.reclaim_drained_partitions(
+                    cur, self.QueuedJob._meta.db_table, retention_str, archive_hook
+                )
+            finally:
+                if cur is not None:
+                    cur.close()
+            return {
+                "deleted": 0,
+                "reclaimed_via_partition_drop": True,
+                "dropped_partitions": dropped,
+                "note": (
+                    "Partition reclaim: jobs beyond retention destroyed by default (D5). "
+                    "Set SQLERY_PARTITION_ARCHIVE_HOOK to archive instead."
+                ),
+            }
+
+        # --- SQLite or non-partitioned PG: Phase-12 batched DELETE loop (D6 — unchanged) ---
         query = self.QueuedJob.objects.all()
 
         if status:
@@ -473,11 +681,41 @@ class DjangoBackend(DatabaseBackend):
             cutoff = timezone.now() - timedelta(days=max_age_days)
             query = query.filter(created_at__lt=cutoff)
 
-        count = query.count()
-        if not dry_run:
-            query.delete()
+        if dry_run:
+            count = query.count()
+            return {"deleted": 0, "count": count}
 
-        return {"deleted": count, "count": count}
+        # Old: unbounded delete that holds table lock for the full result set
+        # count = query.count()
+        # if not dry_run:
+        #     query.delete()
+        # return {"deleted": count, "count": count}
+
+        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE.
+        # The DELETE re-applies the SAME retention filter (`query`) restricted to
+        # the selected ids, so the deleted set is always a subset of the selected
+        # set — guaranteeing forward progress (no infinite re-selection) while
+        # still skipping any row that was claimed/changed mid-loop so it no longer
+        # matches the filter. (A divergent status__in=FINISHED_STATUSES DELETE
+        # filter would re-select non-finished rows forever and hang #12-02.)
+        total_deleted = 0
+        while True:
+            ids = list(query.order_by("id").values_list("id", flat=True)[:CLEANUP_BATCH_SIZE])
+            if not ids:
+                break
+            # Old: status__in re-check diverged from the SELECT filter and looped forever
+            # deleted_count, _ = self.QueuedJob.objects.filter(
+            #     id__in=ids, status__in=FINISHED_STATUSES
+            # ).delete()
+            deleted_count, _ = query.filter(id__in=ids).delete()
+            if not deleted_count:
+                # No selected row was deletable (all changed mid-loop) — stop to
+                # avoid re-selecting the same un-deletable ids indefinitely.
+                break
+            total_deleted += deleted_count
+            time.sleep(0.1)
+
+        return {"deleted": total_deleted, "count": total_deleted}
 
     def cleanup_jobs_by_count(
         self,
@@ -527,7 +765,14 @@ class DjangoBackend(DatabaseBackend):
 
     @retry_on_db_error()
     def vacuum_database(self) -> dict:
-        """Run database vacuum/optimize (PostgreSQL VACUUM)."""
+        """Run database vacuum/optimize (PostgreSQL VACUUM).
+
+        On a partitioned PG install, VACUUM ANALYZE on the parent table
+        (sqlery_queued_job) is skipped — partition DROP leaves nothing to
+        vacuum on the parent and individual partitions are vacuumed by
+        autovacuum per-child (D5/R3). Other tables are always vacuumed.
+        SQLite path is unchanged.
+        """
         # from django.db import connection  # moved to top-level
 
         with connection.cursor() as cursor:
@@ -537,7 +782,11 @@ class DjangoBackend(DatabaseBackend):
                     cursor.execute("VACUUM")
                 else:
                     # PostgreSQL: per-table VACUUM ANALYZE
-                    cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # Old (unconditional): cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # Partition DROP leaves nothing to vacuum on parent table; skip when partitioned.
+                    if not self._partitioned_pg():
+                        cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                    # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
                     cursor.execute("VACUUM ANALYZE sqlery_scheduled_task")
                     cursor.execute("VACUUM ANALYZE sqlery_registry")
                     cursor.execute("VACUUM ANALYZE sqlery_worker")
@@ -573,18 +822,28 @@ class DjangoBackend(DatabaseBackend):
         limit: int | None = None,
     ) -> list:
         """Get jobs in a specific registry."""
+        # Old: .select_related("job") and filter(job__queue_name=queue_name)
+        # JobRegistry.job FK demoted to job_id (D4, Phase 15); select_related and FK traversal removed.
         query = self.JobRegistry.objects.filter(
             registry_type=registry_type,
             exited_at__isnull=True,
-        ).select_related("job")
+        )
 
         if queue_name:
-            query = query.filter(job__queue_name=queue_name)
+            # Old: query = query.filter(job__queue_name=queue_name)
+            # queue_name traversal via FK not possible after demotion — fetch job_ids then filter
+            job_ids = list(query.values_list("job_id", flat=True))
+            job_ids = list(
+                self.QueuedJob.objects.filter(id__in=job_ids, queue_name=queue_name).values_list("id", flat=True)
+            )
+            query = query.filter(job_id__in=job_ids)
 
         if limit:
             query = query[:limit]
 
-        return [entry.job for entry in query]
+        # Old: return [entry.job for entry in query]
+        job_ids = list(query.values_list("job_id", flat=True))
+        return list(self.QueuedJob.objects.filter(id__in=job_ids))
 
     def cleanup_registry(
         self,
@@ -607,42 +866,93 @@ class DjangoBackend(DatabaseBackend):
         return {"deleted": count}
 
     def get_job_by_id(self, job_id: int):
-        """Get job by ID."""
+        """Get job by ID, spanning both sqlery_queued_job and sqlery_scheduled_job."""
+        # Old (single-table — staged jobs were invisible to status APIs):
+        # try:
+        #     return self.QueuedJob.objects.get(id=job_id)
+        # except self.QueuedJob.DoesNotExist:
+        #     return None
+        # Item 10: Verified — this is a full-row SELECT by id (not an UPDATE).
+        # PG index scan by id is acceptable; partition pruning on SELECT is less
+        # critical than on UPDATE. Full row returned including created_at — no
+        # .only() that would drop the field. No change needed; checklist item 10 verified.
         try:
             return self.QueuedJob.objects.get(id=job_id)
         except self.QueuedJob.DoesNotExist:
+            pass
+        try:
+            return self.ScheduledJob.objects.get(id=job_id)
+        except self.ScheduledJob.DoesNotExist:
             return None
 
     def mark_job_success(self, job_id: int, output: str = ""):
-        """Mark job as successful."""
+        """Mark job as successful.
+
+        Staged ScheduledJob rows (not yet promoted) do not have mark_success;
+        the guard prevents AttributeError if an operator calls this for a staged id.
+        """
         job = self.get_job_by_id(job_id)
-        if job:
+        # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_success"):
             job.mark_success(output=output)
         return job
 
     def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
-        """Mark job as failed."""
+        """Mark job as failed.
+
+        Staged ScheduledJob rows do not have mark_failed; guard prevents
+        AttributeError if called for a staged job id (IN-01).
+        """
         job = self.get_job_by_id(job_id)
-        if job:
+        # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
+        if job and hasattr(job, "mark_failed"):
             job.mark_failed(error=error, traceback=traceback)
         return job
 
     def mark_job_archived(self, job_id: int):
         """Mark a failed job as archived (a retry has been created for it)."""
-        self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
+        # Item 8: Add created_at to filter so PG prunes to one partition (write-path pruning).
+        # Old (id-only filter — does not prune to partition on PG):
+        # self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
+        row = self.QueuedJob.objects.filter(id=job_id, status="failed").values("created_at").first()
+        if row:
+            self.QueuedJob.objects.filter(
+                id=job_id, created_at=row["created_at"], status="failed"
+            ).update(status="archived")
 
     def cascade_ancestor_status(self, job_id: int, status: str):
         """Walk parent_job_id chain, set all ancestors to given status."""
         current_id = (
             self.QueuedJob.objects.filter(id=job_id).values_list("parent_job_id", flat=True).first()
         )
+        # Item 9: Add created_at to the UPDATE filter so PG prunes to one partition.
+        # Fetch created_at + parent_job_id together in one query per iteration.
         while current_id:
-            self.QueuedJob.objects.filter(id=current_id).update(status=status)
-            current_id = (
+            # Old (id-only filter — does not prune to partition on PG):
+            # self.QueuedJob.objects.filter(id=current_id).update(status=status)
+            # current_id = (
+            #     self.QueuedJob.objects.filter(id=current_id)
+            #     .values_list("parent_job_id", flat=True)
+            #     .first()
+            # )
+            job_row = (
                 self.QueuedJob.objects.filter(id=current_id)
-                .values_list("parent_job_id", flat=True)
+                .values("created_at", "parent_job_id")
                 .first()
             )
+            if not job_row:
+                break
+            # Old: self.QueuedJob.objects.filter(
+            # Old:     id=current_id, created_at=job_row["created_at"]
+            # Old: ).update(status=status)
+            # WR-03: exclude terminal-status ancestors so a completed or archived
+            # parent is never overwritten by a child's cascaded status change.
+            self.QueuedJob.objects.filter(
+                id=current_id, created_at=job_row["created_at"]
+            ).exclude(
+                status__in=("success", "archived")
+            ).update(status=status)
+            current_id = job_row["parent_job_id"]
 
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
         """Check if scheduled task has pending jobs."""
@@ -654,6 +964,52 @@ class DjangoBackend(DatabaseBackend):
     def update_scheduled_task_next_run(self, task_id: int, next_run_at: datetime):
         """Update scheduled task's next run time."""
         self.ScheduledTask.objects.filter(id=task_id).update(next_run_at=next_run_at)
+
+    @retry_on_db_error()
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ) -> Any:
+        """Atomically advance next_run_at on a CAS and enqueue in the same txn.
+
+        Inside a single ``transaction.atomic()`` block, a queryset ``.update()``
+        filtered on ``next_run_at=observed_next_run_at`` advances the row to
+        ``new_next_run_at`` ONLY when it still matches (rowcount-CAS — the
+        ScheduledTask has no version column, so the observed due time is the
+        idempotency token). On a winning CAS (rowcount == 1) the queued job is
+        created via ``self.create_job`` in the ambient transaction so the advance
+        and the enqueue commit together (CRON-01); only the caller whose advance
+        wins enqueues, so two briefly-overlapping leaders cannot double-fire
+        (CRON-04). When the CAS is lost (rowcount != 1) no job is created.
+
+        The rowcount-CAS gives exactly-once on both SQLite and Postgres, so a
+        ``select_for_update`` is not required.
+
+        Args:
+            task_id: Scheduled task ID.
+            observed_next_run_at: The ``next_run_at`` observed when the task was due.
+            new_next_run_at: The value to advance to when the CAS wins.
+            job_kwargs: Keyword arguments forwarded to ``create_job``.
+
+        Returns:
+            The created QueuedJob when this caller won the CAS, otherwise ``None``.
+        """
+        with transaction.atomic():
+            # # Old (WR-05): filtered only on id + next_run_at, so a task disabled
+            # # mid-cycle could still win the CAS and fire. Re-check enabled=True.
+            # advanced = self.ScheduledTask.objects.filter(
+            #     id=task_id, next_run_at=observed_next_run_at
+            # ).update(next_run_at=new_next_run_at)
+            advanced = self.ScheduledTask.objects.filter(
+                id=task_id, next_run_at=observed_next_run_at, enabled=True
+            ).update(next_run_at=new_next_run_at)
+            if advanced != 1:
+                # Another leader already advanced this tick — do not enqueue.
+                return None
+            return self.create_job(**job_kwargs)
 
     def update_scheduled_task(self, task_id: int, **updates) -> Any:
         """Update scheduled task fields."""
@@ -741,9 +1097,24 @@ class DjangoBackend(DatabaseBackend):
 
         return query.exists()
 
-    def update_job_child_pid(self, job_id: int, child_pid: int):
-        """Store the forked child PID on the job row."""
-        self.QueuedJob.objects.filter(id=job_id).update(child_pid=child_pid)
+    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None):
+        """Store the forked child PID on the job row.
+
+        Args:
+            job_id: QueuedJob primary key.
+            child_pid: PID of the forked child process.
+            created_at: Optional job creation timestamp. When provided, added to the
+                filter so PG prunes to one partition (write-path pruning, item 11).
+                Existing callers that omit it degrade gracefully to id-only filter.
+        """
+        # Item 11: When created_at is available from the caller (e.g. worker.py
+        # which holds the full job object), add it to the filter for partition pruning.
+        # Old (id-only — does not prune to partition on PG):
+        # self.QueuedJob.objects.filter(id=job_id).update(child_pid=child_pid)
+        filter_kwargs: dict = {"id": job_id}
+        if created_at is not None:
+            filter_kwargs["created_at"] = created_at
+        self.QueuedJob.objects.filter(**filter_kwargs).update(child_pid=child_pid)
 
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""
@@ -862,7 +1233,12 @@ class DjangoBackend(DatabaseBackend):
         limit: int = 100,
         offset: int = 0,
     ) -> list:
-        """Get jobs with optional filtering and pagination."""
+        """Get jobs with optional filtering and pagination.
+
+        Returns only rows from sqlery_queued_job (the executable queue).
+        Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
+        """
+        # Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
         query = self.QueuedJob.objects.all()
 
         if status:
@@ -875,6 +1251,28 @@ class DjangoBackend(DatabaseBackend):
         query = query.order_by("-priority", "created_at")
 
         # Apply pagination
+        return list(query[offset : offset + limit])
+
+    def get_staged_jobs(
+        self,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list:
+        """Return staged (pre-promotion) jobs from sqlery_scheduled_job.
+
+        Args:
+            queue_name: Optional queue filter.
+            limit: Maximum number of results to return.
+            offset: Pagination offset.
+
+        Returns:
+            list of ScheduledJob instances ordered by scheduled_at ascending.
+        """
+        query = self.ScheduledJob.objects.all()
+        if queue_name:
+            query = query.filter(queue_name=queue_name)
+        query = query.order_by("scheduled_at")
         return list(query[offset : offset + limit])
 
     def count_jobs(

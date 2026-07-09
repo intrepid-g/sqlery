@@ -19,14 +19,19 @@ To fix: Either:
 - Refactor tests to not rely on true concurrent database access
 """
 
+import os
 import pytest
 import threading
 import time
+from datetime import datetime, timedelta, timezone as dt_timezone
+from unittest import mock
+
 from django.db import connection, transaction
 from django.utils import timezone
-from datetime import timedelta
 from sqlery.models import ScheduledTask, QueuedJob
 from sqlery.executor import TaskExecutor
+from sqlery.compat import get_backend
+from sqlery.core.scheduler import Scheduler
 
 skip_on_sqlite = pytest.mark.skipif(
     connection.vendor == "sqlite",
@@ -359,3 +364,382 @@ class TestAtomicSchedulerPerformance:
         # Verify each task has exactly one job
         for task in tasks:
             assert QueuedJob.objects.filter(scheduled_task=task).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+class TestCronSemanticsHardening:
+    """DB-backed proof of the four CRON behaviors (Phase 10).
+
+    These tests exercise the reworked atomic firing path (Plans 01/03) against the
+    real DB. The single-fire test deliberately runs on SQLite (NOT @skip_on_sqlite)
+    because the CAS on the observed next_run_at makes exactly-once firing
+    engine-independent, unlike the old SELECT FOR UPDATE SKIP LOCKED path. The full
+    {Django, standalone} x {SQLite, Postgres} parity matrix is deferred to Phase 11.
+
+    IMPORTANT — which scheduler is under test:
+    The plan referenced ``TaskExecutor`` (sqlery.executor) as "the Scheduler alias",
+    but that name resolves to the LEGACY Django ``_executor_impl.TaskExecutor``,
+    which was NOT reworked in Plans 01/03 (it still uses SELECT FOR UPDATE SKIP
+    LOCKED, computes next_run_at from wall-clock now, never calls
+    advance_scheduled_task_if_due, and applies no jitter). The hardened path that
+    the daemon and the Phase 9 worker-elected scheduler actually run at runtime is
+    ``sqlery.core.scheduler.Scheduler`` wired to ``get_backend()`` (DjangoBackend
+    here). These tests therefore drive that core Scheduler so they prove the real
+    CRON-01..04 guarantees. (See SUMMARY "Deviations" — Rule 1.)
+    """
+
+    @staticmethod
+    def _scheduler():
+        """Build the hardened core Scheduler wired to the active (Django) backend."""
+        return Scheduler(backend=get_backend())
+
+    @staticmethod
+    def _make_due_cron_task(name="cron-hardening", cron="*/5 * * * *", past_seconds=10):
+        """Create an enabled cron task whose next_run_at is a fixed time in the past.
+
+        The past next_run_at is written via a queryset .update() so the model's
+        save()-time next_run_at recalculation does not clobber the value we set.
+        """
+        due = datetime.now(dt_timezone.utc) - timedelta(seconds=past_seconds)
+        task = ScheduledTask.objects.create(
+            name=name,
+            task_path="tests.test_atomic_scheduler.test_task",
+            cron_expression=cron,
+            queue_name="default",
+            priority=5,
+            enabled=True,
+            schedule_type="cron",
+            next_run_at=due,
+        )
+        # Bypass save() recalculation to pin an exact, drift-free scheduled time.
+        ScheduledTask.objects.filter(id=task.id).update(next_run_at=due)
+        task.refresh_from_db()
+        return task
+
+    def test_cron_fires_exactly_once_under_simulated_overlap(self):
+        """Two leaders observing the same due tick produce exactly one QueuedJob.
+
+        Runs on SQLite: the CAS on observed next_run_at is engine-independent.
+        We read observed_due once, then make two advance attempts against the
+        backend with that SAME observed_due (the way two overlapping leaders would
+        each have read the row before either advanced). Exactly one wins.
+        """
+        task = self._make_due_cron_task()
+        scheduler = self._scheduler()
+        backend = scheduler.backend
+
+        observed_due = task.next_run_at
+        new_next_run = scheduler.calculate_next_run(task.cron_expression, base_time=observed_due)
+        job_kwargs = {
+            "task_path": task.task_path,
+            "kwargs": {},
+            "queue_name": task.queue_name,
+            "priority": task.priority,
+            "scheduled_at": None,
+            "max_retries": 0,
+            "retry_backoff": 1.0,
+            "allow_parallel": False,
+            "timeout_seconds": None,
+            "scheduled_task_id": task.id,
+        }
+
+        # Both attempts use the SAME observed_due — the second is now stale once
+        # the first has advanced the row. Exactly one CAS wins.
+        job_a = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+        job_b = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+
+        winners = [j for j in (job_a, job_b) if j is not None]
+        assert len(winners) == 1, "exactly one advance attempt must win the CAS"
+        assert QueuedJob.objects.filter(scheduled_task_id=task.id).count() == 1
+
+        # The row advanced exactly once, to the computed next occurrence.
+        task.refresh_from_db()
+        assert task.next_run_at == new_next_run
+
+    def test_cron_fires_exactly_once_under_threaded_overlap(self):
+        """Threaded two-leader firing of the same due task still yields one job.
+
+        Complements the sequential test by exercising real thread overlap through
+        the full run_due_tasks path. Engine-independent (CAS), so not skipped on
+        SQLite. The assertion is on the durable invariant: exactly one QueuedJob.
+        """
+        task = self._make_due_cron_task(name="cron-threaded")
+
+        results = []
+        results_lock = threading.Lock()
+
+        def fire():
+            scheduler = self._scheduler()
+            jobs = scheduler.run_due_tasks()
+            mine = [j for j in jobs if j.scheduled_task_id == task.id]
+            with results_lock:
+                results.extend(mine)
+
+        threads = [threading.Thread(target=fire) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert QueuedJob.objects.filter(scheduled_task_id=task.id).count() == 1
+        assert len(results) == 1
+
+    def test_next_run_at_advances_without_drift_across_ticks(self):
+        """next_run_at advances from the SCHEDULED time, not wall-clock now.
+
+        Each fired tick must set next_run_at to calculate_next_run computed from the
+        PRIOR scheduled next_run_at (future-clamped), so a slow scheduler does not
+        accumulate drift. Asserts monotonic, drift-free advance across several ticks.
+        """
+        task = self._make_due_cron_task(name="cron-drift", cron="*/5 * * * *")
+        scheduler = self._scheduler()
+
+        prior_scheduled = task.next_run_at
+        last_next = prior_scheduled
+        for _ in range(3):
+            expected = scheduler.calculate_next_run(task.cron_expression, base_time=last_next)
+            jobs = scheduler.run_due_tasks()
+            fired = [j for j in jobs if j.scheduled_task_id == task.id]
+            task.refresh_from_db()
+
+            if fired:
+                # When the task fired, the advance is computed from the scheduled
+                # time, not from now, and is strictly after the prior value.
+                assert task.next_run_at == expected
+                assert task.next_run_at > last_next
+                last_next = task.next_run_at
+                # Re-arm the task as due for the next tick by rewinding it to a
+                # past scheduled time derived from the LAST scheduled occurrence
+                # (drift-free) so the next iteration fires again.
+                rewound = last_next - timedelta(minutes=5)
+                ScheduledTask.objects.filter(id=task.id).update(next_run_at=rewound)
+                task.refresh_from_db()
+                last_next = rewound
+            # If not fired (already future), the loop simply re-checks; the pinned
+            # past next_run_at guarantees at least the first iteration fires.
+
+        # Final next_run_at is in the future (clamped) once we let it settle.
+        scheduler.run_due_tasks()
+        task.refresh_from_db()
+        assert task.next_run_at > datetime.now(dt_timezone.utc)
+
+    def test_far_behind_task_clamps_to_future_occurrence(self):
+        """A task many ticks behind clamps to a single future occurrence (no replay)."""
+        task = self._make_due_cron_task(name="cron-far-behind", cron="*/5 * * * *", past_seconds=0)
+        # Pin next_run_at to one year ago — far behind.
+        far_past = datetime.now(dt_timezone.utc) - timedelta(days=365)
+        ScheduledTask.objects.filter(id=task.id).update(next_run_at=far_past)
+        task.refresh_from_db()
+
+        scheduler = self._scheduler()
+        jobs = scheduler.run_due_tasks()
+        fired = [j for j in jobs if j.scheduled_task_id == task.id]
+        assert len(fired) == 1, "far-behind task fires exactly once"
+
+        # Exactly one job (no missed-tick replay) and next_run_at is in the future.
+        assert QueuedJob.objects.filter(scheduled_task_id=task.id).count() == 1
+        task.refresh_from_db()
+        assert task.next_run_at > datetime.now(dt_timezone.utc)
+
+    def test_scheduler_jitter_seconds_respected(self):
+        """Jitter knob >0 applies a bounded delay; 0 applies no sleep.
+
+        Timing-tolerant: we patch sqlery.core.scheduler.time.sleep and assert the
+        delay argument is within [0, jitter] when configured >0, and that sleep is
+        NOT called when jitter is 0. We drive the jitter value through the
+        scheduler's _get_jitter_seconds resolution by patching it, since the Django
+        get_config path reads DJANGO_SQL_JOBS only (per 10-02-SUMMARY).
+        """
+        jitter_value = 0.5
+
+        # Jitter > 0: a bounded sleep in [0, jitter] is applied before the advance.
+        self._make_due_cron_task(name="cron-jitter-on")
+        scheduler = self._scheduler()
+        with (
+            mock.patch.object(scheduler, "_get_jitter_seconds", return_value=jitter_value),
+            mock.patch("sqlery.core.scheduler.time.sleep") as mock_sleep,
+        ):
+            scheduler.run_due_tasks()
+            assert mock_sleep.called, "jitter > 0 must apply a sleep on the cron path"
+            delay_arg = mock_sleep.call_args.args[0]
+            assert 0 <= delay_arg <= jitter_value
+
+        # Jitter == 0: no sleep is applied.
+        self._make_due_cron_task(name="cron-jitter-off")
+        scheduler0 = self._scheduler()
+        with (
+            mock.patch.object(scheduler0, "_get_jitter_seconds", return_value=0),
+            mock.patch("sqlery.core.scheduler.time.sleep") as mock_sleep0,
+        ):
+            scheduler0.run_due_tasks()
+            assert not mock_sleep0.called, "jitter == 0 must not sleep"
+
+    def test_interval_and_once_not_regressed(self):
+        """Interval re-advances by its interval; once disables itself after firing."""
+        scheduler = self._scheduler()
+
+        # Interval task: fires, then next_run_at advances to ~now + interval.
+        interval_task = ScheduledTask.objects.create(
+            name="interval-task",
+            task_path="tests.test_atomic_scheduler.test_task",
+            queue_name="default",
+            priority=5,
+            enabled=True,
+            schedule_type="interval",
+            interval=5,
+            interval_unit="minutes",
+            next_run_at=datetime.now(dt_timezone.utc) - timedelta(seconds=10),
+        )
+        ScheduledTask.objects.filter(id=interval_task.id).update(
+            next_run_at=datetime.now(dt_timezone.utc) - timedelta(seconds=10)
+        )
+
+        before = datetime.now(dt_timezone.utc)
+        jobs = scheduler.run_due_tasks()
+        fired = [j for j in jobs if j.scheduled_task_id == interval_task.id]
+        assert len(fired) == 1
+        interval_task.refresh_from_db()
+        # Advanced by ~the interval (5 minutes = 300s) from now.
+        delta = interval_task.next_run_at - before
+        assert timedelta(seconds=290) <= delta <= timedelta(seconds=310)
+
+        # Once task: fires, then is disabled with next_run_at cleared.
+        once_task = ScheduledTask.objects.create(
+            name="once-task",
+            task_path="tests.test_atomic_scheduler.test_task",
+            queue_name="default",
+            priority=5,
+            enabled=True,
+            schedule_type="once",
+            scheduled_time=datetime.now(dt_timezone.utc) - timedelta(seconds=10),
+            next_run_at=datetime.now(dt_timezone.utc) - timedelta(seconds=10),
+        )
+        ScheduledTask.objects.filter(id=once_task.id).update(
+            next_run_at=datetime.now(dt_timezone.utc) - timedelta(seconds=10)
+        )
+
+        jobs = scheduler.run_due_tasks()
+        fired_once = [j for j in jobs if j.scheduled_task_id == once_task.id]
+        assert len(fired_once) == 1
+        once_task.refresh_from_db()
+        assert once_task.enabled is False
+        assert once_task.next_run_at is None
+
+
+@pytest.mark.postgres
+@pytest.mark.django_db(transaction=True)
+class TestCronSemanticsHardeningPostgres:
+    """Django x Postgres mirror of :class:`TestCronSemanticsHardening` (Phase 11).
+
+    PARITY-02 / PARITY-03: Phase 10 proved no-duplicate firing and drift-free
+    next_run_at advance on SQLite only and explicitly deferred the
+    ``{Django, standalone} x Postgres`` cells to Phase 11. This class adds the
+    Django x Postgres half: it asserts the SAME single-fire and drift-free
+    invariants against the SAME hardened path on Postgres' MVCC / row-lock
+    semantics, not just SQLite's optimistic version CAS.
+
+    Like the SQLite class, these tests drive the real
+    ``sqlery.core.scheduler.Scheduler`` wired to ``get_backend()`` (DjangoBackend)
+    and the atomic ``advance_scheduled_task_if_due`` CAS — NOT the legacy
+    ``sqlery.executor.TaskExecutor`` (which still uses SELECT FOR UPDATE SKIP
+    LOCKED, computes next_run_at from wall-clock now, and never calls
+    advance_scheduled_task_if_due). See 10-04-SUMMARY "Deviations" Rule 1.
+
+    The class-level ``@pytest.mark.postgres`` routes these to the dedicated PG CI
+    rail; without ``SQLERY_TEST_PG_URL`` they SKIP cleanly (belt-and-suspenders to
+    the conftest collection gate), and they only execute when it is set.
+    """
+
+    def test_cron_fires_exactly_once_under_simulated_overlap_pg(self):
+        """Two leaders observing the same due tick produce exactly one QueuedJob (PG).
+
+        Mirrors the SQLite single-fire cell: read ``observed_due`` once, then fire
+        two ``advance_scheduled_task_if_due`` attempts with that SAME stale
+        observed_due (as two overlapping leaders would). Exactly one CAS wins,
+        proving the single-winner invariant on Postgres.
+        """
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("SQLERY_TEST_PG_URL not set; PG cell skipped")
+
+        task = TestCronSemanticsHardening._make_due_cron_task(name="cron-hardening-pg")
+        scheduler = TestCronSemanticsHardening._scheduler()
+        backend = scheduler.backend
+
+        observed_due = task.next_run_at
+        new_next_run = scheduler.calculate_next_run(task.cron_expression, base_time=observed_due)
+        job_kwargs = {
+            "task_path": task.task_path,
+            "kwargs": {},
+            "queue_name": task.queue_name,
+            "priority": task.priority,
+            "scheduled_at": None,
+            "max_retries": 0,
+            "retry_backoff": 1.0,
+            "allow_parallel": False,
+            "timeout_seconds": None,
+            "scheduled_task_id": task.id,
+        }
+
+        # Both attempts use the SAME observed_due — the second is stale once the
+        # first has advanced the row. Exactly one CAS wins on Postgres' MVCC.
+        job_a = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+        job_b = backend.advance_scheduled_task_if_due(
+            task.id, observed_due, new_next_run, job_kwargs
+        )
+
+        winners = [j for j in (job_a, job_b) if j is not None]
+        assert len(winners) == 1, "exactly one advance attempt must win the CAS"
+        assert QueuedJob.objects.filter(scheduled_task_id=task.id).count() == 1
+
+        # The row advanced exactly once, to the computed next occurrence.
+        task.refresh_from_db()
+        assert task.next_run_at == new_next_run
+
+    def test_next_run_at_advances_without_drift_across_ticks_pg(self):
+        """next_run_at advances from the SCHEDULED time, not wall-clock now (PG).
+
+        Mirrors the SQLite drift cell: over several ticks each fired advance is
+        computed from the PRIOR scheduled next_run_at (future-clamped), so a slow
+        scheduler does not accumulate drift. Asserts monotonic, drift-free advance
+        on the Postgres path.
+        """
+        if not os.environ.get("SQLERY_TEST_PG_URL"):
+            pytest.skip("SQLERY_TEST_PG_URL not set; PG cell skipped")
+
+        task = TestCronSemanticsHardening._make_due_cron_task(
+            name="cron-drift-pg", cron="*/5 * * * *"
+        )
+        scheduler = TestCronSemanticsHardening._scheduler()
+
+        prior_scheduled = task.next_run_at
+        last_next = prior_scheduled
+        for _ in range(3):
+            expected = scheduler.calculate_next_run(task.cron_expression, base_time=last_next)
+            jobs = scheduler.run_due_tasks()
+            fired = [j for j in jobs if j.scheduled_task_id == task.id]
+            task.refresh_from_db()
+
+            if fired:
+                # When the task fired, the advance is computed from the scheduled
+                # time, not from now, and is strictly after the prior value.
+                assert task.next_run_at == expected
+                assert task.next_run_at > last_next
+                last_next = task.next_run_at
+                # Re-arm the task as due for the next tick by rewinding it to a
+                # past scheduled time derived from the LAST scheduled occurrence
+                # (drift-free) so the next iteration fires again.
+                rewound = last_next - timedelta(minutes=5)
+                ScheduledTask.objects.filter(id=task.id).update(next_run_at=rewound)
+                task.refresh_from_db()
+                last_next = rewound
+
+        # Final next_run_at is in the future (clamped) once we let it settle.
+        scheduler.run_due_tasks()
+        task.refresh_from_db()
+        assert task.next_run_at > datetime.now(dt_timezone.utc)

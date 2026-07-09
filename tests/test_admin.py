@@ -343,3 +343,21 @@ class TestAdminDisplayMethods:
         result = admin.runs_display(job)
         assert "Something went wrong" in result
         assert "<table" in result
+
+
+@pytest.mark.django_db
+@pytest.mark.urls("tests.urls_dashboard")
+def test_unified_dashboard_renders_without_queuedjob_admin(client, django_user_model):
+    """Dashboard must render even when QueuedJob has no admin changelist.
+
+    REGRESSION 2026-06-16: QueuedJob got a composite PK (Phase 15) and Django 5.2+/6.0
+    refuses to register composite-PK models in admin, so `admin:sqlery_queuedjob_changelist`
+    does not resolve. The template hard-reversed it, raising NoReverseMatch (HTTP 500).
+    Before the fix this request raised NoReverseMatch; after, it renders 200.
+    """
+    user = django_user_model.objects.create_superuser(
+        username="dash_admin", email="a@b.c", password="pw"
+    )
+    client.force_login(user)
+    resp = client.get("/admin/sqlery/")
+    assert resp.status_code == 200

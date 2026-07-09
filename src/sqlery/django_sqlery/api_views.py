@@ -16,6 +16,10 @@ from django.http import JsonResponse
 from django.utils import timezone
 
 from ..compat import get_backend
+from sqlery.core.worker_admin import (
+    is_worker_deletable,
+    worker_delete_staleness_threshold_seconds,
+)
 from .intervention import diagnose_system_health, do_manual_intervention_direct
 from .models import DaemonCommand, QueuedJob, ScheduledTask, Worker
 from .utils import enqueue_task
@@ -447,6 +451,23 @@ def api_worker_action(request, worker_id):
                 'msg': 'Worker will be replaced by the daemon within ~10 seconds.',
             })
 
+        elif action == 'delete':
+            # Only stale (non-beating) workers may be removed. Re-validate server-side —
+            # never trust the client's notion of staleness.
+            deletable = is_worker_deletable(
+                worker.status,
+                worker.last_heartbeat,
+                timezone.now(),
+                worker_delete_staleness_threshold_seconds(),
+            )
+            if not deletable:
+                return JsonResponse(
+                    {'error': 'Worker is still active (beating) and cannot be deleted'},
+                    status=409,
+                )
+            worker.delete()
+            return JsonResponse({'success': True, 'worker_id': worker_id})
+
         else:
             return JsonResponse({'error': f'Invalid action: {action}'}, status=400)
 
@@ -515,7 +536,9 @@ def api_worker_detail(request, worker_id):
 
     try:
         worker_uuid = uuid.UUID(worker_id)
-        worker = Worker.objects.select_related('current_job', 'current_job__scheduled_task').get(id=worker_uuid)
+        # Old: Worker.objects.select_related('current_job', 'current_job__scheduled_task').get(...)
+        # current_job FK demoted to current_job_id (D4, Phase 15)
+        worker = Worker.objects.get(id=worker_uuid)
     except (ValueError, Worker.DoesNotExist):
         return JsonResponse({'error': 'Worker not found'}, status=404)
 
@@ -523,18 +546,23 @@ def api_worker_detail(request, worker_id):
 
     # Current job
     current_job = None
-    if worker.current_job:
-        j = worker.current_job
-        elapsed = (now - j.started_at).total_seconds() if j.started_at else None
-        current_job = {
-            'id': j.id,
-            'task_path': j.task_path,
-            'task_name': _job_display_name(j),
-            'status': j.status,
-            'queue_name': j.queue_name,
-            'started_at': j.started_at.isoformat() if j.started_at else None,
-            'elapsed_seconds': elapsed,
-        }
+    # Old: if worker.current_job:  (FK demoted — use current_job_id)
+    if worker.current_job_id:
+        try:
+            j = QueuedJob.objects.select_related('scheduled_task').get(id=worker.current_job_id)
+        except QueuedJob.DoesNotExist:
+            j = None
+        if j:
+            elapsed = (now - j.started_at).total_seconds() if j.started_at else None
+            current_job = {
+                'id': j.id,
+                'task_path': j.task_path,
+                'task_name': _job_display_name(j),
+                'status': j.status,
+                'queue_name': j.queue_name,
+                'started_at': j.started_at.isoformat() if j.started_at else None,
+                'elapsed_seconds': elapsed,
+            }
 
     # Job history — query by worker FK (persisted after completion)
     recent_jobs = QueuedJob.objects.filter(

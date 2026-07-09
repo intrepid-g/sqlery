@@ -20,6 +20,10 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from sqlery.core.worker_admin import (
+    is_worker_deletable,
+    worker_delete_staleness_threshold_seconds,
+)
 from .models import QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .signature import verify_signature
@@ -82,9 +86,14 @@ def _serialize_worker(worker, now) -> dict:
             #         busy_seconds += (now - current_job.started_at).total_seconds()
             # except QueuedJob.DoesNotExist:
             #     pass
-            # Use select_related data (loaded at L573) instead of extra query
-            if worker.current_job and worker.current_job.started_at:
-                busy_seconds += (now - worker.current_job.started_at).total_seconds()
+            # Old: if worker.current_job and worker.current_job.started_at:
+            # current_job FK demoted to current_job_id (D4, Phase 15); fetch explicitly
+            try:
+                _cj = QueuedJob.objects.only("started_at").get(id=worker.current_job_id)
+                if _cj.started_at:
+                    busy_seconds += (now - _cj.started_at).total_seconds()
+            except QueuedJob.DoesNotExist:
+                pass
         worker_data['uptime_seconds'] = uptime_seconds
         worker_data['busy_seconds'] = busy_seconds
         worker_data['idle_seconds'] = max(uptime_seconds - busy_seconds, 0.0)
@@ -106,6 +115,14 @@ def _serialize_worker(worker, now) -> dict:
     else:
         worker_data['heartbeat_age_seconds'] = None
         worker_data['is_stalled'] = True
+
+    # Whether the user may delete this worker (only non-beating/stale ones).
+    worker_data['is_deletable'] = is_worker_deletable(
+        worker.status,
+        worker.last_heartbeat,
+        now,
+        worker_delete_staleness_threshold_seconds(),
+    )
 
     if worker.current_job_id:
         # try:
@@ -130,9 +147,12 @@ def _serialize_worker(worker, now) -> dict:
         #     worker_data['status'] = 'idle'
         # except Exception:
         #     worker_data['current_job'] = None
-        # Use select_related data — sub-ms staleness is irrelevant
-        # given 2s cache + 3s poll interval
-        job = worker.current_job
+        # Old: job = worker.current_job  (FK demoted to current_job_id — D4, Phase 15)
+        # Fetch current job explicitly using current_job_id
+        try:
+            job = QueuedJob.objects.select_related('scheduled_task').get(id=worker.current_job_id)
+        except QueuedJob.DoesNotExist:
+            job = None
         if job:
             worker_data['current_job'] = {
                 'id': job.id,
@@ -195,9 +215,9 @@ def _compute_health_warnings(
     if precomputed_workers is not None:
         active_workers = precomputed_workers
     else:
+        # Old: .select_related('current_job')  — FK demoted to current_job_id (D4, Phase 15)
         active_workers = list(
             Worker.objects.filter(status__in=['idle', 'busy']).exclude(pid=0)
-            .select_related('current_job')
         )
     busy_workers = [w for w in active_workers if w.status == 'busy']
     idle_workers = [w for w in active_workers if w.status == 'idle']
@@ -210,8 +230,13 @@ def _compute_health_warnings(
                 age_str = f'{int(age)}s'
                 job_info = f' on job #{w.current_job_id}' if w.current_job_id else ''
                 job_name = None
-                if w.current_job:
-                    job_name = _job_display_name(w.current_job)
+                # Old: if w.current_job: job_name = _job_display_name(w.current_job)  (FK demoted)
+                if w.current_job_id:
+                    try:
+                        _wj = QueuedJob.objects.only("job_name", "task_path", "scheduled_task_id").get(id=w.current_job_id)
+                        job_name = _job_display_name(_wj)
+                    except QueuedJob.DoesNotExist:
+                        pass
                 action = {
                     'label': f'Stop job #{w.current_job_id}',
                     'kind': 'stop_job',
@@ -758,12 +783,19 @@ def dashboard_stats(request):
         }
 
         # Get active workers list with current job info
+        # REGRESSION 2026-06-16: stale workers (heartbeat 100s of hours old) never disappeared from the dashboard.
+        # Root cause: the query filtered on status in ('idle','busy') but had no upper bound on heartbeat age,
+        #   so a worker that died without updating its status row stayed 'idle' and rendered forever.
+        # Fix: exclude workers whose last_heartbeat is older than 24h from the dashboard listing.
         workers_list = []
         try:
+            stale_cutoff = now - timedelta(hours=24)
+            # I wish I had the time to: make the 24h dashboard cutoff configurable via DJANGO_SQL_JOBS settings.
+            # Old: .select_related('current_job', 'current_job__scheduled_task')  — FK demoted (D4, Phase 15)
             workers_queryset = (
                 Worker.objects.filter(status__in=['idle', 'busy'])
                 .exclude(pid=0)
-                .select_related('current_job', 'current_job__scheduled_task')
+                .exclude(last_heartbeat__lt=stale_cutoff)
                 .order_by('-last_heartbeat')
             )
             _active_workers_list = list(workers_queryset)

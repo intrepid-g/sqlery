@@ -97,8 +97,14 @@ def atomic_claim_job_sqlite(job, worker):
     expected_version = job.version
 
     # Atomically claim the job using UPDATE with version check
+    # Old: rows_updated = QueuedJob.objects.filter(
+    # Old:     id=job.id,
+    # Old:     status='queued',  # Only claim if still queued
+    # Old:     version=expected_version  # Optimistic lock: only succeed if version matches
+    # Old: ).update(
     rows_updated = QueuedJob.objects.filter(
         id=job.id,
+        created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 1)
         status='queued',  # Only claim if still queued
         version=expected_version  # Optimistic lock: only succeed if version matches
     ).update(
@@ -136,8 +142,13 @@ def atomic_claim_job_postgres(job, worker):
 
     expected_version = job.version
 
+    # Old: rows_updated = QueuedJob.objects.filter(
+    # Old:     id=job.id,
+    # Old:     version=expected_version
+    # Old: ).update(
     rows_updated = QueuedJob.objects.filter(
         id=job.id,
+        created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 2)
         version=expected_version
     ).update(
         status='running',

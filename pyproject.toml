@@ -4,10 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlery"
-version = "0.22.4"
+version = "0.24.5"
 description = "Job queue + cron scheduling - works standalone or with Django"
 readme = "README.md"
-requires-python = ">=3.10"
+# requires-python = ">=3.10"
+requires-python = ">=3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Sqlery Contributors"},
@@ -21,9 +22,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    # "Programming Language :: Python :: 3.10",
+    # "Programming Language :: Python :: 3.11",
+    # "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
@@ -116,6 +117,9 @@ dev = [
     "django>=5.2",
     "sqlmodel>=0.0.14",
     "fastapi>=0.104.0",
+    "aiosqlite>=0.19.0",
+    "greenlet>=3.0.0",
+    "psycopg>=3.1.0",
 ]
 
 [project.urls]
@@ -144,6 +148,12 @@ pythonpath = ["."]
 markers = [
     "slow: tests that hit serverful resources (e.g. Postgres); deselect with '-m \"not slow\"'",
     "postgres: requires a running PostgreSQL service (skipped on SQLite-only jobs)",
+    # CR-01 (11-REVIEW): tags the genuinely-standalone PG parity cells (those
+    # backed by a real SQLAlchemy engine via the pg_standalone_backend fixture
+    # or the no-Django subprocess) so the forced-standalone CI step can select
+    # them with `-m \"postgres and standalone_pg\"` WITHOUT pulling in Django-mode
+    # PG cells that would error under an uninitialized standalone backend.
+    "standalone_pg: standalone-backend parity cell that runs against real Postgres",
 ]
 
 [tool.coverage.run]

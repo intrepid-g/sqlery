@@ -5,6 +5,7 @@ Auto-detects the running mode and provides unified interfaces for:
 - Configuration (Django settings vs standalone config)
 """
 
+import os
 import sys
 from abc import ABC, abstractmethod
 from typing import Any
@@ -26,6 +27,19 @@ class DatabaseBackend(ABC):
 
     Implementations provide database operations for either Django ORM or SQLAlchemy.
     """
+
+    def get_raw_cursor(self):
+        """Return a raw DB-API cursor for the daemon's PG-only maintenance loop.
+
+        Partition maintenance (promote_due_scheduled_jobs / reclaim_drained_
+        partitions / ensure_future_partitions) needs a live psycopg cursor.
+        Concrete backends override this to return a real cursor on partitioned
+        PostgreSQL. The default returns None so any backend that does not
+        implement it (or runs on SQLite / non-partitioned PG) causes the daemon
+        to skip PG-only maintenance cleanly instead of raising AttributeError.
+        Callers must close the cursor (and its underlying connection) themselves.
+        """
+        return None
 
     @abstractmethod
     def create_job(
@@ -538,6 +552,44 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
+    def advance_scheduled_task_if_due(
+        self,
+        task_id: int,
+        observed_next_run_at: datetime,
+        new_next_run_at: datetime,
+        job_kwargs: dict,
+    ) -> Any:
+        """Atomically advance a scheduled task and enqueue its job in one transaction.
+
+        Conditionally advances the task's ``next_run_at`` to ``new_next_run_at``
+        ONLY when the row's ``next_run_at`` still equals ``observed_next_run_at``
+        (a compare-and-swap on the observed due time). ScheduledTask has no
+        ``version`` column, so the observed ``next_run_at`` is itself the
+        idempotency token. On a winning advance, the queued job is created from
+        ``job_kwargs`` in the SAME transaction so the advance and the enqueue
+        commit (or roll back) together. When another caller already advanced the
+        row (the CAS is lost), no job is created and ``None`` is returned.
+
+        This folds CRON-01 (atomic enqueue + next_run_at advance — a crash cannot
+        double-fire or skip a tick) and CRON-04 (idempotency under two-leader
+        overlap — only the caller whose advance wins enqueues) into a single
+        primitive, replacing the prior non-atomic check-then-act sequence.
+
+        Args:
+            task_id: Scheduled task ID.
+            observed_next_run_at: The ``next_run_at`` value observed when the task
+                was found due; the CAS predicate compares against this.
+            new_next_run_at: The value to advance ``next_run_at`` to when the CAS wins.
+            job_kwargs: Keyword arguments passed through to create the queued job
+                (e.g. ``task_path``, ``kwargs``, ``queue_name``, ``priority``,
+                ``scheduled_task_id``) within the same transaction.
+
+        Returns:
+            The created job instance when this caller won the CAS, otherwise ``None``.
+        """
+        pass
+
+    @abstractmethod
     def update_scheduled_task(self, task_id: int, **updates) -> Any:
         """Update scheduled task fields.
 
@@ -810,6 +862,12 @@ def _detect_mode() -> str:
     Returns:
         'django' or 'standalone'
     """
+    # Explicit standalone override: honored even when Django happens to be
+    # importable/configured in the same process (e.g. the parity CI rail and
+    # the no-Django subprocess launchers that already set this env var).
+    if os.environ.get("SQLERY_FORCE_STANDALONE") == "1":
+        return "standalone"
+
     # Check if Django is configured and available
     if "django" in sys.modules:
         try:

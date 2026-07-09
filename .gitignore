@@ -63,6 +63,11 @@ coverage.xml
 # SQLite databases (sample project, tests)
 *.sqlite3
 *.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Sample project runtime artifacts
+sample_project/tasks_app/hourly_counter.txt
 
 # Internal docs (local-only, not published)
 docs/internal/

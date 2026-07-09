@@ -40,16 +40,21 @@ def unregister_worker(worker):
         worker: Worker instance to unregister
     """
     # If worker has a current job, mark it as failed
-    if worker.current_job:
-        job = worker.current_job
-        job.status = "failed"
-        job.error = "Worker terminated unexpectedly"
-        job.finished_at = timezone.now()
-        if job.started_at:
-            job.duration_seconds = (
-                job.finished_at - job.started_at
-            ).total_seconds()
-        job.save()
+    # Old: if worker.current_job: job = worker.current_job  (FK demoted — D4, Phase 15)
+    if worker.current_job_id:
+        try:
+            job = QueuedJob.objects.get(id=worker.current_job_id)
+        except QueuedJob.DoesNotExist:
+            job = None
+        if job:
+            job.status = "failed"
+            job.error = "Worker terminated unexpectedly"
+            job.finished_at = timezone.now()
+            if job.started_at:
+                job.duration_seconds = (
+                    job.finished_at - job.started_at
+                ).total_seconds()
+            job.save()
 
     # Delete worker record
     worker.delete()
@@ -92,20 +97,26 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
     dead_workers = list(query)
 
     # Mark their current jobs as failed
+    # Old: if worker.current_job: job = worker.current_job  (FK demoted — D4, Phase 15)
     for worker in dead_workers:
-        if worker.current_job:
-            job = worker.current_job
-            job.status = "failed"
-            job.error = "Worker died/timeout - no heartbeat"
-            job.finished_at = timezone.now()
-            if job.started_at:
-                job.duration_seconds = (
-                    job.finished_at - job.started_at
-                ).total_seconds()
-            job.save()
+        if worker.current_job_id:
+            try:
+                job = QueuedJob.objects.get(id=worker.current_job_id)
+            except QueuedJob.DoesNotExist:
+                job = None
+            if job:
+                job.status = "failed"
+                job.error = "Worker died/timeout - no heartbeat"
+                job.finished_at = timezone.now()
+                if job.started_at:
+                    job.duration_seconds = (
+                        job.finished_at - job.started_at
+                    ).total_seconds()
+                job.save()
 
     # Mark workers as dead (or delete them)
-    query.update(status="dead", current_job=None)
+    # Old: query.update(status="dead", current_job=None)
+    query.update(status="dead", current_job_id=None)
 
     # Optionally: Delete dead workers entirely
     # query.delete()

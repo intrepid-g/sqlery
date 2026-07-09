@@ -9,6 +9,11 @@ DEFAULTS = {
     # Scheduler settings
     "ENABLE_MIDDLEWARE_TRIGGER": True,
     "CHECK_INTERVAL_SECONDS": 60,  # Check for due tasks every 60 seconds
+    # CRON-03: bounded random enqueue delay in seconds. Default 0 = jitter off
+    # (PROJECT.md locked). Plan 03 applies random.uniform(0, jitter) before
+    # enqueue. NOTE: read via get_config (DjangoConfig reads DJANGO_SQL_JOBS
+    # directly, NOT DEFAULTS) — Plan 03 must pass get_config's default (0).
+    "SCHEDULER_JITTER_SECONDS": 0,
 
     # Queue settings
     "DEFAULT_QUEUE": "default",
@@ -99,6 +104,11 @@ DEFAULTS = {
     # Configured = enforce prefix-with-dot-boundary match before importlib.
     "ALLOWED_TASK_MODULES": None,
 
+    # Scheduled job staging threshold (D1 — Phase 14)
+    # Days ahead — jobs scheduled further out than this go to sqlery_scheduled_job
+    # instead of sqlery_queued_job (D1).
+    "SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS": 1,
+
     # DB resilience settings
     "DB_RETRY_MAX_ATTEMPTS": 3,       # Retries on transient DB errors
     "DB_RETRY_BACKOFF_BASE": 0.1,     # Base seconds for exponential backoff
@@ -106,6 +116,11 @@ DEFAULTS = {
     "SQLITE_WAL_MODE": True,          # Enable WAL journal mode for SQLite
     "PG_STATEMENT_TIMEOUT_MS": 30000, # PostgreSQL statement_timeout (ms), 0=disabled
     "PG_LOCK_TIMEOUT_MS": 10000,      # PostgreSQL lock_timeout (ms), 0=disabled
+
+    # Opt-in PG LISTEN/NOTIFY dispatch (Phase 18 — D1/D8).
+    # Default False = byte-identical polling behaviour when off.
+    # This is the ONLY feature flag in the listen-notify milestone.
+    "SQLERY_PG_NOTIFY": False,
 }
 
 
