@@ -78,3 +78,27 @@ Use this file to:
 **Inline comment:** `# REGRESSION 2026-05-25` at `src/sqlery/django_sqlery/_executor_impl.py:318`, `src/sqlery/core/worker.py:88`, `src/sqlery/core/worker.py:170`
 
 **Validation:** Regression test passes; all 16 executor tests pass; direct validation confirms coroutine is detected and run to completion.
+
+## 2026-06-14 — `select_for_update cannot be used outside of a transaction` (PG worker)
+- **Broke:** `run_jobs` worker crashed after one job on PostgreSQL. `run_queue_workers` called `get_queued_jobs(...).exists()` to decide whether to spawn the next worker, but that queryset carries `SELECT ... FOR UPDATE SKIP LOCKED`; `.exists()` outside a transaction raises `TransactionManagementError` on PG (SQLite silently allows it). Surfaced via the partitioned sample project.
+- **Fix:** added a non-locking `_executor_impl.TaskExecutor._has_more_queued_jobs()` existence probe and used it at the spawn-decision site (the lock is only needed when actually claiming).
+- **Test:** `tests/test_more_jobs_probe_regression.py`.
+- Prior related: 2026-05-18 (same class of bug in `backend.py` claim path).
+
+## 2026-06-16 — `NoReverseMatch` for `admin:sqlery_queuedjob_changelist` (unified dashboard)
+- **Broke:** `GET /admin/sqlery/` crashed (HTTP 500) rendering `unified_dashboard.html` — `Reverse for 'sqlery_queuedjob_changelist' not found`. Hit on Django 6.0 with the partitioned QueuedJob.
+- **Root cause:** Phase 15 gave `QueuedJob` a composite primary key. Django 5.2+/6.0 raises `ImproperlyConfigured` for composite-PK models in admin, so `admin.site.register(QueuedJob, ...)` always fails and the changelist URL never exists. A bare `except Exception: pass` in `admin.py` swallowed the failure silently, while the dashboard template hard-reversed the (now nonexistent) URL.
+- **Fix:** template (`unified_dashboard.html`) resolves the QueuedJob admin URLs via `{% url ... as var %}` (empty string on failure) and degrades the Success/Failed stat cards to plain `<div>` when absent; `admin.py` stops swallowing — it now catches `AlreadyRegistered` (autoreload guard) and logs the expected `ImproperlyConfigured` composite-PK case at INFO instead of `except Exception: pass`.
+- **Test:** `test_unified_dashboard_renders_without_queuedjob_admin` in `tests/test_admin.py` (uses test URLconf `tests/urls_dashboard.py` mounting admin + sqlery; fails with `NoReverseMatch` pre-fix, 200 post-fix).
+- **Validation:** reproduced the exact `NoReverseMatch` by registering `QueuedJob` directly (confirmed `ImproperlyConfigured: composite primary key`); test fails on unfixed template, passes after; full `tests/test_admin.py` green (13 passed).
+- **Inline comment:** `REGRESSION 2026-06-16` at `templates/admin/sqlery/unified_dashboard.html` (stat cards + JS url block) and `django_sqlery/admin.py` registration block.
+
+## 2026-06-16 — Dead workers never leave the dashboard (heartbeat 100s of hours stale)
+
+- **What broke:** A worker whose `last_heartbeat` was hundreds of hours old (e.g. `418h17m ago`) kept appearing in the admin dashboard workers table, marked `idle`, with no way to age out. The user expects workers inactive for >24h to disappear.
+- **Root cause:** `dashboard_stats()` (`src/sqlery/django_sqlery/views.py`) built the workers list with `Worker.objects.filter(status__in=['idle','busy'])` and had **no upper bound on heartbeat age**. A worker that died without flipping its status row stayed `idle` and rendered forever; the JS only colored the heartbeat cell red but never removed the row.
+- **Fix:** added `.exclude(last_heartbeat__lt=now - timedelta(hours=24))` to the dashboard worker queryset so workers inactive >24h are omitted from the listing. (`views.py` ~line 777.)
+- **Regression test:** `test_dashboard_excludes_workers_idle_more_than_24h` in `tests/test_dashboard_stale_workers.py` — creates a fresh idle worker and a 418h-stale idle worker, calls `dashboard_stats` as a staff user, asserts the stale one is absent and the fresh one present. Fails pre-fix (`stale-node` present), passes post-fix.
+- **Inline comment:** `REGRESSION 2026-06-16` at `src/sqlery/django_sqlery/views.py` (dashboard workers queryset).
+- **Validation:** confirmed the test fails against the unfixed query (removed the `.exclude(...)` line → `stale-node` reappears) and passes with the fix; `tests/test_serialize_worker.py` + `tests/test_admin.py` remain green (22 passed).
+- **Note:** The 60s/30s heartbeat thresholds elsewhere (`get_worker_heartbeats`, `Worker.is_alive`) are separate liveness concerns and were intentionally left unchanged — the dashboard cutoff is a display concern (left a wish comment to make the 24h value configurable).

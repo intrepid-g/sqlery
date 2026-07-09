@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config
 from .utils import import_task
+from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
 from sqlery.core.db_resilience import configure_connection_resilience
@@ -25,6 +26,26 @@ try:
 except ImportError:
     connections = None
     close_old_connections = None
+
+# Phase 18: guard-import psycopg3 for LISTEN/NOTIFY wake-up (PG-only, opt-in).
+# psycopg is already a declared dependency; this guard is for environments
+# where the standalone mode is used without psycopg installed.
+try:
+    import psycopg as _psycopg
+    import psycopg.sql as _psycopg_sql
+    _psycopg_available = True
+except ImportError:
+    _psycopg = None  # type: ignore[assignment]
+    _psycopg_sql = None  # type: ignore[assignment]
+    _psycopg_available = False
+
+# Phase 18: guard-import sanitize_queue_name_to_channel for channel naming.
+try:
+    from sqlery.core.pg_notify import sanitize_queue_name_to_channel
+    _pg_notify_import_ok = True
+except ImportError:
+    sanitize_queue_name_to_channel = None  # type: ignore[assignment]
+    _pg_notify_import_ok = False
 
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
 
@@ -413,6 +434,11 @@ class WorkerProcess:
         self.jobs_processed = 0
         self.current_job = None
         self.child_pid = None  # PID of forked child currently executing a job
+        # WR-01: scheduler-election state exposed to _fork_and_execute so leases
+        # can be renewed during long-running (blocking) jobs. Held queues this
+        # worker leads and the lease TTL; populated by run() once election runs.
+        self._owned_queues: set[str] = set()
+        self._lease_secs: int = 0
         self.total_busy_seconds = 0.0
         self._heartbeat_due = False
         self._last_loop_time = time.monotonic()
@@ -425,6 +451,9 @@ class WorkerProcess:
         # from ..compat import get_config  # moved to top-level
         self.poll_interval = get_config('WORKER_POLL_INTERVAL', 5)
         self.heartbeat_interval = get_config('WORKER_HEARTBEAT_INTERVAL', 5)
+        # Phase 18: dedicated psycopg3 AUTOCOMMIT connection for LISTEN/NOTIFY
+        # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
+        self._listen_conn = None
 
     def run(self):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
@@ -476,6 +505,47 @@ class WorkerProcess:
 
         self._heartbeat('idle')
 
+        # --- Scheduler-election lifecycle (ported from DaemonManager.run) ---
+        # A bare sqlery-worker self-elects as scheduler-leader per queue using
+        # its own identity. The per-queue lease primitive (Phase 8) skips live
+        # foreign leases, so a running daemon stays authoritative (ELECT-05).
+        # owned_queues is defined BEFORE the try: so the finally: block can
+        # always release it, even if the worker crashes before the loop.
+        scheduler = Scheduler(backend=self.backend)
+        # TTL mirrors the daemon's check_interval * 3 (≈30s) — failover within
+        # one TTL once a dead leader's lease expires (ELECT-06).
+        lease_secs = self.poll_interval * 3
+        # WR-01: mirror the TTL onto the instance so _fork_and_execute can renew
+        # held leases during a long blocking job (otherwise the lease expires
+        # mid-job and another worker takes over scheduling — leadership flap).
+        self._lease_secs = lease_secs
+        try:
+            owned_queues = set(
+                self.backend.claim_queue_leases(
+                    self.queues, self.worker_id, self.node_id, self.pid, lease_secs
+                )
+            )
+        except Exception as e:
+            # Election must never prevent the worker from starting — a worker
+            # that can't elect still claims and executes jobs (ELECT-07).
+            logger.error(f"Initial scheduler-lease claim failed: {e}", exc_info=True)
+            owned_queues = set()
+        # WR-01: keep the instance view of held queues in sync with the local.
+        self._owned_queues = owned_queues
+        logger.info(
+            f"Worker {self.worker_id} scheduler responsibility: "
+            f"{sorted(owned_queues) or 'none yet'}"
+        )
+
+        # Phase 18: open LISTEN connection (no-op when SQLERY_PG_NOTIFY=False or SQLite).
+        self._open_listen_conn()
+        # FORK-SAFETY: _close_listen_conn runs as pre_fork hook in ForkSafeExecutor.fork()
+        # before os.fork() so the LISTEN connection is never inherited by child processes.
+        # _open_listen_conn re-opens in the parent via post_fork_parent so LISTEN resumes
+        # after each fork without blocking the child.
+        self._fork_ctx.register_pre_fork(self._close_listen_conn)
+        self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+
         try:
             while not self.shutdown_requested:
                 try:
@@ -487,16 +557,51 @@ class WorkerProcess:
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
 
+                    # --- Scheduler-election step (every cycle, incl. idle) ---
+                    # Renew held leases, re-claim any expired/unowned queues,
+                    # then fire cron only for queues this worker leads. Wrapped
+                    # in its own try/except so an election error logs and the
+                    # loop continues — election never crashes the worker
+                    # (ELECT-07 safe-degradation).
+                    try:
+                        if owned_queues:
+                            self.backend.renew_queue_leases(
+                                sorted(owned_queues), self.worker_id, lease_secs
+                            )
+                        unowned = set(self.queues) - owned_queues
+                        if unowned:
+                            newly_claimed = set(
+                                self.backend.claim_queue_leases(
+                                    sorted(unowned),
+                                    self.worker_id,
+                                    self.node_id,
+                                    self.pid,
+                                    lease_secs,
+                                )
+                            )
+                            if newly_claimed:
+                                owned_queues |= newly_claimed
+                                logger.info(
+                                    f"Acquired scheduler leases for: {sorted(newly_claimed)}"
+                                )
+                        # Fire cron for held queues only (ELECT-01 + ELECT-02)
+                        jobs = scheduler.run_due_tasks(queue_names=owned_queues)
+                        if jobs:
+                            logger.info(f"Scheduler created {len(jobs)} jobs")
+                    except Exception as e:
+                        logger.error(f"Scheduler-election error: {e}", exc_info=True)
+
                     job = self.backend.claim_job(self.queues, self.worker_id)
 
                     if not job:
                         self._heartbeat('idle')
                         logger.info(".")
-                        elapsed = 0
-                        while elapsed < self.poll_interval and not self.shutdown_requested:
-                            time.sleep(1)
-                            elapsed += 1
-                            self._check_heartbeat()
+                        # elapsed = 0
+                        # while elapsed < self.poll_interval and not self.shutdown_requested:
+                        #     time.sleep(1)
+                        #     elapsed += 1
+                        #     self._check_heartbeat()
+                        self._wait_for_notify()
                         continue
 
                     # Check concurrency
@@ -510,11 +615,12 @@ class WorkerProcess:
                         # Sleep before retrying — without this the worker spins
                         # in a tight loop claiming and releasing the same job
                         # when a zombie running job blocks the queue.
-                        elapsed = 0
-                        while elapsed < self.poll_interval and not self.shutdown_requested:
-                            time.sleep(1)
-                            elapsed += 1
-                            self._check_heartbeat()
+                        # elapsed = 0
+                        # while elapsed < self.poll_interval and not self.shutdown_requested:
+                        #     time.sleep(1)
+                        #     elapsed += 1
+                        #     self._check_heartbeat()
+                        self._wait_for_notify()
                         continue
 
                     # Fork and execute
@@ -554,6 +660,8 @@ class WorkerProcess:
         except KeyboardInterrupt:
             logger.info(f"Worker {self.worker_id} interrupted")
         finally:
+            # Phase 18: close LISTEN connection on graceful shutdown.
+            self._close_listen_conn()
             try:
                 self.backend.update_worker_heartbeat(
                     worker_id=self.worker_id,
@@ -563,6 +671,14 @@ class WorkerProcess:
                 )
             except Exception:
                 pass
+            # Release held scheduler leases on graceful shutdown so another
+            # worker/daemon can take over the queues immediately (ELECT-03).
+            # SIGTERM/SIGINT set self.shutdown_requested, exiting the loop into
+            # this finally; owned_queues is always defined (init'd before try:).
+            try:
+                self.backend.release_queue_leases(sorted(owned_queues), self.worker_id)
+            except Exception as e:
+                logger.error(f"Error releasing scheduler leases: {e}")
             logger.info(f"Worker {self.worker_id} stopped (processed {self.jobs_processed} jobs)")
 
         return self.jobs_processed
@@ -644,6 +760,19 @@ class WorkerProcess:
             # Sleep briefly so parent stays responsive to signals
             time.sleep(0.5)
             self._check_heartbeat()
+            # WR-01: keep scheduler leadership alive across long jobs. The main
+            # loop only renews leases at the top of each iteration, but this
+            # wait blocks for up to (timeout + 60s); without renewal here the
+            # lease (poll_interval*3) expires mid-job and another worker takes
+            # over scheduling (two-leader overlap). Guarded so a renew error
+            # never aborts the wait — election must never crash job execution.
+            try:
+                if self._owned_queues:
+                    self.backend.renew_queue_leases(
+                        sorted(self._owned_queues), self.worker_id, self._lease_secs
+                    )
+            except Exception as e:
+                logger.warning(f"Lease renew during job execution failed: {e}")
 
         # # Pipe read removed — read result from DB instead
         # try:
@@ -717,6 +846,135 @@ class WorkerProcess:
             os.waitpid(pid, 0)
         except (OSError, ProcessLookupError):
             pass
+
+    def _open_listen_conn(self) -> None:
+        """Open a dedicated AUTOCOMMIT psycopg3 connection and LISTEN on all queue channels.
+
+        No-op when SQLERY_PG_NOTIFY is False, when on SQLite, or when psycopg3
+        is unavailable. Any failure is caught and logged — the worker falls back
+        to pure polling. Never called from a signal handler.
+        """
+        if not get_config('SQLERY_PG_NOTIFY', False):
+            return
+        if not _psycopg_available or sanitize_queue_name_to_channel is None:
+            return
+        # WR-01: close any existing LISTEN connection before reopening so a
+        # reopen never leaks the previous connection.
+        if self._listen_conn is not None:
+            try:
+                self._listen_conn.close()
+            except Exception:
+                pass
+            self._listen_conn = None
+        try:
+            # Detect PG DSN: standalone mode exposes DATABASE_URL via get_config;
+            # Django mode reads from connections['default'].settings_dict.
+            database_url = get_config('DATABASE_URL', None)
+            if database_url:
+                if 'postgresql' not in database_url and 'postgres' not in database_url:
+                    return
+                dsn = database_url
+            elif connections is not None:
+                # Django mode: build DSN from connection settings dict.
+                try:
+                    db_settings = connections['default'].settings_dict
+                except Exception:
+                    return
+                if db_settings.get('ENGINE', '').find('postgresql') == -1 and \
+                        db_settings.get('ENGINE', '').find('psycopg') == -1:
+                    return
+                dsn = _psycopg.conninfo.make_conninfo(
+                    dbname=db_settings.get('NAME', ''),
+                    host=db_settings.get('HOST', '') or None,
+                    port=db_settings.get('PORT', '') or None,
+                    user=db_settings.get('USER', '') or None,
+                    password=db_settings.get('PASSWORD', '') or None,
+                )
+            else:
+                return
+
+            self._listen_conn = _psycopg.connect(dsn, autocommit=True)
+            channels = []
+            for queue in self.queues:
+                channel = sanitize_queue_name_to_channel(queue)
+                self._listen_conn.execute(
+                    _psycopg_sql.SQL("LISTEN {}").format(
+                        _psycopg_sql.Identifier(channel)
+                    )
+                )
+                channels.append(channel)
+            logger.info(
+                f"Worker {self.worker_id}: LISTEN connection open on channels {channels}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Worker {self.worker_id}: failed to open LISTEN connection: {e}; "
+                f"falling back to polling"
+            )
+            # WR-01: close the orphaned connection (opened above) before
+            # clearing the reference, otherwise it leaks until GC/idle timeout.
+            # Old: self._listen_conn = None
+            if self._listen_conn is not None:
+                try:
+                    self._listen_conn.close()
+                except Exception:
+                    pass
+            self._listen_conn = None
+
+    def _close_listen_conn(self) -> None:
+        """Close the LISTEN connection. Safe to call when connection is None.
+
+        Registered as a pre_fork hook on ForkSafeExecutor so it runs before
+        every os.fork(), ensuring the child never inherits the LISTEN connection.
+        Also called in run() finally on graceful shutdown.
+        """
+        if self._listen_conn is None:
+            return
+        try:
+            self._listen_conn.close()
+        except Exception:
+            pass
+        self._listen_conn = None
+        logger.debug(f"Worker {self.worker_id}: LISTEN connection closed")
+
+    def _wait_for_notify(self) -> None:
+        """Block up to poll_interval for a NOTIFY, in <=1s slices.
+
+        Falls back to plain time.sleep slices if no LISTEN connection is open
+        (flag-off path, SQLite, or after a LISTEN connection error). Heartbeat
+        is checked between slices so the worker stays responsive to SIGUSR1.
+
+        Mirrors the pgwq reference Worker._wait() pattern exactly.
+        """
+        if self._listen_conn is None:
+            # Flag-off / SQLite / no connection — original 1s-slice sleep loop
+            elapsed = 0
+            while elapsed < self.poll_interval and not self.shutdown_requested:
+                time.sleep(1)
+                elapsed += 1
+                self._check_heartbeat()
+            return
+        # Flag-on + PG: wait for NOTIFY with poll_interval timeout, in 1s slices
+        end = time.monotonic() + self.poll_interval
+        while not self.shutdown_requested:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                for _ in self._listen_conn.notifies(
+                    timeout=min(remaining, 1.0), stop_after=1
+                ):
+                    return  # NOTIFY received — wake up to claim immediately
+            except Exception as e:
+                logger.warning(
+                    f"Worker {self.worker_id}: LISTEN connection error: {e}; "
+                    f"closing, falling back to polling"
+                )
+                self._close_listen_conn()
+                return
+            self._check_heartbeat()
+            if self.shutdown_requested:
+                return
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""

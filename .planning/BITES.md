@@ -35,12 +35,17 @@
 
 ## Bite queue
 
-1. Migrate error-recovery `_reset_db_connections()` calls to ForkSafeExecutor hooks `[pending]`
-2. Add retry loop with exponential backoff before auto-registration `[pending]`
-3. Add worker registration security (whitelist or shared secret) `[pending]`
-4. Multi-worker PostgreSQL concurrent claim stress test under real contention `[pending]`
-5. Support user-registered custom pre/post-fork hooks `[pending]`
+- Verify the worker process (PID) is actually dead before allowing delete — from "2026-06-16 — Delete stale workers from the dashboard" `[pending]`
+- Add worker registration security (whitelist or shared secret) `[pending]`
+- Add retry loop with exponential backoff before auto-registration `[pending]`
+- Migrate error-recovery `_reset_db_connections()` calls to ForkSafeExecutor hooks `[pending]`
+- Support user-registered custom pre/post-fork hooks `[pending]`
+- Multi-worker PostgreSQL concurrent claim stress test under real contention `[pending]`
 
 ## Ignored bites
 
-(None yet)
+Items deemed too small or non-functional for standalone bites.
+
+### 2026-06-16 — Make the worker-delete staleness threshold configurable
+- **Source:** Deferred from 2026-06-16 — Delete stale workers from the dashboard
+- **Why ignored:** config-only (expose existing 300s seam via DJANGO_SQL_JOBS); auto-demoted

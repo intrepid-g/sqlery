@@ -17,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        # python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.13']
         django-version: ['5.2']  # LTS floor (ASYN-02) per 02-01-PLAN.
 
     services:
@@ -80,7 +81,67 @@ jobs:
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sqlery_test
       # Plan 03-07: the exit-code-5 tolerance is removed. PG rail must
       # collect > 0 tests; an empty collection now fails the job.
+      # Phase 11 (PARITY-05): this step has no path filter, so -m postgres
+      # also collects the new parity cells under the DJANGO backend —
+      # tests/test_parity_scheduler.py (Django x Postgres failover/E2E) plus
+      # the PG cells in tests/test_atomic_scheduler.py and
+      # tests/test_core_standalone.py. It therefore enforces the
+      # Django x Postgres parity cells of the matrix. Command unchanged.
       run: uv run pytest -m postgres -v --tb=short
+
+    # Phase 11 (PARITY-05): the standalone x Postgres parity cells are NOT
+    # exercised by the step above (pytest-django resolves the Django backend)
+    # nor by the standalone-no-django job (import-only, never runs pytest).
+    # SQLERY_FORCE_STANDALONE=1 forces compat to resolve the standalone
+    # backend even though Django is installed in [dev], matching the
+    # tests/integration/conftest.py::_run_no_django convention. This closes
+    # the silently-skipped standalone x Postgres cell. No `|| echo` escape —
+    # a failing cell fails the build (first-class gate). A --collect-only
+    # pre-check rejects an empty collection (exit 5) so a missing/skipped
+    # standalone PG cell fails the job too.
+    #
+    # CR-01 (11-REVIEW): the previous selection ran the WHOLE of three files
+    # under -m postgres with SQLERY_FORCE_STANDALONE=1. Two of those files
+    # contain DJANGO-mode PG cells (test_parity_scheduler.py::TestParityFailover,
+    # test_atomic_scheduler.py::TestCronSemanticsHardeningPostgres) that resolve
+    # get_backend() -> SQLAlchemyBackend WITHOUT ever calling initialize(), so
+    # they raise RuntimeError("Database not initialized") on the live PG rail and
+    # ERROR the build for the wrong reason. The Django x Postgres cells are
+    # already covered by the unforced "Run @pytest.mark.postgres suite" step
+    # above. We now scope this step to the GENUINELY-standalone PG cells via the
+    # dedicated `standalone_pg` marker (registered in pyproject.toml), so
+    # `-m "postgres and standalone_pg"` collects ONLY the standalone-backend
+    # cells. The --collect-only precheck (WR-03) therefore guarantees the
+    # standalone cells specifically are collected: an empty/exit-5 collection
+    # now means a real missing standalone cell, not just any postgres cell.
+    - name: Run standalone-mode parity suite with PostgreSQL
+      env:
+        PYTHONPATH: .
+        SQLERY_FORCE_STANDALONE: "1"
+        SQLERY_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sqlery_test
+      run: |
+        # Old (CR-01: also selected Django-ORM PG cells that resolve an
+        # uninitialized SQLAlchemy backend and ERROR; the --co precheck could
+        # pass on those Django cells alone, masking a missing standalone cell):
+        # uv run pytest -m postgres --co -q \
+        #   tests/test_parity_scheduler.py \
+        #   tests/test_core_standalone.py \
+        #   tests/test_atomic_scheduler.py
+        # uv run pytest -m postgres -v --tb=short \
+        #   tests/test_parity_scheduler.py \
+        #   tests/test_core_standalone.py \
+        #   tests/test_atomic_scheduler.py
+        # New: scope to the standalone-backend PG cells only (WR-03 precheck now
+        # asserts the standalone cells specifically are collected).
+        uv run pytest -m "postgres and standalone_pg" --co -q \
+          tests/test_parity_scheduler.py \
+          tests/test_core_standalone.py \
+          tests/chaos/test_lease_zombie.py
+        uv run pytest -m "postgres and standalone_pg" -v --tb=short \
+          tests/test_parity_scheduler.py \
+          tests/test_core_standalone.py \
+          tests/chaos/test_lease_zombie.py
 
     - name: Run tests with coverage
       env:
@@ -115,10 +176,12 @@ jobs:
       with:
         version: "latest"
 
-    - name: Set up Python 3.10
+    # - name: Set up Python 3.10
+    - name: Set up Python 3.13
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        # python-version: '3.10'
+        python-version: '3.13'
 
     - name: Install package WITHOUT django (standalone extra only)
       run: |

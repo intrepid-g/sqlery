@@ -1,0 +1,32 @@
+{
+  "source_path": "/Users/gabriel/Documents/GitHub/sqlery-public/.planning/intel/ingest-src/PLAN.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "sqlery production-grade plan",
+  "summary": "13-step technical implementation plan for partition-based bloat elimination in sqlery's PostgreSQL job queue, with senior review (14 findings) folded in.",
+  "scope": [
+    "PostgreSQL daily time-range partitioning of sqlery_queued_job",
+    "partial pending index (queue_name, priority DESC, created_at WHERE status='queued')",
+    "batched DELETE cleanup fallback (SQLite / non-partitioned PG)",
+    "core/partitioning.py (ensure_future_partitions, reclaim_drained_partitions, check_default_partition)",
+    "core/cleanup.py and core/daemon.py partition maintenance routing",
+    "far-future scheduled_at staging table (sqlery_scheduled_job) and promotion",
+    "Django composite PK (created_at, id) and FK demotion to BigIntegerField",
+    "stop-the-world migration 0029_partition_queued_job (atomic=False, PG-only)",
+    "claim/write path created_at partition pruning (db_compat.py, models.py, backend.py)",
+    "FastAPI/SQLAlchemy adapter mirroring",
+    "optional LISTEN/NOTIFY worker wake-up (SQLERY_PG_NOTIFY)",
+    "testing, rollback, observability metrics",
+    "config keys: SQLERY_PARTITION_INTERVAL, SQLERY_PARTITION_PREMAKE, SQLERY_PARTITION_RETENTION, SQLERY_PG_NOTIFY, SQLERY_PARTITION_ARCHIVE_HOOK"
+  ],
+  "cross_refs": [
+    "sqlery-vs-pgque.md",
+    "sql/pgwq.sql",
+    "clients/python/pgwq/",
+    "clients/python/pgwq/worker.py"
+  ],
+  "locked": false,
+  "precedence": 1,
+  "notes": "Manifest declared SPEC with precedence 1; content confirms: concrete DDL, migration SQL, index definitions, config contracts, and an exhaustive write-path checklist. Step structure: Steps 1-13 (partial index; batched DELETE; core/partitioning.py; core/cleanup.py routing; daemon maintenance tick; staging table; composite PK; partition migration 0029; Django/async backend; claim path created_at; FastAPI adapter; LISTEN/NOTIFY; testing/rollback/observability). Senior review status ADDRESSED (rev 2026-06-10). Contains locked-decision-like rationale (hand-rolled vs pg_partman) but classified per manifest as SPEC."
+}

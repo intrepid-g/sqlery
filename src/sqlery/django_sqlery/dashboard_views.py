@@ -6,6 +6,7 @@ from django.contrib import admin
 from django.contrib.admin.views.decorators import staff_member_required
 from django.shortcuts import render, get_object_or_404
 
+from .. import __version__ as sqlery_version
 from .models import ScheduledTask, Worker
 
 
@@ -19,6 +20,7 @@ def dashboard_view(request):
         'site_title': admin.site.site_title,
         'site_header': admin.site.site_header,
         'has_permission': request.user.is_active and request.user.is_staff,
+        'sqlery_version': sqlery_version,
     }
     return render(request, 'admin/sqlery/dashboard.html', context)
 
@@ -41,6 +43,7 @@ def sqlery_unified_view(request):
         'site_title': admin.site.site_title,
         'site_header': admin.site.site_header,
         'has_permission': request.user.is_active and request.user.is_staff,
+        'sqlery_version': sqlery_version,
     }
     return render(request, 'admin/sqlery/unified_dashboard.html', context)
 

@@ -3,73 +3,8 @@
 ## Shipped milestones
 
 - **v0.21 — Feature-Complete Run Modes** (2026-03-18 → 2026-05-15) — 4 phases, 25 plans, 43 requirements. All execution modes production-ready across Django and standalone integrations on SQLite and Postgres; async worker rebuilt; security hardened (dashboard auth, webhook SSRF, CSRF, task module allowlist); test/CI infrastructure rebuilt. Archive: [`milestones/v0.21-ROADMAP.md`](milestones/v0.21-ROADMAP.md) · [`milestones/v0.21-REQUIREMENTS.md`](milestones/v0.21-REQUIREMENTS.md) · [`v0.21-MILESTONE-AUDIT.md`](v0.21-MILESTONE-AUDIT.md)
+- **v0.22 — Stability, Coverage, and Operational Confidence** (2026-05-15, released through v0.22.3) — 3 phases (Phases 5–7). Restored trustworthy CI/coverage signal without the collection-error workaround or the emergency coverage floor; battle-tested crash/retry/timeout/zombie/heartbeat/lease recovery and PostgreSQL concurrent-claim behavior; delivered operator runbooks and troubleshooting docs for the production-facing execution modes.
+- **v0.23.0 — Worker-Elected Cron Scheduler** (shipped 2026-06-08) — 4 phases (Phases 8–11), 11 plans, 21 requirements. A bare `sqlery-worker` cluster now fires recurring cron with no daemon present by self-electing a per-queue scheduler-leader over a real lease scheme at true parity across {Django, standalone} × {SQLite, Postgres}: built the standalone `sqlery_daemon_lease` (SQLModel + migration + atomic claim/renew/release), wired core-shared scheduler election into the worker poll loop (daemon stays authoritative, failover within one TTL), hardened cron to fire exactly-once via an atomic `advance_scheduled_task_if_due` CAS with drift correction and a jitter knob, and enforced the full matrix as a first-class CI gate. Archive: [`milestones/v0.23.0-ROADMAP.md`](milestones/v0.23.0-ROADMAP.md) · [`milestones/v0.23.0-REQUIREMENTS.md`](milestones/v0.23.0-REQUIREMENTS.md) · [`milestones/v0.23.0-MILESTONE-AUDIT.md`](milestones/v0.23.0-MILESTONE-AUDIT.md)
 
-## Active milestone
+- **v0.24.0 — Partition Bloat Elimination** (shipped 2026-06-12) — 7 phases (12–18), 24 plans, 11 requirements. Eliminated unbounded jobs-table bloat by converting `sqlery_queued_job` to daily RANGE partitions on `created_at` with a composite PK `(created_at, id)`, hand-rolled partition maintenance (provision-ahead + invariant-checked DROP reclaim under back-pressure, advisory-lock-coordinated across daemons), far-future scheduled-job staging so no queued row pins a drained partition, and an idempotent stop-the-world cutover migration with rename-based rollback — verified by a ≥1M-row round-trip on real Postgres. Backends prune every hot write path to a single partition, cleanup routes to partition-drop reclaim, and full parity was delivered for the standalone SQLAlchemy mode. Optional opt-in PG LISTEN/NOTIFY sub-100ms dispatch shipped behind a flag (byte-identical off). SQLite path unchanged throughout. Archive: [`milestones/v0.24.0-ROADMAP.md`](milestones/v0.24.0-ROADMAP.md) · [`milestones/v0.24.0-REQUIREMENTS.md`](milestones/v0.24.0-REQUIREMENTS.md) · [`milestones/v0.24.0-MILESTONE-AUDIT.md`](milestones/v0.24.0-MILESTONE-AUDIT.md)
 
-**v0.22 — Stability, Coverage, and Operational Confidence** (started 2026-05-15)
-
-Goal: increase trust in the six shipped execution modes before adding more complexity by fixing CI/coverage signal, battle-testing failure and concurrency behavior, and improving operator readiness.
-
-## Phases
-
-- [ ] **Phase 5: CI Signal and Coverage Recovery** - Remove temporary test/coverage workarounds and make default plus PostgreSQL CI rails trustworthy
-- [ ] **Phase 6: Failure-Path and PostgreSQL Hardening** - Battle-test crash/recovery, retry/timeout, zombie/heartbeat/lease, and concurrent-claim behavior
-- [ ] **Phase 7: Operational Readiness** - Improve runbooks/troubleshooting and close or explicitly defer the highest-value remaining operator-facing hardening gaps
-
-## Phase Details
-
-### Phase 5: CI Signal and Coverage Recovery
-**Goal**: CI tells the truth about the current system without relying on temporary collection or coverage escape hatches
-**Depends on**: Nothing (first phase of v0.22)
-**Requirements**: TEST-01, TEST-02, TEST-03, TEST-04
-**Success Criteria** (what must be TRUE):
-  1. The default non-PostgreSQL suite collects and runs without the known Django collection-error workaround
-  2. The PostgreSQL rail collects and runs cleanly in CI with representative mode coverage
-  3. `pyproject.toml` coverage settings no longer rely on the documented emergency 13% floor workaround
-  4. The standalone-no-Django guarantee is continuously demonstrated in CI or an equivalent automated proof
-**Plans**: 3 plans
-Plans:
-- [ ] 05-01-PLAN.md — Fix collection errors and restore clean default-suite execution
-- [ ] 05-02-PLAN.md — Raise coverage gate to a trustworthy clean-suite baseline and keep PG rail green
-- [ ] 05-03-PLAN.md — Resolve standalone-no-Django proof gap in CI
-**UI hint**: no
-
-### Phase 6: Failure-Path and PostgreSQL Hardening
-**Goal**: Production-critical failure and concurrency paths are regression-tested, deterministic, and trusted under realistic worker behavior
-**Depends on**: Phase 5
-**Requirements**: HARD-01, HARD-02, HARD-03, HARD-04, PG-01, PG-02
-**Success Criteria** (what must be TRUE):
-  1. Crash/recovery paths for daemon and workers are covered by deterministic regression tests with clear expected terminal states
-  2. Retry, timeout, and backoff behavior is validated across representative execution modes
-  3. Zombie detection, stale-heartbeat handling, and lease recovery are covered by explicit state-transition tests
-  4. PostgreSQL concurrent-claim and contention scenarios are tested under multi-worker pressure
-  5. Fork/DB lifecycle handling is validated so subprocess and daemon workers do not retain invalid connection state after fork
-**Plans**: 3 plans
-Plans:
-- [ ] 06-01-PLAN.md — Crash/retry/timeout recovery matrix for core execution modes
-- [ ] 06-02-PLAN.md — Zombie, heartbeat, and lease hardening pass
-- [ ] 06-03-PLAN.md — PostgreSQL concurrency and fork/DB lifecycle battle tests
-**UI hint**: no
-
-### Phase 7: Operational Readiness
-**Goal**: Maintainers have production-grade guidance for operating Sqlery and the highest-value remaining trust gaps are resolved or consciously deferred
-**Depends on**: Phase 6
-**Requirements**: OPS-01, OPS-02, OPS-03
-**Success Criteria** (what must be TRUE):
-  1. Operators can deploy, run, observe, restart, and recover the core production modes using project docs alone
-  2. Troubleshooting docs cover the most likely field failures around heartbeats, stuck jobs, crashes, and DB connectivity
-  3. The remaining trust-affecting follow-ups are either implemented in this phase or explicitly deferred with rationale in planning/docs
-**Plans**: 2 plans
-Plans:
-- [ ] 07-01-PLAN.md — Operator runbooks and recovery/troubleshooting docs
-- [ ] 07-02-PLAN.md — Close or document trust-affecting follow-up hardening items
-**UI hint**: no
-
-## Lower-priority / [FOLLOWUP] carry-forward
-
-- Compat milestone (Celery/RQ/scheduler permanent drop-in surface) — deliberately deferred behind v0.22 maturity pass.
-- Lambda fidelity testing (LocalStack/SAM) — deferred from v0.21 Phase 2 unless Phase 7 pulls it forward.
-- Dashboard audit logging / rate limiting / payload encryption at rest — future ops/security work.
-- Quarterly dead-code retention sweep — each `#CLEANUP` marker has a `Remove after YYYY-MM-DD`; arrive at the date, decide per-file.
-
-See `.planning/BACKLOG.md` for the full backlog.

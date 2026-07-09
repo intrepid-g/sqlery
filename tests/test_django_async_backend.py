@@ -69,7 +69,9 @@ async def test_aclaim_job_claims_and_marks_running(backend, make_job):
 
     from sqlery.django_sqlery.models import QueuedJob
 
-    fresh = await QueuedJob.objects.aget(pk=job.id)
+    # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
+    # pk is now a composite (created_at, id); look up by id only.
+    fresh = await QueuedJob.objects.aget(id=job.id)
     assert fresh.status == "running"
 
 
@@ -103,7 +105,9 @@ async def test_amark_running(backend, make_job):
 
     job = await sync_to_async(make_job)()
     await backend.amark_running(job.id, "wkr-1")
-    fresh = await QueuedJob.objects.aget(pk=job.id)
+    # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
+    # pk is now a composite (created_at, id); look up by id only.
+    fresh = await QueuedJob.objects.aget(id=job.id)
     assert fresh.status == "running"
 
 
@@ -113,7 +117,8 @@ async def test_amark_success(backend, make_job):
 
     job = await sync_to_async(make_job)(status="running")
     await backend.amark_success(job.id, "ok")
-    fresh = await QueuedJob.objects.aget(pk=job.id)
+    # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
+    fresh = await QueuedJob.objects.aget(id=job.id)
     assert fresh.status == "success"
     assert fresh.output == "ok"
 
@@ -124,7 +129,8 @@ async def test_amark_failed(backend, make_job):
 
     job = await sync_to_async(make_job)(status="running")
     await backend.amark_failed(job.id, "boom", traceback="tb")
-    fresh = await QueuedJob.objects.aget(pk=job.id)
+    # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
+    fresh = await QueuedJob.objects.aget(id=job.id)
     assert fresh.status == "failed"
     assert fresh.error == "boom"
     assert fresh.traceback == "tb"
@@ -136,7 +142,8 @@ async def test_amark_shutting_down(backend, make_job):
 
     job = await sync_to_async(make_job)(status="running")
     await backend.amark_shutting_down(job.id)
-    fresh = await QueuedJob.objects.aget(pk=job.id)
+    # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
+    fresh = await QueuedJob.objects.aget(id=job.id)
     assert fresh.status == "shutting_down"
 
 

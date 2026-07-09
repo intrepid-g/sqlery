@@ -13,13 +13,22 @@ from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
-from django.db.models import F
+from django.db.models import F, Q
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from uuid6 import uuid7
 
 from .db_compat import is_sqlite
+
+
+def _generate_job_id() -> int:
+    """62-bit time-sortable id from a UUID v7 (default for QueuedJob.id).
+
+    Resolves fields.E100 (BigAutoField under a CompositePrimaryKey) while keeping
+    id assignment working on both SQLite and PostgreSQL without an AutoField.
+    """
+    return uuid7().int & ((1 << 62) - 1)
 from .friendly_name import uuid_to_friendly
 from .settings import get_setting
 from .utils import calculate_next_run, validate_cron_expression
@@ -356,6 +365,22 @@ class QueuedJob(models.Model):
         ("shutting_down", "Shutting Down"),
     ]
 
+    # Django 5.2 composite PK — partition key (created_at) must be first.
+    # id stays globally unique (shared IDENTITY sequence with sqlery_scheduled_job).
+    # FKs from JobRegistry and Worker demoted to BigIntegerField per D4 (Phase 15):
+    # orphans on partition drop are an accepted, documented trade-off.
+    pk = models.CompositePrimaryKey("created_at", "id")
+    # Old: id = models.BigAutoField(primary_key=False)
+    #   BigAutoField under a CompositePrimaryKey raises fields.E100 ("AutoFields
+    #   must set primary_key=True"), which blocks `manage.py check`/`migrate` in
+    #   real Django apps. The id value is DB-assigned — nextval('sqlery_job_id_seq')
+    #   on Postgres (migrations 0029-0030) and an autoincrement rowid on SQLite —
+    #   so a plain BigIntegerField carries the column without the AutoField check.
+    #   A 62-bit UUID-v7-derived default assigns the id on insert for BOTH backends
+    #   (mirrors the standalone SQLModel listener) — globally unique, time-sortable,
+    #   no collision with the Postgres sequence (which still backs raw-SQL inserts).
+    id = models.BigIntegerField(default=_generate_job_id, editable=False)
+
     # Task definition
     task_path = models.CharField(
         max_length=500,
@@ -390,8 +415,10 @@ class QueuedJob(models.Model):
         help_text="Optimistic locking version for atomic job claiming (increments on each update)",
     )
 
-    # Retry chain linkage
-    parent_job_id = models.IntegerField(
+    # Retry chain linkage. BigIntegerField (not IntegerField) because it stores a
+    # QueuedJob id, which is a 64-bit _generate_job_id() value — an int4 column
+    # overflows ("integer out of range") the moment a failed job spawns a retry.
+    parent_job_id = models.BigIntegerField(
         null=True,
         blank=True,
         db_index=True,
@@ -494,11 +521,23 @@ class QueuedJob(models.Model):
     )
 
     # Optional unique string identifier (e.g. 'send-invoice-123')
+    # Old: unique=True — cannot exist on a PG partitioned table without including the
+    # partition key (created_at) in the constraint.  Uniqueness is enforced at application
+    # level in backend.create_job: named job always wins (stop + delete conflicts before
+    # insert).  unique=True removed by migration 0030 state_operations AlterField to keep
+    # ORM state in sync with the physical schema after the partitioned cutover.
+    # job_name = models.CharField(
+    #     max_length=255,
+    #     null=True,
+    #     blank=True,
+    #     unique=True,
+    #     db_index=True,
+    #     help_text="Optional unique string identifier (e.g. 'send-invoice-123')",
+    # )
     job_name = models.CharField(
         max_length=255,
         null=True,
         blank=True,
-        unique=True,
         db_index=True,
         help_text="Optional unique string identifier (e.g. 'send-invoice-123')",
     )
@@ -589,7 +628,12 @@ class QueuedJob(models.Model):
         verbose_name = "Job"
         verbose_name_plural = "Jobs"
         indexes = [
-            models.Index(fields=["queue_name", "status", "-priority", "created_at"]),
+            # Old: models.Index(fields=["queue_name", "status", "-priority", "created_at"]),
+            models.Index(
+                fields=["queue_name", "-priority", "created_at"],
+                name="sqlery_job_pending_idx",
+                condition=Q(status="queued"),
+            ),
             models.Index(fields=["task_path", "status"]),
             models.Index(fields=["-created_at"], name="sqlery_job_created_desc"),
             models.Index(fields=["-finished_at"], name="sqlery_job_finished_desc"),
@@ -620,7 +664,10 @@ class QueuedJob(models.Model):
 
         expected_version = self.version
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 3
+        ).update(
             status="running",
             started_at=timezone.now(),
             worker_pid=os.getpid(),
@@ -653,7 +700,10 @@ class QueuedJob(models.Model):
         # Record this run in history (update in-memory only)
         self._record_run(status="success", output=str(output))
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 4
+        ).update(
             status="success",
             finished_at=self.finished_at,
             duration_seconds=self.duration_seconds,
@@ -704,7 +754,10 @@ class QueuedJob(models.Model):
         # Record this run in history (update in-memory only)
         self._record_run(status="failed", error=str(error))
 
-        rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
+        rows_updated = QueuedJob.objects.filter(
+            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
+        ).update(
             status="failed",
             finished_at=self.finished_at,
             duration_seconds=self.duration_seconds,
@@ -756,11 +809,14 @@ class QueuedJob(models.Model):
             pass
 
         # Reset worker state so it shows idle immediately on the dashboard
-        worker = Worker.objects.filter(current_job=self, status="busy").first()
+        # Old: worker = Worker.objects.filter(current_job=self, status="busy").first()
+        worker = Worker.objects.filter(current_job_id=self.id, status="busy").first()
         if worker:
             worker.status = "idle"
-            worker.current_job = None
-            worker.save(update_fields=["status", "current_job", "last_heartbeat"])
+            # Old: worker.current_job = None
+            worker.current_job_id = None
+            # Old: worker.save(update_fields=["status", "current_job", "last_heartbeat"])
+            worker.save(update_fields=["status", "current_job_id", "last_heartbeat"])
 
         return True
 
@@ -778,7 +834,8 @@ class QueuedJob(models.Model):
             Worker = apps.get_model("sqlery", "Worker")
             Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
                 status="idle",
-                current_job=None,
+                # Old: current_job=None,
+                current_job_id=None,
                 last_heartbeat=timezone.now(),
             )
         except Exception:
@@ -820,7 +877,9 @@ class QueuedJob(models.Model):
 
     def save_meta(self) -> None:
         """Persist the in-memory meta dict to the database."""
-        QueuedJob.objects.filter(pk=self.pk).update(meta=self.meta)
+        # Old: QueuedJob.objects.filter(pk=self.pk).update(meta=self.meta)
+        # created_at already present per Phase 15 — checklist item 6 verified
+        QueuedJob.objects.filter(id=self.id, created_at=self.created_at).update(meta=self.meta)
 
     def refresh_meta(self) -> None:
         """Reload meta from the database into this instance."""
@@ -973,11 +1032,11 @@ class JobRegistry(models.Model):
         ("canceled", "Canceled"),
     ]
 
-    job = models.ForeignKey(
-        QueuedJob,
-        on_delete=models.CASCADE,
-        related_name="registry_entries",
-        help_text="Job being tracked",
+    # Old: job = models.ForeignKey(QueuedJob, on_delete=models.CASCADE, related_name="registry_entries", help_text="Job being tracked")
+    # #CLEANUP: Remove after soak — rename job_id back to job if FK ever restored
+    job_id = models.BigIntegerField(
+        db_index=True,
+        help_text="ID of the QueuedJob being tracked (FK demoted — D4: referential integrity to partitioned table intentionally dropped)",
     )
     registry_type = models.CharField(
         max_length=20,
@@ -1006,13 +1065,15 @@ class JobRegistry(models.Model):
         ordering = ["-entered_at"]
         indexes = [
             models.Index(fields=["registry_type", "entered_at"]),
-            models.Index(fields=["job", "registry_type"]),
+            # Old: models.Index(fields=["job", "registry_type"]),
+            models.Index(fields=["job_id", "registry_type"]),
             models.Index(fields=["registry_type", "exited_at"]),
         ]
         verbose_name_plural = "Job registries"
 
     def __str__(self):
-        return f"{self.job.id} in {self.registry_type} registry"
+        # Old: return f"{self.job.id} in {self.registry_type} registry"
+        return f"{self.job_id} in {self.registry_type} registry"
 
 
 class Worker(models.Model):
@@ -1044,13 +1105,13 @@ class Worker(models.Model):
         default="idle",
         db_index=True,
     )
-    current_job = models.ForeignKey(
-        QueuedJob,
+    # Old: current_job = models.ForeignKey(QueuedJob, null=True, blank=True, on_delete=models.SET_NULL, related_name="current_worker", help_text="Job currently being processed")
+    # #CLEANUP: Remove after soak — rename current_job_id back to current_job if FK ever restored
+    current_job_id = models.BigIntegerField(
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="current_worker",
-        help_text="Job currently being processed",
+        db_index=True,
+        help_text="ID of the QueuedJob currently being processed (FK demoted — D4: referential integrity to partitioned table intentionally dropped)",
     )
 
     # Configuration
@@ -1195,6 +1256,13 @@ class DaemonLease(models.Model):
     running the scheduler and zombie cleanup for that queue. Renewed every
     loop iteration; expires after check_interval × 3 seconds if the daemon
     dies without a clean shutdown.
+
+    Schema divergence note (WR-05): the standalone SQLModel ``DaemonLease``
+    (``core/models.py``) carries an extra ``version`` column for SQLite
+    optimistic-CAS take-over. Django uses ``SELECT FOR UPDATE SKIP LOCKED`` and
+    intentionally omits that column, so the two stacks produce slightly
+    different DDL for the shared ``sqlery_daemon_lease`` table. A single
+    database must not be migrated by both stacks.
     """
 
     queue_name = models.CharField(max_length=255, primary_key=True)
@@ -1211,6 +1279,60 @@ class DaemonLease(models.Model):
 
     def __str__(self):
         return f"DaemonLease({self.queue_name} → {self.daemon_id})"
+
+
+class ScheduledJob(models.Model):
+    """A staged far-future job in the scheduling table.
+
+    Far-future jobs (scheduled_at > now() + staging threshold) land here
+    instead of sqlery_queued_job so they cannot pin otherwise-drained partitions.
+    The daemon promotion loop moves rows from this table into sqlery_queued_job
+    once scheduled_at is within the lookahead window.
+
+    The id column shares sqlery_queued_job_id_seq on PostgreSQL (wired in
+    migration 0029) so ids are globally unique across both tables.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    queue_name = models.CharField(
+        max_length=50,
+        default="default",
+        help_text="Queue name for job routing",
+    )
+    task_path = models.CharField(
+        max_length=500,
+        help_text="Python path to callable",
+    )
+    payload = models.JSONField(
+        default=dict,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Serialised job kwargs dict",
+    )
+    scheduled_at = models.DateTimeField(
+        help_text="UTC datetime when this job becomes due for promotion",
+    )
+    priority = models.IntegerField(
+        default=0,
+        help_text="Priority for enqueued jobs (higher = sooner)",
+    )
+    max_retries = models.IntegerField(
+        default=0,
+        help_text="Max retry attempts after failure",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "sqlery_scheduled_job"
+        ordering = ["scheduled_at"]
+        verbose_name = "Staged scheduled job"
+        verbose_name_plural = "Staged scheduled jobs"
+        indexes = [
+            models.Index(fields=["scheduled_at"], name="sqlery_staged_job_sched_idx"),
+        ]
+
+    def __str__(self):
+        return f"ScheduledJob {self.id} → {self.task_path} at {self.scheduled_at}"
 
 
 # Backward compatibility alias

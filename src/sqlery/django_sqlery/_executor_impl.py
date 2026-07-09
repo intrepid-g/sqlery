@@ -234,6 +234,22 @@ class TaskExecutor:
 
         return queryset
 
+    def _has_more_queued_jobs(self, queue_name=None):
+        """Non-locking existence probe for ready-to-run jobs.
+
+        ``get_queued_jobs`` applies ``SELECT ... FOR UPDATE SKIP LOCKED`` for
+        atomic claiming; calling ``.exists()`` on it outside a transaction
+        raises ``TransactionManagementError`` on PostgreSQL. The "are there more
+        jobs?" check needs no row lock, so it runs a plain query instead.
+        """
+        now = timezone.now()
+        queryset = QueuedJob.objects.filter(status="queued").filter(
+            Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
+        )
+        if queue_name:
+            queryset = queryset.filter(queue_name=queue_name)
+        return queryset.exists()
+
     def can_execute_job(self, job):
         """Check if job can be executed based on queue-level concurrency control.
 
@@ -484,7 +500,10 @@ class TaskExecutor:
             # If not in "once" mode, process just one job and spawn next worker
             if not once:
                 # Check if more jobs exist - spawn next worker immediately if so
-                more_jobs_exist = self.get_queued_jobs(queue_name=queue_name, limit=1).exists()
+                # Old: get_queued_jobs(...).exists() — that queryset carries
+                # SELECT FOR UPDATE SKIP LOCKED and .exists() outside a txn raised
+                # TransactionManagementError on PG. Use the non-locking probe.
+                more_jobs_exist = self._has_more_queued_jobs(queue_name=queue_name)
                 if more_jobs_exist:
                     logger.info("More jobs exist - spawning next worker immediately")
                     self._spawn_next_worker(queue_name)

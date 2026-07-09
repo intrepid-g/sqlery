@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import Index
+from sqlalchemy import BigInteger, Index, DateTime
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -56,12 +56,40 @@ class ScheduledTask(SQLModel, table=True):
 
 
 class QueuedJob(SQLModel, table=True):
-    """A job in the queue, waiting to be executed or already processed."""
+    """A job in the queue, waiting to be executed or already processed.
+
+    Schema note: composite primary key (created_at, id) mirrors the Django
+    model for partition parity. In standalone mode the id is assigned by the
+    `before_flush` listener below (a 62-bit UUID-v7-derived integer) on BOTH
+    SQLite and PostgreSQL — this guarantees no id collision between QueuedJob
+    and ScheduledJob via UUID-v7 global uniqueness. A `sqlery_job_id_seq`
+    DEFAULT also exists on the PG column (created by database.py DDL) as a
+    fallback, but the listener assigns the id before insert so the sequence is
+    not normally exercised in standalone mode. (Django mode draws ids from the
+    shared sequence directly — see migration 0029.)
+    """
 
     __tablename__ = "sqlery_queued_job"
 
-    # Primary key
-    id: int | None = Field(default=None, primary_key=True)
+    # Composite primary key — id first for SQLAlchemy ordering; created_at
+    # second so that partition pruning on created_at works for both backends.
+    #
+    # id assignment strategy (standalone mode):
+    #   The `before_flush` listener below assigns a 62-bit UUID-v7-derived
+    #   integer (time-sortable, globally unique) whenever id is None — on BOTH
+    #   SQLite and PostgreSQL. PG additionally carries a nextval('sqlery_job_id_seq')
+    #   column DEFAULT (from database.py DDL) as a safety fallback, but the
+    #   listener pre-empts it. UUID-v7 uniqueness — not the sequence — is what
+    #   guarantees QueuedJob/ScheduledJob ids never collide in standalone mode.
+    #
+    # Note: autoincrement=True is intentionally absent — SQLite does not
+    # support AUTOINCREMENT for composite primary keys and raises CompileError.
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, nullable=False),
+    )
+    # created_at is also part of the PK so partitioned tables can route rows
+    # by time range. default_factory ensures a value is always set on insert.
 
     # Task definition
     task_path: str = Field(max_length=500, description="Python path to callable (e.g., 'myapp.tasks.my_function')")
@@ -74,8 +102,10 @@ class QueuedJob(SQLModel, table=True):
     # Status
     status: str = Field(default="queued", max_length=20, index=True, description="Job status (queued/running/success/failed/archived/shutting_down)")
 
-    # Retry chain linkage
-    parent_job_id: int | None = Field(default=None, index=True, description="ID of the failed job this retry was created from (links retry chain)")
+    # Retry chain linkage. BigInteger (matching the raw DDL in
+    # fastapi_sqlery/database.py) because it stores a 64-bit QueuedJob id — a
+    # plain Integer column overflows once a failed job spawns a retry.
+    parent_job_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True, nullable=True), description="ID of the failed job this retry was created from (links retry chain)")
 
     # Retry configuration
     retry_count: int = Field(default=0, description="Current retry attempt number (0 = first attempt)")
@@ -120,8 +150,12 @@ class QueuedJob(SQLModel, table=True):
     scheduled_task_id: int | None = Field(default=None, foreign_key="sqlery_scheduled_task.id")
     worker_id: UUID | None = Field(default=None, foreign_key="sqlery_worker.id")
 
-    # Timing
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="When job was enqueued")
+    # Timing — created_at is part of the composite PK (created_at, id)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        primary_key=True,
+        description="When job was enqueued (also part of composite PK for partitioning)",
+    )
     scheduled_at: datetime | None = Field(default=None, index=True, description="When job should run (NULL = run immediately)")
     started_at: datetime | None = Field(default=None, description="When execution began")
     finished_at: datetime | None = Field(default=None, description="When execution completed")
@@ -223,6 +257,71 @@ class QueuedJob(SQLModel, table=True):
         return self.retry_backoff * (2 ** self.retry_count)
 
 
+class ScheduledJob(SQLModel, table=True):
+    """Staging table for jobs that are scheduled to run at a future time.
+
+    Mirrors Django's ScheduledJob model shape for drop-in compatibility.
+    Rows are promoted to QueuedJob when their scheduled_at time arrives.
+    The id is assigned by the same `before_flush` UUID-v7 listener as
+    QueuedJob (see QueuedJob docstring) on both SQLite and PostgreSQL, which
+    guarantees ids never collide with QueuedJob. (Django mode draws ScheduledJob
+    ids from the shared sqlery_job_id_seq — see migration 0029.)
+    """
+
+    __tablename__ = "sqlery_scheduled_job"
+
+    # Composite primary key matching QueuedJob.
+    # id follows the same two-tier assignment strategy as QueuedJob.id.
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, nullable=False),
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        primary_key=True,
+        description="When the scheduled job was created (also part of composite PK)",
+    )
+
+    # Queue configuration
+    queue_name: str = Field(
+        default="default",
+        max_length=50,
+        index=True,
+        description="Queue name for job routing",
+    )
+
+    # Task definition
+    task_path: str = Field(
+        max_length=500,
+        description="Python path to callable (e.g., 'myapp.tasks.my_function')",
+    )
+    payload: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSON),
+        description="JSON payload (keyword arguments) to pass to the task function",
+    )
+
+    # Scheduling
+    scheduled_at: datetime = Field(
+        description="When the job should be promoted to QueuedJob and executed",
+    )
+
+    # Job configuration
+    priority: int = Field(
+        default=0,
+        description="Priority for the resulting QueuedJob (higher = sooner)",
+    )
+    max_retries: int = Field(
+        default=0,
+        description="Maximum number of retry attempts (0 = no retries)",
+    )
+
+    class Config:
+        """SQLModel configuration."""
+
+        table = True
+
+
 class JobRegistry(SQLModel, table=True):
     """Track job lifecycle in registries (RQ-compatible)."""
 
@@ -231,7 +330,7 @@ class JobRegistry(SQLModel, table=True):
     # Primary key
     id: int | None = Field(default=None, primary_key=True)
 
-    # Foreign key
+    # Foreign key — references sqlery_queued_job.id (not composite FK; id is sufficient)
     job_id: int = Field(foreign_key="sqlery_queued_job.id", description="Job being tracked")
 
     # Registry type
@@ -305,3 +404,75 @@ class Worker(SQLModel, table=True):
         # from datetime import timedelta  # moved to top-level
         threshold = datetime.now(UTC) - timedelta(seconds=timeout_seconds)
         return self.last_heartbeat >= threshold
+
+
+class DaemonLease(SQLModel, table=True):
+    """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone).
+
+    Schema divergence note (WR-05): this standalone table intentionally carries
+    an extra ``version`` column that the Django ``DaemonLease`` model
+    (``django_sqlery/models.py``) does NOT have. The column backs the SQLite
+    optimistic-CAS take-over path; Django relies on ``SELECT FOR UPDATE SKIP
+    LOCKED`` and never needs it. Both stacks share the same ``db_table``
+    (``sqlery_daemon_lease``); a deployment must not run migrations from both
+    stacks against the same database, since the column sets differ by design.
+    """
+
+    __tablename__ = "sqlery_daemon_lease"
+
+    queue_name: str = Field(max_length=255, primary_key=True)
+    daemon_id: str = Field(max_length=255, description="daemon_{node_id}_{pid}")
+    node_id: str = Field(max_length=255)
+    pid: int
+    # Old (WR-04): naive columns forced re-normalization at every read site.
+    # acquired_at: datetime
+    # expires_at: datetime = Field(index=True)
+    # New (WR-04): timezone-aware columns so Postgres stores timestamptz and
+    # reads come back aware (SQLite still returns naive; comparison sites keep
+    # the UTC-normalization helper for that case).
+    acquired_at: datetime = Field(sa_column=Column(DateTime(timezone=True)))
+    expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), index=True))
+    # Optimistic locking (SQLite CAS) — mirrors QueuedJob.version (models.py:113-114)
+    version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
+
+
+# ---------------------------------------------------------------------------
+# Composite-PK id generation (event listener) — standalone mode
+# ---------------------------------------------------------------------------
+# Composite primary keys cannot use SQLite AUTOINCREMENT. When id is None
+# before a flush we assign a 62-bit time-sortable integer derived from a UUID
+# v7. This fires on BOTH SQLite and PostgreSQL in standalone mode — so even
+# though PG carries a nextval('sqlery_job_id_seq') column DEFAULT (created by
+# database.py DDL), the listener assigns the id first and the sequence default
+# is not normally exercised. UUID-v7 global uniqueness is what guarantees
+# QueuedJob and ScheduledJob ids never collide in standalone mode. (Django mode
+# uses the shared sequence directly via migration 0029; it has no listener.)
+#
+# The listener is registered on the SQLAlchemy Session class (not per-session)
+# so it applies to all sessions created from any engine.
+
+from sqlalchemy import event as _sa_event
+from sqlalchemy.orm import Session as _SASession
+
+
+def _generate_job_id_from_uuid7() -> int:
+    """Generate a 62-bit time-sortable integer from a UUID v7.
+
+    UUID v7 is a 128-bit time-ordered value.  We take the lower 62 bits
+    to stay within signed BigInteger range on all databases.
+    """
+    return uuid7().int & ((1 << 62) - 1)
+
+
+@_sa_event.listens_for(_SASession, "before_flush")
+def _assign_composite_pk_ids(session, flush_context, instances):
+    """Auto-assign id for QueuedJob/ScheduledJob rows that have id=None.
+
+    This hook fires before every flush.  It only acts on new objects
+    (session.new) whose id attribute is None, so it is safe to call
+    multiple times and does not overwrite ids supplied by the caller or
+    by a PostgreSQL sequence server_default.
+    """
+    for obj in session.new:
+        if isinstance(obj, (QueuedJob, ScheduledJob)) and obj.id is None:
+            obj.id = _generate_job_id_from_uuid7()

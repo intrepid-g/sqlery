@@ -70,8 +70,10 @@ def _build_running_job(worker_kwargs: dict | None = None, job_kwargs: dict | Non
     }
     jk.update(job_kwargs or {})
     job = QueuedJob.objects.create(**jk)
-    worker.current_job = job
-    worker.save(update_fields=["current_job"])
+    # Old: worker.current_job = job  (FK demoted to current_job_id BigIntegerField in Phase 15)
+    # Old: worker.save(update_fields=["current_job"])
+    worker.current_job_id = job.id
+    worker.save(update_fields=["current_job_id"])
     return worker, job
 
 
@@ -116,17 +118,21 @@ class TestZombie5CheckSequence:
             # current_job points elsewhere — job is abandoned. Create a real
             # other job so the FK constraint is satisfied.
             from sqlery.django_sqlery.models import QueuedJob
+
             other = QueuedJob.objects.create(
                 task_path="tests.chaos.conftest.task_succeeds",
                 queue_name="default",
                 status="running",
             )
-            worker.current_job = other
-            worker.save(update_fields=["current_job"])
+            # Old: worker.current_job = other  (FK demoted in Phase 15)
+            # Old: worker.save(update_fields=["current_job"])
+            worker.current_job_id = other.id
+            worker.save(update_fields=["current_job_id"])
         elif case == "heartbeat_stale":
             # Push heartbeat well past 3 * WORKER_ALIVE_TIMEOUT (default 30s).
             # last_heartbeat is auto_now=True so save() resets it — use update().
             from sqlery.django_sqlery.models import Worker as W
+
             W.objects.filter(pk=worker.pk).update(
                 last_heartbeat=timezone.now() - timedelta(hours=1)
             )
@@ -138,8 +144,7 @@ class TestZombie5CheckSequence:
 
         job.refresh_from_db()
         assert job.status == "failed", (
-            f"case={case}: expected zombie sweep to mark job failed, "
-            f"got status={job.status!r}"
+            f"case={case}: expected zombie sweep to mark job failed, " f"got status={job.status!r}"
         )
         assert (job.termination_reason or "").startswith("zombie") or "zombie" in (
             job.termination_reason or ""
@@ -241,13 +246,22 @@ def _lease_supported(backend) -> bool:
         # Signature drift between Django and SQLAlchemy backends — treat as
         # 'unsupported on this backend' rather than masking other bugs.
         return False
+    # WR-01 (11-REVIEW): a RuntimeError here means the engine/config is not
+    # ready (uninitialized standalone _engine). Treat as 'unsupported in this
+    # run' rather than claiming support and then erroring on the real _claim().
+    # Old: except Exception: return True  # masked RuntimeError("Database not initialized")
+    except RuntimeError:
+        return False
     except Exception:
         return True
 
 
 def _claim(backend, queue: str, daemon_id: str, lease_secs: int = 30):
     return backend.claim_queue_leases(
-        queues=[queue], daemon_id=daemon_id, node_id="chaos", pid=os.getpid(),
+        queues=[queue],
+        daemon_id=daemon_id,
+        node_id="chaos",
+        pid=os.getpid(),
         lease_secs=lease_secs,
     )
 
@@ -265,15 +279,25 @@ class TestLeaseExpiry:
         if not _lease_supported(backend):
             pytest.skip("active backend does not implement queue leases")
 
-        # Acquire with a near-zero TTL, wait it out, re-acquire from a
-        # different daemon_id — the takeover must succeed.
+        # WR-04 (11-REVIEW): force expiry via a PAST expires_at write instead of
+        # a real time.sleep(1.5) — mirrors the parity cells' "no real TTL sleep"
+        # convention (11-PATTERNS) and removes 1.5s of wall-clock per run.
+        # Acquire, expire the lease in-place, then re-acquire from a different
+        # daemon_id — the takeover must succeed.
         first = _claim(backend, "chaos-q", "daemon-a", lease_secs=1)
         assert "chaos-q" in (first or [])
-        import time
+        # Old (real wall-clock sleep aged a 1s lease):
+        # import time
+        # time.sleep(1.5)
+        from django.utils import timezone
 
-        time.sleep(1.5)
+        from sqlery.django_sqlery.models import DaemonLease
+
+        DaemonLease.objects.filter(queue_name="chaos-q").update(
+            expires_at=timezone.now() - timedelta(seconds=5)
+        )
         second = _claim(backend, "chaos-q", "daemon-b", lease_secs=10)
-        assert "chaos-q" in (second or [])
+        assert "chaos-q" in (second or []), "expired lease must be re-claimable by daemon-b"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -343,3 +367,106 @@ class TestLeaseGracefulRelease:
         _release(backend, "graceful", "alpha")
         second = _claim(backend, "graceful", "beta", lease_secs=60)
         assert "graceful" in (second or []), "release should allow immediate re-acquire"
+
+
+# ---------------------------------------------------------------------------
+# Standalone-backend failover on Postgres (PARITY-01, standalone half)
+# ---------------------------------------------------------------------------
+# TestLeaseExpiry / TestLeaseContentionPostgres above cover the active-backend
+# (Django, under pytest-django) lease-takeover path. This class proves the SAME
+# takeover on the STANDALONE SQLAlchemyBackend bound to a real PG service — the
+# standalone half of PARITY-01's real-backend failover. Expiry is forced via a
+# PAST expires_at write (no real TTL sleep), matching the 11-PATTERNS convention.
+
+
+@pytest.fixture
+def pg_standalone_backend(monkeypatch):
+    """Per-test standalone SQLAlchemyBackend bound to a real PG service.
+
+    Mirrors ``tests/unit/test_sqlalchemy_backend_sync.py::pg_sync_backend``:
+    auto-skips when ``SQLERY_TEST_PG_URL`` is unset and rebuilds the schema
+    (``drop_all`` / ``create_all``) so each cell starts from an empty DB
+    (mitigates T-11-02-04: no cross-cell lease-row leakage).
+    """
+    pg_url = os.environ.get("SQLERY_TEST_PG_URL")
+    if not pg_url:
+        pytest.skip("SQLERY_TEST_PG_URL not set; PG mirror skipped")
+
+    from sqlalchemy import create_engine
+    from sqlmodel import SQLModel
+    from sqlery.fastapi_sqlery import database as db_mod
+    from sqlery.core import models as _core_models  # noqa: F401
+
+    engine = create_engine(pg_url, future=True)
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+    from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+    backend = SQLAlchemyBackend()
+    try:
+        yield backend
+    finally:
+        try:
+            SQLModel.metadata.drop_all(engine)
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.standalone_pg  # CR-01 (11-REVIEW): genuinely-standalone PG cell (real SQLAlchemy engine).
+class TestStandaloneLeaseFailoverPostgres:
+    """Standalone SQLAlchemyBackend lease takeover on a real Postgres service.
+
+    The standalone half of PARITY-01's real-backend failover: once the leader
+    (``daemon-a``) dies, a second daemon (``daemon-b``) re-claims the queue.
+    """
+
+    def test_expired_standalone_lease_is_taken_over_pg(self, pg_standalone_backend):
+        from datetime import datetime, UTC
+
+        from sqlmodel import select
+        from sqlery.core.models import DaemonLease
+
+        backend = pg_standalone_backend
+
+        # Leader daemon-a claims the queue.
+        first = backend.claim_queue_leases(
+            queues=["failover-standalone-q"],
+            daemon_id="daemon-a",
+            node_id="node-a",
+            pid=1,
+            lease_secs=300,
+        )
+        assert first == ["failover-standalone-q"]
+
+        # Leader dies: force its lease expired by writing a PAST expires_at
+        # through the backend's own session (NEVER a real ~30s TTL sleep).
+        with backend._get_session() as session:
+            row = session.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "failover-standalone-q")
+            ).first()
+            assert row is not None
+            row.expires_at = datetime.now(UTC) - timedelta(seconds=30)
+            session.add(row)
+            session.commit()
+
+        # A second daemon takes over the dead leader's expired lease.
+        second = backend.claim_queue_leases(
+            queues=["failover-standalone-q"],
+            daemon_id="daemon-b",
+            node_id="node-b",
+            pid=2,
+            lease_secs=300,
+        )
+        assert "failover-standalone-q" in (
+            second or []
+        ), "daemon-b must take over the expired standalone lease"
+
+        # Ownership transferred to daemon-b.
+        with backend._get_session() as session:
+            owner = session.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "failover-standalone-q")
+            ).first()
+            assert owner.daemon_id == "daemon-b"

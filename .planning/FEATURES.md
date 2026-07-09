@@ -10,14 +10,21 @@ What this app currently does.
 - Fork-per-job execution uses hook-based connection lifecycle (`ForkSafeExecutor`) — DB connections are guaranteed closed before fork and reopened after, with leak verification
 - Daemon manages worker pool lifecycle and scheduled task enqueueing
 - Dashboard and CLI for job monitoring and management
+- Dashboard shows a Delete button on stale workers (no heartbeat for >5 min); clicking removes the worker and reloads the table in place. A beating (recently active) worker cannot be deleted (server rejects with 409).
 
 ## Bug fixes
 
 - 2025-05-18: Fix workers unable to claim jobs due to race condition in worker registration. Workers now auto-register on-demand if not found during claim attempt.
 - 2026-05-21: Fix standalone sync backend unconditionally using SELECT FOR UPDATE SKIP LOCKED on SQLite, which does not support row-level locking and caused race conditions where multiple workers could claim the same job. Now uses optimistic version-CAS updates on SQLite while keeping SKIP LOCKED on PostgreSQL.
 
+## Shipped
+
+- 2026-06-16 — Delete stale workers from the dashboard
+
 ## Known gaps (deferred from bites)
 
+- Worker delete relies on heartbeat age only — it does not verify the OS process (PID) is actually dead
+- Worker delete staleness threshold (5 min) is hardcoded, not configurable per deployment
 - Worker auto-registration could use retry with exponential backoff instead of immediate creation
 - Worker registration security: no whitelist validation or shared secret required
 - Multi-worker PostgreSQL concurrent claim stress test under real contention (PG-only, needs CI service)

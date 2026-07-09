@@ -262,7 +262,9 @@ class TestRetryAndTTL:
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
 
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
             session.add(row)
             session.commit()
@@ -601,12 +603,23 @@ class TestCleanup:
         with sync_backend._get_session() as session:
             from sqlery.core.models import QueuedJob
 
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.created_at = datetime.now(UTC) - timedelta(days=30)
             session.add(row)
             session.commit()
         result = sync_backend.cleanup_jobs(max_age_days=1)
         assert result["deleted"] >= 1
+
+    def test_cleanup_jobs_max_age_dry_run(self, sync_backend):
+        # CR-01 regression: on the SQLite/non-partitioned branch, the dry_run
+        # path referenced `cutoff` before it was assigned, raising
+        # NameError when called with max_age_days + dry_run together.
+        _create_basic_job(sync_backend)
+        result = sync_backend.cleanup_jobs(max_age_days=7, dry_run=True)
+        assert result["deleted"] == 0
+        assert "count" in result
 
     def test_cleanup_jobs_by_count(self, sync_backend):
         for _ in range(5):
@@ -741,7 +754,9 @@ class TestMiscMethods:
         from sqlery.core.models import QueuedJob
 
         with sync_backend._get_session() as session:
-            row = session.get(QueuedJob, j.id)
+            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
+            from sqlmodel import select as _select
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
             row.tags = ["acme"]
             row.status = "running"
             session.add(row)
@@ -975,3 +990,241 @@ class TestLeaseLifecyclePostgres:
             lease_secs=60,
         )
         assert second == []
+
+    def test_expired_lease_taken_over_under_concurrent_lock(self, pg_sync_backend):
+        """CR-01 regression: an EXPIRED lease row held (locked) inside another
+        open transaction must still be taken over by a second claimant.
+
+        The old ``SELECT FOR UPDATE SKIP LOCKED`` probe returned zero rows when
+        the row was locked by an open transaction, so the second daemon fell
+        into the INSERT branch (PK conflict -> IntegrityError -> False) and the
+        expired lease was left unclaimed for that cycle. With a blocking row
+        lock, the second daemon waits for the lock, then observes the expired
+        row and takes it over.
+        """
+        import threading
+        from datetime import datetime, timedelta, UTC
+
+        from sqlmodel import select
+        from sqlery.core.models import DaemonLease
+
+        # Seed an EXPIRED lease held by daemon d1.
+        assert pg_sync_backend.claim_queue_leases(
+            queues=["pg-takeover"], daemon_id="d1", node_id="n1", pid=1, lease_secs=60
+        ) == ["pg-takeover"]
+        with pg_sync_backend._get_session() as session:
+            row = session.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "pg-takeover")
+            ).first()
+            row.expires_at = datetime.now(UTC) - timedelta(seconds=30)
+            session.add(row)
+            session.commit()
+
+        # Open a transaction that locks the (expired) lease row and holds the
+        # lock while a second daemon attempts to claim in another thread.
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        holder_session = pg_sync_backend._get_session()
+        try:
+            locked = holder_session.exec(
+                select(DaemonLease)
+                .where(DaemonLease.queue_name == "pg-takeover")
+                .with_for_update()
+            ).first()
+            assert locked is not None
+            lock_acquired.set()
+
+            takeover_result: list[list[str]] = []
+
+            def claim_from_other_daemon():
+                lock_acquired.wait(timeout=5)
+                takeover_result.append(
+                    pg_sync_backend.claim_queue_leases(
+                        queues=["pg-takeover"],
+                        daemon_id="d2",
+                        node_id="n2",
+                        pid=2,
+                        lease_secs=60,
+                    )
+                )
+
+            t = threading.Thread(target=claim_from_other_daemon)
+            t.start()
+            # Give the claimant time to block on the row lock, then release.
+            release_lock.wait(timeout=0.5)
+            holder_session.rollback()  # release the lock without altering the row
+            t.join(timeout=10)
+        finally:
+            holder_session.close()
+
+        # The blocking lock makes the expired row visible; d2 takes it over.
+        assert takeover_result == [["pg-takeover"]]
+        owner = pg_sync_backend._get_session()
+        try:
+            final = owner.exec(
+                select(DaemonLease).where(DaemonLease.queue_name == "pg-takeover")
+            ).first()
+            assert final.daemon_id == "d2"
+        finally:
+            owner.close()
+
+
+# ---------------------------------------------------------------------------
+# 11. SQLite lease lifecycle (LEASE-03/04/05)
+# ---------------------------------------------------------------------------
+# Mirrors the FakeBackend lease contract in tests/unit/test_daemon.py
+# (TestLeaseLifecycle) against the real SQLite-backed SQLAlchemyBackend.
+
+
+def _read_lease(backend, queue_name):
+    """Return the DaemonLease row for a queue, or None, via the backend session."""
+    from sqlmodel import select
+    from sqlery.core.models import DaemonLease
+
+    with backend._get_session() as session:
+        return session.exec(select(DaemonLease).where(DaemonLease.queue_name == queue_name)).first()
+
+
+def _count_leases(backend):
+    """Return the total number of DaemonLease rows via the backend session."""
+    from sqlmodel import select
+    from sqlery.core.models import DaemonLease
+
+    with backend._get_session() as session:
+        return len(session.exec(select(DaemonLease)).all())
+
+
+class TestSQLAlchemyLeaseLifecycle:
+    """Lease claim/renew/release lifecycle on the real SQLite backend."""
+
+    def test_claim_free_queue_inserts_and_returns(self, sync_backend):
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1", "q2"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        assert set(owned) == {"q1", "q2"}
+        assert _count_leases(sync_backend) == 2
+        assert _read_lease(sync_backend, "q1").daemon_id == "d1"
+        assert _read_lease(sync_backend, "q2").daemon_id == "d1"
+
+    def test_claim_skips_live_lease_of_other_daemon(self, sync_backend):
+        pre = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="other", node_id="n1", pid=1, lease_secs=300
+        )
+        assert pre == ["q1"]
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="self", node_id="n2", pid=2, lease_secs=30
+        )
+        assert owned == []
+        # Live holder is untouched.
+        assert _read_lease(sync_backend, "q1").daemon_id == "other"
+
+    def test_expired_lease_is_reclaimed(self, sync_backend):
+        # Seed a lease held by another daemon that is already expired.
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="other", node_id="n1", pid=1, lease_secs=300
+        )
+        with sync_backend._get_session() as session:
+            from sqlmodel import select
+            from sqlery.core.models import DaemonLease
+
+            row = session.exec(select(DaemonLease).where(DaemonLease.queue_name == "q1")).first()
+            row.expires_at = datetime.now(UTC) - timedelta(seconds=10)
+            session.add(row)
+            session.commit()
+
+        owned = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="self", node_id="n2", pid=2, lease_secs=30
+        )
+        assert owned == ["q1"]
+        reclaimed = _read_lease(sync_backend, "q1")
+        assert reclaimed.daemon_id == "self"
+        assert reclaimed.node_id == "n2"
+        assert reclaimed.pid == 2
+        # Take-over must still be a single row (no duplicate insert).
+        assert _count_leases(sync_backend) == 1
+
+    def test_reclaim_own_live_lease_is_idempotent(self, sync_backend):
+        first = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=300
+        )
+        assert first == ["q1"]
+        # Re-claiming a queue we already hold (still live) is treated as held.
+        again = sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=300
+        )
+        assert again == ["q1"]
+        assert _count_leases(sync_backend) == 1
+
+    def test_renew_extends_expires_at(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=5
+        )
+        original = _read_lease(sync_backend, "q1").expires_at
+        sync_backend.renew_queue_leases(["q1"], "d1", lease_secs=60)
+        assert _read_lease(sync_backend, "q1").expires_at > original
+
+    def test_renew_by_wrong_daemon_is_noop(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=5
+        )
+        original = _read_lease(sync_backend, "q1").expires_at
+        # A renew from a non-owner daemon must not change expires_at.
+        sync_backend.renew_queue_leases(["q1"], "intruder", lease_secs=600)
+        assert _read_lease(sync_backend, "q1").expires_at == original
+
+    def test_release_deletes_only_owned(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1", "q2"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        sync_backend.release_queue_leases(["q1", "q2"], "d1")
+        assert _read_lease(sync_backend, "q1") is None
+        assert _read_lease(sync_backend, "q2") is None
+        assert _count_leases(sync_backend) == 0
+
+    def test_release_by_wrong_daemon_leaves_row_intact(self, sync_backend):
+        sync_backend.claim_queue_leases(
+            queues=["q1"], daemon_id="d1", node_id="n1", pid=1, lease_secs=30
+        )
+        # A release from a non-owner daemon must not delete the row.
+        sync_backend.release_queue_leases(["q1"], "intruder")
+        assert _read_lease(sync_backend, "q1") is not None
+        assert _read_lease(sync_backend, "q1").daemon_id == "d1"
+
+    def test_concurrent_claim_one_winner(self, sync_backend):
+        """Two threads racing to claim the same free queue: exactly one wins."""
+        import threading
+
+        results = []
+        lock = threading.Lock()
+
+        def claim(daemon_id):
+            owned = sync_backend.claim_queue_leases(
+                queues=["race"], daemon_id=daemon_id, node_id="n", pid=1, lease_secs=60
+            )
+            with lock:
+                results.append(owned == ["race"])
+
+        t1 = threading.Thread(target=claim, args=("d1",))
+        t2 = threading.Thread(target=claim, args=("d2",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Optimistic CAS / unique PK guarantees a single lease row regardless of
+        # how many threads observed the queue as free.
+        assert results.count(True) == 1
+        assert _count_leases(sync_backend) == 1
+
+    def test_daemon_call_contract_matches_signatures(self, sync_backend):
+        """Pin LEASE-05: the daemon's exact call shape (daemon.py:363/413) works.
+
+        The daemon calls ``claim_queue_leases(queues, daemon_id, node_id, pid,
+        lease_secs)``; confirm that arity is satisfiable and returns a list,
+        without spawning the daemon process.
+        """
+        owned = sync_backend.claim_queue_leases(
+            ["default"], daemon_id="daemon_node_1", node_id="node", pid=1, lease_secs=30
+        )
+        assert isinstance(owned, list)
+        assert owned == ["default"]

@@ -907,7 +907,11 @@ function updateWorkers(data) {
             } else {
                 heartbeatText = formatDateTime(worker.last_heartbeat);
             }
-            const heartbeatDisplay = `<span style="${heartbeatStyle}"${heartbeatTitle}>${heartbeatText}</span>`;
+            let heartbeatDisplay = `<span style="${heartbeatStyle}"${heartbeatTitle}>${heartbeatText}</span>`;
+            // Stale (non-beating) workers can be removed by the user; beating ones cannot.
+            if (worker.is_deletable) {
+                heartbeatDisplay += ` <button class="btn btn-danger btn-small" style="margin-left:0.5rem;padding:2px 8px;font-size:0.8em;" onclick="event.stopPropagation();deleteWorker('${worker.id}')">Delete</button>`;
+            }
 
             const cellValues = [
                 `<code style="font-size:0.85em;" title="${escapeHtml(worker.id)}">${escapeHtml(worker.friendly_name || worker.id.substring(0,8))}</code>`,
@@ -1171,6 +1175,13 @@ async function workerAction(workerId, action, extraBody = {}) {
 function restartWorker(workerId) {
     if (!confirm('Restart this worker?\n\nThis sends SIGTERM to the process. The daemon will spawn a replacement within ~10 seconds.')) return;
     workerAction(workerId, 'restart');
+}
+
+function deleteWorker(workerId) {
+    if (!confirm('Remove this stale worker?\n\nOnly workers that have stopped beating can be removed. On success the row disappears in place.')) return;
+    // workerAction POSTs {action:'delete'}, then refreshAll() reloads the workers table in
+    // place — the removed worker is no longer in the list, so its row vanishes.
+    workerAction(workerId, 'delete');
 }
 
 function workerPauseFor(workerId) {
