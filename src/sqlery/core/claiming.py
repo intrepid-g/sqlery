@@ -258,9 +258,16 @@ def claim_next_job_with_queue_priority(
         # Old: if hasattr(worker, 'current_job'): worker.current_job = job
         if hasattr(worker, 'current_job_id'):
             worker.current_job_id = job.id
+        if hasattr(worker, 'last_heartbeat'):
+            # Refresh heartbeat on claim so an idle worker's stale pre-claim
+            # heartbeat doesn't briefly trip the dashboard's stale-worker warning.
+            worker.last_heartbeat = datetime.now(timezone.utc)
         if hasattr(worker, 'save'):
             # Old: worker.save(update_fields=["status", "current_job"])
-            worker.save(update_fields=["status", "current_job_id"])
+            update_fields = ["status", "current_job_id"]
+            if hasattr(worker, 'last_heartbeat'):
+                update_fields.append("last_heartbeat")
+            worker.save(update_fields=update_fields)
 
         # Track in registry
         if enable_registries:
