@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `JobExecutor._kill_worker_process()` (used by the admin "Stop Job" action) never reaped the killed child, leaking it as a permanent zombie under a PID-1 worker container. Its `os.kill(pid, 0)` liveness check couldn't tell a live process from an un-reaped zombie (both answer signal-0 successfully), so termination was never actually observed. Liveness now goes through `os.waitpid(pid, os.WNOHANG)`, which detects exit and reaps in the same call.
+
 ## [0.24.5] - 2026-07-08
 
 ### Fixed

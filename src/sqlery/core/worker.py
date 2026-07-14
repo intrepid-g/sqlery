@@ -362,6 +362,25 @@ class JobExecutor:
                         f"Stale job {job.id} will be retried as job {retry_job.id}"
                     )
 
+    @staticmethod
+    def _reaped(pid: int) -> bool:
+        """Non-blocking check-and-reap: True once `pid` has exited and been reaped.
+
+        Uses `os.waitpid(pid, os.WNOHANG)` instead of `os.kill(pid, 0)` for
+        liveness — a zombie (exited but un-reaped) child still answers
+        `os.kill(pid, 0)` successfully because it's still in the process
+        table, so that check alone can never observe termination and the
+        child is left as a permanent zombie under a PID-1 worker (no init to
+        reap orphans). `waitpid(WNOHANG)` both detects exit and reaps in one
+        step.
+        """
+        try:
+            reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            # Not our child (or already reaped by something else) — treat as gone.
+            return True
+        return reaped_pid == pid
+
     def _kill_worker_process(self, pid: int) -> bool:
         """Kill a worker process by PID. Tries SIGTERM then SIGKILL."""
         try:
@@ -375,19 +394,18 @@ class JobExecutor:
 
             for _ in range(10):
                 time.sleep(0.5)
-                try:
-                    os.kill(pid, 0)
-                except OSError:
+                if self._reaped(pid):
                     logger.info(f"Worker process {pid} terminated gracefully")
                     return True
 
             logger.warning(f"Worker process {pid} did not terminate, sending SIGKILL")
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
             time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if self._reaped(pid):
                 logger.info(f"Worker process {pid} killed with SIGKILL")
                 return True
 
