@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from unittest import mock
@@ -357,6 +358,35 @@ class TestCleanupStaleJobs:
         ex = JobExecutor(backend=fake_backend)
         ex.cleanup_stale_jobs()
         assert fresh.status == "running"
+
+
+class TestKilledChildIsReaped:
+    """Real-subprocess coverage for the zombie-reap fix (_kill_worker_process).
+
+    Spawns an actual short-lived child via `os.fork()`, kills it through the
+    worker's kill helper, then asserts the child is fully reaped rather than
+    left as a zombie in the process table: `os.waitpid(pid, os.WNOHANG)` on an
+    already-reaped pid raises `ChildProcessError`. If the fix regressed (kill
+    without waitpid), the child would still be a zombie and `waitpid` would
+    instead return `(pid, status)` on the first call — the wrong polarity,
+    caught by the assertion below.
+    """
+
+    def _spawn_sleeper(self) -> int:
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(5)
+            os._exit(0)
+        return pid
+
+    def test_kill_worker_process_reaps_child(self, fake_backend):
+        pid = self._spawn_sleeper()
+        ex = JobExecutor(backend=fake_backend)
+
+        assert ex._kill_worker_process(pid) is True
+
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
 
 
 # ---------------------------------------------------------------------------
