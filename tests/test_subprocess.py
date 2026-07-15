@@ -109,33 +109,32 @@ class TestExecutionStrategy:
         assert get_execution_strategy() == "thread"
 
     def test_django_tasks_mode_explicit(self, settings):
-        """EXECUTION_MODE='django-tasks' should return django-tasks if available."""
+        """EXECUTION_MODE='django-tasks' should return django-tasks (installed in dev extra)."""
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "django-tasks"}
-        # django_tasks is likely not installed, so it should fallback to subprocess
-        # or return django-tasks if installed
-        result = get_execution_strategy()
-        assert result in ["django-tasks", "subprocess"]
+        assert get_execution_strategy() == "django-tasks"
 
-    def test_django_tasks_mode_fallback(self, settings):
+    def test_django_tasks_mode_fallback(self, settings, monkeypatch):
         """EXECUTION_MODE='django-tasks' should fallback to subprocess if unavailable."""
+        import sqlery.django_sqlery.subprocess_executor as subprocess_executor_module
+
+        monkeypatch.setattr(subprocess_executor_module, "django_tasks", None)
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "django-tasks"}
-        # django_tasks not available (ImportError will be raised)
         assert get_execution_strategy() == "subprocess"
 
     def test_auto_mode_with_django_tasks(self, settings):
-        """Auto mode should prefer django-tasks if USE_DJANGO_TASKS=True."""
+        """Auto mode should prefer django-tasks if USE_DJANGO_TASKS=True (installed in dev extra)."""
         settings.DJANGO_SQL_JOBS = {
             "EXECUTION_MODE": "auto",
             "USE_DJANGO_TASKS": True,
         }
-        # Will be either django-tasks or subprocess depending on if django_tasks is installed
-        strategy = get_execution_strategy()
-        assert strategy in ["django-tasks", "subprocess"]
+        assert get_execution_strategy() == "django-tasks"
 
-    def test_auto_mode_without_django_tasks(self, settings):
+    def test_auto_mode_without_django_tasks(self, settings, monkeypatch):
         """Auto mode should use subprocess if django-tasks unavailable."""
+        import sqlery.django_sqlery.subprocess_executor as subprocess_executor_module
+
+        monkeypatch.setattr(subprocess_executor_module, "django_tasks", None)
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "auto"}
-        # django_tasks not available
         assert get_execution_strategy() == "subprocess"
 
     def test_invalid_mode_fallback(self, settings):
