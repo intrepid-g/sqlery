@@ -95,6 +95,12 @@ Items acknowledged at v0.23.0 milestone close (all pre-existing from prior miles
 | quick_task | worker-security (20260521) | missing | 2026-06-08 |
 | quick_task | 260525-myr-make-compat-rq-py-backend-agnostic-so-st | unknown | 2026-06-08 |
 
+## Quick Tasks Completed
+
+| ID | Task | Date | Deliverable |
+|----|------|------|-------------|
+| 260715-ey7 | Honest doc: alternative run modes not fully implemented/tested | 2026-07-15 | docs/internal/RUN_MODES_STATUS.md (untracked — docs/internal/ gitignored by repo convention) |
+
 ## Session Continuity
 
 Last session: 2026-06-14T18:10:35.656Z
