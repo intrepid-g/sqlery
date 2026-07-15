@@ -79,6 +79,26 @@ def _process_queue_subprocess(queue_name: str | None = None):
 # ===== Django-Tasks Mode =====
 
 
+def _run_due_tasks_job():
+    """Module-level job body for django-tasks scheduler enqueue.
+
+    django-tasks requires the decorated function to be a module-level function
+    (it rejects closures via ``is_module_level_function``), so this cannot be
+    nested inside ``_enqueue_django_tasks``.
+    """
+    executor = TaskExecutor()
+    return executor.run_due_tasks()
+
+
+def _run_queue_job(queue_name: str | None = None):
+    """Module-level job body for django-tasks queue processing.
+
+    See ``_run_due_tasks_job`` docstring for why this must be module-level.
+    """
+    executor = TaskExecutor()
+    return executor.run_queue_workers(queue_name=queue_name, once=True)
+
+
 def _enqueue_django_tasks():
     """Enqueue jobs for due tasks via django-tasks."""
     if task is None:
@@ -86,19 +106,7 @@ def _enqueue_django_tasks():
         _enqueue_synchronously()
         return
 
-    # try:
-    #     from django_tasks import task  # moved to top-level
-    # except ImportError:
-    #     ...
-
-    @task()
-    def enqueue_due_tasks():
-        # from .executor import TaskExecutor  # moved to top-level
-
-        executor = TaskExecutor()
-        return executor.run_due_tasks()
-
-    enqueue_due_tasks()
+    task(_run_due_tasks_job).enqueue()
     logger.info("Triggered scheduler via django-tasks")
 
 
@@ -109,19 +117,7 @@ def _process_queue_django_tasks(queue_name: str | None = None):
         _process_queue_synchronously(queue_name)
         return
 
-    # try:
-    #     from django_tasks import task  # moved to top-level
-    # except ImportError:
-    #     ...
-
-    @task()
-    def process_queue():
-        # from .executor import TaskExecutor  # moved to top-level
-
-        executor = TaskExecutor()
-        return executor.run_queue_workers(queue_name=queue_name, once=True)
-
-    process_queue()
+    task(_run_queue_job).enqueue(queue_name)
     logger.info("Triggered worker via django-tasks")
 
 

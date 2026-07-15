@@ -142,41 +142,53 @@ except ImportError:
 
 
 class TestDjangoTasksMode:
-    """Test django-tasks execution mode."""
+    """Test django-tasks execution mode.
+
+    ``sqlery.triggers`` does ``from django_tasks import task`` at module load
+    time, so patching ``django_tasks.task`` after import has no effect on the
+    name bound in ``sqlery.triggers`` -- the module-under-test's own ``task``
+    attribute must be patched instead.
+    """
 
     @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
-    @patch("django_tasks.task")
+    @patch("sqlery.triggers.task")
     def test_enqueue_django_tasks_uses_task_decorator(self, mock_task):
-        """Should use @task decorator from django-tasks."""
-        mock_task_func = MagicMock()
-        mock_task.return_value = lambda f: mock_task_func
-        from sqlery.triggers import _enqueue_django_tasks
+        """Should wrap the module-level job with @task and enqueue it."""
+        mock_task_instance = MagicMock()
+        mock_task.return_value = mock_task_instance
+        from sqlery.triggers import _enqueue_django_tasks, _run_due_tasks_job
         _enqueue_django_tasks()
-        mock_task.assert_called_once()
+        mock_task.assert_called_once_with(_run_due_tasks_job)
+        mock_task_instance.enqueue.assert_called_once_with()
 
     @patch("sqlery.triggers._enqueue_synchronously")
-    def test_enqueue_django_tasks_fallsback_on_import_error(self, mock_sync):
-        """Should fallback to synchronous if django-tasks not available."""
+    def test_enqueue_django_tasks_fallsback_when_unavailable(self, mock_sync, monkeypatch):
+        """Should fallback to synchronous when django-tasks is unavailable."""
+        import sqlery.triggers as triggers_module
+
+        monkeypatch.setattr(triggers_module, "task", None)
         from sqlery.triggers import _enqueue_django_tasks
-        # The function should fallback since django_tasks is not installed
         _enqueue_django_tasks()
         mock_sync.assert_called_once()
 
     @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
-    @patch("django_tasks.task")
+    @patch("sqlery.triggers.task")
     def test_process_queue_django_tasks_uses_task_decorator(self, mock_task):
-        """Should use @task decorator from django-tasks."""
-        mock_task_func = MagicMock()
-        mock_task.return_value = lambda f: mock_task_func
-        from sqlery.triggers import _process_queue_django_tasks
+        """Should wrap the module-level job with @task and enqueue it."""
+        mock_task_instance = MagicMock()
+        mock_task.return_value = mock_task_instance
+        from sqlery.triggers import _process_queue_django_tasks, _run_queue_job
         _process_queue_django_tasks(queue_name="email")
-        mock_task.assert_called_once()
+        mock_task.assert_called_once_with(_run_queue_job)
+        mock_task_instance.enqueue.assert_called_once_with("email")
 
     @patch("sqlery.triggers._process_queue_synchronously")
-    def test_process_queue_django_tasks_fallsback_on_import_error(self, mock_sync):
-        """Should fallback to synchronous if django-tasks not available."""
+    def test_process_queue_django_tasks_fallsback_when_unavailable(self, mock_sync, monkeypatch):
+        """Should fallback to synchronous when django-tasks is unavailable."""
+        import sqlery.triggers as triggers_module
+
+        monkeypatch.setattr(triggers_module, "task", None)
         from sqlery.triggers import _process_queue_django_tasks
-        # The function should fallback since django_tasks is not installed
         _process_queue_django_tasks(queue_name="email")
         mock_sync.assert_called_once_with("email")
 
