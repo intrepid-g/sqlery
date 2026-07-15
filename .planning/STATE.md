@@ -100,6 +100,7 @@ Items acknowledged at v0.23.0 milestone close (all pre-existing from prior miles
 | ID | Task | Date | Deliverable |
 |----|------|------|-------------|
 | 260715-ey7 | Honest doc: alternative run modes not fully implemented/tested | 2026-07-15 | docs/internal/RUN_MODES_STATUS.md (untracked — docs/internal/ gitignored by repo convention) |
+| 260715-inf | django-tasks in dev extra (+ fixed a nested-closure bug it unlocked); added async worker Postgres E2E coverage (+ found & xfailed a real DjangoAsyncBackend.acursor() bug on PG) | 2026-07-15 | commits d85d1cb, b55213d; .planning/quick/260715-inf-django-tasks-in-dev-extra-async-worker-p/260715-inf-SUMMARY.md |
 
 ## Session Continuity
 
