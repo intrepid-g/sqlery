@@ -151,56 +151,45 @@ class TestDjangoTasksMode:
     """
 
     @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
-    @patch("sqlery.triggers.task")
-    def test_enqueue_django_tasks_uses_task_decorator(self, mock_task):
-        """Should wrap the module-level job with @task and enqueue it."""
-        mock_task_instance = MagicMock()
-        mock_task.return_value = mock_task_instance
-        from sqlery.triggers import _enqueue_django_tasks, _run_due_tasks_job
+    @patch("sqlery.triggers._due_tasks_task")
+    def test_enqueue_django_tasks_enqueues_module_task(self, mock_task_obj):
+        """Should enqueue the module-level django-tasks Task."""
+        from sqlery.triggers import _enqueue_django_tasks
         _enqueue_django_tasks()
-        mock_task.assert_called_once_with(_run_due_tasks_job)
-        mock_task_instance.enqueue.assert_called_once_with()
+        mock_task_obj.enqueue.assert_called_once_with()
 
     @patch("sqlery.triggers._enqueue_synchronously")
     def test_enqueue_django_tasks_fallsback_when_unavailable(self, mock_sync, monkeypatch):
         """Should fallback to synchronous when django-tasks is unavailable."""
         import sqlery.triggers as triggers_module
 
-        monkeypatch.setattr(triggers_module, "task", None)
+        monkeypatch.setattr(triggers_module, "_due_tasks_task", None)
         from sqlery.triggers import _enqueue_django_tasks
         _enqueue_django_tasks()
         mock_sync.assert_called_once()
 
     @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
-    @patch("sqlery.triggers.task")
-    def test_process_queue_django_tasks_uses_task_decorator(self, mock_task):
-        """Should wrap the module-level job with @task and enqueue it."""
-        mock_task_instance = MagicMock()
-        mock_task.return_value = mock_task_instance
-        from sqlery.triggers import _process_queue_django_tasks, _run_queue_job
+    @patch("sqlery.triggers._queue_task")
+    def test_process_queue_django_tasks_enqueues_module_task(self, mock_task_obj):
+        """Should enqueue the module-level django-tasks Task with the queue name."""
+        from sqlery.triggers import _process_queue_django_tasks
         _process_queue_django_tasks(queue_name="email")
-        mock_task.assert_called_once_with(_run_queue_job)
-        mock_task_instance.enqueue.assert_called_once_with("email")
+        mock_task_obj.enqueue.assert_called_once_with("email")
 
     @patch("sqlery.triggers._process_queue_synchronously")
     def test_process_queue_django_tasks_fallsback_when_unavailable(self, mock_sync, monkeypatch):
         """Should fallback to synchronous when django-tasks is unavailable."""
         import sqlery.triggers as triggers_module
 
-        monkeypatch.setattr(triggers_module, "task", None)
+        monkeypatch.setattr(triggers_module, "_queue_task", None)
         from sqlery.triggers import _process_queue_django_tasks
         _process_queue_django_tasks(queue_name="email")
         mock_sync.assert_called_once_with("email")
 
     @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
     @pytest.mark.django_db
-    @pytest.mark.xfail(
-        strict=True,
-        reason="_run_queue_job returns list[QueuedJob]; django-tasks normalize_json "
-        "raises TypeError storing it, so the TaskResult is FAILED whenever work was done",
-    )
-    # SCR-BREAKS[U1-1]: job bodies return QueuedJob model lists, so django-tasks marks
-    # every productive trigger run FAILED (TypeError in normalize_json); only empty runs succeed.
+    # SCR-BREAKS[U1-1] (fixed): job bodies used to return QueuedJob model lists, so django-tasks
+    # marked every productive trigger run FAILED (TypeError in normalize_json); now returns job ids.
     def test_django_tasks_result_succeeds_after_processing_jobs(self):
         """A trigger run that actually processes jobs should be recorded SUCCEEDED."""
         from django_tasks import TaskResultStatus
