@@ -192,6 +192,37 @@ class TestDjangoTasksMode:
         _process_queue_django_tasks(queue_name="email")
         mock_sync.assert_called_once_with("email")
 
+    @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
+    @pytest.mark.django_db
+    @pytest.mark.xfail(
+        strict=True,
+        reason="_run_queue_job returns list[QueuedJob]; django-tasks normalize_json "
+        "raises TypeError storing it, so the TaskResult is FAILED whenever work was done",
+    )
+    # SCR-BREAKS[U1-1]: job bodies return QueuedJob model lists, so django-tasks marks
+    # every productive trigger run FAILED (TypeError in normalize_json); only empty runs succeed.
+    def test_django_tasks_result_succeeds_after_processing_jobs(self):
+        """A trigger run that actually processes jobs should be recorded SUCCEEDED."""
+        from django_tasks import TaskResultStatus
+        from django_tasks import task as django_tasks_task
+        from sqlery.models import QueuedJob
+        from sqlery.triggers import _run_queue_job
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_executor.dummy_task",
+            queue_name="test",
+        )
+
+        # enqueue_on_commit=False so ImmediateBackend runs inside the test transaction
+        result = django_tasks_task(_run_queue_job, enqueue_on_commit=False).enqueue("test")
+
+        job.refresh_from_db()
+        assert job.status == "success"
+        assert result.status == TaskResultStatus.SUCCEEDED, (
+            f"django-tasks recorded {result.status} for a run that processed the job: "
+            f"{result.errors[0].traceback if result.errors else ''}"
+        )
+
 
 @pytest.mark.django_db
 class TestSynchronousMode:
