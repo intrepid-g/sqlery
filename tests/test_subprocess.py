@@ -12,6 +12,12 @@ from sqlery.subprocess_executor import (
     get_manage_py_path,
 )
 
+try:
+    import django_tasks  # noqa: F401
+    HAS_DJANGO_TASKS = True
+except ImportError:
+    HAS_DJANGO_TASKS = False
+
 
 class TestManagePyPathResolution:
     """Test absolute path resolution for manage.py."""
@@ -108,6 +114,7 @@ class TestExecutionStrategy:
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "thread"}
         assert get_execution_strategy() == "thread"
 
+    @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
     def test_django_tasks_mode_explicit(self, settings):
         """EXECUTION_MODE='django-tasks' should return django-tasks (installed in dev extra)."""
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "django-tasks"}
@@ -121,6 +128,7 @@ class TestExecutionStrategy:
         settings.DJANGO_SQL_JOBS = {"EXECUTION_MODE": "django-tasks"}
         assert get_execution_strategy() == "subprocess"
 
+    @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
     def test_auto_mode_with_django_tasks(self, settings):
         """Auto mode should prefer django-tasks if USE_DJANGO_TASKS=True (installed in dev extra)."""
         settings.DJANGO_SQL_JOBS = {
