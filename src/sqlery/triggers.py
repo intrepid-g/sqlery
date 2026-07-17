@@ -109,12 +109,19 @@ def _run_queue_job(queue_name: str | None = None):
 
 
 # Built once at import: django-tasks Tasks are frozen declarations and
-# get_backend().validate_task() runs at construction, so per-call task(...)
-# re-validated on every trigger. Module-level also makes them importable
+# get_backend().validate_task() runs at construction, so the previous per-call task(...)
+# pattern re-validated the backend on every trigger. Module-level also makes them importable
 # for django-tasks' db_worker introspection.
 if task is not None:
-    _due_tasks_task = task(_run_due_tasks_job)
-    _queue_task = task(_run_queue_job)
+    try:
+        _due_tasks_task = task(_run_due_tasks_job)
+        _queue_task = task(_run_queue_job)
+    except Exception as e:
+        # A broken TASKS setting must not crash importers (middleware, CLI) of
+        # modes that never use django-tasks; fall back to synchronous triggers.
+        logger.warning(f"django-tasks task construction failed ({e}), django-tasks mode will fall back to synchronous")
+        _due_tasks_task = None
+        _queue_task = None
 else:
     _due_tasks_task = None
     _queue_task = None
