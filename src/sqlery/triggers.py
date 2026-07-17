@@ -85,39 +85,69 @@ def _run_due_tasks_job():
     django-tasks requires the decorated function to be a module-level function
     (it rejects closures via ``is_module_level_function``), so this cannot be
     nested inside ``_enqueue_django_tasks``.
+
+    Returns processed job ids, not model instances: django-tasks stores the
+    return value via ``normalize_json``, which raises TypeError on QueuedJob
+    objects and would mark every productive run FAILED.
     """
     executor = TaskExecutor()
-    return executor.run_due_tasks()
+    # tried returning executor.run_due_tasks() directly → list[QueuedJob] is not
+    # JSON-serializable; django-tasks recorded FAILED whenever jobs were processed
+    jobs = executor.run_due_tasks()
+    return [str(job.id) for job in jobs]
 
 
 def _run_queue_job(queue_name: str | None = None):
     """Module-level job body for django-tasks queue processing.
 
-    See ``_run_due_tasks_job`` docstring for why this must be module-level.
+    See ``_run_due_tasks_job`` docstring for why this must be module-level
+    and why it returns job ids instead of QueuedJob instances.
     """
     executor = TaskExecutor()
-    return executor.run_queue_workers(queue_name=queue_name, once=True)
+    jobs = executor.run_queue_workers(queue_name=queue_name, once=True)
+    return [str(job.id) for job in jobs]
+
+
+# Built once at import: django-tasks Tasks are frozen declarations and
+# get_backend().validate_task() runs at construction, so per-call task(...)
+# re-validated on every trigger. Module-level also makes them importable
+# for django-tasks' db_worker introspection.
+if task is not None:
+    _due_tasks_task = task(_run_due_tasks_job)
+    _queue_task = task(_run_queue_job)
+else:
+    _due_tasks_task = None
+    _queue_task = None
 
 
 def _enqueue_django_tasks():
-    """Enqueue jobs for due tasks via django-tasks."""
-    if task is None:
+    """Enqueue jobs for due tasks via django-tasks.
+
+    Note: without a configured Django ``TASKS`` setting, django-tasks falls
+    back to ImmediateBackend, which executes synchronously in the calling
+    thread — configure a real backend (e.g. database) for async execution.
+    """
+    if _due_tasks_task is None:
         logger.warning("django-tasks not available, falling back to synchronous")
         _enqueue_synchronously()
         return
 
-    task(_run_due_tasks_job).enqueue()
+    # Old: task(_run_due_tasks_job).enqueue() per call — rebuilt/validated the Task each trigger
+    _due_tasks_task.enqueue()
     logger.info("Triggered scheduler via django-tasks")
 
 
 def _process_queue_django_tasks(queue_name: str | None = None):
-    """Process queue via django-tasks."""
-    if task is None:
+    """Process queue via django-tasks.
+
+    See ``_enqueue_django_tasks`` for the ImmediateBackend caveat.
+    """
+    if _queue_task is None:
         logger.warning("django-tasks not available, falling back to synchronous")
         _process_queue_synchronously(queue_name)
         return
 
-    task(_run_queue_job).enqueue(queue_name)
+    _queue_task.enqueue(queue_name)
     logger.info("Triggered worker via django-tasks")
 
 
