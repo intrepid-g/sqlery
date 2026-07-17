@@ -213,6 +213,40 @@ class TestDjangoTasksMode:
         )
 
 
+class TestDjangoTasksImportSafety:
+    """Importing sqlery.triggers must not crash on django-tasks config errors."""
+
+    @pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
+    @pytest.mark.xfail(
+        strict=True,
+        reason="module-scope task(...) construction validates the django-tasks backend at "
+        "import time, so a misconfigured TASKS setting crashes every importer of "
+        "sqlery.triggers (middleware, CLI) even in modes that never use django-tasks",
+    )
+    # SCR-BREAKS[R2-U1-1]: with TASKS misconfigured (e.g. QUEUES without 'default'),
+    # importing sqlery.triggers raises InvalidTaskError at import — startup crash for
+    # subprocess/thread-mode sites; pre-module-scope, the error surfaced only on trigger calls.
+    def test_import_survives_misconfigured_django_tasks_backend(self):
+        """sqlery.triggers should import cleanly even if TASKS config is invalid."""
+        import importlib
+
+        from django.test import override_settings
+
+        import sqlery.triggers as triggers_module
+
+        bad_tasks = {
+            "default": {
+                "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+                "QUEUES": ["high", "low"],  # no 'default' queue -> InvalidTaskError
+            }
+        }
+        try:
+            with override_settings(TASKS=bad_tasks):
+                importlib.reload(triggers_module)
+        finally:
+            importlib.reload(triggers_module)
+
+
 @pytest.mark.django_db
 class TestSynchronousMode:
     """Test synchronous execution mode."""
