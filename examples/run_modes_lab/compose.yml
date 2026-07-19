@@ -1,0 +1,235 @@
+# Shared Django environment variables (YAML anchor)
+x-django-env: &django-env
+  DJANGO_SETTINGS_MODULE: config.settings
+  PYTHONPATH: /app/django_project
+  SECRET_KEY: ${SECRET_KEY:-lab-dev-secret-change-me}
+  DATABASE_URL: ${DATABASE_URL:-postgresql://sqlery:sqlery@postgres:5432/sqlery_lab}
+
+# Shared Django service template (YAML anchor)
+x-django-service: &django-service
+  build:
+    context: ../..
+    dockerfile: examples/run_modes_lab/Dockerfile
+  image: run_modes_lab-django
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    <<: *django-env
+
+services:
+  # PostgreSQL database (shared by all services)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sqlery_lab}
+      POSTGRES_USER: ${POSTGRES_USER:-sqlery}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sqlery}
+    volumes:
+      - sqlery_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sqlery -d sqlery_lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  # Run Django migrations (one-time setup)
+  migrate:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python manage.py migrate --noinput
+    restart: "no"
+
+  # Daemon execution mode (scheduler + worker pool)
+  daemon:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python manage.py daemon start --no-detach
+    environment:
+      <<: *django-env
+      TRIGGER_MODE: daemon
+      ENABLE_DAEMON: "true"
+
+  # Subprocess execution mode (periodic trigger of subprocess workers)
+  subprocess-worker:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python /app/scripts/run_subprocess_loop.py
+    environment:
+      <<: *django-env
+      TRIGGER_MODE: subprocess
+      EXECUTION_MODE: subprocess
+      LAB_QUEUE: subprocess_queue
+      LAB_TICK_SECONDS: ${LAB_TICK_SECONDS:-5}
+
+  # Thread execution mode (blocking synchronous execution)
+  thread-worker:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python /app/scripts/run_thread_loop.py
+    environment:
+      <<: *django-env
+      TRIGGER_MODE: middleware
+      EXECUTION_MODE: thread
+      LAB_QUEUE: thread_queue
+      LAB_TICK_SECONDS: ${LAB_TICK_SECONDS:-5}
+
+  # HTTP trigger mode (Django server with signed HTTP endpoint)
+  http-trigger:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python manage.py runserver 0.0.0.0:8001
+    ports:
+      - "8001:8001"
+    environment:
+      <<: *django-env
+      TRIGGER_MODE: http
+      INTERNAL_SECRET: ${INTERNAL_SECRET:-lab-internal-secret}
+      INTERNAL_BASE_URL: http://http-trigger:8001
+      INTERNAL_ALLOWED_IPS: "*"
+
+  # HTTP trigger caller (periodic sidecar that POSTs signed requests)
+  http-caller:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      http-trigger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    command: python /app/scripts/run_http_caller.py
+    environment:
+      <<: *django-env
+      LAB_HTTP_TARGET: http://http-trigger:8001/internal/trigger/
+      INTERNAL_SECRET: ${INTERNAL_SECRET:-lab-internal-secret}
+      LAB_QUEUE: http_queue
+      LAB_TICK_SECONDS: ${LAB_TICK_SECONDS:-5}
+
+  # Lambda simulation mode (invokes handler directly)
+  lambda-sim:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python /app/scripts/run_lambda_sim.py
+    environment:
+      <<: *django-env
+      TRIGGER_MODE: eventbridge
+      LAB_QUEUE: lambda_queue
+      LAB_TICK_SECONDS: ${LAB_TICK_SECONDS:-5}
+
+  # Async worker mode (django-tasks worker)
+  async-worker:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python manage.py db_worker
+    environment:
+      <<: *django-env
+      USE_DJANGO_TASKS: "true"
+      EXECUTION_MODE: django-tasks
+      LAB_QUEUE: async_queue
+
+  # Standalone FastAPI web dashboard
+  standalone-web:
+    build:
+      context: ../..
+      dockerfile: examples/run_modes_lab/standalone_project/Dockerfile
+    image: run_modes_lab-standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: sqlery-web run --host 0.0.0.0 --port 8010
+    ports:
+      - "8010:8010"
+    environment:
+      SQLERY_DATABASE_URL: ${SQLERY_DATABASE_URL:-postgresql+psycopg://sqlery:sqlery@postgres:5432/sqlery_lab}
+
+  # Standalone worker (FastAPI mode)
+  standalone-worker:
+    build:
+      context: ../..
+      dockerfile: examples/run_modes_lab/standalone_project/Dockerfile
+    image: run_modes_lab-standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      standalone-web:
+        condition: service_started
+    command: sqlery-worker run --queues standalone_queue
+    environment:
+      SQLERY_DATABASE_URL: ${SQLERY_DATABASE_URL:-postgresql+psycopg://sqlery:sqlery@postgres:5432/sqlery_lab}
+
+  # Verification script (runs on-demand via `make verify`)
+  verifier:
+    <<: *django-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      daemon:
+        condition: service_started
+      subprocess-worker:
+        condition: service_started
+      thread-worker:
+        condition: service_started
+      http-trigger:
+        condition: service_started
+      http-caller:
+        condition: service_started
+      lambda-sim:
+        condition: service_started
+      async-worker:
+        condition: service_started
+      standalone-web:
+        condition: service_started
+      standalone-worker:
+        condition: service_started
+    command: python /app/scripts/verify_all_modes.py
+    profiles:
+      - verify
+    environment:
+      <<: *django-env
+      LAB_QUEUE_DAEMON: daemon_queue
+      LAB_QUEUE_SUBPROCESS: subprocess_queue
+      LAB_QUEUE_THREAD: thread_queue
+      LAB_QUEUE_HTTP: http_queue
+      LAB_QUEUE_LAMBDA: lambda_queue
+      LAB_QUEUE_ASYNC: async_queue
+      LAB_QUEUE_STANDALONE: standalone_queue
+      LAB_VERIFY_TIMEOUT_SECONDS: ${LAB_VERIFY_TIMEOUT_SECONDS:-60}
+      LAB_STANDALONE_DB_URL: ${SQLERY_DATABASE_URL:-postgresql+psycopg://sqlery:sqlery@postgres:5432/sqlery_lab}
+
+volumes:
+  sqlery_postgres_data:
