@@ -500,6 +500,59 @@ class TestScheduledTasks:
         with transaction.atomic():
             assert_in_atomic_block("some_caller")  # must not raise
 
+    @pytest.mark.django_db(transaction=True)
+    def test_get_claimable_jobs_outside_transaction_on_sqlite_does_not_raise(self):
+        """REGRESSION 2026-08-08: the select_for_update guard in
+        atomic_claim_job_queryset() must only fire for backends that
+        actually call select_for_update() (Postgres). On SQLite,
+        select_for_update() is never applied (see atomic_claim_job_queryset
+        docstring), so the guard must not fire there either -- it was
+        previously called unconditionally before the is_postgresql() check,
+        which broke the main worker poll loop
+        (DjangoBackend.get_claimable_jobs -> claim_next_job_with_queue_priority
+        -> worker_process.py), which has no enclosing transaction.atomic().
+
+        Uses transaction=True (matching the guard's own regression test) so
+        this call really runs outside any atomic block -- the default
+        django_db fixture wraps every test in one, which would hide the bug.
+        """
+        from sqlery.django_sqlery.backend import DjangoBackend
+
+        backend = DjangoBackend()
+        _create_basic_job(backend, queue_name="default")
+
+        # Must not raise RuntimeError on SQLite, even with no enclosing
+        # transaction.atomic() block.
+        out = backend.get_claimable_jobs(queues=["default"], limit=1)
+        assert len(out) == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_get_claimable_jobs_outside_transaction_on_postgres_still_guarded(self):
+        """Companion to the SQLite test above: on PostgreSQL,
+        select_for_update() IS applied, so the guard must still fire when
+        get_claimable_jobs() is called outside a transaction.atomic() block
+        -- this is the original bug the guard was added to catch (see
+        REGRESSIONS.md 2026-05-18 / 2026-06-14 / 2026-08-08).
+
+        Skipped when not running against Postgres (e.g. local SQLite-only
+        runs); runs for real in CI's Postgres job via
+        db_compat.is_postgresql().
+        """
+        from django.db import connection
+
+        from sqlery.django_sqlery.backend import DjangoBackend
+        from sqlery.django_sqlery.db_compat import is_postgresql
+
+        if not is_postgresql():
+            pytest.skip("Requires a live PostgreSQL connection")
+
+        backend = DjangoBackend()
+        _create_basic_job(backend, queue_name="default")
+
+        assert not connection.in_atomic_block
+        with pytest.raises(RuntimeError, match="transaction.atomic"):
+            backend.get_claimable_jobs(queues=["default"], limit=1)
+
 
 # ---------------------------------------------------------------------------
 # 6. Registry

@@ -76,8 +76,11 @@ def atomic_claim_job_queryset(queryset):
     PostgreSQL: Uses SELECT FOR UPDATE SKIP LOCKED for true atomic claiming
     SQLite: Returns unlocked queryset (locking handled by UPDATE below)
 
-    Callers must already be inside a ``transaction.atomic()`` block --
-    enforced by ``assert_in_atomic_block()`` below, see REGRESSIONS.md.
+    Callers must already be inside a ``transaction.atomic()`` block whenever
+    ``select_for_update()`` is actually applied (Postgres and other
+    non-SQLite backends) -- enforced by ``assert_in_atomic_block()`` below,
+    see REGRESSIONS.md. SQLite never calls ``select_for_update()`` here (it
+    is a no-op on that backend), so the guard does not apply there.
 
     Args:
         queryset: Django QuerySet to apply locking to
@@ -85,17 +88,20 @@ def atomic_claim_job_queryset(queryset):
     Returns:
         QuerySet: Locked queryset (Postgres) or unlocked queryset (SQLite)
     """
-    assert_in_atomic_block("atomic_claim_job_queryset")
     if is_postgresql():
         # PostgreSQL: SELECT FOR UPDATE SKIP LOCKED
         # Ensures only one worker can claim each job
+        assert_in_atomic_block("atomic_claim_job_queryset")
         return queryset.select_for_update(skip_locked=True)
     elif is_sqlite():
         # SQLite: No row-level locking, use UPDATE-based claiming below
         # SKIP LOCKED not supported, so we return unlocked queryset
+        # select_for_update() is never called on this path, so the
+        # atomic-block guard does not apply here (see REGRESSIONS.md).
         return queryset
     else:
         # Other databases: Try SELECT FOR UPDATE without skip_locked
+        assert_in_atomic_block("atomic_claim_job_queryset")
         logger.warning(
             f"Database {get_database_vendor()} may not support SKIP LOCKED. "
             "Using basic SELECT FOR UPDATE."
