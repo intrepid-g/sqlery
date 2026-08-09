@@ -30,6 +30,7 @@ Concurrency contract:
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any
 
 from django.db import connection
@@ -386,6 +387,28 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         async for task in qs:
             results.append(task)
         return results
+
+    # ----- retry path --------------------------------------------------
+
+    async def arequeue_retry(self, failed_job) -> None:
+        """Insert a fresh ``queued`` row carrying the retry chain."""
+        retry_count = (getattr(failed_job, "retry_count", 0) or 0) + 1
+        backoff = float(getattr(failed_job, "retry_backoff", 1.0) or 1.0)
+        delay = backoff * (2 ** (retry_count - 1))
+        scheduled_at = timezone.now() + timedelta(seconds=delay)
+
+        await QueuedJob.objects.acreate(
+            task_path=failed_job.task_path,
+            kwargs=dict(failed_job.kwargs) if isinstance(failed_job.kwargs, dict) else {},
+            queue_name=getattr(failed_job, "queue_name", "default"),
+            priority=getattr(failed_job, "priority", 0) or 0,
+            status="queued",
+            parent_job_id=failed_job.id,
+            retry_count=retry_count,
+            max_retries=getattr(failed_job, "max_retries", 0) or 0,
+            retry_backoff=backoff,
+            scheduled_at=scheduled_at,
+        )
 
     # ----- registry --------------------------------------------------------
 

@@ -827,6 +827,16 @@ class AsyncDatabaseBackend(ABC):
         pass
 
     @abstractmethod
+    async def arequeue_retry(self, failed_job) -> None:
+        """Insert a fresh ``queued`` row carrying the retry chain from a failed job.
+
+        Async analog of the sync worker's ``_retry_job`` requeue step. Must be
+        implemented by every concrete async backend so retries are never
+        silently dropped -- see ``AsyncWorker._requeue_for_retry``.
+        """
+        pass
+
+    @abstractmethod
     async def aregistry_add(self, registry_name: str, job_id) -> None:
         """Async analog of DatabaseBackend.add_job_to_registry."""
         pass
