@@ -14,7 +14,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 
-from ..compat import get_backend, get_config
+from ..compat import get_backend, get_config, JobFencingError
 from .utils import import_task
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
@@ -70,6 +70,11 @@ class JobExecutor:
 
         # Refresh job state from database
         job = self.backend.get_job_by_id(job.id)
+        # Captured before execution runs so mark_job_success/failed below can
+        # fence the completion write against this exact version — see
+        # JobFencingError docstring for why a fresh re-fetch there would
+        # defeat the CAS if the job was reclaimed mid-execution.
+        expected_version = getattr(job, 'version', None)
 
         # Skip if already running
         if job.status == 'running':
@@ -112,7 +117,16 @@ class JobExecutor:
                 finally:
                     _current_job_var.reset(_token)
 
-                job = self.backend.mark_job_success(job.id, output=result or "")
+                try:
+                    job = self.backend.mark_job_success(
+                        job.id, output=result or "", expected_version=expected_version
+                    )
+                except JobFencingError as e:
+                    logger.warning(
+                        f"Job {job.id} succeeded but was superseded by another worker "
+                        f"before completion could be recorded — discarding this result: {e}"
+                    )
+                    return job
                 # If this is a retry, cascade success to all ancestor attempts
                 if getattr(job, 'parent_job_id', None):
                     try:
@@ -128,7 +142,17 @@ class JobExecutor:
         except Exception as e:
             error_msg = str(e)
             error_traceback = tb.format_exc()
-            job = self.backend.mark_job_failed(job.id, error=error_msg, traceback=error_traceback)
+            try:
+                job = self.backend.mark_job_failed(
+                    job.id, error=error_msg, traceback=error_traceback,
+                    expected_version=expected_version,
+                )
+            except JobFencingError as fence_err:
+                logger.warning(
+                    f"Job {job.id} failed but was superseded by another worker "
+                    f"before completion could be recorded — discarding this result: {fence_err}"
+                )
+                return job
             logger.error(f"Job {job.id} failed: {error_msg}")
 
             if self._should_retry(job):
@@ -148,6 +172,7 @@ class JobExecutor:
         This method never returns.
         """
         # write_fd = int(os.environ.pop('_SQLERY_RESULT_FD'))
+        expected_version = None  # set below; kept here so the except: block never NameErrors
 
         try:
             # Configure DB resilience for child's fresh connection.
@@ -163,6 +188,9 @@ class JobExecutor:
 
             # Refresh job from DB (new connection)
             job = self.backend.get_job_by_id(job.id)
+            # Captured before execution so the completion write below is
+            # fenced against this exact version (see JobFencingError).
+            expected_version = getattr(job, 'version', None)
 
             # Apply timeout
             if not job.timeout_seconds:
@@ -191,8 +219,21 @@ class JobExecutor:
             finally:
                 _current_job_var.reset(_token)
 
-            # Mark success in DB from child
-            job = self.backend.mark_job_success(job.id, output=result or "")
+            # Mark success in DB from child, fenced against the version this
+            # child observed at start-of-execution — if another worker
+            # reclaimed the job (this worker's lease/heartbeat went stale
+            # mid-run), the version has moved on and the write is rejected
+            # instead of clobbering the reclaiming worker's outcome.
+            try:
+                job = self.backend.mark_job_success(
+                    job.id, output=result or "", expected_version=expected_version
+                )
+            except JobFencingError as e:
+                logger.warning(
+                    f"Job {job.id} succeeded but was superseded by another worker "
+                    f"before completion could be recorded — discarding this result: {e}"
+                )
+                os._exit(0)
             # If this is a retry, cascade success to all ancestor attempts
             if getattr(job, 'parent_job_id', None):
                 try:
@@ -221,7 +262,10 @@ class JobExecutor:
                 # (e.g. a ProgrammingError in bulk_insert), which would cause
                 # mark_job_failed to fail on the same broken connection.
                 self._reset_db_connections()
-                failed_job = self.backend.mark_job_failed(job.id, error=error_msg, traceback=error_traceback)
+                failed_job = self.backend.mark_job_failed(
+                    job.id, error=error_msg, traceback=error_traceback,
+                    expected_version=expected_version,
+                )
 
                 # Handle retry in child (it has the DB connection)
                 if self._should_retry(failed_job):
@@ -230,6 +274,11 @@ class JobExecutor:
                         f"Job {job.id} will be retried as job {retry_job.id} "
                         f"(attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
                     )
+            except JobFencingError as fence_err:
+                logger.warning(
+                    f"Job {job.id} failed but was superseded by another worker "
+                    f"before completion could be recorded — discarding this result: {fence_err}"
+                )
             except Exception as mark_err:
                 logger.error(f"Failed to mark job {job.id} as failed: {mark_err}")
 
@@ -742,6 +791,17 @@ class WorkerProcess:
         start_time = time.monotonic()
         child_exited = False
         exit_status = None
+        # Heartbeat-driven job lease renewal: a bare `sqlery-worker` (no daemon)
+        # never receives SIGUSR1, so _check_heartbeat()'s deferred heartbeat
+        # never fires and worker_last_heartbeat stays frozen at job-claim time
+        # for the whole job. The daemon's zombie detector (Check 5, ~3x
+        # WORKER_ALIVE_TIMEOUT) then treats a merely-slow job as a dead worker
+        # and fails/requeues it while it's still genuinely running — the
+        # classic false-positive lease expiry. Send a real heartbeat here on
+        # every tick of actual observed liveness (this loop only runs while
+        # the parent is alive and polling waitpid) instead of relying on a
+        # fixed poll_interval*3 window with no relation to job runtime.
+        last_lease_heartbeat = time.monotonic()
 
         while not child_exited:
             try:
@@ -778,6 +838,15 @@ class WorkerProcess:
             # Sleep briefly so parent stays responsive to signals
             time.sleep(0.5)
             self._check_heartbeat()
+            # Send an unconditional liveness heartbeat every heartbeat_interval
+            # (not gated on SIGUSR1/_heartbeat_due — see comment above the loop
+            # init) so the job's effective lease renews at the worker's actual
+            # heartbeat cadence instead of expiring on a fixed poll_interval*3
+            # window unrelated to how long the job runs.
+            now = time.monotonic()
+            if now - last_lease_heartbeat >= self.heartbeat_interval:
+                self._heartbeat('busy', job_id=job.id)
+                last_lease_heartbeat = now
             # WR-01: keep scheduler leadership alive across long jobs. The main
             # loop only renews leases at the top of each iteration, but this
             # wait blocks for up to (timeout + 60s); without renewal here the

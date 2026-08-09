@@ -16,7 +16,7 @@ from sqlalchemy import and_, or_, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, func, delete
 
-from ..compat import DatabaseBackend, get_config
+from ..compat import DatabaseBackend, JobFencingError, get_config
 from ..core.models import QueuedJob, ScheduledJob, ScheduledTask, JobRegistry, Worker, DaemonLease
 from .database import get_engine, get_session
 
@@ -1308,42 +1308,71 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return staged
             return None
 
-    def mark_job_success(self, job_id: int, output: str = ""):
+    def mark_job_success(self, job_id: int, output: str = "", expected_version: int | None = None):
         """Mark job as successful.
 
         Staged ScheduledJob rows (not yet promoted) do not have mark_success;
         the guard prevents AttributeError if an operator calls this for a staged id.
+
+        expected_version fences the write: when given, the update only
+        applies if the row's current version still matches (optimistic-
+        locking CAS, mirroring claim_job's version-CAS branch above). If it
+        doesn't match, another worker already reclaimed this job (its lease/
+        heartbeat went stale and the zombie detector requeued it) — raise
+        JobFencingError instead of silently clobbering the reclaiming
+        worker's result.
         """
-        # Old (single-table only):
-        # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
         job = self.get_job_by_id(job_id)
         # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_success"):
             with self._get_session() as session:
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
+                    # ponytail: check-then-commit, not a WHERE-clause CAS UPDATE — a
+                    # concurrent writer could still slip in between this check and
+                    # session.commit(). Closes the realistic race (reclaim happened
+                    # before this read); upgrade path is a single UPDATE ... WHERE
+                    # version=expected_version RETURNING *, like claim_job's SQLite branch.
+                    if expected_version is not None and (db_job.version or 0) != expected_version:
+                        raise JobFencingError(
+                            f"Job {job_id} was reclaimed by another worker "
+                            f"(expected version {expected_version}, found {db_job.version})"
+                        )
                     db_job.mark_success(output=output)
+                    db_job.version = (db_job.version or 0) + 1
                     session.add(db_job)
                     session.commit()
                     session.refresh(db_job)
                     return db_job
         return job
 
-    def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
+    def mark_job_failed(
+        self,
+        job_id: int,
+        error: str,
+        traceback: str = "",
+        expected_version: int | None = None,
+    ):
         """Mark job as failed.
 
         Staged ScheduledJob rows do not have mark_failed; guard prevents
         AttributeError if called for a staged job id (IN-01).
+
+        See mark_job_success for expected_version fencing semantics.
         """
-        # Old (single-table only):
-        # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
         job = self.get_job_by_id(job_id)
         # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_failed"):
             with self._get_session() as session:
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
+                    if expected_version is not None and (db_job.version or 0) != expected_version:
+                        raise JobFencingError(
+                            f"Job {job_id} was reclaimed by another worker "
+                            f"(expected version {expected_version}, found {db_job.version})"
+                        )
                     db_job.mark_failed(error=error, traceback=traceback)
+                    db_job.version = (db_job.version or 0) + 1
                     session.add(db_job)
                     session.commit()
                     session.refresh(db_job)

@@ -470,3 +470,99 @@ class TestStandaloneLeaseFailoverPostgres:
                 select(DaemonLease).where(DaemonLease.queue_name == "failover-standalone-q")
             ).first()
             assert owner.daemon_id == "daemon-b"
+
+
+# ---------------------------------------------------------------------------
+# TestFencedCompletionAfterReclaim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+class TestFencedCompletionAfterReclaim:
+    """Race: a job's original worker goes heartbeat-stale mid-execution, the
+    zombie sweep fails/reclaims the job (bumping its version), and the
+    "superseded" original worker later tries to write its own completion.
+
+    Without version fencing that late write silently wins (mark_job_success /
+    mark_job_failed always re-fetch the *current* row before applying their
+    own CAS, so they always succeed against whatever version is current —
+    never the version the superseded worker actually observed). With fencing,
+    the superseded worker's completion write must raise JobFencingError and
+    the reclaiming write (already recorded by the zombie sweep) must survive
+    untouched — i.e. no double-execution artifact clobbers the real outcome.
+    """
+
+    def test_stale_worker_completion_is_rejected_after_zombie_reclaim(self):
+        from django.utils import timezone
+        from sqlery.compat import get_backend, JobFencingError
+        from sqlery.core.daemon import DaemonManager
+
+        worker, job = _build_running_job()
+        # Version the "original" worker captured before it started running
+        # the task body — mirrors JobExecutor.execute_job_in_child's
+        # `expected_version = getattr(job, 'version', None)`.
+        expected_version = job.version
+
+        # Force the worker's heartbeat stale enough to trip Check 5, without
+        # sleeping ~90s for the real WORKER_ALIVE_TIMEOUT*3 window.
+        from sqlery.django_sqlery.models import Worker as W
+
+        W.objects.filter(pk=worker.pk).update(
+            last_heartbeat=timezone.now() - timedelta(hours=1)
+        )
+        job.worker_pid = None  # keep Check 1 from firing first
+        job.save(update_fields=["worker_pid"])
+
+        backend = get_backend()
+        DaemonManager._fail_zombie_running_jobs(backend)
+
+        job.refresh_from_db()
+        assert job.status == "failed", "zombie sweep must have reclaimed the job"
+        reclaimed_version = job.version
+        assert reclaimed_version != expected_version, (
+            "zombie reclaim must bump the version — otherwise fencing has "
+            "nothing to detect"
+        )
+
+        # The superseded original worker now finishes its (stale) run and
+        # tries to record success against the version it originally claimed.
+        with pytest.raises(JobFencingError):
+            backend.mark_job_success(
+                job.id, output="late result", expected_version=expected_version
+            )
+
+        # The zombie sweep's outcome must be untouched — no silent clobber.
+        job.refresh_from_db()
+        assert job.status == "failed"
+        assert job.output != "late result"
+
+    def test_unfenced_call_would_have_clobbered(self):
+        """Sanity control: omitting expected_version reproduces the historical
+        bug (the whole reason this fix exists) — the stale write succeeds and
+        overwrites the reclaiming worker's result. Pins the pre-fix behaviour
+        so a future refactor can't silently drop the `expected_version=None`
+        default and reintroduce fencing everywhere without anyone noticing.
+        """
+        from django.utils import timezone
+        from sqlery.compat import get_backend
+        from sqlery.core.daemon import DaemonManager
+        from sqlery.django_sqlery.models import Worker as W
+
+        worker, job = _build_running_job()
+        W.objects.filter(pk=worker.pk).update(
+            last_heartbeat=timezone.now() - timedelta(hours=1)
+        )
+        job.worker_pid = None
+        job.save(update_fields=["worker_pid"])
+
+        backend = get_backend()
+        DaemonManager._fail_zombie_running_jobs(backend)
+        job.refresh_from_db()
+        assert job.status == "failed"
+
+        # No expected_version passed — reproduces the pre-fencing call sites.
+        backend.mark_job_success(job.id, output="late result")
+
+        job.refresh_from_db()
+        assert job.status == "success"
+        assert job.output == "late result"
