@@ -19,6 +19,8 @@ from django.dispatch import receiver
 from django.utils import timezone
 from uuid6 import uuid7
 
+from sqlery.core.utils import reject_unawaited_coroutine
+
 from .db_compat import is_sqlite
 
 
@@ -690,6 +692,10 @@ class QueuedJob(models.Model):
             ConcurrentModificationError: If job was modified by another process
         """
         # from django.db.models import F  # moved to top-level
+
+        # REGRESSION 2026-08-08: guard the shared success-recording choke point,
+        # not just individual executor call sites -- see REGRESSIONS.md
+        reject_unawaited_coroutine(output)
 
         expected_version = self.version
         self.finished_at = timezone.now()

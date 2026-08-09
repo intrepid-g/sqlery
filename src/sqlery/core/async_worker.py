@@ -32,7 +32,6 @@ import signal
 import socket
 import time
 import traceback as tb_module
-from datetime import datetime, timedelta, UTC
 from typing import Any, Awaitable, Callable
 
 from sqlery.compat import AsyncDatabaseBackend
@@ -270,48 +269,11 @@ class AsyncWorker:
     async def _requeue_for_retry(self, failed_job: Any) -> None:
         """Insert a fresh ``queued`` row carrying the retry chain.
 
-        Currently implemented for ``SQLAlchemyAsyncBackend`` via the standalone
-        async session factory. Other backends will be added when their async
-        retry helpers exist (Django retry path is sync today).
+        Delegates to ``AsyncDatabaseBackend.arequeue_retry``, which every
+        concrete async backend (Django, SQLAlchemy) must implement -- see
+        ``sqlery.compat.AsyncDatabaseBackend``.
         """
-        retry_count = (getattr(failed_job, "retry_count", 0) or 0) + 1
-        backoff = float(getattr(failed_job, "retry_backoff", 1.0) or 1.0)
-        delay = backoff * (2 ** (retry_count - 1))
-        scheduled_at = datetime.now(UTC) + timedelta(seconds=delay)
-
-        # Lazy import to keep core import-light and avoid the Django backend
-        # importing SQLAlchemy bits at module load.
-        try:
-            from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
-            from sqlery.fastapi_sqlery.database import get_async_session_factory
-            from sqlery.core.models import QueuedJob
-        except Exception:  # pragma: no cover - sqlalchemy not available
-            logger.warning("Async retry-requeue: SQLAlchemy backend unavailable")
-            return
-
-        if not isinstance(self.backend, SQLAlchemyAsyncBackend):
-            logger.warning(
-                "Async retry-requeue not implemented for backend %s; skipping",
-                type(self.backend).__name__,
-            )
-            return
-
-        factory = get_async_session_factory()
-        async with factory() as session:
-            retry_row = QueuedJob(
-                task_path=failed_job.task_path,
-                kwargs=dict(failed_job.kwargs) if isinstance(failed_job.kwargs, dict) else {},
-                queue_name=getattr(failed_job, "queue_name", "default"),
-                priority=getattr(failed_job, "priority", 0) or 0,
-                status="queued",
-                parent_job_id=failed_job.id,
-                retry_count=retry_count,
-                max_retries=getattr(failed_job, "max_retries", 0) or 0,
-                retry_backoff=backoff,
-                scheduled_at=scheduled_at,
-            )
-            session.add(retry_row)
-            await session.commit()
+        await self.backend.arequeue_retry(failed_job)
 
     # ------------------------------------------------------------ shutdown
 

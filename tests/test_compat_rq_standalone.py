@@ -148,10 +148,10 @@ class MockBackend(DatabaseBackend):
     def cleanup_registry(self, registry_type=None, max_age_days=None) -> dict:
         return {}
 
-    def mark_job_success(self, job_id, output=""):
+    def mark_job_success(self, job_id, output="", expected_version=None):
         return None
 
-    def mark_job_failed(self, job_id, error, traceback=""):
+    def mark_job_failed(self, job_id, error, traceback="", expected_version=None):
         return None
 
     def mark_job_archived(self, job_id):

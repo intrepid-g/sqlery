@@ -430,26 +430,42 @@ class FakeBackend(DatabaseBackend):
         return self._jobs.get(job_id)
 
     # ---- @abstractmethod mark_job_success
-    def mark_job_success(self, job_id: int, output: str = ""):
+    def mark_job_success(self, job_id: int, output: str = "", expected_version=None):
         self._record("mark_job_success", job_id)
         job = self._jobs.get(job_id)
         if job is None:
             return None
+        if expected_version is not None and getattr(job, "version", None) != expected_version:
+            from sqlery.compat import JobFencingError
+
+            raise JobFencingError(
+                f"Job {job_id} was reclaimed by another worker "
+                f"(expected version {expected_version}, found {job.version})"
+            )
         job.status = "success"
         job.output = output
         job.finished_at = _utcnow()
+        job.version = (getattr(job, "version", 0) or 0) + 1
         return job
 
     # ---- @abstractmethod mark_job_failed
-    def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
+    def mark_job_failed(self, job_id: int, error: str, traceback: str = "", expected_version=None):
         self._record("mark_job_failed", job_id, error)
         job = self._jobs.get(job_id)
         if job is None:
             return None
+        if expected_version is not None and getattr(job, "version", None) != expected_version:
+            from sqlery.compat import JobFencingError
+
+            raise JobFencingError(
+                f"Job {job_id} was reclaimed by another worker "
+                f"(expected version {expected_version}, found {job.version})"
+            )
         job.status = "failed"
         job.error = error
         job.traceback = traceback
         job.finished_at = _utcnow()
+        job.version = (getattr(job, "version", 0) or 0) + 1
         return job
 
     # ---- @abstractmethod mark_job_archived

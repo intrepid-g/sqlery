@@ -22,6 +22,20 @@ _backend = None
 _config = None
 
 
+class JobFencingError(Exception):
+    """Raised when a job completion write is rejected by version fencing.
+
+    A worker captures the job's `version` before executing it. If the
+    completion write (mark_job_success/mark_job_failed) finds the row's
+    current version no longer matches, another worker has already
+    reclaimed the job (e.g. after this worker's lease/heartbeat went
+    stale and the daemon's zombie detector requeued it). This worker is
+    superseded — its result must not clobber the reclaiming worker's
+    outcome. Mirrors DjangoBackend's ConcurrentModificationError but is
+    framework-agnostic so standalone/SQLAlchemy mode raises the same type.
+    """
+
+
 class DatabaseBackend(ABC):
     """Abstract database backend interface.
 
@@ -484,29 +498,47 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    def mark_job_success(self, job_id: int, output: str = ""):
+    def mark_job_success(self, job_id: int, output: str = "", expected_version: int | None = None):
         """Mark job as successful.
 
         Args:
             job_id: Job ID
             output: Job output/result
+            expected_version: If given, fences the write with optimistic
+                locking against this version (the version the caller
+                observed before executing the job). Raises JobFencingError
+                if the row's current version has moved on — another worker
+                already reclaimed and possibly re-ran this job.
 
         Returns:
             Updated job instance
+
+        Raises:
+            JobFencingError: expected_version given and no longer current
         """
         pass
 
     @abstractmethod
-    def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
+    def mark_job_failed(
+        self,
+        job_id: int,
+        error: str,
+        traceback: str = "",
+        expected_version: int | None = None,
+    ):
         """Mark job as failed.
 
         Args:
             job_id: Job ID
             error: Error message
             traceback: Full traceback
+            expected_version: See mark_job_success.
 
         Returns:
             Updated job instance
+
+        Raises:
+            JobFencingError: expected_version given and no longer current
         """
         pass
 
@@ -824,6 +856,16 @@ class AsyncDatabaseBackend(ABC):
     @abstractmethod
     async def aget_due_scheduled_tasks(self, now) -> list:
         """Async analog of DatabaseBackend.get_due_scheduled_tasks."""
+        pass
+
+    @abstractmethod
+    async def arequeue_retry(self, failed_job) -> None:
+        """Insert a fresh ``queued`` row carrying the retry chain from a failed job.
+
+        Async analog of the sync worker's ``_retry_job`` requeue step. Must be
+        implemented by every concrete async backend so retries are never
+        silently dropped -- see ``AsyncWorker._requeue_for_retry``.
+        """
         pass
 
     @abstractmethod

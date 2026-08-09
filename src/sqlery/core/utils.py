@@ -4,11 +4,34 @@ Consolidated from django_sqlery/utils.py and rate_limit_utils.py.
 These functions have zero framework dependencies.
 """
 
+import inspect
 import re
 from datetime import datetime, timedelta, timezone as dt_timezone
 from importlib import import_module
 
 from sqlery.crontab import next_cron_occurrence, parse_cron_string, InvalidExpression
+
+
+# ===== Result recording utilities =====
+
+def reject_unawaited_coroutine(output) -> None:
+    """Guard against storing an unawaited coroutine/awaitable as a job result.
+
+    A caller that forgets to await an async task's return value ends up with
+    the coroutine object itself as `output` -- the job then gets recorded as
+    successful even though its body never ran. Every result-recording path
+    (`QueuedJob.mark_success` in both integration modes) calls this first, so
+    the bug class is structurally caught regardless of which executor call
+    site produced the unawaited value.
+
+    Raises:
+        TypeError: If `output` is a coroutine or other awaitable.
+    """
+    if inspect.isawaitable(output):
+        raise TypeError(
+            f"Job result is an unawaited {type(output).__name__!r} -- the task "
+            "body never ran. Await/run the coroutine before recording the result."
+        )
 
 
 # ===== Cron utilities =====

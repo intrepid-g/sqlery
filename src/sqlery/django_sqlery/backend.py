@@ -17,10 +17,24 @@ from django.utils import timezone
 
 from sqlery.core.db_resilience import retry_on_db_error
 
-from ..compat import DatabaseBackend
-from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
+from ..compat import DatabaseBackend, JobFencingError
+from .db_compat import (
+    assert_in_atomic_block,
+    atomic_claim_job,
+    atomic_claim_job_queryset,
+    is_sqlite,
+)
 # Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
-from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker, ScheduledJob
+from .models import (
+    ConcurrentModificationError,
+    DaemonLease,
+    QueuedJob,
+    ScheduledTask,
+    JobRegistry,
+    TagLock,
+    Worker,
+    ScheduledJob,
+)
 from .settings import get_setting
 from sqlery.core.claiming import claim_next_job_with_queue_priority
 # Partition maintenance helpers — guarded against psycopg absence (standalone/SQLite installs)
@@ -885,28 +899,53 @@ class DjangoBackend(DatabaseBackend):
         except self.ScheduledJob.DoesNotExist:
             return None
 
-    def mark_job_success(self, job_id: int, output: str = ""):
+    def mark_job_success(self, job_id: int, output: str = "", expected_version: int | None = None):
         """Mark job as successful.
 
         Staged ScheduledJob rows (not yet promoted) do not have mark_success;
         the guard prevents AttributeError if an operator calls this for a staged id.
+
+        expected_version fences the write against a stale lease (see
+        DatabaseBackend.mark_job_success): without it, the fresh
+        get_job_by_id() below always reads the row's *current* version,
+        which defeats mark_success()'s own optimistic-locking CAS — a
+        superseded worker would silently "win" the CAS against a version
+        it never actually held.
         """
         job = self.get_job_by_id(job_id)
         # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_success"):
-            job.mark_success(output=output)
+            if expected_version is not None:
+                job.version = expected_version
+            try:
+                job.mark_success(output=output)
+            except ConcurrentModificationError as e:
+                raise JobFencingError(str(e)) from e
         return job
 
-    def mark_job_failed(self, job_id: int, error: str, traceback: str = ""):
+    def mark_job_failed(
+        self,
+        job_id: int,
+        error: str,
+        traceback: str = "",
+        expected_version: int | None = None,
+    ):
         """Mark job as failed.
 
         Staged ScheduledJob rows do not have mark_failed; guard prevents
         AttributeError if called for a staged job id (IN-01).
+
+        See mark_job_success for expected_version fencing semantics.
         """
         job = self.get_job_by_id(job_id)
         # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_failed"):
-            job.mark_failed(error=error, traceback=traceback)
+            if expected_version is not None:
+                job.version = expected_version
+            try:
+                job.mark_failed(error=error, traceback=traceback)
+            except ConcurrentModificationError as e:
+                raise JobFencingError(str(e)) from e
         return job
 
     def mark_job_archived(self, job_id: int):
@@ -1160,6 +1199,7 @@ class DjangoBackend(DatabaseBackend):
         # Acquire exclusive locks (Postgres: SELECT FOR UPDATE, SQLite: no-op)
         tag_queryset = TagLock.objects.filter(tag__in=tags)
         if not is_sqlite():
+            assert_in_atomic_block("acquire_tag_locks")
             tag_queryset = tag_queryset.select_for_update()
         list(tag_queryset)  # Force evaluation to actually acquire locks
 
@@ -1207,14 +1247,20 @@ class DjangoBackend(DatabaseBackend):
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
+        # REGRESSION 2026-08-08: select_for_update used outside transaction
+        # Root cause: same class of bug as 2026-05-18/2026-06-14 -- this method
+        # was promoted to the framework-agnostic core.scheduler_tasks module
+        # without an enclosing transaction.atomic(), so it worked on SQLite
+        # but raised TransactionManagementError on PostgreSQL.
         try:
-            return atomic_claim_job_queryset(
-                self.ScheduledTask.objects.filter(
-                    id=task_id,
-                    enabled=True,
-                    next_run_at__lte=timezone.now(),
-                )
-            ).get()
+            with transaction.atomic():
+                return atomic_claim_job_queryset(
+                    self.ScheduledTask.objects.filter(
+                        id=task_id,
+                        enabled=True,
+                        next_run_at__lte=timezone.now(),
+                    )
+                ).get()
         except self.ScheduledTask.DoesNotExist:
             return None
 

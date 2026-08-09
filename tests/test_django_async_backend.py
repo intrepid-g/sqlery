@@ -147,6 +147,27 @@ async def test_amark_shutting_down(backend, make_job):
     assert fresh.status == "shutting_down"
 
 
+# ----- arequeue_retry --------------------------------------------------------
+
+
+async def test_arequeue_retry_inserts_queued_row_with_incremented_count(backend, make_job):
+    from asgiref.sync import sync_to_async
+    from sqlery.django_sqlery.models import QueuedJob
+
+    job = await sync_to_async(make_job)(
+        status="failed", max_retries=2, retry_count=0, retry_backoff=1.0
+    )
+    await backend.arequeue_retry(job)
+
+    rows = [r async for r in QueuedJob.objects.filter(parent_job_id=job.id)]
+    assert len(rows) == 1
+    retry = rows[0]
+    assert retry.status == "queued"
+    assert retry.retry_count == 1
+    assert retry.max_retries == 2
+    assert retry.parent_job_id == job.id
+
+
 # ----- aget_status / aget_job -----------------------------------------------
 
 

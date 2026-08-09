@@ -132,6 +132,37 @@ async def test_amark_success(backend, make_job, session_factory):
         assert fresh.output == "ok"
 
 
+async def test_amark_success_rejects_unawaited_coroutine(backend, make_job, session_factory):
+    """REGRESSION 2026-08-08: an async worker that forgets to await a task's
+    coroutine must not have it silently recorded as a successful result.
+
+    amark_success() bypasses QueuedJob.mark_success() (it issues a raw
+    ``update()`` statement), so this is a call site the earlier 2026-05-25
+    fix (sync executors only) never covered. Assert the real side effect:
+    the row must stay untouched, not merely that an exception was raised.
+    """
+
+    async def _task():
+        return "should have been awaited"
+
+    job = await make_job(status="running")
+    coro = _task()
+    try:
+        with pytest.raises(TypeError, match="unawaited"):
+            await backend.amark_success(job.id, coro)
+    finally:
+        coro.close()
+
+    from sqlalchemy import select
+
+    async with session_factory() as s:
+        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        fresh = res.scalars().first()
+        # The job must NOT be marked success from the unawaited coroutine.
+        assert fresh.status == "running"
+        assert fresh.output != str(coro)
+
+
 async def test_amark_failed(backend, make_job, session_factory):
     job = await make_job(status="running")
     await backend.amark_failed(job.id, "boom", traceback="tb")
