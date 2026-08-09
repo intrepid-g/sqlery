@@ -30,6 +30,7 @@ from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core.utils import reject_unawaited_coroutine
 
 from .database import get_async_session_factory
 
@@ -206,6 +207,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             await session.commit()
 
     async def amark_success(self, job_id, result) -> None:
+        # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
+        # (raw update() statement), so it needs its own guard against unawaited
+        # coroutines.
+        reject_unawaited_coroutine(result)
         now = _utcnow()
         output = "" if result is None else str(result)
         factory = get_async_session_factory()
@@ -419,6 +424,32 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             return list(res.scalars().all())
 
     # ----- registry --------------------------------------------------------
+
+    # ----- retry path --------------------------------------------------
+
+    async def arequeue_retry(self, failed_job) -> None:
+        """Insert a fresh ``queued`` row carrying the retry chain."""
+        retry_count = (getattr(failed_job, "retry_count", 0) or 0) + 1
+        backoff = float(getattr(failed_job, "retry_backoff", 1.0) or 1.0)
+        delay = backoff * (2 ** (retry_count - 1))
+        scheduled_at = _utcnow() + timedelta(seconds=delay)
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            retry_row = QueuedJob(
+                task_path=failed_job.task_path,
+                kwargs=dict(failed_job.kwargs) if isinstance(failed_job.kwargs, dict) else {},
+                queue_name=getattr(failed_job, "queue_name", "default"),
+                priority=getattr(failed_job, "priority", 0) or 0,
+                status="queued",
+                parent_job_id=failed_job.id,
+                retry_count=retry_count,
+                max_retries=getattr(failed_job, "max_retries", 0) or 0,
+                retry_backoff=backoff,
+                scheduled_at=scheduled_at,
+            )
+            session.add(retry_row)
+            await session.commit()
 
     async def aregistry_add(self, registry_name: str, job_id) -> None:
         factory = get_async_session_factory()

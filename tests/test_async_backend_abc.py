@@ -29,6 +29,7 @@ REQUIRED_METHODS = {
     "aget_due_scheduled_tasks",
     "aregistry_add",
     "aregistry_remove",
+    "arequeue_retry",
 }
 
 
