@@ -566,3 +566,132 @@ class TestFencedCompletionAfterReclaim:
         job.refresh_from_db()
         assert job.status == "success"
         assert job.output == "late result"
+
+
+# ---------------------------------------------------------------------------
+# TestStandaloneFencedCompletionAfterReclaim
+# ---------------------------------------------------------------------------
+#
+# Standalone-mode mirror of TestFencedCompletionAfterReclaim above. Proves
+# SQLAlchemyBackend.fail_zombie_job bumps `version` on reclaim (like Django's
+# CAS mark_failed with F("version")+1) so the fencing check added by the
+# lease-renewal fix actually fires in standalone mode too — before this fix
+# fail_zombie_job never touched version and the stale worker's late write
+# silently clobbered the zombie outcome.
+
+
+@pytest.fixture
+def standalone_zombie_backend(tmp_path, monkeypatch):
+    """Per-test standalone SQLAlchemyBackend against a temp-file SQLite engine.
+
+    Mirrors ``tests/unit/test_sqlalchemy_backend_sync.py::sync_backend``.
+    """
+    from sqlalchemy import create_engine
+    from sqlmodel import SQLModel
+    from sqlery.fastapi_sqlery import database as db_mod
+    from sqlery.core import models as _core_models  # noqa: F401
+
+    db_path = tmp_path / "zombie_db.sqlite"
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
+
+    from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+    backend = SQLAlchemyBackend()
+    try:
+        yield backend
+    finally:
+        engine.dispose()
+
+
+class TestStandaloneFencedCompletionAfterReclaim:
+    """Standalone mirror of TestFencedCompletionAfterReclaim, proving the
+    fencing check is no longer a silent no-op in SQLAlchemy/standalone mode.
+    """
+
+    def test_stale_worker_completion_is_rejected_after_zombie_reclaim(
+        self, standalone_zombie_backend
+    ):
+        from datetime import datetime, UTC
+
+        from sqlmodel import select
+        from sqlery.compat import JobFencingError
+        from sqlery.core.daemon import DaemonManager
+        from sqlery.core.models import QueuedJob, Worker
+
+        backend = standalone_zombie_backend
+
+        with backend._get_session() as session:
+            worker = Worker(
+                node_id=os.environ.get("NODE_ID") or os.uname().nodename,
+                pid=os.getpid(),
+                status="busy",
+                last_heartbeat=datetime.now(UTC),
+            )
+            session.add(worker)
+            session.commit()
+            session.refresh(worker)
+
+            job = QueuedJob(
+                task_path="tests.chaos.conftest.task_succeeds",
+                queue_name="default",
+                status="running",
+                worker_id=worker.id,
+                worker_pid=os.getpid(),
+                started_at=datetime.now(UTC),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+
+            worker.current_job_id = job.id
+            session.add(worker)
+            session.commit()
+
+            job_id = job.id
+            worker_id = worker.id
+
+        # Version the "original" worker captured before it started running
+        # the task body — mirrors JobExecutor's `expected_version` capture.
+        expected_version = 0
+
+        # Force the worker's heartbeat stale enough to trip Check 5, without
+        # sleeping ~90s for the real WORKER_ALIVE_TIMEOUT*3 window.
+        with backend._get_session() as session:
+            db_worker = session.exec(select(Worker).where(Worker.id == worker_id)).first()
+            db_worker.last_heartbeat = datetime.now(UTC) - timedelta(hours=1)
+            session.add(db_worker)
+            session.commit()
+
+            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            db_job.worker_pid = None  # keep Check 1 from firing first
+            session.add(db_job)
+            session.commit()
+
+        DaemonManager._fail_zombie_running_jobs(backend)
+
+        with backend._get_session() as session:
+            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            assert db_job.status == "failed", "zombie sweep must have reclaimed the job"
+            reclaimed_version = db_job.version
+            assert reclaimed_version != expected_version, (
+                "zombie reclaim must bump the version in standalone mode too — "
+                "otherwise fencing has nothing to detect"
+            )
+
+        # The superseded original worker now finishes its (stale) run and
+        # tries to record success against the version it originally claimed.
+        with pytest.raises(JobFencingError):
+            backend.mark_job_success(
+                job_id, output="late result", expected_version=expected_version
+            )
+
+        # The zombie sweep's outcome must be untouched — no silent clobber.
+        with backend._get_session() as session:
+            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            assert db_job.status == "failed"
+            assert db_job.output != "late result"

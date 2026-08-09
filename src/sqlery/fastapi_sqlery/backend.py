@@ -1710,13 +1710,23 @@ class SQLAlchemyBackend(DatabaseBackend):
             return records
 
     def fail_zombie_job(self, job_id: int, reason: str) -> bool:
-        """Mark a running job failed with termination_reason='zombie_job'."""
+        """Mark a running job failed with termination_reason='zombie_job'.
+
+        Bumps `version` on reclaim, mirroring DjangoBackend's CAS
+        mark_failed (F("version") + 1). Without this, a superseded
+        worker's late completion write (mark_job_success/mark_job_failed
+        fenced with its originally-observed expected_version) would still
+        match the unchanged version and silently overwrite the zombie
+        outcome — the fencing check added in the lease-renewal fix would
+        be a silent no-op in standalone mode.
+        """
         with self._get_session() as session:
             # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job is None:
                 return False
             job.mark_failed(error=reason, termination_reason="zombie_job")
+            job.version = (job.version or 0) + 1
             session.add(job)
             session.commit()
             return True
