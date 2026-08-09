@@ -40,11 +40,44 @@ def is_sqlite():
     return get_database_vendor() == 'sqlite'
 
 
+def assert_in_atomic_block(caller: str) -> None:
+    """Guard against select_for_update() being evaluated outside a transaction.
+
+    REGRESSION 2026-05-18 / 2026-06-14: select_for_update() works fine on
+    SQLite outside a transaction, but Django raises
+    TransactionManagementError on PostgreSQL. That difference means the bug
+    only shows up when someone runs against real Postgres -- it happened
+    twice because SQLite-only local testing and CI both stayed green.
+
+    This assertion fails immediately, on every database backend, the moment
+    a select_for_update() call site is reached without an enclosing
+    transaction.atomic() block -- so the mistake is caught in dev/CI
+    (including SQLite) instead of only in a live Postgres deployment.
+
+    Args:
+        caller: Name of the calling function, used in the error message.
+
+    Raises:
+        RuntimeError: If not currently inside a transaction.atomic() block.
+    """
+    if not connection.in_atomic_block:
+        raise RuntimeError(
+            f"{caller} calls select_for_update() but is not running inside a "
+            "transaction.atomic() block. This works by accident on SQLite and "
+            "raises TransactionManagementError on PostgreSQL "
+            "(see REGRESSIONS.md 2026-05-18 / 2026-06-14). Wrap the call site "
+            "in `with transaction.atomic():`."
+        )
+
+
 def atomic_claim_job_queryset(queryset):
     """Apply database-appropriate locking to job queryset.
 
     PostgreSQL: Uses SELECT FOR UPDATE SKIP LOCKED for true atomic claiming
     SQLite: Returns unlocked queryset (locking handled by UPDATE below)
+
+    Callers must already be inside a ``transaction.atomic()`` block --
+    enforced by ``assert_in_atomic_block()`` below, see REGRESSIONS.md.
 
     Args:
         queryset: Django QuerySet to apply locking to
@@ -52,6 +85,7 @@ def atomic_claim_job_queryset(queryset):
     Returns:
         QuerySet: Locked queryset (Postgres) or unlocked queryset (SQLite)
     """
+    assert_in_atomic_block("atomic_claim_job_queryset")
     if is_postgresql():
         # PostgreSQL: SELECT FOR UPDATE SKIP LOCKED
         # Ensures only one worker can claim each job

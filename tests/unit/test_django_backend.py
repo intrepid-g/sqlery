@@ -453,6 +453,53 @@ class TestScheduledTasks:
         claimed = django_backend.claim_due_scheduled_task(t.id)
         assert claimed is not None and claimed.id == t.id
 
+    def test_claim_due_scheduled_task_runs_inside_transaction(self, django_backend):
+        """Regression 2026-08-08: claim_due_scheduled_task must wrap
+        select_for_update in transaction.atomic() (same bug class as
+        2026-05-18 / 2026-06-14, see REGRESSIONS.md)."""
+        from unittest.mock import patch
+        from django.db import transaction
+
+        t = django_backend.create_scheduled_task(
+            name="cl2", task_path="m.f", cron_expression="* * * * *",
+            queue_name="default", priority=0,
+        )
+        django_backend.update_scheduled_task_next_run(
+            t.id, timezone.now() - timedelta(minutes=1)
+        )
+
+        atomic_calls = []
+        original_atomic = transaction.atomic
+
+        def tracking_atomic(*args, **kwargs):
+            atomic_calls.append(True)
+            return original_atomic(*args, **kwargs)
+
+        with patch.object(transaction, "atomic", side_effect=tracking_atomic):
+            django_backend.claim_due_scheduled_task(t.id)
+
+        assert len(atomic_calls) >= 1, "claim_due_scheduled_task must use transaction.atomic()"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_select_for_update_guard_raises_outside_transaction(self):
+        """The db_compat guard must fail loudly on any DB backend (not just
+        Postgres) when select_for_update() is reached outside an atomic
+        block -- this is the CI-visible tripwire for the recurring bug
+        class documented in REGRESSIONS.md.
+
+        Uses transaction=True so this test is NOT itself wrapped in an
+        implicit atomic block by pytest-django (the default django_db
+        fixture wraps every test in one for rollback isolation, which would
+        make "outside a transaction" impossible to observe here)."""
+        from sqlery.django_sqlery.db_compat import assert_in_atomic_block
+
+        with pytest.raises(RuntimeError, match="transaction.atomic"):
+            assert_in_atomic_block("some_caller")
+
+        from django.db import transaction
+        with transaction.atomic():
+            assert_in_atomic_block("some_caller")  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # 6. Registry

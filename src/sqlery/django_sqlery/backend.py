@@ -18,7 +18,12 @@ from django.utils import timezone
 from sqlery.core.db_resilience import retry_on_db_error
 
 from ..compat import DatabaseBackend, JobFencingError
-from .db_compat import atomic_claim_job, atomic_claim_job_queryset, is_sqlite
+from .db_compat import (
+    assert_in_atomic_block,
+    atomic_claim_job,
+    atomic_claim_job_queryset,
+    is_sqlite,
+)
 # Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
 from .models import (
     ConcurrentModificationError,
@@ -1194,6 +1199,7 @@ class DjangoBackend(DatabaseBackend):
         # Acquire exclusive locks (Postgres: SELECT FOR UPDATE, SQLite: no-op)
         tag_queryset = TagLock.objects.filter(tag__in=tags)
         if not is_sqlite():
+            assert_in_atomic_block("acquire_tag_locks")
             tag_queryset = tag_queryset.select_for_update()
         list(tag_queryset)  # Force evaluation to actually acquire locks
 
@@ -1241,14 +1247,20 @@ class DjangoBackend(DatabaseBackend):
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
+        # REGRESSION 2026-08-08: select_for_update used outside transaction
+        # Root cause: same class of bug as 2026-05-18/2026-06-14 -- this method
+        # was promoted to the framework-agnostic core.scheduler_tasks module
+        # without an enclosing transaction.atomic(), so it worked on SQLite
+        # but raised TransactionManagementError on PostgreSQL.
         try:
-            return atomic_claim_job_queryset(
-                self.ScheduledTask.objects.filter(
-                    id=task_id,
-                    enabled=True,
-                    next_run_at__lte=timezone.now(),
-                )
-            ).get()
+            with transaction.atomic():
+                return atomic_claim_job_queryset(
+                    self.ScheduledTask.objects.filter(
+                        id=task_id,
+                        enabled=True,
+                        next_run_at__lte=timezone.now(),
+                    )
+                ).get()
         except self.ScheduledTask.DoesNotExist:
             return None
 
