@@ -36,6 +36,7 @@ from django.db import connection
 from django.utils import timezone
 
 from sqlery.compat import AsyncDatabaseBackend
+from sqlery.core.utils import reject_unawaited_coroutine
 
 from .models import (
     DaemonLease,
@@ -229,6 +230,9 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             )
 
     async def amark_success(self, job_id, result) -> None:
+        # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
+        # (raw .aupdate()), so it needs its own guard against unawaited coroutines.
+        reject_unawaited_coroutine(result)
         now = timezone.now()
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
         # Add created_at to filter for partition pruning (write-path item, async mirror).

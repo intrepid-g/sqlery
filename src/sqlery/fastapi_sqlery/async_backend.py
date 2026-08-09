@@ -30,6 +30,7 @@ from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core.utils import reject_unawaited_coroutine
 
 from .database import get_async_session_factory
 
@@ -206,6 +207,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             await session.commit()
 
     async def amark_success(self, job_id, result) -> None:
+        # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
+        # (raw update() statement), so it needs its own guard against unawaited
+        # coroutines.
+        reject_unawaited_coroutine(result)
         now = _utcnow()
         output = "" if result is None else str(result)
         factory = get_async_session_factory()

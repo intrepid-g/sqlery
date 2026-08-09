@@ -15,6 +15,8 @@ from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
 from sqlalchemy import BigInteger, Index, DateTime
 
+from sqlery.core.utils import reject_unawaited_coroutine
+
 
 class ScheduledTask(SQLModel, table=True):
     """A scheduled task that runs on a cron schedule."""
@@ -194,6 +196,9 @@ class QueuedJob(SQLModel, table=True):
 
     def mark_success(self, output: str = ""):
         """Mark job as successful."""
+        # REGRESSION 2026-08-08: guard the shared success-recording choke point,
+        # not just individual executor call sites -- see REGRESSIONS.md
+        reject_unawaited_coroutine(output)
         self.status = "success"
         self.finished_at = datetime.now(UTC)
         if self.started_at:
