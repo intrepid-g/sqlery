@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.24.9] - 2026-08-10
+
+### Fixed
+
+- Job-completion fencing: workers now pass the post-claim `expected_version` to `mark_job_success`/`mark_job_failed`, so a stale worker whose job was reclaimed by the zombie sweep can no longer clobber the reclaimed job's outcome. A rejected late write raises `JobFencingError`, which is logged and discarded instead of double-recording a result. (Note: the SQLAlchemy backend's check is read-then-commit, not atomic CAS — tracked in #17.)
+- Async worker retry-requeue: `arequeue_retry` is now implemented on both async backends. Previously a hard-coded `isinstance` check made retries a silent no-op on the Django async backend.
+- Unawaited-coroutine guard: `mark_success`/`amark_success` on both backends now reject a coroutine object as a job result instead of persisting its repr.
+- `select_for_update` call sites in the Django backend are guarded by `assert_in_atomic_block`, catching lock-less claims at the seam instead of failing silently on Postgres. The SQLite no-op claim path is exempt.
+
 ## [0.24.7] - 2026-07-14
 
 ### Fixed
