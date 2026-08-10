@@ -38,6 +38,7 @@ from sqlery.core.worker import WorkerProcess
 
 # Reuse the proven election harness verbatim rather than duplicating it — these
 # are the exact helpers `TestWorkerSchedulerElection` drives the wiring with.
+from tests.pg_url import sqlalchemy_pg_url
 from tests.unit.conftest import FakeBackend, _utcnow, make_scheduled_task
 from tests.unit.test_worker import (
     _claimed_queues,
@@ -228,7 +229,7 @@ class TestParityBareWorkerE2E:
         if db == "postgres":
             if not os.environ.get("SQLERY_TEST_PG_URL"):
                 pytest.skip("SQLERY_TEST_PG_URL not set; PG standalone E2E skipped")
-            db_url = os.environ["SQLERY_TEST_PG_URL"]
+            db_url = sqlalchemy_pg_url(os.environ["SQLERY_TEST_PG_URL"])
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
             tmp.close()

@@ -359,6 +359,7 @@ class WorkerPoolManager:
 
         stopped = 0
         sig = signal.SIGKILL if force else signal.SIGTERM
+        signaled_pids: set[int] = set()
 
         for worker in workers:
             # Only stop workers on this node
@@ -386,6 +387,7 @@ class WorkerPoolManager:
             try:
                 os.kill(pid, sig)
                 stopped += 1
+                signaled_pids.add(pid)
                 logger.info(f"Sent {signal.Signals(sig).name} to worker {worker_id} (PID {pid})")
             except ProcessLookupError:
                 # Process already dead
@@ -405,6 +407,34 @@ class WorkerPoolManager:
                 )
             except Exception as e:
                 logger.error(f"Failed to update worker {worker_id} status: {e}")
+
+        # Fallback: also signal locally-tracked worker subprocesses that
+        # never made it into the DB heartbeat sweep above. spawn_worker()
+        # forks the child before the child's WorkerProcess.__init__ has a
+        # chance to INSERT its heartbeat row; a one-shot cycle
+        # (`_run_daemon(once=True)`) can reach this `finally` block before
+        # that INSERT lands, so the DB-driven loop above never sees (and
+        # never signals) the newly spawned PID. Since the child is spawned
+        # with `start_new_session=True` (detached process group), an
+        # unsignaled worker keeps polling forever as an orphan — this is
+        # what leaked and hung CI (killed as an orphan process partway
+        # through the run). Signaling every tracked Popen handle directly
+        # closes that race regardless of heartbeat timing.
+        for proc in self._child_processes:
+            if proc.pid in signaled_pids:
+                continue
+            if proc.poll() is not None:
+                continue  # already exited
+            try:
+                proc.send_signal(sig)
+                stopped += 1
+                logger.info(
+                    f"Sent {signal.Signals(sig).name} to untracked worker (PID {proc.pid})"
+                )
+            except ProcessLookupError:
+                logger.debug(f"Untracked worker (PID {proc.pid}) already dead")
+            except Exception as e:
+                logger.error(f"Error stopping untracked worker (PID {proc.pid}): {e}")
 
         return stopped
 

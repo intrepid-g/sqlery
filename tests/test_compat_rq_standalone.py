@@ -166,6 +166,12 @@ class MockBackend(DatabaseBackend):
     def update_scheduled_task_next_run(self, task_id, next_run_at):
         pass
 
+    def advance_scheduled_task_if_due(
+        self, task_id, observed_next_run_at, new_next_run_at, job_kwargs
+    ):
+        """Fake CAS: always wins (no concurrent tasks in these tests) and enqueues."""
+        return FakeJob(id=task_id)
+
     def update_scheduled_task(self, task_id, **updates):
         return None
 

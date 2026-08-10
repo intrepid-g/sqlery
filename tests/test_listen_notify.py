@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sqlery.core.pg_notify import sanitize_queue_name_to_channel
+from tests.pg_url import sqlalchemy_pg_url
 
 # ---------------------------------------------------------------------------
 # PG skip marker — mirrors test_lifecycle_partitioned.py exactly
@@ -586,9 +587,7 @@ class TestSQLAlchemyNotifyDeliveryPG:
         pg_url = os.environ["SQLERY_TEST_PG_URL"]
         # SQLAlchemy defaults bare postgresql:// to psycopg2 (not installed);
         # sqlery uses psycopg3. Force the psycopg3 driver for init_database.
-        sa_url = pg_url
-        if sa_url.startswith("postgresql://"):
-            sa_url = "postgresql+psycopg://" + sa_url[len("postgresql://"):]
+        sa_url = sqlalchemy_pg_url(pg_url)
         # psycopg.connect() wants a libpq DSN, not the SQLAlchemy +psycopg form.
         listen_dsn = pg_url
         if listen_dsn.startswith("postgresql+psycopg://"):

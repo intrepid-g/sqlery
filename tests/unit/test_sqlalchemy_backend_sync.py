@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, UTC
 
 import pytest
 
+from tests.pg_url import sqlalchemy_pg_url
+
 # Skip these tests entirely under the Django pytest harness so we don't import
 # Django settings or fight with pytest-django's DB fixtures.
 pytestmark = []
@@ -893,14 +895,21 @@ def pg_sync_backend(monkeypatch):
     if not pg_url:
         pytest.skip("SQLERY_TEST_PG_URL not set; PG mirror skipped")
 
-    from sqlalchemy import create_engine
-    from sqlmodel import SQLModel
+    from sqlalchemy import create_engine, text
     from sqlery.fastapi_sqlery import database as db_mod
     from sqlery.core import models as _core_models  # noqa: F401
 
-    engine = create_engine(pg_url, future=True)
-    SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
+    # NOTE: sqlery_queued_job's PG schema is a partitioned table with only a
+    # composite (id, created_at) unique constraint, and sqlery_worker /
+    # sqlery_registry are deliberately created WITHOUT FK constraints (D4 —
+    # see database.py's _FK_DEMOTED_TABLES) because a single-column FK against
+    # a partitioned table's id is not satisfiable in real PostgreSQL. Plain
+    # SQLModel.metadata.create_all/drop_all bypasses that and raises
+    # InvalidForeignKey / CircularDependencyError, so use the same
+    # init_database() path production code uses instead.
+    db_mod._engine = None
+    db_mod.init_database(sqlalchemy_pg_url(pg_url))
+    engine = db_mod.get_engine()
     monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
 
     from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
@@ -910,9 +919,12 @@ def pg_sync_backend(monkeypatch):
         yield backend
     finally:
         try:
-            SQLModel.metadata.drop_all(engine)
+            with engine.connect() as conn:
+                conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+                conn.commit()
         finally:
             engine.dispose()
+            db_mod._engine = None
 
 
 @pytest.mark.postgres
@@ -1024,7 +1036,8 @@ class TestLeaseLifecyclePostgres:
         # lock while a second daemon attempts to claim in another thread.
         lock_acquired = threading.Event()
         release_lock = threading.Event()
-        holder_session = pg_sync_backend._get_session()
+        holder_cm = pg_sync_backend._get_session()
+        holder_session = holder_cm.__enter__()
         try:
             locked = holder_session.exec(
                 select(DaemonLease)
@@ -1055,18 +1068,19 @@ class TestLeaseLifecyclePostgres:
             holder_session.rollback()  # release the lock without altering the row
             t.join(timeout=10)
         finally:
-            holder_session.close()
+            holder_cm.__exit__(None, None, None)
 
         # The blocking lock makes the expired row visible; d2 takes it over.
         assert takeover_result == [["pg-takeover"]]
-        owner = pg_sync_backend._get_session()
+        owner_cm = pg_sync_backend._get_session()
+        owner = owner_cm.__enter__()
         try:
             final = owner.exec(
                 select(DaemonLease).where(DaemonLease.queue_name == "pg-takeover")
             ).first()
             assert final.daemon_id == "d2"
         finally:
-            owner.close()
+            owner_cm.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------

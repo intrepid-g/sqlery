@@ -74,6 +74,8 @@ from typing import Any
 
 import pytest
 
+from tests.pg_url import sqlalchemy_pg_url
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,9 +122,31 @@ def pytest_collection_modifyitems(config, items):
     marker (introduced by plan 03-07) on ``SQLERY_TEST_PG_URL``. That
     keeps PG-marked tests skipped (not errored) when the env var is
     unset, regardless of whether they ride the integration harness.
+
+    ``daemon``/``http-trigger`` + ``sqlite`` cells are also skipped
+    unconditionally (see ``skip_subprocess_sqlite`` below) — both modes fork
+    a REAL, detached (``start_new_session=True``) OS subprocess to execute
+    the job (``WorkerPoolManager.spawn_worker`` for daemon,
+    ``spawn_worker_subprocess``/``subprocess_middleware`` for http-trigger),
+    but the SQLite test DB is ``:memory:`` (``tests/settings.py``), which is
+    private to the parent test process's connection. The forked subprocess
+    connects to its own empty in-memory DB, can never see the job the test
+    enqueued, and (daemon mode) polls forever. That leaves an un-terminated
+    orphan child process running after the test's 30s poll loop times out —
+    which is what surfaced as CI getting killed mid-run with "Terminate
+    orphan process" once ``-x`` stopped masking it. The ``postgres`` db
+    cells are unaffected (a real Postgres server is genuinely shared across
+    processes) and still run on the PG rail.
     """
     skip_02_08 = pytest.mark.skip(reason="covered by plan 02-08")
     skip_no_pg = pytest.mark.skip(reason="SQLERY_TEST_PG_URL not set; postgres cells skipped")
+    skip_subprocess_sqlite = pytest.mark.skip(
+        reason=(
+            "mode forks a real worker subprocess that cannot see the "
+            "parent's :memory: SQLite DB — see pytest_collection_modifyitems "
+            "docstring; leaks an orphan process that hangs/kills CI"
+        )
+    )
     pg_url_set = _has_postgres_env()
     for item in items:
         # Plan 03-07: any `@pytest.mark.postgres` test/param is skipped
@@ -140,6 +164,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_02_08)
         if db == "postgres" and not pg_url_set:
             item.add_marker(skip_no_pg)
+        if mode in ("daemon", "http-trigger") and db == "sqlite":
+            item.add_marker(skip_subprocess_sqlite)
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +584,7 @@ def _build_harness(mode: str, integration: str, db: str):
             tmp.close()
             db_url = f"sqlite:///{tmp.name}"
         elif db == "postgres":
-            db_url = os.environ["SQLERY_TEST_PG_URL"]
+            db_url = sqlalchemy_pg_url(os.environ["SQLERY_TEST_PG_URL"])
         else:
             raise AssertionError(f"unknown db: {db}")
         # Initialize the standalone DB so the tables exist before any

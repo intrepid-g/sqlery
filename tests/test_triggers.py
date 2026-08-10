@@ -195,19 +195,25 @@ class TestDjangoTasksMode:
         from django_tasks import TaskResultStatus
         from django_tasks import task as django_tasks_task
         from sqlery.models import QueuedJob
-        from sqlery.triggers import _run_queue_job
+        from sqlery.triggers import _run_queue_job, django_tasks_supports_enqueue_on_commit
 
         job = QueuedJob.objects.create(
             task_path="tests.test_executor.dummy_task",
             queue_name="test",
         )
 
-        # enqueue_on_commit=False so ImmediateBackend runs inside the test transaction
-        result = django_tasks_task(_run_queue_job, enqueue_on_commit=False).enqueue("test")
+        # enqueue_on_commit=False so ImmediateBackend runs inside the test transaction.
+        # Dropped from Task in django-tasks 0.10+; only pass it when supported.
+        task_kwargs = (
+            {"enqueue_on_commit": False} if django_tasks_supports_enqueue_on_commit() else {}
+        )
+        result = django_tasks_task(_run_queue_job, **task_kwargs).enqueue("test")
 
         job.refresh_from_db()
         assert job.status == "success"
-        assert result.status == TaskResultStatus.SUCCEEDED, (
+        # SUCCEEDED renamed to SUCCESSFUL in django-tasks 0.10+; resolve whichever exists.
+        succeeded = getattr(TaskResultStatus, "SUCCESSFUL", None) or TaskResultStatus.SUCCEEDED
+        assert result.status == succeeded, (
             f"django-tasks recorded {result.status} for a run that processed the job: "
             f"{result.errors[0].traceback if result.errors else ''}"
         )

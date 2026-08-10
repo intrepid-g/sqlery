@@ -8,6 +8,7 @@ import os
 import socket
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -125,6 +126,35 @@ class DjangoBackend(DatabaseBackend):
         if not self._partitioned_pg():
             return None
         return connection.cursor()
+
+    @contextmanager
+    def raw_cursor(self):
+        """Context manager yielding a raw psycopg cursor without closing Django's connection.
+
+        BUG FIX: the daemon's generic ``_nullable_cursor_cm`` fallback (used when a
+        backend has no ``raw_cursor()``) closes ``cur.connection`` on exit — correct
+        for ``SQLAlchemyBackend.get_raw_cursor()`` (a freshly checked-out pooled
+        connection per call) but WRONG here: ``DjangoBackend.get_raw_cursor()``
+        returns a cursor on Django's persistent thread-local ``connection`` object.
+        Closing the underlying DBAPI connection directly desyncs it from Django's
+        own bookkeeping (``connection.connection`` still looks "open"), so every
+        subsequent ORM query on that thread/process raises
+        ``OperationalError: the connection is closed`` — this was cascading through
+        the entire postgres test session after any daemon partition-maintenance
+        tick ran. Only the cursor is closed here; Django owns the connection
+        lifecycle itself (``close_old_connections`` / request-boundary teardown).
+        """
+        if not self._partitioned_pg():
+            yield None
+            return
+        cur = connection.cursor()
+        try:
+            yield cur
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def create_job(
         self,
