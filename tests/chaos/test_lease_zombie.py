@@ -27,6 +27,8 @@ from datetime import timedelta
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
+from tests.pg_url import sqlalchemy_pg_url
+
 pytestmark = pytest.mark.timeout(60)
 
 CHAOS_SETTINGS = settings(
@@ -392,14 +394,18 @@ def pg_standalone_backend(monkeypatch):
     if not pg_url:
         pytest.skip("SQLERY_TEST_PG_URL not set; PG mirror skipped")
 
-    from sqlalchemy import create_engine
-    from sqlmodel import SQLModel
+    from sqlalchemy import text
     from sqlery.fastapi_sqlery import database as db_mod
     from sqlery.core import models as _core_models  # noqa: F401
 
-    engine = create_engine(pg_url, future=True)
-    SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
+    # NOTE: mirrors pg_sync_backend in tests/unit/test_sqlalchemy_backend_sync.py
+    # -- plain SQLModel.metadata.create_all/drop_all raises InvalidForeignKey /
+    # CircularDependencyError against the partitioned sqlery_queued_job table
+    # and the FK-demoted sqlery_worker/sqlery_registry tables (D4). Use the
+    # same init_database() path production code uses instead.
+    db_mod._engine = None
+    db_mod.init_database(sqlalchemy_pg_url(pg_url))
+    engine = db_mod.get_engine()
     monkeypatch.setattr(db_mod, "_engine", engine, raising=False)
 
     from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
@@ -409,9 +415,12 @@ def pg_standalone_backend(monkeypatch):
         yield backend
     finally:
         try:
-            SQLModel.metadata.drop_all(engine)
+            with engine.connect() as conn:
+                conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+                conn.commit()
         finally:
             engine.dispose()
+            db_mod._engine = None
 
 
 @pytest.mark.postgres

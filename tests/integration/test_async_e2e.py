@@ -36,6 +36,7 @@ from sqlery.core.models import QueuedJob
 from sqlery.fastapi_sqlery import async_backend as _ab  # registers Lease on metadata  # noqa: F401
 from sqlery.fastapi_sqlery import database as _db_mod
 from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
+from tests.pg_url import sqlalchemy_pg_url
 
 
 pytestmark = pytest.mark.asyncio
@@ -48,10 +49,7 @@ def _pg_url() -> str:
     — the sync engine used by ``init_database`` also needs ``+psycopg`` since
     psycopg2 is not an installed dependency (project standardizes on psycopg3).
     """
-    raw = os.environ["SQLERY_TEST_PG_URL"]
-    if raw.startswith("postgresql://") or raw.startswith("postgresql+psycopg2://"):
-        return "postgresql+psycopg" + raw[raw.index("://"):]
-    return raw
+    return sqlalchemy_pg_url(os.environ["SQLERY_TEST_PG_URL"])
 
 
 # ---------------------------------------------------------------------------

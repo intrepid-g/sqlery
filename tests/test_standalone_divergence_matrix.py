@@ -30,6 +30,8 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
+from tests.pg_url import sqlalchemy_pg_url
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,10 +43,7 @@ def _pg_url() -> str:
     raw = os.environ.get("SQLERY_TEST_PG_URL", "")
     if not raw:
         return raw
-    # Translate postgresql:// -> postgresql+psycopg:// (psycopg3, no psycopg2 needed)
-    if raw.startswith("postgresql://") or raw.startswith("postgresql+psycopg2://"):
-        return "postgresql+psycopg" + raw[raw.index("://"):]
-    return raw
+    return sqlalchemy_pg_url(raw)
 
 
 def _far_future() -> datetime:

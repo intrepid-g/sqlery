@@ -74,6 +74,8 @@ from typing import Any
 
 import pytest
 
+from tests.pg_url import sqlalchemy_pg_url
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -582,7 +584,7 @@ def _build_harness(mode: str, integration: str, db: str):
             tmp.close()
             db_url = f"sqlite:///{tmp.name}"
         elif db == "postgres":
-            db_url = os.environ["SQLERY_TEST_PG_URL"]
+            db_url = sqlalchemy_pg_url(os.environ["SQLERY_TEST_PG_URL"])
         else:
             raise AssertionError(f"unknown db: {db}")
         # Initialize the standalone DB so the tables exist before any
