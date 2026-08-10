@@ -253,26 +253,42 @@ class TestScheduledTaskRecomputation:
     """Test automatic schedule recomputation on changes."""
 
     def test_cron_expression_change_recalculates_next_run(self):
-        """Test that changing cron_expression recalculates next_run_at."""
-        # Create task with daily cron (midnight)
-        task = ScheduledTask.objects.create(
-            name="Daily Task",
-            task_path="myapp.tasks.daily",
-            cron_expression="0 0 * * *",  # Midnight daily
-        )
+        """Test that changing cron_expression recalculates next_run_at.
 
+        Time is frozen: on real wall-clock the daily and hourly crons resolve to
+        the same instant during the last hour of the day (both -> next midnight),
+        which made this assertion fail between 23:00 and 00:00 UTC.
+        """
+        from unittest.mock import patch
+        from datetime import datetime, timezone as dt_tz
+
+        frozen_now = datetime(2026, 3, 10, 1, 10, 0, tzinfo=dt_tz.utc)
+
+        # Create task with daily cron (midnight)
+        with patch("sqlery.core.utils.datetime") as mock_dt:
+            mock_dt.now.return_value = frozen_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            task = ScheduledTask.objects.create(
+                name="Daily Task",
+                task_path="myapp.tasks.daily",
+                cron_expression="0 0 * * *",  # Midnight daily
+            )
+
+        # From 01:10 the next midnight is the following day.
         original_next_run = task.next_run_at
-        assert original_next_run.hour == 0
-        assert original_next_run.minute == 0
+        assert original_next_run == datetime(2026, 3, 11, 0, 0, 0, tzinfo=dt_tz.utc)
 
         # Change to hourly cron
-        task.cron_expression = "0 * * * *"  # Every hour on the hour
-        task.save()
+        with patch("sqlery.core.utils.datetime") as mock_dt:
+            mock_dt.now.return_value = frozen_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            task.cron_expression = "0 * * * *"  # Every hour on the hour
+            task.save()
 
-        # Should recalculate - next run should be sooner
+        # Should recalculate to the next hour boundary (02:00), far sooner.
         task.refresh_from_db()
-        assert task.next_run_at != original_next_run
-        assert task.next_run_at.minute == 0
+        assert task.next_run_at == datetime(2026, 3, 10, 2, 0, 0, tzinfo=dt_tz.utc)
+        assert task.next_run_at < original_next_run
 
     def test_enabling_task_recalculates_next_run(self):
         """Test that re-enabling a disabled task recalculates next_run_at.

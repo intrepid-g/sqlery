@@ -704,3 +704,70 @@ class TestStandaloneFencedCompletionAfterReclaim:
             db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             assert db_job.status == "failed"
             assert db_job.output != "late result"
+
+    def test_version_bump_in_the_read_to_update_window_is_still_rejected(
+        self, standalone_zombie_backend, monkeypatch
+    ):
+        """Real concurrency-shaped TOCTOU check (GH #17).
+
+        The old implementation checked `db_job.version == expected_version`
+        on a row it had already read, then committed separately — a writer
+        that reclaimed the job *after* that check but *before* the commit
+        would slip through undetected. This test forces exactly that
+        interleaving: a "reclaiming" writer bumps the row's version from
+        inside `QueuedJob.mark_success` itself, i.e. after
+        `mark_job_success` has read the row but before its completion write
+        lands. The fenced UPDATE's WHERE clause re-checks the version at
+        write time, not at read time, so it must still be rejected.
+        """
+        from datetime import datetime, UTC
+
+        from sqlmodel import select
+        from sqlery.compat import JobFencingError
+        from sqlery.core.models import QueuedJob
+
+        backend = standalone_zombie_backend
+
+        with backend._get_session() as session:
+            job = QueuedJob(
+                task_path="tests.chaos.conftest.task_succeeds",
+                queue_name="default",
+                status="running",
+                worker_pid=os.getpid(),
+                started_at=datetime.now(UTC),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            job_id = job.id
+
+        # Version the caller captured before executing the task body.
+        expected_version = 0
+
+        original_mark_success = QueuedJob.mark_success
+
+        def reclaim_then_mark_success(self_job, *args, **kwargs):
+            # Simulate a concurrent worker reclaiming the job (bumping its
+            # version) in the window between mark_job_success's row read
+            # and its completion write — the TOCTOU window the old
+            # check-then-commit code was vulnerable to.
+            with backend._get_session() as race_session:
+                race_job = race_session.exec(
+                    select(QueuedJob).where(QueuedJob.id == job_id)
+                ).first()
+                race_job.version = (race_job.version or 0) + 1
+                race_session.add(race_job)
+                race_session.commit()
+            return original_mark_success(self_job, *args, **kwargs)
+
+        monkeypatch.setattr(QueuedJob, "mark_success", reclaim_then_mark_success)
+
+        with pytest.raises(JobFencingError):
+            backend.mark_job_success(
+                job_id, output="stale result", expected_version=expected_version
+            )
+
+        with backend._get_session() as session:
+            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            assert db_job.output != "stale result"
+            assert db_job.version == 1
