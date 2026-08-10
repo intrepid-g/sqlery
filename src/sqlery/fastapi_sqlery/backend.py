@@ -1328,22 +1328,20 @@ class SQLAlchemyBackend(DatabaseBackend):
             with self._get_session() as session:
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
-                    # ponytail: check-then-commit, not a WHERE-clause CAS UPDATE — a
-                    # concurrent writer could still slip in between this check and
-                    # session.commit(). Closes the realistic race (reclaim happened
-                    # before this read); upgrade path is a single UPDATE ... WHERE
-                    # version=expected_version RETURNING *, like claim_job's SQLite branch.
-                    if expected_version is not None and (db_job.version or 0) != expected_version:
-                        raise JobFencingError(
-                            f"Job {job_id} was reclaimed by another worker "
-                            f"(expected version {expected_version}, found {db_job.version})"
-                        )
+                    # Detach before mutating: an attached instance's dirty attributes
+                    # would autoflush unconditionally on the next session.exec() call,
+                    # bypassing the version-fenced UPDATE below (the CAS check has to
+                    # be the only write path, not a side effect of ORM tracking).
+                    session.expunge(db_job)
                     db_job.mark_success(output=output)
-                    db_job.version = (db_job.version or 0) + 1
-                    session.add(db_job)
-                    session.commit()
-                    session.refresh(db_job)
-                    return db_job
+                    values = {
+                        "status": db_job.status,
+                        "finished_at": db_job.finished_at,
+                        "duration_seconds": db_job.duration_seconds,
+                        "output": db_job.output,
+                        "runs": db_job.runs,
+                    }
+                    return self._fenced_update(session, job_id, expected_version, values)
         return job
 
     def mark_job_failed(
@@ -1366,18 +1364,51 @@ class SQLAlchemyBackend(DatabaseBackend):
             with self._get_session() as session:
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
-                    if expected_version is not None and (db_job.version or 0) != expected_version:
-                        raise JobFencingError(
-                            f"Job {job_id} was reclaimed by another worker "
-                            f"(expected version {expected_version}, found {db_job.version})"
-                        )
+                    session.expunge(db_job)
                     db_job.mark_failed(error=error, traceback=traceback)
-                    db_job.version = (db_job.version or 0) + 1
-                    session.add(db_job)
-                    session.commit()
-                    session.refresh(db_job)
-                    return db_job
+                    values = {
+                        "status": db_job.status,
+                        "finished_at": db_job.finished_at,
+                        "duration_seconds": db_job.duration_seconds,
+                        "error": db_job.error,
+                        "traceback": db_job.traceback,
+                        "termination_reason": db_job.termination_reason,
+                        "runs": db_job.runs,
+                    }
+                    return self._fenced_update(session, job_id, expected_version, values)
         return job
+
+    def _fenced_update(
+        self, session: Session, job_id: int, expected_version: int | None, values: dict
+    ):
+        """Apply `values` to a QueuedJob via a single atomic conditional UPDATE.
+
+        When expected_version is given, the UPDATE only matches a row whose
+        current version still equals it (WHERE-clause CAS, mirroring
+        DjangoBackend.mark_success/mark_failed and claim_job's SQLite branch).
+        Zero rows affected means another worker already reclaimed the job
+        (its lease/heartbeat went stale and the zombie detector requeued
+        it) -- raise JobFencingError instead of silently clobbering the
+        reclaiming worker's result. Always bumps version by 1 on success.
+        """
+        stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+        if expected_version is not None:
+            stmt = stmt.where(QueuedJob.version == expected_version)
+        stmt = stmt.values(version=QueuedJob.version + 1, **values).execution_options(
+            synchronize_session=False
+        )
+        result = session.exec(stmt)
+        if result.rowcount == 0:
+            session.rollback()
+            if expected_version is not None:
+                raise JobFencingError(
+                    f"Job {job_id} was reclaimed by another worker "
+                    f"(expected version {expected_version})"
+                )
+            # No row matched at all (job deleted concurrently) -- nothing to return.
+            return None
+        session.commit()
+        return session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
 
     def mark_job_archived(self, job_id: int):
         """Mark a failed job as archived (a retry has been created for it).
