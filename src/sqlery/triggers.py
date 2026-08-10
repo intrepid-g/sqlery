@@ -1,5 +1,6 @@
 """Trigger mechanisms for sqlery."""
 
+import dataclasses
 import logging
 
 from sqlery.core.worker import TaskExecutor
@@ -11,6 +12,21 @@ except ImportError:
     task = None
 
 logger = logging.getLogger(__name__)
+
+
+def django_tasks_supports_enqueue_on_commit() -> bool:
+    """Check whether the installed django-tasks ``Task`` accepts ``enqueue_on_commit``.
+
+    django-tasks 0.10 dropped the ``enqueue_on_commit`` kwarg from the frozen
+    ``Task`` dataclass; passing it now raises ``TypeError``. Feature-detect via
+    the dataclass fields instead of pinning/sniffing a version, so sqlery works
+    against both old (<0.10) and new (>=0.10) releases.
+    """
+    if task is None:
+        return False
+    from django_tasks.base import Task
+
+    return "enqueue_on_commit" in {f.name for f in dataclasses.fields(Task)}
 
 
 def trigger_due_tasks():
