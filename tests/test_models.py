@@ -376,27 +376,43 @@ class TestScheduledTaskRecomputation:
         assert task.next_run_at.minute == 0
 
     def test_multiple_cron_changes(self):
-        """Test multiple successive cron changes."""
-        task = ScheduledTask.objects.create(
-            name="Changing Task",
-            task_path="myapp.tasks.test",
-            cron_expression="0 0 * * *",  # Daily at midnight
-        )
+        """Test multiple successive cron changes.
 
-        # Change 1: To hourly
-        task.cron_expression = "0 * * * *"
-        task.save()
-        task.refresh_from_db()
-        next_run_1 = task.next_run_at
+        Freezes time at minute=10 so hourly (next tick :00) and every-5-minutes
+        (next tick :15) cron expressions provably diverge. Without freezing,
+        this test flaked ~8% of the time: during the last 5 minutes of any
+        hour, both expressions' next tick coincide at the following hour.
+        """
+        from unittest.mock import patch
+        from datetime import datetime, timezone as dt_tz
 
-        # Change 2: To every 5 minutes
-        task.cron_expression = "*/5 * * * *"
-        task.save()
-        task.refresh_from_db()
-        next_run_2 = task.next_run_at
+        frozen_t = datetime(2026, 3, 10, 1, 10, 0, tzinfo=dt_tz.utc)
+        with patch("sqlery.core.utils.datetime") as mock_dt:
+            mock_dt.now.return_value = frozen_t
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            task = ScheduledTask.objects.create(
+                name="Changing Task",
+                task_path="myapp.tasks.test",
+                cron_expression="0 0 * * *",  # Daily at midnight
+            )
+
+            # Change 1: To hourly
+            task.cron_expression = "0 * * * *"
+            task.save()
+            task.refresh_from_db()
+            next_run_1 = task.next_run_at
+
+            # Change 2: To every 5 minutes
+            task.cron_expression = "*/5 * * * *"
+            task.save()
+            task.refresh_from_db()
+            next_run_2 = task.next_run_at
 
         # Each change should produce different next_run_at
         assert next_run_2 != next_run_1
+        assert next_run_1 == datetime(2026, 3, 10, 2, 0, 0, tzinfo=dt_tz.utc)
+        assert next_run_2 == datetime(2026, 3, 10, 1, 15, 0, tzinfo=dt_tz.utc)
 
     def test_disabled_then_cron_change_then_enable(self):
         """Test complex scenario: disable, change cron, re-enable.

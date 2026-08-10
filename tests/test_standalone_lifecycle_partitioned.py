@@ -22,6 +22,8 @@ import re
 
 import pytest
 
+from tests.pg_url import sqlalchemy_pg_url
+
 _SKIP_NO_PG = pytest.mark.skipif(
     not os.environ.get("SQLERY_TEST_PG_URL"),
     reason="SQLERY_TEST_PG_URL not set — PG required for partitioned lifecycle tests",
@@ -36,11 +38,7 @@ pytestmark = _SKIP_NO_PG
 
 def _pg_url() -> str:
     """Return the PG test URL, translating to psycopg3 dialect for SQLAlchemy."""
-    raw = os.environ["SQLERY_TEST_PG_URL"]
-    # Translate postgresql:// -> postgresql+psycopg:// (psycopg3, no psycopg2 needed)
-    if raw.startswith("postgresql://") or raw.startswith("postgresql+psycopg2://"):
-        return "postgresql+psycopg" + raw[raw.index("://"):]
-    return raw
+    return sqlalchemy_pg_url(os.environ["SQLERY_TEST_PG_URL"])
 
 
 def _query_relkind(engine, table_name: str) -> str | None:

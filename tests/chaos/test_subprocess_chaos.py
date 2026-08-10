@@ -22,6 +22,7 @@ from tests.chaos.conftest import (
     managed_workers,
     wait_for_status,
 )
+from tests.pg_url import sqlalchemy_pg_url
 
 # Module-level timeout: per-test cap (T-03-11).
 pytestmark = pytest.mark.timeout(60)
@@ -227,7 +228,7 @@ def chaos_pg_url():
     url = os.environ.get("SQLERY_TEST_PG_URL")
     if not url:
         pytest.skip("SQLERY_TEST_PG_URL not set; postgres chaos mirror skipped")
-    return url
+    return sqlalchemy_pg_url(url)
 
 
 @pytest.mark.postgres

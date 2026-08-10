@@ -32,7 +32,7 @@ _migration_module = importlib.import_module(
 _VendorGuardedCutover = _migration_module._VendorGuardedCutover
 
 # Path to the audit artefact written by plan 15-01.
-PHASE_15_SC5_AUDIT_PATH = ".planning/phases/15-schema-cutover/BLAST-RADIUS-AUDIT.md"
+PHASE_15_SC5_AUDIT_PATH = ".planning/milestones/v0.24.0-phases/15-schema-cutover/BLAST-RADIUS-AUDIT.md"
 
 # Shared skipif marker for all PG-only tests.
 _SKIP_NO_PG = pytest.mark.skipif(
