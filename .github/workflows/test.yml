@@ -86,8 +86,18 @@ jobs:
       # tests/test_parity_scheduler.py (Django x Postgres failover/E2E) plus
       # the PG cells in tests/test_atomic_scheduler.py and
       # tests/test_core_standalone.py. It therefore enforces the
-      # Django x Postgres parity cells of the matrix. Command unchanged.
-      run: uv run pytest -m postgres -v --tb=short
+      # Django x Postgres parity cells of the matrix.
+      # Issue #23: this step previously had NO --timeout, unlike every other
+      # pytest invocation in this workflow (see the chaos/atomic-claiming
+      # steps above). A hanging cell (e.g. a daemon E2E cell that forks a
+      # real detached worker subprocess) would run until GitHub's own job
+      # cancellation force-kills the whole process tree — bypassing the
+      # in-process finally-block cleanup that reaps tracked child processes
+      # (worker_pool.py/daemon.py) — which is what surfaced as "operation was
+      # canceled" plus orphaned uv/pytest/python3 processes. A pytest-level
+      # timeout raises a catchable exception inside the hanging test instead,
+      # so that cleanup runs and the failure reports cleanly.
+      run: uv run pytest -m postgres -v --tb=short --timeout=90
 
     # Phase 11 (PARITY-05): the standalone x Postgres parity cells are NOT
     # exercised by the step above (pytest-django resolves the Django backend)
@@ -138,7 +148,10 @@ jobs:
           tests/test_parity_scheduler.py \
           tests/test_core_standalone.py \
           tests/chaos/test_lease_zombie.py
-        uv run pytest -m "postgres and standalone_pg" -v --tb=short \
+        # Issue #23: add --timeout so a hang here fails cleanly through pytest's
+        # own catchable timeout instead of the job needing external cancellation
+        # (see the matching comment on the "Run @pytest.mark.postgres suite" step).
+        uv run pytest -m "postgres and standalone_pg" -v --tb=short --timeout=90 \
           tests/test_parity_scheduler.py \
           tests/test_core_standalone.py \
           tests/chaos/test_lease_zombie.py
