@@ -96,6 +96,48 @@ def _has_postgres_env() -> bool:
     return bool(os.environ.get("SQLERY_TEST_PG_URL"))
 
 
+def _clear_standalone_pg_queue() -> None:
+    """Delete leftover job rows from the shared standalone-mode PG test DB.
+
+    Standalone-mode postgres cells connect directly to ``SQLERY_TEST_PG_URL``
+    with NO per-test isolation (unlike Django cells, which get automatic
+    flushing from ``transactional_db``). A stale 'queued'/'running' row left
+    by an earlier cell — or a previous, interrupted test run against the
+    same persistent database — gets claimed by ``claim_job()``'s
+    oldest-first ordering ahead of the row the CURRENT test just enqueued.
+    The current test's job then sits 'queued' until its poll timeout while
+    the stale job silently "succeeds" in its place (issue #23, lead 2:
+    ``test_async_e2e_standalone_pg`` and
+    ``test_mode_e2e[postgres-standalone-subprocess]``). Truncating before
+    each postgres-marked test restores the isolation Django gets for free.
+    """
+    import psycopg
+
+    url = os.environ.get("SQLERY_TEST_PG_URL")
+    if not url:
+        return
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE sqlery_queued_job CASCADE")
+    except psycopg.errors.UndefinedTable:
+        pass  # First postgres test of the session — nothing to clean up yet.
+
+
+@pytest.fixture(autouse=True)
+def _isolate_standalone_postgres_queue(request):
+    """Autouse: clear stale queue rows before every ``@pytest.mark.postgres`` test.
+
+    Scoped to this directory (``tests/integration/``) so it covers both
+    ``test_modes.py``'s postgres cells and ``test_async_e2e.py``'s
+    ``test_async_e2e_standalone_pg`` — the two places issue #23 observed
+    "job stuck in queued" failures traced back to shared-queue pollution.
+    """
+    if "postgres" in request.keywords:
+        _clear_standalone_pg_queue()
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Parametrization (db, integration, mode)
 # ---------------------------------------------------------------------------
@@ -147,6 +189,25 @@ def pytest_collection_modifyitems(config, items):
             "docstring; leaks an orphan process that hangs/kills CI"
         )
     )
+    # Issue #23: get_manage_py_path() finds a manage.py fine once one exists at
+    # BASE_DIR, but the spawned `python manage.py run_jobs --once` subprocess
+    # re-imports tests.settings from scratch and resolves DATABASES['NAME'] from
+    # the raw SQLERY_TEST_PG_URL env var — it never sees pytest-django's runtime
+    # swap to the "test_<name>" database, so it claims against the WRONG
+    # database and the job the test enqueued (in the test DB) is invisible to
+    # it. Confirmed by direct repro: adding a manage.py removes the "not found"
+    # error but the job still never leaves 'queued'. Fixing this needs the
+    # child to learn the swapped test-db name (deeper pytest-django surgery),
+    # not a one-line change — skip with a stated reason per the issue's own
+    # suggested approach rather than leave it failing or paper over it.
+    skip_django_http_trigger_pg = pytest.mark.skip(
+        reason=(
+            "real manage.py subprocess spawn re-resolves DATABASES['NAME'] from "
+            "SQLERY_TEST_PG_URL directly and misses pytest-django's test_<name> "
+            "swap, so the spawned worker can never see the enqueued job — see "
+            "pytest_collection_modifyitems docstring / issue #23 lead 1"
+        )
+    )
     pg_url_set = _has_postgres_env()
     for item in items:
         # Plan 03-07: any `@pytest.mark.postgres` test/param is skipped
@@ -166,6 +227,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_no_pg)
         if mode in ("daemon", "http-trigger") and db == "sqlite":
             item.add_marker(skip_subprocess_sqlite)
+        if (mode, integration, db) == ("http-trigger", "django", "postgres"):
+            item.add_marker(skip_django_http_trigger_pg)
 
 
 # ---------------------------------------------------------------------------
@@ -459,10 +522,21 @@ class _StandaloneHarness:
         Runs in a no-Django subprocess so the standalone backend is the one
         wired. Uses ``httpx.ASGITransport`` to call the app without binding a
         real port.
+
+        The FastAPI app installs ``DashboardAuthMiddleware`` (SEC-01) in front
+        of EVERY route, including ``/trigger`` — see
+        ``sqlery.fastapi_sqlery.app`` module comment and ``docs/SECURITY.md``
+        ("Every request must carry the X-Sqlery-Key header" in standalone
+        mode). The request below must set ``SQLERY_DASHBOARD_API_KEY`` before
+        importing ``app`` (the middleware reads it once at import time) and
+        send the matching ``X-Sqlery-Key`` header, or the dashboard middleware
+        rejects the request with 401 before it ever reaches the trigger's own
+        HMAC-signature check — the job then sits 'queued' forever (issue #23).
         """
         script = "\n".join([
             "import asyncio, json, os",
             "os.environ['SQLERY_INTERNAL_SECRET'] = 'test-secret'",
+            "os.environ['SQLERY_DASHBOARD_API_KEY'] = 'test-dashboard-key'",
             "from sqlery.compat import initialize, set_config",
             f"initialize(database_url={self.db_url!r}, enable_daemon=False)",
             "set_config('INTERNAL_SECRET', 'test-secret')",
@@ -474,7 +548,8 @@ class _StandaloneHarness:
             "    transport = httpx.ASGITransport(app=app)",
             "    async with httpx.AsyncClient(transport=transport, base_url='http://test') as c:",
             f"        body = json.dumps({{'action': 'process_queue', 'queue_name': 'default', 'job_id': {job_id}}})",
-            "        r = await c.post('/trigger', content=body, headers={'X-Signature': sig, 'X-Timestamp': ts, 'Content-Type': 'application/json'})",
+            "        headers = {'X-Signature': sig, 'X-Timestamp': ts, 'Content-Type': 'application/json', 'X-Sqlery-Key': 'test-dashboard-key'}",
+            "        r = await c.post('/trigger', content=body, headers=headers)",
             "        print('STATUS', r.status_code, r.text)",
             "asyncio.run(_run())",
         ])
