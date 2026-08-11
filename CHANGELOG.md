@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.24.10] - 2026-08-11
+
+### Fixed
+
+- SQLAlchemy backend job-completion fencing is now atomic: `mark_job_success`/`mark_job_failed` perform a CAS `UPDATE ... WHERE version = expected_version` instead of a read-then-commit check, closing the race left open in 0.24.9 (tracked as #17).
+- `django-tasks` compatibility restored against its latest (API-breaking 0.10) release; CI no longer pinned below it.
+- Daemon E2E tests no longer leak orphan worker processes, unblocking CI runs.
+- Daemon no longer closes the Django persistent DB connection out from under the process.
+- Dropped a legacy-table foreign key that was blocking PostgreSQL test-suite flush/teardown.
+
 ## [0.24.9] - 2026-08-10
 
 ### Fixed
