@@ -868,7 +868,7 @@ wheels = [
 
 [[package]]
 name = "sqlery"
-version = "0.24.9"
+version = "0.24.12"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },

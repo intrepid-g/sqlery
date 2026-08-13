@@ -53,6 +53,7 @@ class JobFunction:
 
         # Copy function metadata
         functools.update_wrapper(self, func)
+        self.__annotations__ = getattr(func, "__annotations__", {})
 
     @property
     def queue(self):
@@ -266,6 +267,7 @@ class AsyncJobFunction:
 
         # Copy function metadata
         functools.update_wrapper(self, func)
+        self.__annotations__ = getattr(func, "__annotations__", {})
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call the original async function directly."""

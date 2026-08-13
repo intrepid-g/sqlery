@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlery"
-version = "0.24.11"
+version = "0.24.12"
 description = "Job queue + cron scheduling - works standalone or with Django"
 readme = "README.md"
 # requires-python = ">=3.10"
@@ -19,6 +19,7 @@ classifiers = [
     "Framework :: Django :: 4.2",
     "Framework :: Django :: 5.0",
     "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

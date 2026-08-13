@@ -19,7 +19,7 @@ jobs:
       matrix:
         # python-version: ['3.11', '3.12', '3.13']
         python-version: ['3.13']
-        django-version: ['5.2']  # LTS floor (ASYN-02) per 02-01-PLAN.
+        django-version: ['5.2', '6.1']  # Supported floor plus current Django 6.x.
 
     services:
       postgres:

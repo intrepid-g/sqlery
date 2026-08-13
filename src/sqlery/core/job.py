@@ -50,6 +50,7 @@ class JobWrapper:
         # See: https://docs.python.org/3/library/functools.html#functools.update_wrapper
         # Note: wraps(func)(self) is unusual and can break pickling/introspection
         update_wrapper(self, func)
+        self.__annotations__ = getattr(func, "__annotations__", {})
 
     def __call__(self, *args, **kwargs) -> Any:
         """Call the original function directly.
