@@ -218,8 +218,10 @@ class AsyncWorker:
         # mid-flight, return immediately — drain_with_deadline takes over
         # writing the terminal status.
         shutdown_event = self._shutdown_event
-        if shutdown_event is None or self._shutting_down:
+        if shutdown_event is None:
             self._inflight.pop(job_id, None)
+            return
+        if self._shutting_down:
             return
 
         shutdown_wait = asyncio.create_task(shutdown_event.wait())
