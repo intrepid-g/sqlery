@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Async shutdown no longer skips drain handling when shutdown starts immediately after a job is registered as in-flight.
 - Job decorator wrappers preserve `__annotations__` on Python 3.14, where `functools.update_wrapper()` no longer copies them by default.
 
 ## [0.24.11] - 2026-08-13
