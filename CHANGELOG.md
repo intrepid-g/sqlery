@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.24.11] - 2026-08-13
+
+### Fixed
+
+- Postgres E2E test rail (issue #23): three independent root causes behind failing `test_mode_e2e[postgres-*]` cells and CI-runner orphan processes. Standalone http-trigger tests now send the required `X-Sqlery-Key` dashboard-auth header; standalone postgres cells get per-test queue isolation (previously shared one persistent queue with no cleanup); the Django http-trigger postgres cell is skipped with a documented reason (subprocess resolves the wrong test database). Both postgres CI steps now carry `--timeout=90` so a hang fails cleanly through pytest instead of forcing GitHub's external, uncatchable job cancellation.
+
 ## [0.24.10] - 2026-08-11
 
 ### Fixed
