@@ -129,16 +129,18 @@ async def test_deadline_wins_observes_transient_state_and_requeues_retry(
 
     worker = AsyncWorker(
         backend=backend, queues=["default"],
-        poll_interval=0.01, shutdown_deadline_seconds=0.2,
+        poll_interval=0.01, shutdown_deadline_seconds=1.0,
     )
 
     observed_statuses: list[str] = []
     observed_event = asyncio.Event()
+    inflight_event = asyncio.Event()
 
     async def peeker():
         # Peek the row's status until we observe the transient 'shutting_down'
         # state, then stop (so we don't contend with drain's terminal write).
-        end_time = asyncio.get_event_loop().time() + 1.0
+        await inflight_event.wait()
+        end_time = asyncio.get_event_loop().time() + 2.0
         while asyncio.get_event_loop().time() < end_time:
             status = await backend.aget_status(job.id)
             if status is not None:
@@ -151,8 +153,11 @@ async def test_deadline_wins_observes_transient_state_and_requeues_retry(
     async def trigger():
         for _ in range(200):
             if worker._inflight:
+                inflight_event.set()
                 break
             await asyncio.sleep(0.01)
+        else:
+            inflight_event.set()
         worker._initiate_shutdown()
 
     await asyncio.gather(
