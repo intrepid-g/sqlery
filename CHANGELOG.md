@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.24.12] - 2026-08-13
+
+### Changed
+
+- Django compatibility is now exercised in CI on both Django 5.2 and Django 6.1, and package metadata advertises Django 6.1 support.
+
+### Fixed
+
+- Job decorator wrappers preserve `__annotations__` on Python 3.14, where `functools.update_wrapper()` no longer copies them by default.
+
 ## [0.24.11] - 2026-08-13
 
 ### Fixed
