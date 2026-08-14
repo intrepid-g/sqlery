@@ -37,6 +37,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlery.core.claiming import expire_ttl_jobs
 from sqlery.core.signature import verify_signature
 
 logger = logging.getLogger(__name__)
@@ -252,6 +253,10 @@ def _dispatch_process_queue(payload: dict) -> TriggerResult:
         import uuid
         worker_id = f"trigger-{uuid.uuid4()}"
         try:
+            # H1 follow-up: claim_job no longer expires TTL jobs for free
+            # (that moved to the persistent worker loops); one-shot callers
+            # like this HTTP trigger must expire explicitly before claiming.
+            expire_ttl_jobs(backend)
             job = backend.claim_job([queue_name], worker_id)
         except Exception as e:  # pragma: no cover
             logger.exception("claim_job failed inside HTTP trigger")

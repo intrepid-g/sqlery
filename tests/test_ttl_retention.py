@@ -246,6 +246,81 @@ class TestExpireTTLJobs:
 
 
 # ---------------------------------------------------------------------------
+# 1b. H1 regression: TTL expiry must still run for one-shot claim_job() callers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestExpiredJobsNotClaimedViaClaimJob:
+    """H1 moved expire_ttl_jobs() out of claim_next_job_with_queue_priority.
+
+    backend.claim_job() (used by lambda_core.py, triggers.py, job_queue.py) used
+    to get TTL expiry "for free" via that delegation. It must still, since those
+    are one-shot callers with no persistent poll loop to expire jobs later.
+    """
+
+    def test_job_queue_claim_job_expires_before_claiming(self):
+        """job_queue.claim_job() (core/job_queue.py:317) must expire TTL jobs
+        before claiming, since it no longer gets that behavior for free."""
+        from sqlery.core.job_queue import claim_job as core_claim_job
+
+        expired = _create_job(ttl=1)
+        expired_id = expired.id
+        QueuedJob.objects.filter(id=expired_id).update(
+            created_at=timezone.now() - timedelta(seconds=60)
+        )
+        fresh = _create_job(ttl=None)
+
+        claimed = core_claim_job(["default"], "worker_testnode_1")
+
+        expired = QueuedJob.objects.get(id=expired_id)
+        assert expired.status == "failed"
+        assert expired.termination_reason == "expired"
+        # The fresh job is the only claimable one left.
+        assert claimed is not None
+        assert claimed.id == fresh.id
+
+
+@pytest.mark.django_db
+class TestGetClaimableJobsExcludesExpiredTTL:
+    """H1 follow-up: get_claimable_jobs itself excludes TTL-expired jobs so a
+    caller with no persistent poll loop can't claim+execute an expired job.
+    The periodic expire_ttl_jobs() sweep is what marks them failed."""
+
+    def test_expired_ttl_job_excluded_from_claimable(self):
+        backend = DjangoBackend()
+        job = _create_job(ttl=1)
+        QueuedJob.objects.filter(id=job.id).update(
+            created_at=timezone.now() - timedelta(seconds=60)
+        )
+        claimable = backend.get_claimable_jobs(queues=["default"], limit=10)
+        assert not any(j.id == job.id for j in claimable)
+
+    def test_unexpired_ttl_job_included_in_claimable(self):
+        backend = DjangoBackend()
+        job = _create_job(ttl=3600)
+        claimable = backend.get_claimable_jobs(queues=["default"], limit=10)
+        assert any(j.id == job.id for j in claimable)
+
+    def test_zero_ttl_job_excluded_from_claimable(self):
+        """ttl=0 must be treated as immediately expired, not 'no limit'."""
+        backend = DjangoBackend()
+        job = _create_job(ttl=0)
+        claimable = backend.get_claimable_jobs(queues=["default"], limit=10)
+        assert not any(j.id == job.id for j in claimable)
+
+    def test_claim_job_returns_none_when_only_expired_ttl_job_queued(self):
+        backend = DjangoBackend()
+        job = _create_job(ttl=1)
+        job_id = job.id
+        QueuedJob.objects.filter(id=job_id).update(
+            created_at=timezone.now() - timedelta(seconds=60)
+        )
+        claimed = backend.claim_job(["default"], "worker_testnode_2")
+        assert claimed is None
+        assert QueuedJob.objects.get(id=job_id).status == "queued"
+
+
+# ---------------------------------------------------------------------------
 # 3. get_expired_ttl_jobs() on DjangoBackend
 # ---------------------------------------------------------------------------
 

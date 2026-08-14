@@ -17,6 +17,7 @@ from django.db.models import Q, Count
 from django.utils import timezone
 
 from sqlery.core.db_resilience import retry_on_db_error
+from sqlery.core.utils import is_ttl_expired
 
 from ..compat import DatabaseBackend, JobFencingError
 from .db_compat import (
@@ -1209,11 +1210,11 @@ class DjangoBackend(DatabaseBackend):
         # from datetime import timedelta  # moved to top-level
 
         now = timezone.now()
-        expired = []
-        for job in self.QueuedJob.objects.filter(status="queued", ttl__isnull=False):
-            if job.created_at + timedelta(seconds=job.ttl) < now:
-                expired.append(job)
-        return expired
+        return [
+            job
+            for job in self.QueuedJob.objects.filter(status="queued", ttl__isnull=False)
+            if is_ttl_expired(job, now)
+        ]
 
     def acquire_tag_locks(self, tags: list[str]) -> None:
         """Acquire exclusive locks on tag coordination rows."""
@@ -1271,7 +1272,13 @@ class DjangoBackend(DatabaseBackend):
         else:
             queryset = queryset.order_by("-priority", "created_at")
 
-        return list(queryset[:limit])
+        # H1 follow-up: get_claimable_jobs must exclude TTL-expired jobs so a
+        # caller with no persistent poll loop (lambda_core, triggers, job_queue)
+        # can't claim+execute an expired job. Filtered in Python (not SQL) —
+        # see is_ttl_expired's docstring for why. The periodic expire_ttl_jobs()
+        # sweep is what actually marks these jobs failed.
+        now = timezone.now()
+        return [j for j in queryset[:limit] if not is_ttl_expired(j, now)]
 
     def atomic_claim_job(self, job, worker) -> bool:
         """Atomically claim a specific job for a worker."""

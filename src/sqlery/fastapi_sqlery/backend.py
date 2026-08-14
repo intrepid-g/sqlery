@@ -18,6 +18,7 @@ from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend, JobFencingError, get_config
 from ..core.models import QueuedJob, ScheduledJob, ScheduledTask, JobRegistry, Worker, DaemonLease
+from ..core.utils import is_ttl_expired
 from .database import get_engine, get_session
 
 # Partition maintenance helpers — guarded against psycopg absence (SQLite installs)
@@ -1904,11 +1905,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 )
             )
             now = datetime.now(UTC)
-            expired = []
-            for job in session.exec(stmt).all():
-                if job.created_at + timedelta(seconds=job.ttl) < now:
-                    expired.append(job)
-            return expired
+            return [j for j in session.exec(stmt).all() if is_ttl_expired(j, now)]
 
     def acquire_tag_locks(self, tags: list[str]) -> None:
         """Acquire exclusive locks on tag coordination rows (PostgreSQL)."""
@@ -1943,7 +1940,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if determine_claim_strategy(dialect) == "skip_locked":
                 stmt = stmt.with_for_update(skip_locked=True)
-            return list(session.exec(stmt).all())
+            # H1 follow-up: exclude TTL-expired jobs so a caller with no
+            # persistent poll loop can't claim+execute an expired job. See
+            # is_ttl_expired's docstring for why this stays a Python filter.
+            return [j for j in session.exec(stmt).all() if not is_ttl_expired(j, now)]
 
     def atomic_claim_job(self, job, worker) -> bool:
         """Atomically claim a specific job for a worker.

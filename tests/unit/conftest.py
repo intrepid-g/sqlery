@@ -633,7 +633,14 @@ class FakeBackend(DatabaseBackend):
         self._record("acquire_tag_locks", tuple(tags))
 
     def get_claimable_jobs(self, queues, priority_weights=None, limit=1) -> list:
-        out = [j for j in self._jobs.values() if j.status == "queued" and j.queue_name in queues]
+        from sqlery.core.utils import is_ttl_expired
+
+        now = _utcnow()
+        out = [
+            j
+            for j in self._jobs.values()
+            if j.status == "queued" and j.queue_name in queues and not is_ttl_expired(j, now)
+        ]
         # Order by priority desc, then created_at asc.
         out.sort(key=lambda j: (-j.priority, j.created_at))
         # Optional queue weighting

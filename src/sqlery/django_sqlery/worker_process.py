@@ -16,7 +16,7 @@ django.setup()
 from django.utils import timezone
 
 from sqlery.core.worker import TaskExecutor
-from sqlery.core.claiming import claim_next_job_with_queue_priority, release_job
+from sqlery.core.claiming import claim_next_job_with_queue_priority, release_job, expire_ttl_jobs
 from sqlery.compat import get_backend
 from .worker_registry import register_worker, unregister_worker, update_heartbeat
 from .settings import get_setting
@@ -60,6 +60,9 @@ def run_worker():
     executor = TaskExecutor()
     heartbeat_interval = get_setting("WORKER_HEARTBEAT_INTERVAL", 5)
     last_heartbeat = time.time()
+    # H1 follow-up: throttle expire_ttl_jobs so back-to-back claims under load
+    # don't each re-run the TTL sweep — at most once per heartbeat_interval.
+    last_ttl_expiry = 0.0
 
     # Resolve backend + queues once for the lifetime of this worker loop
     # (Phase 04-01: fix arity bug — claim_next_job_with_queue_priority requires
@@ -73,6 +76,16 @@ def run_worker():
             if time.time() - last_heartbeat >= heartbeat_interval:
                 update_heartbeat(worker)
                 last_heartbeat = time.time()
+
+            # Moved from claim_next_job_with_queue_priority (H1): TTL expiry no longer
+            # runs on every claim call. Throttled to at most once per heartbeat_interval.
+            now = time.time()
+            if now - last_ttl_expiry >= heartbeat_interval:
+                last_ttl_expiry = now
+                try:
+                    expire_ttl_jobs(backend)
+                except Exception as e:
+                    logger.error(f"TTL expiry error: {e}", exc_info=True)
 
             # Try to claim a job
             job = claim_next_job_with_queue_priority(worker, backend, queues)

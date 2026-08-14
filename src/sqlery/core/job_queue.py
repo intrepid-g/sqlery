@@ -3,6 +3,7 @@
 from datetime import datetime, timezone as tz
 
 from ..compat import get_backend, get_config
+from .claiming import expire_ttl_jobs
 
 
 class Queue:
@@ -329,6 +330,10 @@ def claim_job(queues: list[str], worker_id: str):
     # from ..compat import get_backend  # moved to top-level
 
     backend = get_backend()
+    # H1 follow-up: claim_job no longer expires TTL jobs for free (that moved
+    # to the persistent worker loops); this one-shot entry point must expire
+    # explicitly before claiming.
+    expire_ttl_jobs(backend)
     return backend.claim_job(queues, worker_id)
 
 

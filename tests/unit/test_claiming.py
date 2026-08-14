@@ -321,13 +321,41 @@ class TestClaimingPriority:
         with pytest.raises(RuntimeError):
             claiming.release_job(worker=object(), job=object(), status="success")
 
-    def test_ttl_expiry_runs_before_claim_loop(self, fake_backend):
+    def test_expired_ttl_job_is_not_claimable(self, fake_backend):
+        """H1: TTL expiry moved out of the claim path onto the periodic worker
+        tick and the get_claimable_jobs guard (see worker.py /
+        worker_process.py, and the backends' get_claimable_jobs). The claim
+        loop itself no longer expires jobs -- it just can't see them as
+        candidates, so an expired-but-not-yet-swept job is left untouched."""
         old = fake_backend.add_job(
             make_job(ttl=1, created_at=datetime.now(timezone.utc) - timedelta(seconds=10))
         )
         worker = make_worker()
-        claim_next_job_with_queue_priority(
+        claimed = claim_next_job_with_queue_priority(
             worker=worker, backend=fake_backend, queues=["default"], enable_registries=False
         )
-        assert old.status == "failed"
-        assert old.termination_reason == "expired"
+        assert claimed is None
+        assert old.status == "queued"
+        # No expiry side effect from the claim call itself -- that's the
+        # periodic expire_ttl_jobs() sweep's job.
+        assert old.termination_reason is None
+
+    def test_blocked_candidate_does_not_starve_claimable_job_behind_it(self, fake_backend):
+        """Regression test for the starvation bug fixed by H1: a single
+        `get_claimable_jobs(limit=max_attempts)` fetch means a job blocked by a
+        tag-concurrency limit no longer gets re-fetched on every attempt,
+        starving a claimable job behind it in priority order."""
+        fake_backend.add_job(make_job(tags=["t"], status="running"))  # occupies the tag slot
+        blocked = fake_backend.add_job(make_job(tags=["t"], priority=10))  # job A: first, blocked
+        claimable = fake_backend.add_job(make_job(tags=[], priority=5))  # job B: behind, claimable
+        worker = make_worker()
+        claimed = claim_next_job_with_queue_priority(
+            worker=worker,
+            backend=fake_backend,
+            queues=["default"],
+            tag_concurrency_limits={"t": 1},
+            max_attempts=10,
+            enable_registries=False,
+        )
+        assert claimed is claimable
+        assert blocked.status == "queued"
