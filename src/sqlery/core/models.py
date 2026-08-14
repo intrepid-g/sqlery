@@ -5,7 +5,7 @@ to ensure consistency with Django models.
 """
 
 import os
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, UTC
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 # Needed for SQLModel forward-reference string annotations in Relationship() — union syntax ("X | None")
 # is not supported by SQLAlchemy's string resolver, so Optional["X"] must be used instead.
@@ -16,6 +16,8 @@ from sqlmodel import Field, SQLModel, Column, JSON, Relationship
 from sqlalchemy import BigInteger, Index, DateTime
 
 from sqlery.core.utils import reject_unawaited_coroutine
+from sqlery.core.worker_admin import is_worker_beating
+from sqlery.compat import get_config
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -402,13 +404,13 @@ class Worker(SQLModel, table=True):
             ("status", "last_heartbeat"),
         ]
 
-    def is_alive(self, timeout_seconds: int = 30) -> bool:
-        """Check if worker is alive based on heartbeat."""
-        if self.status == "dead":
-            return False
-        # from datetime import timedelta  # moved to top-level
-        threshold = datetime.now(UTC) - timedelta(seconds=timeout_seconds)
-        return self.last_heartbeat >= threshold
+    def is_alive(self, timeout_seconds: int | None = None) -> bool:
+        """Check if worker is alive based on heartbeat (see is_worker_beating)."""
+        if timeout_seconds is None:
+            timeout_seconds = get_config("WORKER_ALIVE_TIMEOUT", 30)
+        return is_worker_beating(
+            self.status, self.last_heartbeat, datetime.now(UTC), timeout_seconds
+        )
 
 
 class DaemonLease(SQLModel, table=True):

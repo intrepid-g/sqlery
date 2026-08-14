@@ -33,3 +33,28 @@ def is_worker_deletable(
         return True
     age_seconds = (now - last_heartbeat).total_seconds()
     return age_seconds >= threshold_seconds
+
+
+# Gray area: what makes a worker "alive"? The package used to answer this four ways —
+#   no cutoff at all (dashboard counts), 24h (dashboard row list), 60s
+#   (get_worker_heartbeats) and 30s (Worker.is_alive). A container destroyed with
+#   ENABLE_DAEMON=False leaves its rows at status='idle' forever, and only the
+#   daemon-only reaper (cleanup_dead_workers) ever writes status='dead' — so the
+#   no-cutoff count reported dead workers as active and stuck-queue detection
+#   called an empty queue healthy.
+# Decision: ONE definition — a worker is alive when its status is not 'dead' AND its
+#   last heartbeat is younger than WORKER_ALIVE_TIMEOUT (default 30s, the same knob
+#   cleanup_dead_workers uses). Liveness is derived from the heartbeat at read time,
+#   so it is correct with or without a reaper running.
+# Forced by: heartbeats are written by the worker itself on every waitpid tick
+#   (core/worker.py lease renewal), so a busy long-job worker still beats.
+def is_worker_beating(
+    status: str | None,
+    last_heartbeat: datetime | None,
+    now: datetime,
+    timeout_seconds: int,
+) -> bool:
+    """Return True when the worker is genuinely alive (heartbeat within timeout)."""
+    if status == "dead" or last_heartbeat is None:
+        return False
+    return (now - last_heartbeat).total_seconds() < timeout_seconds

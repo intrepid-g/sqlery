@@ -4,12 +4,43 @@ import subprocess
 import sys
 import os
 import logging
+from pathlib import Path
+
+from django.conf import settings as django_settings
 from django.core.cache import cache
 
 from .subprocess_executor import get_manage_py_path
 from .settings import get_setting
 
 logger = logging.getLogger(__name__)
+
+TRIGGER_LOG_NAME = "sqlery_subprocess_trigger.log"
+
+
+def _trigger_log_path() -> Path | None:
+    """Where a spawned run_jobs child writes its stdout/stderr, or None if nowhere."""
+    configured = get_setting("SUBPROCESS_TRIGGER_LOG", None)
+    if configured is not None:
+        # Explicit opt-out: SUBPROCESS_TRIGGER_LOG = "" (or False) restores DEVNULL.
+        return Path(configured) if configured else None
+    base_dir = getattr(django_settings, "BASE_DIR", None)
+    if not base_dir:
+        return None
+    return Path(base_dir) / "tmp" / TRIGGER_LOG_NAME
+
+
+def _open_trigger_log():
+    """Open the trigger log in append mode, falling back to DEVNULL on any failure."""
+    path = _trigger_log_path()
+    if path is None:
+        return subprocess.DEVNULL
+    try:
+        path.parent.mkdir(exist_ok=True, parents=True)
+        return open(path, "a")
+    except Exception as e:
+        # Never let logging break job execution — this is the only executor there is.
+        logger.warning(f"Cannot open sqlery subprocess trigger log {path}: {e}")
+        return subprocess.DEVNULL
 
 
 class SubprocessTriggerMiddleware:
@@ -89,6 +120,13 @@ class SubprocessTriggerMiddleware:
         # Get absolute path to manage.py (prevents CWD issues)
         manage_py = get_manage_py_path()
 
+        # Old: stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        # Discarding both streams made this mode undebuggable: a child that died
+        # mid-job left the row at status='running' with empty error/traceback and
+        # NOTHING anywhere said why. In a web-container-only deployment this is the
+        # only executor there is, so its failures must be recoverable from disk.
+        child_output = _open_trigger_log()
+
         # Spawn subprocess (fire-and-forget)
         # NOTE: Each invocation processes EXACTLY ONE job
         subprocess.Popen(
@@ -98,11 +136,17 @@ class SubprocessTriggerMiddleware:
                 "run_jobs",
                 # No --once flag - command now always processes ONE job
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=child_output,
+            stderr=subprocess.STDOUT,
             env=os.environ,  # Inherit environment (critical!)
             start_new_session=True,  # Detach from parent, prevents zombies
             close_fds=True,  # Close file descriptors
         )
+        if child_output not in (subprocess.DEVNULL, None):
+            # Parent's copy is no longer needed; the child holds its own fd.
+            try:
+                child_output.close()
+            except Exception:  # pragma: no cover - fd already gone
+                pass
 
         logger.debug(f"Spawned subprocess: {sys.executable} {manage_py} run_jobs")

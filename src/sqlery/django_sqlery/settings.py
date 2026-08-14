@@ -27,6 +27,11 @@ DEFAULTS = {
 
     # HTTP trigger settings (for ASGI/async deployments)
     "TRIGGER_MODE": "middleware",  # 'middleware', 'http', 'subprocess', 'daemon', 'eventbridge', or 'disabled'
+    # Where a subprocess-trigger child writes stdout/stderr. None = BASE_DIR/tmp/
+    # sqlery_subprocess_trigger.log. Set to "" to discard output (the old DEVNULL
+    # behaviour) — not recommended: in subprocess mode this file is the only place
+    # a crashed run_jobs child leaves a traceback.
+    "SUBPROCESS_TRIGGER_LOG": None,
     "INTERNAL_BASE_URL": None,  # e.g., 'http://127.0.0.1:8000' (required for http mode)
     "INTERNAL_SECRET": None,  # Shared secret for HMAC signatures (required for http mode)
     "SIGNATURE_MAX_AGE": 5,  # Signature validity in seconds

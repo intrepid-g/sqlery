@@ -73,6 +73,13 @@ class SQLAlchemyBackend(DatabaseBackend):
         self._get_session = get_session
         self._partitioned_pg_cache: bool | None = None
 
+    @staticmethod
+    def _worker_pk(worker_id) -> uuid.UUID:
+        try:
+            return uuid.UUID(str(worker_id))
+        except (ValueError, TypeError):
+            return uuid.uuid5(uuid.NAMESPACE_URL, f"sqlery-worker:{worker_id}")
+
     def _partitioned_pg(self) -> bool:
         """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
 
@@ -198,13 +205,15 @@ class SQLAlchemyBackend(DatabaseBackend):
             try:
                 pid = int(parts[-1])
             except ValueError:
-                return None
-            node_id = "_".join(parts[1:-1])
-            with self._get_session() as session:
-                stmt = select(Worker).where(and_(Worker.node_id == node_id, Worker.pid == pid))
-                return session.exec(stmt).first()
+                pid = None
+            if pid is not None:
+                node_id = "_".join(parts[1:-1])
+                with self._get_session() as session:
+                    stmt = select(Worker).where(and_(Worker.node_id == node_id, Worker.pid == pid))
+                    return session.exec(stmt).first()
 
-        return None
+        with self._get_session() as session:
+            return session.get(Worker, self._worker_pk(worker_id))
 
     # def create_job(  # Original 9-param signature
     #     self,
@@ -835,8 +844,13 @@ class SQLAlchemyBackend(DatabaseBackend):
             stmt = select(Worker)
 
             if active_only:
-                threshold = datetime.now(UTC) - timedelta(seconds=60)
-                stmt = stmt.where(Worker.last_heartbeat >= threshold)
+                # Old: hardcoded 60s — a fourth, disagreeing definition of "alive".
+                threshold = datetime.now(UTC) - timedelta(
+                    seconds=get_config("WORKER_ALIVE_TIMEOUT", 30)
+                )
+                stmt = stmt.where(
+                    Worker.last_heartbeat >= threshold, Worker.status != "dead"
+                )
 
             stmt = stmt.order_by(Worker.last_heartbeat.desc())
 
@@ -853,7 +867,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         # import socket  # moved to top-level
 
         with self._get_session() as session:
-            worker = session.get(Worker, worker_id)
+            worker = session.get(Worker, self._worker_pk(worker_id))
 
             if worker:
                 worker.status = status
@@ -863,7 +877,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                     worker.jobs_processed = jobs_processed
             else:
                 worker = Worker(
-                    id=worker_id,
+                    id=self._worker_pk(worker_id),
                     node_id=socket.gethostname(),
                     pid=os.getpid(),
                     status=status,
@@ -1803,7 +1817,7 @@ class SQLAlchemyBackend(DatabaseBackend):
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete stale Worker row from a previous crash."""
         with self._get_session() as session:
-            worker = session.get(Worker, worker_id)
+            worker = session.get(Worker, self._worker_pk(worker_id))
             if worker:
                 session.delete(worker)
                 session.commit()
@@ -1843,7 +1857,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.add(db_job)
 
             # Update worker back to idle
-            worker = session.get(Worker, worker_id)
+            worker = session.get(Worker, self._worker_pk(worker_id))
             if worker:
                 worker.status = "idle"
                 worker.current_job_id = None

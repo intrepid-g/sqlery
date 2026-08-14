@@ -157,14 +157,20 @@ class ForkSafeExecutor:
     @staticmethod
     def _check_django_connections() -> list[str] | None:
         try:
+            from django.conf import settings
             from django.db import connections as dj_connections
         except ImportError:
             return None
+        if not settings.configured:
+            return None
         open_names = []
-        for name in dj_connections:
-            conn = dj_connections[name]
-            if conn.connection is not None:
-                open_names.append(name)
+        try:
+            for name in dj_connections:
+                conn = dj_connections[name]
+                if conn.connection is not None:
+                    open_names.append(name)
+        except Exception:
+            return None
         return open_names or None
 
     @staticmethod
@@ -183,8 +189,9 @@ class ForkSafeExecutor:
         executor = cls()
 
         try:
+            from django.conf import settings
             from django.db import connections as dj_connections, close_old_connections
-            django_available = True
+            django_available = settings.configured
         except ImportError:
             django_available = False
             dj_connections = None

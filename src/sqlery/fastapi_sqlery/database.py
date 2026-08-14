@@ -350,6 +350,8 @@ def init_database(database_url: str, **kwargs):
         **kwargs: Additional engine configuration
     """
     global _engine
+    if database_url.startswith("postgresql://"):
+        database_url = "postgresql+psycopg://" + database_url.split("://", 1)[1]
 
     if database_url.startswith('sqlite'):
         # from sqlalchemy.pool import StaticPool  # moved to top-level

@@ -547,7 +547,10 @@ class DjangoBackend(DatabaseBackend):
         query = self.Worker.objects.all()
 
         if active_only:
-            threshold = timezone.now() - timedelta(seconds=60)
+            # Old: hardcoded 60s — a fourth, disagreeing definition of "alive".
+            threshold = timezone.now() - timedelta(
+                seconds=get_setting("WORKER_ALIVE_TIMEOUT", 30)
+            )
             query = query.filter(last_heartbeat__gte=threshold).exclude(status="dead")
 
         return list(query.order_by("-last_heartbeat"))
