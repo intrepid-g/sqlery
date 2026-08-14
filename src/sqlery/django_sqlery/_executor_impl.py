@@ -22,10 +22,10 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .db_compat import atomic_claim_job_queryset
-from .models import ScheduledTask, QueuedJob
+from .models import ScheduledTask, QueuedJob, Worker
 from .subprocess_executor import get_manage_py_path
+from .settings import get_setting
 from .utils import import_task, calculate_next_run
-from .worker_registry import cleanup_dead_workers
 
 # Use the canonical ContextVar from sqlery.core.worker so context sharing
 # across the standalone + Django code paths uses ONE instance.
@@ -602,12 +602,23 @@ class TaskExecutor:
     def _reap_dead_worker_rows(self):
         """Mark workers that stopped beating as dead (daemon-free deployments).
 
-        cleanup_dead_workers() normally only ever runs inside the daemon, so with
-        ENABLE_DAEMON=False the rows of a destroyed container stay 'idle' forever
-        and the dashboard reports them as active workers.
+        The daemon-only reaper never runs here, so with ENABLE_DAEMON=False the
+        rows of a destroyed container stay 'idle' forever and the dashboard
+        reports them as active workers.
+
+        Deliberately NOT worker_registry.cleanup_dead_workers(): that function also
+        sweeps "ghost" running jobs that have no active worker row pointing at them.
+        In this path jobs are claimed by a bare `manage.py run_jobs` process that
+        never creates a worker row at all, so that sweep would fail every genuinely
+        running job. Worker rows only — orphaned jobs are handled by
+        _reap_orphaned_running_jobs(), which checks the claiming PID.
         """
         try:
-            count = cleanup_dead_workers()
+            timeout_seconds = get_setting("WORKER_ALIVE_TIMEOUT", 30)
+            cutoff = timezone.now() - timedelta(seconds=timeout_seconds)
+            count = Worker.objects.filter(
+                status__in=["idle", "busy"], last_heartbeat__lt=cutoff
+            ).update(status="dead", current_job_id=None)
             if count:
                 logger.info(f"Reaped {count} dead worker row(s)")
         except Exception as e:

@@ -1,5 +1,7 @@
 """Tests for pure worker-deletion eligibility decisions (no DB)."""
 
+
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from sqlery.core.worker_admin import (
@@ -71,3 +73,26 @@ def test_missing_heartbeat_is_not_beating():
 
 def test_heartbeat_exactly_at_timeout_is_not_beating():
     assert is_worker_beating("busy", NOW - timedelta(seconds=ALIVE_TIMEOUT), NOW, ALIVE_TIMEOUT) is False
+
+
+@pytest.mark.django_db
+def test_cleanup_dead_workers_runs_without_field_error():
+    """cleanup_dead_workers() must not raise on the demoted current_job FK.
+
+    REGRESSION 2026-08-13: the ghost-running-job sweep still filtered on
+    `current_job__isnull`, which raises FieldError since the FK became a plain
+    current_job_id column — so the entire reaper aborted every time it ran.
+    """
+    from django.utils import timezone as dj_tz
+    from sqlery.django_sqlery.models import Worker
+    from sqlery.django_sqlery.worker_registry import cleanup_dead_workers
+
+    worker = Worker.objects.create(node_id="gone-node", pid=4242, status="idle")
+    Worker.objects.filter(pk=worker.pk).update(
+        last_heartbeat=dj_tz.now() - timedelta(hours=1)
+    )
+
+    assert cleanup_dead_workers() == 1
+
+    worker.refresh_from_db()
+    assert worker.status == "dead"
