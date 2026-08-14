@@ -191,6 +191,29 @@ def _serialize_worker(worker, now) -> dict:
     return worker_data
 
 
+def _queue_is_stuck(now, due_filter, grace_seconds: int = 60) -> bool:
+    """Return True when the queue shows no sign of draining.
+
+    Sync/eager execution processes jobs without registering Worker rows, so
+    "queued > 0 and no active workers" alone is a false alarm while jobs are
+    completing. Only report stuck when nothing finished recently AND the
+    oldest due queued job has waited longer than the grace period.
+    """
+    recently_completed = QueuedJob.objects.filter(
+        status__in=['success', 'failed'],
+        finished_at__gte=now - timedelta(minutes=5),
+    ).exists()
+    if recently_completed:
+        return False
+    oldest = (
+        QueuedJob.objects.filter(status='queued').filter(due_filter)
+        .order_by('created_at').only('created_at').first()
+    )
+    if oldest is None or oldest.created_at is None:
+        return False
+    return (now - oldest.created_at).total_seconds() > grace_seconds
+
+
 def _compute_health_warnings(
     now,
     *,
@@ -277,7 +300,9 @@ def _compute_health_warnings(
         running_count = QueuedJob.objects.filter(status='running').count()
 
     # 2. Jobs queued, no active workers at all
-    if queued_count > 0 and not active_workers:
+    # Old: if queued_count > 0 and not active_workers:  — false alarm in sync/eager
+    # mode, where jobs drain with zero registered workers.
+    if queued_count > 0 and not active_workers and _queue_is_stuck(now, _due_filter):
         warnings_list.append({
             'type': 'warning',
             'msg': f'{queued_count} job(s) queued but no active workers — restart the worker daemon',
