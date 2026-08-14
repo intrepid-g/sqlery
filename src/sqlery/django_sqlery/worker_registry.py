@@ -126,7 +126,9 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
     # from .models import QueuedJob  # moved to top-level
     active_worker_job_ids = set(
         Worker.objects.filter(status__in=["idle", "busy"])
-        .exclude(current_job__isnull=True)
+        # Old: .exclude(current_job__isnull=True) — FieldError since the FK was
+        # demoted to a plain id column (D4, Phase 15); this whole function raised.
+        .exclude(current_job_id__isnull=True)
         .values_list("current_job_id", flat=True)
     )
     ghost_running = QueuedJob.objects.filter(status="running").exclude(
