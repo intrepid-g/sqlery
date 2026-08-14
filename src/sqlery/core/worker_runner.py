@@ -35,14 +35,17 @@ def main():
             # Django bootstrap — no-op in standalone mode
             pass
 
-    # Configure logging after Django setup so compat layer works
-    # (sqlery imports trigger sqlery/__init__.py which needs Django first)
+    from sqlery.compat import get_config, initialize, is_standalone_mode
+
+    if is_standalone_mode() and os.environ.get("SQLERY_DATABASE_URL"):
+        initialize(database_url=os.environ["SQLERY_DATABASE_URL"], enable_daemon=False)
+
+    # Configure logging after Django/standalone setup so compat layer works.
     from sqlery.core.log_config import configure_logging
     configure_logging(f'sqlery_worker_{os.getpid()}.log')
 
     # Import and run worker (mode detection will happen correctly now)
     from sqlery.core.worker import WorkerProcess
-    from sqlery.compat import get_config
 
     # Get queue configuration
     queues = get_config('WORKER_QUEUES', ['default'])

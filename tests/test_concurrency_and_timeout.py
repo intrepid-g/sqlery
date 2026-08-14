@@ -15,6 +15,7 @@ as override parameters to the JobFunction.enqueue() method, similar to how `max_
 was added.
 """
 
+import os
 import pytest
 import time
 from django.utils import timezone
@@ -623,3 +624,69 @@ class TestAPIWithNewFields:
 
         assert job_instance.allow_parallel is False
         assert job_instance.timeout_seconds == 100
+
+
+class TestOrphanedClaimerReaping:
+    """A job whose claiming process died must not stay 'running' forever.
+
+    REGRESSION 2026-08-13 (data_sync): with ENABLE_DAEMON=False and
+    TRIGGER_MODE='subprocess', a `manage.py run_jobs` child claimed a job, died,
+    and the row stayed status='running' with an empty error for 7+ hours. Every
+    reaper that would have caught it lives in the daemon, and the one non-daemon
+    path waited 2x timeout_seconds (3600s when NULL) before even looking.
+    """
+
+    @pytest.mark.django_db
+    def test_job_with_dead_claimer_pid_is_reaped_immediately(self):
+        """Dead owner PID is proof nobody is executing — no need to wait an hour."""
+        executor = TaskExecutor()
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_concurrency_and_timeout.fast_task",
+            queue_name="sync",
+            status="running",
+            started_at=timezone.now(),  # just started — far inside any threshold
+            worker_pid=999999,  # nonexistent process
+        )
+
+        executor._cleanup_stale_jobs()
+
+        job.refresh_from_db()
+        assert job.status == "failed"
+        assert "no longer exists" in job.error
+
+    @pytest.mark.django_db
+    def test_job_owned_by_a_live_process_is_left_alone(self):
+        """A live claimer must never be reaped — this guards against false positives."""
+        executor = TaskExecutor()
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_concurrency_and_timeout.fast_task",
+            queue_name="sync",
+            status="running",
+            started_at=timezone.now(),
+            worker_pid=os.getpid(),  # this very process is alive
+        )
+
+        executor._cleanup_stale_jobs()
+
+        job.refresh_from_db()
+        assert job.status == "running"
+
+    @pytest.mark.django_db
+    def test_orphan_in_another_queue_is_reaped_despite_queue_filter(self):
+        """Reaping orphans is global; only the time-threshold pass is queue-scoped."""
+        executor = TaskExecutor()
+
+        job = QueuedJob.objects.create(
+            task_path="tests.test_concurrency_and_timeout.fast_task",
+            queue_name="queue-b",
+            status="running",
+            started_at=timezone.now(),
+            worker_pid=999999,
+        )
+
+        executor._cleanup_stale_jobs(queue_name="queue-a")
+
+        job.refresh_from_db()
+        assert job.status == "failed"

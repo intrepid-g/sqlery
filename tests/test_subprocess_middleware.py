@@ -1,5 +1,6 @@
 """Tests for direct subprocess trigger middleware."""
 
+import subprocess
 import pytest
 from unittest.mock import patch, MagicMock, call
 from django.test import RequestFactory
@@ -167,11 +168,18 @@ class TestSubprocessTriggerMiddleware:
                 assert kwargs["start_new_session"] is True
                 assert kwargs["close_fds"] is True
 
-    def test_middleware_redirects_output(self, settings):
-        """Subprocess should redirect stdout/stderr to DEVNULL."""
+    def test_middleware_captures_child_output_to_log(self, settings, tmp_path):
+        """Child stdout+stderr must land in a file we can read after a crash.
+
+        REGRESSION: output went to DEVNULL, so a run_jobs child that died mid-job
+        left the row at status='running' with an empty error/traceback and no
+        diagnostic anywhere. In subprocess mode this child is the only executor.
+        """
+        log_path = tmp_path / "trigger.log"
         settings.DJANGO_SQL_JOBS = {
             "TRIGGER_MODE": "subprocess",
             "ENABLE_MIDDLEWARE_TRIGGER": True,
+            "SUBPROCESS_TRIGGER_LOG": str(log_path),
         }
 
         get_response = MagicMock(return_value=MagicMock())
@@ -179,18 +187,57 @@ class TestSubprocessTriggerMiddleware:
 
         with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
             with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
-                with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.DEVNULL") as mock_devnull:
-                    mock_path.return_value = "/path/to/manage.py"
+                mock_path.return_value = "/path/to/manage.py"
 
-                    factory = RequestFactory()
-                    request = factory.get("/")
+                middleware(RequestFactory().get("/"))
 
-                    middleware(request)
+                args, kwargs = mock_popen.call_args
+                # stdout is a real writable file at the configured path...
+                assert kwargs["stdout"].name == str(log_path)
+                # ...and stderr is folded into it so tracebacks are captured too.
+                assert kwargs["stderr"] == subprocess.STDOUT
+        assert log_path.exists()
 
-                    # Verify output redirected
-                    args, kwargs = mock_popen.call_args
-                    assert kwargs["stdout"] == mock_devnull
-                    assert kwargs["stderr"] == mock_devnull
+    def test_empty_log_setting_restores_devnull(self, settings):
+        """SUBPROCESS_TRIGGER_LOG='' is the explicit opt-out back to discarding."""
+        settings.DJANGO_SQL_JOBS = {
+            "TRIGGER_MODE": "subprocess",
+            "ENABLE_MIDDLEWARE_TRIGGER": True,
+            "SUBPROCESS_TRIGGER_LOG": "",
+        }
+
+        get_response = MagicMock(return_value=MagicMock())
+        middleware = SubprocessTriggerMiddleware(get_response)
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                middleware(RequestFactory().get("/"))
+
+                args, kwargs = mock_popen.call_args
+                assert kwargs["stdout"] == subprocess.DEVNULL
+
+    def test_unwritable_log_falls_back_to_devnull_and_still_spawns(self, settings):
+        """A bad log path must never stop job execution — it is the only executor."""
+        settings.DJANGO_SQL_JOBS = {
+            "TRIGGER_MODE": "subprocess",
+            "ENABLE_MIDDLEWARE_TRIGGER": True,
+            "SUBPROCESS_TRIGGER_LOG": "/proc/nonexistent-dir/trigger.log",
+        }
+
+        get_response = MagicMock(return_value=MagicMock())
+        middleware = SubprocessTriggerMiddleware(get_response)
+
+        with patch("sqlery.django_sqlery.subprocess_middleware.subprocess.Popen") as mock_popen:
+            with patch("sqlery.django_sqlery.subprocess_middleware.get_manage_py_path") as mock_path:
+                mock_path.return_value = "/path/to/manage.py"
+
+                middleware(RequestFactory().get("/"))
+
+                mock_popen.assert_called_once()  # still spawned
+                args, kwargs = mock_popen.call_args
+                assert kwargs["stdout"] == subprocess.DEVNULL
 
     def test_middleware_handles_spawn_failure(self, settings):
         """Middleware should handle subprocess spawn failures gracefully."""

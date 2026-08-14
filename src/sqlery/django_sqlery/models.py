@@ -20,6 +20,7 @@ from django.utils import timezone
 from uuid6 import uuid7
 
 from sqlery.core.utils import reject_unawaited_coroutine
+from sqlery.core.worker_admin import is_worker_beating
 
 from .db_compat import is_sqlite
 
@@ -1172,12 +1173,13 @@ class Worker(models.Model):
     def __str__(self):
         return f"{self.friendly_name} [{self.status}] on {self.node_id}"
 
-    def is_alive(self, timeout_seconds=30):
-        """Check if worker is alive based on heartbeat."""
-        if self.status == "dead":
-            return False
-        threshold = timezone.now() - timezone.timedelta(seconds=timeout_seconds)
-        return self.last_heartbeat >= threshold
+    def is_alive(self, timeout_seconds=None):
+        """Check if worker is alive based on heartbeat (see is_worker_beating)."""
+        if timeout_seconds is None:
+            timeout_seconds = get_setting("WORKER_ALIVE_TIMEOUT", 30)
+        return is_worker_beating(
+            self.status, self.last_heartbeat, timezone.now(), timeout_seconds
+        )
 
 
 class DaemonCommand(models.Model):

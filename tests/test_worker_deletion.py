@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from sqlery.core.worker_admin import (
+    is_worker_beating,
     is_worker_deletable,
     worker_delete_staleness_threshold_seconds,
 )
@@ -44,3 +45,29 @@ def test_dead_worker_always_deletable_even_if_recent():
 
 def test_missing_heartbeat_is_deletable():
     assert is_worker_deletable("idle", None, NOW, THRESHOLD) is True
+
+
+# --- Single definition of "alive" (see is_worker_beating docstring) ---
+
+ALIVE_TIMEOUT = 30
+
+
+def test_recent_heartbeat_is_beating():
+    assert is_worker_beating("idle", NOW - timedelta(seconds=5), NOW, ALIVE_TIMEOUT) is True
+
+
+def test_unreaped_worker_with_old_heartbeat_is_not_beating():
+    """status='idle' but silent for an hour — the destroyed-container case."""
+    assert is_worker_beating("idle", NOW - timedelta(hours=1), NOW, ALIVE_TIMEOUT) is False
+
+
+def test_dead_status_is_never_beating():
+    assert is_worker_beating("dead", NOW, NOW, ALIVE_TIMEOUT) is False
+
+
+def test_missing_heartbeat_is_not_beating():
+    assert is_worker_beating("busy", None, NOW, ALIVE_TIMEOUT) is False
+
+
+def test_heartbeat_exactly_at_timeout_is_not_beating():
+    assert is_worker_beating("busy", NOW - timedelta(seconds=ALIVE_TIMEOUT), NOW, ALIVE_TIMEOUT) is False

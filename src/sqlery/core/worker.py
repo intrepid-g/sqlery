@@ -619,7 +619,10 @@ class WorkerProcess:
                     # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
                     # from django.db import close_old_connections  # moved to top-level (try/except)
                     if close_old_connections is not None:
-                        close_old_connections()
+                        try:
+                            close_old_connections()
+                        except Exception:
+                            pass
 
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
@@ -759,13 +762,17 @@ class WorkerProcess:
         """
         # from ..compat import get_config  # moved to top-level
         timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
+        job_id = job.id
 
         child_pid = self._fork_ctx.fork()
 
         if child_pid == 0:
             # === CHILD PROCESS ===
-            os.setpgrp()
             try:
+                try:
+                    os.setpgrp()
+                except OSError:
+                    pass
                 self.executor.execute_job_in_child(job)
             except Exception:
                 os._exit(1)
@@ -773,15 +780,15 @@ class WorkerProcess:
 
         # === PARENT PROCESS ===
         self.child_pid = child_pid
-        logger.info(f"Forked child PID {child_pid} for job {job.id}")
+        logger.info(f"Forked child PID {child_pid} for job {job_id}")
 
         try:
-            self.backend.update_job_child_pid(job.id, child_pid)
+            self.backend.update_job_child_pid(job_id, child_pid)
         except Exception:
             pass
 
         # Update heartbeat with child info
-        self._heartbeat('busy', job_id=job.id)
+        self._heartbeat('busy', job_id=job_id)
 
         # Two-layer timeout: child SIGALRM fires at `timeout`, parent
         # force-kills at `timeout + 60s` as safety net (like RQ).
@@ -821,14 +828,14 @@ class WorkerProcess:
             elapsed = time.monotonic() - start_time
             # if timeout and elapsed > timeout:
             if parent_timeout and elapsed > parent_timeout:
-                logger.warning(f"Job {job.id} timed out after {int(elapsed)}s (parent safety net), killing child PID {child_pid}")
+                logger.warning(f"Job {job_id} timed out after {int(elapsed)}s (parent safety net), killing child PID {child_pid}")
                 self._kill_child(child_pid)
                 # # Pipe close removed
                 # os.close(read_fd)
                 try:
                     self.backend.mark_job_failed(
-                        job.id,
-                        error=f"Job {job.id} exceeded timeout of {timeout} seconds (parent safety net at {int(elapsed)}s)",
+                        job_id,
+                        error=f"Job {job_id} exceeded timeout of {timeout} seconds (parent safety net at {int(elapsed)}s)",
                         traceback=f"Parent killed child PID {child_pid} after {int(elapsed)}s",
                     )
                 except Exception:
@@ -845,7 +852,7 @@ class WorkerProcess:
             # window unrelated to how long the job runs.
             now = time.monotonic()
             if now - last_lease_heartbeat >= self.heartbeat_interval:
-                self._heartbeat('busy', job_id=job.id)
+                self._heartbeat('busy', job_id=job_id)
                 last_lease_heartbeat = now
             # WR-01: keep scheduler leadership alive across long jobs. The main
             # loop only renews leases at the top of each iteration, but this
@@ -879,7 +886,7 @@ class WorkerProcess:
 
         # Reconnect DB (may be stale after waiting)
         self.executor._reset_db_connections()
-        refreshed = self.backend.get_job_by_id(job.id)
+        refreshed = self.backend.get_job_by_id(job_id)
         if refreshed and refreshed.status == 'success':
             return {'success': True, 'output': refreshed.output or ''}
         elif refreshed and refreshed.status == 'failed':
@@ -890,12 +897,12 @@ class WorkerProcess:
             # Child crashed — mark failed if not already marked by child
             try:
                 self.backend.mark_job_failed(
-                    job.id,
+                    job_id,
                     error=f"Child process exited with status {exit_status}",
                     traceback=f"Child PID {child_pid} exited abnormally",
                 )
             except Exception as e:
-                logger.error(f"Failed to mark crashed job {job.id}: {e}")
+                logger.error(f"Failed to mark crashed job {job_id}: {e}")
             return {'success': False, 'error': f'Child exited with status {exit_status}'}
 
     def _kill_child(self, pid: int):

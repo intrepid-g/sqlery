@@ -66,11 +66,13 @@ harness — e.g. ``tests/unit/test_sqlalchemy_backend_sync.py``'s PG mirror.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 
@@ -96,6 +98,18 @@ def _has_postgres_env() -> bool:
     return bool(os.environ.get("SQLERY_TEST_PG_URL"))
 
 
+def _django_database_url() -> str:
+    from django.db import connection
+
+    db = connection.settings_dict
+    user = quote(db.get("USER") or "")
+    password = quote(db.get("PASSWORD") or "")
+    auth = f"{user}:{password}@" if user or password else ""
+    host = db.get("HOST") or "localhost"
+    port = f":{db.get('PORT')}" if db.get("PORT") else ""
+    return f"postgresql://{auth}{host}{port}/{quote(db['NAME'])}"
+
+
 def _clear_standalone_pg_queue() -> None:
     """Delete leftover job rows from the shared standalone-mode PG test DB.
 
@@ -119,7 +133,10 @@ def _clear_standalone_pg_queue() -> None:
     try:
         with psycopg.connect(url, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute("TRUNCATE TABLE sqlery_queued_job CASCADE")
+                cur.execute(
+                    "TRUNCATE TABLE sqlery_queued_job, sqlery_worker, "
+                    "sqlery_daemon_lease CASCADE"
+                )
     except psycopg.errors.UndefinedTable:
         pass  # First postgres test of the session — nothing to clean up yet.
 
@@ -272,7 +289,8 @@ class _DjangoHarness:
 
     def run_mode_until_finished(self, job_id: int, timeout: int = 30) -> None:
         if self.mode == "daemon":
-            self._drive_daemon_once()
+            self._drive_daemon_until_finished(job_id, timeout)
+            return
         elif self.mode == "subprocess":
             self._drive_subprocess(job_id)
         elif self.mode == "http-trigger":
@@ -372,25 +390,35 @@ class _DjangoHarness:
                 f"body={response.content!r}"
             )
 
-    def _drive_daemon_once(self):
-        """Run a single daemon cycle in-process via the --once entry point.
-
-        Uses ``DaemonManager._run_daemon(once=True)`` — the same entry point
-        that ``python manage.py daemon start --once`` invokes. The cycle
-        claims any queued jobs into the worker pool, which then forks and
-        executes them.
-        """
-        from sqlery.core.daemon import DaemonManager
-        # Limit workers to keep the cycle cheap; this fixture-level config
-        # bleeds into get_config but the surrounding test is single-cell.
-        from sqlery.compat import set_config
+    def _drive_daemon_until_finished(self, job_id: int, timeout: int):
+        """Run a real daemon process until the worker it spawns finishes the job."""
+        timeout = max(timeout, 90)
+        env = os.environ.copy()
+        if self.db == "postgres":
+            db_url = _django_database_url()
+            env["SQLERY_TEST_PG_URL"] = db_url
+            env["DATABASE_URL"] = db_url
+        script = (
+            "import django; django.setup();"
+            "from sqlery.core.daemon import DaemonManager;"
+            "DaemonManager()._run_daemon(max_workers=1);"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", script], env=env, start_new_session=True)
         try:
-            set_config("MAX_WORKERS_PER_NODE", 1)
-            set_config("DAEMON_CHECK_INTERVAL", 1)
-        except Exception:
-            # Django mode: set_config is a no-op; that's fine.
-            pass
-        DaemonManager()._run_daemon(max_workers=1, once=True)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                status = self.status(job_id)
+                if status in {"success", "failed"}:
+                    if status == "failed":
+                        job = self.backend.get_job_by_id(job_id)
+                        print(getattr(job, "error", ""), file=sys.stderr)
+                        print(getattr(job, "traceback", ""), file=sys.stderr)
+                    return
+                if proc.poll() is not None:
+                    return
+                time.sleep(0.1)
+        finally:
+            _stop_process(proc)
 
 
 class _StandaloneHarness:
@@ -428,7 +456,8 @@ class _StandaloneHarness:
         if self.mode == "sync":
             self._drive_sync(job_id)
         elif self.mode == "daemon":
-            self._drive_daemon_once()
+            self._drive_daemon_until_finished(job_id, timeout)
+            return
         elif self.mode == "subprocess":
             self._drive_subprocess_standalone(job_id)
         elif self.mode == "http-trigger":
@@ -488,16 +517,37 @@ class _StandaloneHarness:
         )
         _run_no_django(script)
 
-    def _drive_daemon_once(self):
-        script = (
-            "from sqlery.compat import initialize, set_config;"
-            f"initialize(database_url={self.db_url!r}, enable_daemon=True);"
-            "set_config('MAX_WORKERS_PER_NODE', 1);"
-            "set_config('DAEMON_CHECK_INTERVAL', 1);"
-            "from sqlery.core.daemon import DaemonManager;"
-            "DaemonManager()._run_daemon(max_workers=1, once=True);"
+    def _drive_daemon_until_finished(self, job_id: int, timeout: int):
+        timeout = max(timeout, 90)
+        env = _no_django_env()
+        env["SQLERY_DATABASE_URL"] = self.db_url
+        env["DJANGO_SQL_JOBS_MAX_WORKERS"] = "1"
+        env["DJANGO_SQL_JOBS_CHECK_INTERVAL"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "sqlery.core.worker_runner"],
+            env=env,
+            start_new_session=True,
         )
-        _run_no_django(script, timeout=60)
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                status = self.status(job_id)
+                if status in {"success", "failed"}:
+                    if status == "failed":
+                        script = (
+                            "from sqlery.compat import initialize, get_backend;"
+                            f"initialize(database_url={self.db_url!r}, enable_daemon=False);"
+                            f"job = get_backend().get_job_by_id({job_id});"
+                            "print(getattr(job, 'error', ''));"
+                            "print(getattr(job, 'traceback', ''));"
+                        )
+                        print(_run_no_django(script), file=sys.stderr)
+                    return
+                if proc.poll() is not None:
+                    return
+                time.sleep(0.1)
+        finally:
+            _stop_process(proc)
 
     def _drive_subprocess_standalone(self, job_id: int):
         """Invoke ``spawn_subprocess_worker`` from inside a no-Django subprocess.
@@ -583,20 +633,9 @@ _STANDALONE_BACKEND_SENTINEL = _StandaloneBackendSentinel()
 
 def _run_no_django(script: str, timeout: int = 30) -> str:
     """Run a Python script with DJANGO_SETTINGS_MODULE scrubbed."""
-    import subprocess
-
-    env = {k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"}
-    # Force compat to read 'standalone' mode (defensive — the absence of
-    # DJANGO_SETTINGS_MODULE plus uninstalled django would already do this,
-    # but django IS installed in dev, so we need an explicit hint via env).
-    env["SQLERY_FORCE_STANDALONE"] = "1"
-    # Ensure src/ is importable.
-    repo_root = Path(__file__).resolve().parents[2]
-    env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-
     result = subprocess.run(
         [sys.executable, "-c", script],
-        env=env,
+        env=_no_django_env(),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -608,6 +647,25 @@ def _run_no_django(script: str, timeout: int = 30) -> str:
             f"--- stderr ---\n{result.stderr}"
         )
     return result.stdout
+
+
+def _no_django_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"}
+    env["SQLERY_FORCE_STANDALONE"] = "1"
+    repo_root = Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------

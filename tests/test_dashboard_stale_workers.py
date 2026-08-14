@@ -53,3 +53,43 @@ def test_dashboard_excludes_workers_idle_more_than_24h(rf):
 
     assert "fresh-node" in node_ids
     assert "stale-node" not in node_ids  # would FAIL before the 24h cutoff fix
+
+
+@pytest.mark.django_db
+def test_worker_counts_exclude_workers_that_stopped_beating(rf):
+    """REGRESSION 2026-08-13: counts read the status column with no heartbeat bound.
+
+    A container destroyed with ENABLE_DAEMON=False leaves rows at status='idle'
+    forever, because only the daemon-only reaper writes status='dead'. The
+    dashboard then reported those workers as active and, since has_active_workers
+    feeds stuck-queue detection, called a queue with zero real workers healthy.
+    """
+    now = timezone.now()
+
+    Worker.objects.create(node_id="beating-node", pid=111, status="idle")
+
+    ghost = Worker.objects.create(node_id="ghost-node", pid=222, status="busy")
+    # Never reaped: status still 'busy', but silent for an hour.
+    Worker.objects.filter(pk=ghost.pk).update(last_heartbeat=now - timedelta(hours=1))
+
+    payload = _stats_payload(rf)
+    stats = payload['worker_stats']
+
+    assert stats['active'] == 1  # only the beating worker
+    assert stats['busy'] == 0  # the ghost's 'busy' status must not count
+    assert stats['dead'] == 1
+    assert payload['system_health']['has_active_workers'] is True
+
+
+@pytest.mark.django_db
+def test_queue_with_only_ghost_workers_is_not_reported_as_having_workers(rf):
+    """Zero beating workers ⇒ has_active_workers is False, whatever the status column says."""
+    now = timezone.now()
+
+    ghost = Worker.objects.create(node_id="ghost-only", pid=333, status="idle")
+    Worker.objects.filter(pk=ghost.pk).update(last_heartbeat=now - timedelta(hours=1))
+
+    payload = _stats_payload(rf)
+
+    assert payload['worker_stats']['active'] == 0
+    assert payload['system_health']['has_active_workers'] is False

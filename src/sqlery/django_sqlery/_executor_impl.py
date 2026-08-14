@@ -25,12 +25,37 @@ from .db_compat import atomic_claim_job_queryset
 from .models import ScheduledTask, QueuedJob
 from .subprocess_executor import get_manage_py_path
 from .utils import import_task, calculate_next_run
+from .worker_registry import cleanup_dead_workers
 
 # Use the canonical ContextVar from sqlery.core.worker so context sharing
 # across the standalone + Django code paths uses ONE instance.
 from sqlery.core.worker import _current_job_var  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+def _claimer_process_is_gone(pid: int) -> bool:
+    """True only when PID is provably dead. Uncertainty always answers False.
+
+    Deliberately NOT deadlines._pid_is_sqlery_worker: that helper reads
+    /proc/<pid>/cmdline and requires the string "sqlery" in it, but a live
+    claimer's cmdline is "python manage.py run_jobs" — it would be reported dead
+    while it is actively executing the job, and we would reap a live job.
+    Only ProcessLookupError is proof of death. A recycled PID therefore reads as
+    alive (false negative), which merely defers the row to the time threshold —
+    the safe direction.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False  # exists, owned by another user
+    except OSError:
+        return False
+    return False
 
 
 class _RQCompatJob:
@@ -452,8 +477,19 @@ class TaskExecutor:
         """
         logger.info(f"Worker starting (queue={queue_name or 'all'}, once={once}, max_jobs={max_jobs})")
 
-        # Clean up stale jobs before processing (crashed workers)
-        self._cleanup_stale_jobs(queue_name)
+        # Clean up stale jobs before processing (crashed workers).
+        # Guarded: mark_failed can raise (ConcurrentModificationError, dependent-job
+        # fan-out, synchronous webhook). Unguarded, one bad row aborted cleanup AND
+        # claiming on every single invocation — the queue would never drain again.
+        try:
+            self._cleanup_stale_jobs(queue_name)
+        except Exception as e:
+            logger.warning(f"Stale-job cleanup failed, continuing to claim: {e}")
+
+        # In web-container-only deployments (ENABLE_DAEMON=False) this is the only
+        # process that ever runs, so it must also reap the worker rows the daemon
+        # would normally reap — otherwise dead workers accumulate forever.
+        self._reap_dead_worker_rows()
 
         processed_jobs = []
         jobs_processed = 0
@@ -513,6 +549,70 @@ class TaskExecutor:
 
         return processed_jobs
 
+    def _reap_orphaned_running_jobs(self):
+        """Fail running jobs whose claiming process is provably gone.
+
+        REGRESSION 2026-08-13: a run_jobs child that died mid-job left its row
+        'running' for 7+ hours. The only reaper waited 2x timeout_seconds (3600s
+        when timeout_seconds is NULL) and never used the PID as evidence of death,
+        so a web-container-only deployment (ENABLE_DAEMON=False, no daemon reaper)
+        never recovered the job.
+
+        In the run_jobs model the claiming process IS the executing process, so a
+        dead PID proves nobody is executing the job. Scoped to rows with no worker
+        row (worker_id IS NULL) because that is by construction the single-container
+        path — a PID is meaningless across nodes, where the time threshold in
+        _cleanup_stale_jobs remains the correct fallback. Jobs already past that
+        threshold are left to the existing path so its kill-the-hung-process
+        behaviour is preserved.
+        """
+        now = timezone.now()
+        candidates = QueuedJob.objects.filter(
+            status="running", worker_id__isnull=True, started_at__isnull=False
+        ).exclude(worker_pid__isnull=True).exclude(worker_pid=0)
+
+        for job in candidates:
+            threshold_seconds = job.timeout_seconds * 2 if job.timeout_seconds else 3600
+            if (now - job.started_at).total_seconds() > threshold_seconds:
+                continue  # already stale — the existing path handles (and kills) it
+            if job.worker_pid == os.getpid():
+                continue  # our own row
+            if _claimer_process_is_gone(job.worker_pid):
+                self._fail_orphaned_job(job)
+
+    def _fail_orphaned_job(self, job):
+        """Fail a running job whose claiming process no longer exists."""
+        try:
+            job.mark_failed(
+                error=(
+                    f"Claiming process (pid {job.worker_pid}) no longer exists — "
+                    "container restart, OOM, or crash"
+                ),
+                traceback="Job stuck in 'running' with a dead owner PID and no worker row",
+                termination_reason="orphaned_claimer",
+            )
+        except Exception as e:
+            # One unreapable row must never block claiming for everything else.
+            logger.warning(f"Could not reap orphaned job {job.id}: {e}")
+            return
+        logger.warning(f"Reaped orphaned job {job.id} (dead pid {job.worker_pid})")
+        if job.should_retry():
+            self._retry_job(job)
+
+    def _reap_dead_worker_rows(self):
+        """Mark workers that stopped beating as dead (daemon-free deployments).
+
+        cleanup_dead_workers() normally only ever runs inside the daemon, so with
+        ENABLE_DAEMON=False the rows of a destroyed container stay 'idle' forever
+        and the dashboard reports them as active workers.
+        """
+        try:
+            count = cleanup_dead_workers()
+            if count:
+                logger.info(f"Reaped {count} dead worker row(s)")
+        except Exception as e:
+            logger.warning(f"Dead-worker reaping failed: {e}")
+
     def _cleanup_stale_jobs(self, queue_name=None):
         """Reset stale jobs stuck in 'running' state (crashed workers).
 
@@ -533,6 +633,11 @@ class TaskExecutor:
         queryset = QueuedJob.objects.filter(status="running")
         if queue_name:
             queryset = queryset.filter(queue_name=queue_name)
+
+        # Orphan sweep runs GLOBALLY (ignores queue_name): a row orphaned in queue X
+        # would otherwise stay invisible forever to a worker started with --queue Y.
+        # Only the time-threshold pass below stays queue-scoped.
+        self._reap_orphaned_running_jobs()
 
         for job in queryset:
             if not job.started_at:

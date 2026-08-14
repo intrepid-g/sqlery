@@ -21,6 +21,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from sqlery.core.worker_admin import (
+    is_worker_beating,
     is_worker_deletable,
     worker_delete_staleness_threshold_seconds,
 )
@@ -49,6 +50,11 @@ def _job_display_name(j) -> str:
             return short
         return j.task_path
     return f'job #{j.id}'
+
+
+def worker_alive_timeout_seconds() -> int:
+    """Seconds without a heartbeat after which a worker is not alive."""
+    return get_setting('WORKER_ALIVE_TIMEOUT', 30)
 
 
 def _serialize_worker(worker, now) -> dict:
@@ -115,6 +121,11 @@ def _serialize_worker(worker, now) -> dict:
     else:
         worker_data['heartbeat_age_seconds'] = None
         worker_data['is_stalled'] = True
+
+    # Single source of truth for "alive" — heartbeat-based, not the status column.
+    worker_data['is_alive'] = is_worker_beating(
+        worker.status, worker.last_heartbeat, now, worker_alive_timeout_seconds()
+    )
 
     # Whether the user may delete this worker (only non-beating/stale ones).
     worker_data['is_deletable'] = is_worker_deletable(
@@ -767,11 +778,19 @@ def dashboard_stats(request):
         multi_worker_enabled = max_workers > 1
 
         # Get worker counts
+        # REGRESSION 2026-08-13: dashboard counted workers of a destroyed container as
+        # "active" forever. Root cause: this aggregate read only the status column, and the
+        # only writer of status='dead' (cleanup_dead_workers) runs in the daemon — with
+        # ENABLE_DAEMON=False nothing ever reaped, so rows stayed 'idle'. has_active_workers
+        # feeds stuck-queue detection, so a queue with zero real workers looked healthy.
+        # Fix: bound every count by last_heartbeat, same definition as is_worker_beating().
+        alive_cutoff = now - timedelta(seconds=worker_alive_timeout_seconds())
+        beating = Q(last_heartbeat__gte=alive_cutoff) & ~Q(status='dead')
         worker_counts = Worker.objects.exclude(pid=0).aggregate(
-            active=Count('id', filter=Q(status__in=['idle', 'busy'])),
-            idle=Count('id', filter=Q(status='idle')),
-            busy=Count('id', filter=Q(status='busy')),
-            dead=Count('id', filter=Q(status='dead')),
+            active=Count('id', filter=beating & Q(status__in=['idle', 'busy'])),
+            idle=Count('id', filter=beating & Q(status='idle')),
+            busy=Count('id', filter=beating & Q(status='busy')),
+            dead=Count('id', filter=Q(status='dead') | Q(last_heartbeat__lt=alive_cutoff)),
         )
 
         worker_stats = {
@@ -787,6 +806,9 @@ def dashboard_stats(request):
         # Root cause: the query filtered on status in ('idle','busy') but had no upper bound on heartbeat age,
         #   so a worker that died without updating its status row stayed 'idle' and rendered forever.
         # Fix: exclude workers whose last_heartbeat is older than 24h from the dashboard listing.
+        # NOTE: this 24h window is a *recently seen* window for the row list only — it is NOT
+        # the definition of alive. Each row carries `is_alive` from is_worker_beating(), which
+        # is the single definition shared with the counts above.
         workers_list = []
         try:
             stale_cutoff = now - timedelta(hours=24)
