@@ -1,3 +1,24 @@
+/* Theme tokens - mirror Django admin's own light/auto/dark switch */
+:root {
+    --sqlery-highlight-bg: #fffbe6;
+    --sqlery-warn-bg: #fff3cd;
+    --sqlery-warn-fg: #856404;
+}
+
+@media (prefers-color-scheme: dark) {
+    html[data-theme="dark"], html:not([data-theme="light"]) {
+        --sqlery-highlight-bg: #4a3f14;
+        --sqlery-warn-bg: #583305;
+        --sqlery-warn-fg: #ffd873;
+    }
+}
+
+html[data-theme="dark"] {
+    --sqlery-highlight-bg: #4a3f14;
+    --sqlery-warn-bg: #583305;
+    --sqlery-warn-fg: #ffd873;
+}
+
 /* Stats Dashboard */
 .sqlery-stats {
     display: grid;
@@ -10,9 +31,9 @@
     background: var(--body-bg, #f8f9fa);
     padding: 1.5rem;
     border-radius: 4px;
+    border: 1px solid var(--border-color, #ddd);
     border-left: 4px solid var(--primary, #417690);
     transition: transform 0.2s;
-    border: 1px solid var(--border-color, #ddd);
 }
 
 .stat-card:hover {
@@ -815,8 +836,8 @@ code {
 }
 
 @keyframes feedNewHighlight {
-    0%   { background: #fffbe6; }
-    60%  { background: #fffbe6; }
+    0%   { background: var(--sqlery-highlight-bg, #fffbe6); }
+    60%  { background: var(--sqlery-highlight-bg, #fffbe6); }
     100% { background: transparent; }
 }
 
@@ -829,7 +850,7 @@ code {
 }
 
 .feed-item:has(.feed-dot.warning) {
-    background: #fff8f0;
+    background: var(--sqlery-warn-bg, #fff8f0);
 }
 
 .feed-dot {

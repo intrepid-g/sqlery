@@ -5,6 +5,24 @@
 
 {% block extrastyle %}
 <style>
+    /* Theme tokens - mirror Django admin's own light/auto/dark switch.
+       Duplicated from dashboard.css: this template does not load that
+       stylesheet, so its tokens are out of scope here. */
+    :root {
+        --sqlery-warn-bg: #fff3cd;
+        --sqlery-warn-fg: #856404;
+    }
+    @media (prefers-color-scheme: dark) {
+        html[data-theme="dark"], html:not([data-theme="light"]) {
+            --sqlery-warn-bg: #583305;
+            --sqlery-warn-fg: #ffd873;
+        }
+    }
+    html[data-theme="dark"] {
+        --sqlery-warn-bg: #583305;
+        --sqlery-warn-fg: #ffd873;
+    }
+
     .dashboard-container {
         padding: 20px;
         max-width: 1400px;
@@ -25,7 +43,7 @@
 
     .refresh-indicator {
         font-size: 12px;
-        color: #333;
+        color: var(--body-fg, #333);
         font-weight: 500;
     }
 
@@ -42,8 +60,8 @@
     }
 
     .stat-card {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 8px;
         padding: 20px;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
@@ -52,7 +70,7 @@
     .stat-card h3 {
         margin: 0 0 15px 0;
         font-size: 14px;
-        color: #444;
+        color: var(--body-medium-color, #444);
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
@@ -73,14 +91,14 @@
 
     .stat-detail {
         font-size: 14px;
-        color: #555;
+        color: var(--body-quiet-color, #555);
         font-weight: 500;
         margin: 5px 0;
     }
 
     .queue-table, .scheduled-tasks-table, .recent-jobs-table {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 8px;
         padding: 20px;
         margin-bottom: 30px;
@@ -100,20 +118,21 @@
     th {
         text-align: left;
         padding: 12px;
-        background: #f8f9fa;
-        border-bottom: 2px solid #ddd;
+        background: var(--darkened-bg, #f8f9fa);
+        border-bottom: 2px solid var(--border-color, #ddd);
         font-weight: 600;
         font-size: 13px;
     }
 
     td {
         padding: 12px;
-        border-bottom: 1px solid #eee;
+        border-bottom: 1px solid var(--border-color, #eee);
         font-size: 13px;
+        color: var(--body-fg, #333);
     }
 
     tr:hover {
-        background: #f8f9fa;
+        background: var(--darkened-bg, #f8f9fa);
     }
 
     .status-badge {
@@ -126,7 +145,7 @@
     }
 
     .status-badge.queued { background: #d1ecf1; color: #0c5460; }
-    .status-badge.running { background: #fff3cd; color: #856404; }
+    .status-badge.running { background: var(--sqlery-warn-bg, #fff3cd); color: var(--sqlery-warn-fg, #856404); }
     .status-badge.success { background: #d4edda; color: #155724; }
     .status-badge.failed { background: #f8d7da; color: #721c24; }
     .status-badge.enabled { background: #d4edda; color: #155724; }
@@ -135,14 +154,14 @@
     .empty-state {
         text-align: center;
         padding: 40px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         font-weight: 500;
     }
 
     .loading {
         text-align: center;
         padding: 40px;
-        color: #555;
+        color: var(--body-quiet-color, #555);
         font-weight: 500;
     }
 
@@ -167,7 +186,7 @@
 
     .task-path-small {
         font-size: 11px;
-        color: #777;
+        color: var(--body-quiet-color, #777);
         display: block;
         margin-top: 2px;
     }
@@ -214,7 +233,7 @@
 
     .collapse-toggle {
         font-size: 14px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         transition: transform 0.2s ease;
     }
 
@@ -238,12 +257,12 @@
     .worker-summary {
         margin-bottom: 15px;
         padding: 10px;
-        background: #f8f9fa;
+        background: var(--darkened-bg, #f8f9fa);
         border-radius: 4px;
     }
 
     .status-badge.idle { background: #d4edda; color: #155724; }
-    .status-badge.busy { background: #fff3cd; color: #856404; }
+    .status-badge.busy { background: var(--sqlery-warn-bg, #fff3cd); color: var(--sqlery-warn-fg, #856404); }
     .status-badge.dead { background: #f8d7da; color: #721c24; }
 </style>
 {% endblock %}
@@ -406,12 +425,12 @@ function restoreCollapsedState(contentId) {
         const workerStatsCard = data.multi_worker_enabled ? `
             <div class="stat-card">
                 <h3>Workers</h3>
-                <div class="stat-value" style="color: ${data.worker_stats.active > 0 ? '#ffc107' : '#999'};">
+                <div class="stat-value" style="color: ${data.worker_stats.active > 0 ? '#ffc107' : 'var(--body-quiet-color, #999)'};">
                     ${data.worker_stats.active}/${data.worker_stats.max_workers}
                 </div>
                 <div class="stat-detail">
                     ${data.worker_stats.active === 0
-                        ? `<span style="color: #999;">No workers running</span>`
+                        ? `<span style="color: var(--body-quiet-color, #999);">No workers running</span>`
                         : `Idle: ${data.worker_stats.idle} | Busy: ${data.worker_stats.busy}`
                     }
                 </div>
@@ -555,7 +574,7 @@ function restoreCollapsedState(contentId) {
 
         // Worker summary
         const summaryHtml = `
-            <div style="margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px;">
+            <div style="margin-bottom: 15px; padding: 10px; background: var(--darkened-bg, #f8f9fa); border-radius: 4px;">
                 <strong>Active Workers:</strong> ${stats.active} / ${stats.max_workers} &nbsp;|&nbsp;
                 <strong>Idle:</strong> <span style="color: #28a745;">${stats.idle}</span> &nbsp;|&nbsp;
                 <strong>Busy:</strong> <span style="color: #ffc107;">${stats.busy}</span> &nbsp;|&nbsp;
@@ -793,7 +812,7 @@ function restoreCollapsedState(contentId) {
     window.addEventListener('beforeunload', stopAutoRefresh);
 })();
 </script>
-<footer style="text-align:center; padding:12px 0; margin-top:16px; font-size:11px; color:#888;">
+<footer style="text-align:center; padding:12px 0; margin-top:16px; font-size:11px; color:var(--body-quiet-color, #888);">
     Sqlery v{{ sqlery_version }}
 </footer>
 {% endblock %}

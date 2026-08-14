@@ -13,9 +13,27 @@
 {% block extrastyle %}
 {{ block.super }}
 <style>
+    /* Theme tokens - mirror Django admin's own light/auto/dark switch.
+       Duplicated from dashboard.css: this template does not load that
+       stylesheet, so its tokens are out of scope here. */
+    :root {
+        --sqlery-warn-bg: #fff3cd;
+        --sqlery-warn-fg: #856404;
+    }
+    @media (prefers-color-scheme: dark) {
+        html[data-theme="dark"], html:not([data-theme="light"]) {
+            --sqlery-warn-bg: #583305;
+            --sqlery-warn-fg: #ffd873;
+        }
+    }
+    html[data-theme="dark"] {
+        --sqlery-warn-bg: #583305;
+        --sqlery-warn-fg: #ffd873;
+    }
+
     .job-runs-section {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 6px;
         padding: 20px;
         margin-top: 20px;
@@ -35,20 +53,21 @@
     .job-runs-section th {
         text-align: left;
         padding: 12px;
-        background: #f8f9fa;
-        border-bottom: 2px solid #ddd;
+        background: var(--darkened-bg, #f8f9fa);
+        border-bottom: 2px solid var(--border-color, #ddd);
         font-weight: 600;
         font-size: 13px;
     }
 
     .job-runs-section td {
         padding: 12px;
-        border-bottom: 1px solid #eee;
+        border-bottom: 1px solid var(--border-color, #eee);
         font-size: 13px;
+        color: var(--body-fg, #333);
     }
 
     .job-runs-section tr:hover {
-        background: #f8f9fa;
+        background: var(--darkened-bg, #f8f9fa);
     }
 
     .status-badge {
@@ -61,7 +80,7 @@
     }
 
     .status-badge.queued { background: #d1ecf1; color: #0c5460; }
-    .status-badge.running { background: #fff3cd; color: #856404; }
+    .status-badge.running { background: var(--sqlery-warn-bg, #fff3cd); color: var(--sqlery-warn-fg, #856404); }
     .status-badge.success { background: #d4edda; color: #155724; }
     .status-badge.failed { background: #f8d7da; color: #721c24; }
 
@@ -78,7 +97,7 @@
     .empty-state {
         text-align: center;
         padding: 40px;
-        color: #999;
+        color: var(--body-quiet-color, #999);
     }
 
     .job-output {
