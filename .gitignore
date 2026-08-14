@@ -76,3 +76,6 @@ docs/archive/
 # Development artifacts
 .last-response
 .gitignoreo
+
+# Local planning artifacts
+.planning/
