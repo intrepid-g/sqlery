@@ -46,15 +46,19 @@ def spawn_worker():
 
     # Run worker as module to preserve package structure for relative imports
     # Use -m to run as module: python -m sqlery.worker_process
-    process = subprocess.Popen(
-        [sys.executable, "-m", "sqlery.worker_process"],
-        stdout=worker_log_file,
-        stderr=worker_log_file,
-        stdin=subprocess.DEVNULL,
-        env=os.environ,
-        start_new_session=True,
-        close_fds=False,  # Keep log file descriptor open
-    )
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "sqlery.worker_process"],
+            stdout=worker_log_file,
+            stderr=worker_log_file,
+            stdin=subprocess.DEVNULL,
+            env=os.environ,
+            start_new_session=True,
+        )
+    finally:
+        # Popen dups the fd for the child; close the parent's handle to avoid leaking it.
+        if worker_log_file is not subprocess.DEVNULL:
+            worker_log_file.close()
 
     return process
 
