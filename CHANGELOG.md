@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.24.14] - 2026-08-13
+
+### Fixed
+
+- Daemon-free deployments no longer fail healthy jobs while reaping. The `ENABLE_DAEMON=False` reaper called `cleanup_dead_workers()`, which also sweeps "ghost" running jobs that no active worker row points at — but in this path jobs are claimed by a bare `manage.py run_jobs` process that never creates a worker row, so every genuinely running job matched the sweep. The reaper now marks dead worker rows only; orphaned jobs stay the job of `_reap_orphaned_running_jobs()`, which checks the claiming PID.
+- `cleanup_dead_workers()` raised `FieldError` on every call and did nothing. It filtered on `current_job__isnull` after the field was demoted from a foreign key to a plain id column; it now filters on `current_job_id__isnull`.
+
+## [0.24.13] - 2026-08-13
+
+### Added
+
+- `WORKER_ALIVE_TIMEOUT` (default 30 seconds) is now the single definition of worker liveness, shared by the dashboard counts, the row list, and the reapers via `is_worker_beating()`.
+- `SUBPROCESS_TRIGGER_LOG` setting: subprocess-trigger children now write stdout/stderr to `BASE_DIR/tmp/sqlery_subprocess_trigger.log` instead of `DEVNULL`, so a crashed `run_jobs` child leaves a traceback somewhere. Set it to `""` to restore the old discard behaviour.
+
+### Fixed
+
+- The dashboard counted the workers of a destroyed container as active indefinitely. Worker counts read only the `status` column, and the sole writer of `status='dead'` runs in the daemon — so with `ENABLE_DAEMON=False` nothing ever reaped and rows stayed `idle`. Because `has_active_workers` feeds stuck-queue detection, a queue with zero real workers was reported healthy. Every count is now bounded by `last_heartbeat`. The 24h window on the row list is a "recently seen" filter only, and each row now carries its own `is_alive`.
+- Running jobs whose claiming process died mid-job are now failed rather than left `running` forever. The PID check treats uncertainty as "still alive", so a job is only failed when its claimer is provably gone.
+- Workers that stop beating are now marked dead in daemon-free deployments, where the daemon-only reaper never runs.
+
 ## [0.24.12] - 2026-08-13
 
 ### Changed
