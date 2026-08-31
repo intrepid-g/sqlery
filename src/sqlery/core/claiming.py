@@ -209,22 +209,22 @@ def claim_next_job_with_queue_priority(
     if tag_rate_limits is None:
         tag_rate_limits = {}
 
-    # Expire TTL jobs before claiming
-    expire_ttl_jobs(backend)
+    # Old: expire_ttl_jobs(backend) ran here on every claim call (per-claim TTL SELECT).
+    # Moved to: the persistent worker poll loops (throttled — see worker.py
+    # WorkerProcess.run and django_sqlery/worker_process.py run_worker), and to the
+    # one-shot claim call sites that used to get TTL expiry "for free" via
+    # backend.claim_job() -> this function (lambda_core.py, triggers.py, job_queue.py).
 
-    for attempt in range(max_attempts):
-        # Get next claimable job(s)
-        candidates = backend.get_claimable_jobs(
-            queues=queues,
-            priority_weights=queue_priorities,
-            limit=1,
-        )
+    # Old: fetched candidates one at a time (limit=1) inside the attempt loop, re-running
+    # the SELECT every attempt. A candidate blocked by tag/rate/dependency checks was
+    # re-fetched forever, starving any claimable job behind it. Fetch once instead.
+    candidates = backend.get_claimable_jobs(
+        queues=queues,
+        priority_weights=queue_priorities,
+        limit=max_attempts,
+    )
 
-        if not candidates:
-            return None
-
-        job = candidates[0]
-
+    for job in candidates:
         # Acquire exclusive locks on tag coordination rows
         tags = getattr(job, 'tags', None)
         if tags:

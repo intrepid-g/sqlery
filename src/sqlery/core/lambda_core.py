@@ -16,6 +16,8 @@ import logging
 import uuid
 from typing import Any
 
+from sqlery.core.claiming import expire_ttl_jobs
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,10 @@ def process_event(event: dict, backend) -> dict:
         else:
             worker_id = f"lambda-{uuid.uuid4()}"
             try:
+                # H1 follow-up: claim_job no longer expires TTL jobs for free
+                # (that moved to the persistent worker loops); one-shot callers
+                # like Lambda must expire explicitly before claiming.
+                expire_ttl_jobs(backend)
                 job = backend.claim_job([queue_name], worker_id)
             except Exception:
                 logger.exception("lambda_core: claim_job failed")

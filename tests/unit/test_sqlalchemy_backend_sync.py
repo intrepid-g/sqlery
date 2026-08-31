@@ -252,13 +252,6 @@ class TestRetryAndTTL:
             sync_backend.mark_job_failed(j.id, "x")
         assert sync_backend.retry_failed_jobs(max_jobs=2) == 2
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: SQLite stores created_at as naive while "
-        "backend uses datetime.now(UTC) (aware); arithmetic raises TypeError. "
-        "Out of scope for plan 03-04; tracked as backend bug.",
-        raises=TypeError,
-        strict=False,
-    )
     def test_get_expired_ttl_jobs(self, sync_backend):
         j = _create_basic_job(sync_backend, ttl=1)
         with sync_backend._get_session() as session:
@@ -273,11 +266,6 @@ class TestRetryAndTTL:
         expired = sync_backend.get_expired_ttl_jobs()
         assert any(e.id == j.id for e in expired)
 
-    @pytest.mark.xfail(
-        reason="Same pre-existing naive/aware datetime bug as above.",
-        raises=TypeError,
-        strict=False,
-    )
     def test_get_expired_ttl_excludes_unexpired(self, sync_backend):
         j = _create_basic_job(sync_backend, ttl=3600)
         expired = sync_backend.get_expired_ttl_jobs()
@@ -287,6 +275,34 @@ class TestRetryAndTTL:
         _create_basic_job(sync_backend, ttl=None)
         expired = sync_backend.get_expired_ttl_jobs()
         assert expired == []
+
+    def test_get_claimable_jobs_excludes_expired_ttl(self, sync_backend):
+        """H1 follow-up: get_claimable_jobs must exclude TTL-expired jobs so a
+        one-shot caller (no persistent poll loop) can't claim+execute one."""
+        j = _create_basic_job(sync_backend, ttl=1)
+        with sync_backend._get_session() as session:
+            from sqlery.core.models import QueuedJob
+            from sqlmodel import select as _select
+
+            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
+            row.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
+            session.add(row)
+            session.commit()
+
+        claimable = sync_backend.get_claimable_jobs(queues=["default"], limit=10)
+        assert not any(c.id == j.id for c in claimable)
+
+    def test_get_claimable_jobs_includes_unexpired_ttl(self, sync_backend):
+        j = _create_basic_job(sync_backend, ttl=3600)
+        claimable = sync_backend.get_claimable_jobs(queues=["default"], limit=10)
+        assert any(c.id == j.id for c in claimable)
+
+    # Note: SQLAlchemyBackend.claim_job() has its own raw claim query and does
+    # NOT go through get_claimable_jobs() -- it never expired TTL jobs, before
+    # or after H1. Out of scope here; get_claimable_jobs is the guarded path
+    # used by claim_next_job_with_queue_priority (the Django backend's
+    # claim_job). Standalone callers of SQLAlchemyBackend.claim_job (e.g.
+    # subprocess_executor.py) remain on the unguarded raw-query path.
 
 
 # ---------------------------------------------------------------------------

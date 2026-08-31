@@ -5,6 +5,24 @@
 
 {% block extrastyle %}
 <style>
+    /* Theme tokens - mirror Django admin's own light/auto/dark switch.
+       Duplicated from dashboard.css: this template does not load that
+       stylesheet, so its tokens are out of scope here. */
+    :root {
+        --sqlery-warn-bg: #fff3cd;
+        --sqlery-warn-fg: #856404;
+    }
+    @media (prefers-color-scheme: dark) {
+        html[data-theme="dark"], html:not([data-theme="light"]) {
+            --sqlery-warn-bg: #583305;
+            --sqlery-warn-fg: #ffd873;
+        }
+    }
+    html[data-theme="dark"] {
+        --sqlery-warn-bg: #583305;
+        --sqlery-warn-fg: #ffd873;
+    }
+
     .dashboard-container {
         padding: 20px;
         max-width: 1400px;
@@ -25,7 +43,7 @@
 
     .refresh-indicator {
         font-size: 12px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
     }
 
     .refresh-indicator.error {
@@ -40,8 +58,8 @@
     }
 
     .stat-card {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 8px;
         padding: 20px;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
@@ -50,7 +68,7 @@
     .stat-card h3 {
         margin: 0 0 15px 0;
         font-size: 14px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         text-transform: uppercase;
         letter-spacing: 0.5px;
     }
@@ -70,13 +88,13 @@
 
     .stat-detail {
         font-size: 14px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         margin: 5px 0;
     }
 
     .queue-table, .scheduled-tasks-table, .recent-jobs-table {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 8px;
         padding: 20px;
         margin-bottom: 30px;
@@ -96,20 +114,21 @@
     th {
         text-align: left;
         padding: 12px;
-        background: #f8f9fa;
-        border-bottom: 2px solid #ddd;
+        background: var(--darkened-bg, #f8f9fa);
+        border-bottom: 2px solid var(--border-color, #ddd);
         font-weight: 600;
         font-size: 13px;
     }
 
     td {
         padding: 12px;
-        border-bottom: 1px solid #eee;
+        border-bottom: 1px solid var(--border-color, #eee);
         font-size: 13px;
+        color: var(--body-fg, #333);
     }
 
     tr:hover {
-        background: #f8f9fa;
+        background: var(--darkened-bg, #f8f9fa);
     }
 
     .status-badge {
@@ -122,7 +141,7 @@
     }
 
     .status-badge.queued { background: #d1ecf1; color: #0c5460; }
-    .status-badge.running { background: #fff3cd; color: #856404; }
+    .status-badge.running { background: var(--sqlery-warn-bg, #fff3cd); color: var(--sqlery-warn-fg, #856404); }
     .status-badge.success { background: #d4edda; color: #155724; }
     .status-badge.failed { background: #f8d7da; color: #721c24; }
     .status-badge.enabled { background: #d4edda; color: #155724; }
@@ -131,13 +150,13 @@
     .empty-state {
         text-align: center;
         padding: 40px;
-        color: #999;
+        color: var(--body-quiet-color, #999);
     }
 
     .loading {
         text-align: center;
         padding: 40px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
     }
 
     .error-message {
@@ -161,7 +180,7 @@
 
     .task-path-small {
         font-size: 11px;
-        color: #999;
+        color: var(--body-quiet-color, #999);
         display: block;
         margin-top: 2px;
     }
@@ -176,7 +195,7 @@
     }
 
     .scrollable-table::-webkit-scrollbar-track {
-        background: #f1f1f1;
+        background: var(--darkened-bg, #f1f1f1);
         border-radius: 4px;
     }
 
@@ -417,7 +436,7 @@
 
         // Worker summary
         const summaryHtml = `
-            <div style="margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px;">
+            <div style="margin-bottom: 15px; padding: 10px; background: var(--darkened-bg, #f8f9fa); border-radius: 4px;">
                 <strong>Active Workers:</strong> ${stats.active} / ${stats.max_workers} &nbsp;|&nbsp;
                 <strong>Idle:</strong> <span style="color: #28a745;">${stats.idle}</span> &nbsp;|&nbsp;
                 <strong>Busy:</strong> <span style="color: #ffc107;">${stats.busy}</span> &nbsp;|&nbsp;

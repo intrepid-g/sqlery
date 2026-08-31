@@ -19,6 +19,7 @@ from .utils import import_task
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
+from .claiming import expire_ttl_jobs
 from sqlery.core.db_resilience import configure_connection_resilience
 
 try:
@@ -509,6 +510,9 @@ class WorkerProcess:
         self.total_busy_seconds = 0.0
         self._heartbeat_due = False
         self._last_loop_time = time.monotonic()
+        # H1 follow-up: throttle expire_ttl_jobs so back-to-back claims under
+        # load don't each re-run the TTL sweep — at most once per poll_interval.
+        self._last_ttl_expiry_time = 0.0
 
         # import socket  # moved to top-level
         self.node_id = os.environ.get("NODE_ID", socket.gethostname())
@@ -660,6 +664,18 @@ class WorkerProcess:
                             logger.info(f"Scheduler created {len(jobs)} jobs")
                     except Exception as e:
                         logger.error(f"Scheduler-election error: {e}", exc_info=True)
+
+                    # Moved from claim_next_job_with_queue_priority (H1): TTL expiry no
+                    # longer runs a SELECT on every claim call. Throttled to at most
+                    # once per poll_interval so back-to-back claims under load don't
+                    # each re-run the sweep.
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - self._last_ttl_expiry_time >= self.poll_interval:
+                        self._last_ttl_expiry_time = now_monotonic
+                        try:
+                            expire_ttl_jobs(self.backend)
+                        except Exception as e:
+                            logger.error(f"TTL expiry error: {e}", exc_info=True)
 
                     job = self.backend.claim_job(self.queues, self.worker_id)
 

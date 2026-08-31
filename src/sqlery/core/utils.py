@@ -14,6 +14,24 @@ from sqlery.crontab import next_cron_occurrence, parse_cron_string, InvalidExpre
 
 # ===== Result recording utilities =====
 
+def is_ttl_expired(job, now: datetime) -> bool:
+    """True if a queued job's TTL has elapsed. Mirrors backend.get_expired_ttl_jobs.
+
+    ttl=0 counts as expired (never truthiness-check ttl). Boundary is a strict
+    `<` so this exactly mirrors get_expired_ttl_jobs — no limbo between "not
+    expired yet" and "expired but still claimable".
+    """
+    ttl = getattr(job, "ttl", None)
+    if ttl is None:
+        return False
+    created = job.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=dt_timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt_timezone.utc)
+    return created + timedelta(seconds=ttl) < now
+
+
 def reject_unawaited_coroutine(output) -> None:
     """Guard against storing an unawaited coroutine/awaitable as a job result.
 
