@@ -376,25 +376,39 @@ class SQLAlchemyBackend(DatabaseBackend):
             dialect = session.bind.dialect.name if session.bind is not None else ""
             strategy = determine_claim_strategy(dialect)
 
-            stmt = (
-                select(QueuedJob)
-                .where(
-                    and_(
-                        QueuedJob.queue_name.in_(queues),
-                        QueuedJob.status == "queued",
-                        or_(
-                            QueuedJob.scheduled_at == None,
-                            QueuedJob.scheduled_at <= now,
-                        ),
+            skipped_ids: list = []
+            job = None
+            for _ in range(25):
+                stmt = (
+                    select(QueuedJob)
+                    .where(
+                        and_(
+                            QueuedJob.queue_name.in_(queues),
+                            QueuedJob.status == "queued",
+                            or_(
+                                QueuedJob.scheduled_at == None,
+                                QueuedJob.scheduled_at <= now,
+                            ),
+                        )
                     )
+                    .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
+                    .limit(1)
                 )
-                .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
-                .limit(1)
-            )
-            if strategy == "skip_locked":
-                stmt = stmt.with_for_update(skip_locked=True)
+                if skipped_ids:
+                    stmt = stmt.where(QueuedJob.id.not_in(skipped_ids))
+                if strategy == "skip_locked":
+                    stmt = stmt.with_for_update(skip_locked=True)
 
-            job = session.exec(stmt).first()
+                candidate = session.exec(stmt).first()
+                if candidate is None:
+                    return None
+                # Enforce depends_on / ttl like the shared Django claiming path.
+                if self._claim_blocked(session, candidate, now):
+                    skipped_ids.append(candidate.id)
+                    session.commit()  # release the row lock / persist a dependency failure
+                    continue
+                job = candidate
+                break
             if job is None:
                 return None
 
@@ -428,6 +442,59 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return None
             refreshed = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             return refreshed
+
+    @staticmethod
+    def _claim_blocked(session, job, now) -> bool:
+        """True if ``job`` must not be claimed now (unmet/failed dependency, expired TTL)."""
+        ttl = getattr(job, "ttl", None)
+        created = getattr(job, "created_at", None)
+        if ttl and created is not None:
+            created_aware = created if created.tzinfo else created.replace(tzinfo=UTC)
+            if (now - created_aware).total_seconds() > ttl:
+                job.status = "failed"
+                job.error = f"Job expired after {ttl}s in queue (ttl)"
+                job.finished_at = now
+                session.add(job)
+                return True
+        deps = getattr(job, "dependencies", None)
+        if not deps:
+            return False
+        dep_rows = session.exec(select(QueuedJob).where(QueuedJob.id.in_(deps))).all()
+        found = {d.id for d in dep_rows}
+        failed = [d.id for d in dep_rows if d.status == "failed"] + [
+            d for d in deps if d not in found
+        ]
+        if failed:
+            job.status = "failed"
+            job.error = f"Dependencies failed: {failed}"
+            job.finished_at = now
+            session.add(job)
+            return True
+        return any(d.status != "success" for d in dep_rows)
+
+    def claim_job_by_id(self, job_id, worker_id: str):
+        """Atomically claim one specific queued job via a compare-and-set UPDATE."""
+        with self._get_session() as session:
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            if job is None or job.status != "queued":
+                return None
+            current_version = job.version or 0
+            res = session.exec(
+                update(QueuedJob)
+                .where(QueuedJob.id == job.id)
+                .where(QueuedJob.version == current_version)
+                .where(QueuedJob.status == "queued")
+                .values(
+                    status="running",
+                    started_at=datetime.now(UTC),
+                    worker_pid=os.getpid(),
+                    version=current_version + 1,
+                )
+            )
+            session.commit()
+            if res.rowcount != 1:
+                return None
+            return session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
 
     def claim_queue_leases(
         self,

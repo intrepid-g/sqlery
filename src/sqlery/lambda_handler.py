@@ -103,7 +103,11 @@ def handler(event, context):
     # Initialize Django
     setup_django()
 
-    logger.info(f"Lambda invoked with event: {json.dumps(event)}")
+    # Log only the shape of the event: payloads may carry secrets/PII.
+    logger.info(
+        f"Lambda invoked: action={event.get('action', 'process_queue')!r} "
+        f"keys={sorted(str(k) for k in event)}"
+    )
 
     action = event.get("action", "process_queue")
 

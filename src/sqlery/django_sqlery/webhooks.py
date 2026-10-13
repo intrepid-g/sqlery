@@ -145,7 +145,10 @@ def send_webhook(job, event='success'):
             job.webhook_url,
             data=json.dumps(payload, cls=_SafeEncoder),
             headers=headers,
-            timeout=timeout
+            timeout=timeout,
+            # Never follow redirects: a 3xx to an internal address would bypass the
+            # SSRF validation done on the original URL.
+            allow_redirects=False,
         )
 
         if response.status_code in (200, 201, 202, 204):

@@ -54,9 +54,9 @@ def process_event(event: dict, backend) -> dict:
         job: Any = None
         if job_id is not None:
             try:
-                job = backend.get_job_by_id(int(job_id))
+                job = backend.claim_job_by_id(int(job_id), f"lambda-{uuid.uuid4()}")
             except Exception:
-                logger.exception("lambda_core: get_job_by_id failed")
+                logger.exception("lambda_core: claim_job_by_id failed")
         else:
             worker_id = f"lambda-{uuid.uuid4()}"
             try:

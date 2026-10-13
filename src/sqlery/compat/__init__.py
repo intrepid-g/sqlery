@@ -100,6 +100,15 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def claim_job_by_id(self, job_id: int, worker_id: str):
+        """Atomically claim one specific *queued* job (queued -> running).
+
+        Used by trigger/serverless paths that execute a named job. Returns the claimed
+        job, or ``None`` if it does not exist or is not claimable (already running,
+        finished, cancelled, or claimed by another caller).
+        """
+        raise NotImplementedError
+
     def is_worker_paused(self, worker_id: str) -> bool:
         """Check if worker is currently paused (paused_until is in the future)."""
         return False
