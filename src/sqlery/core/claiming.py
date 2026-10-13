@@ -44,6 +44,17 @@ def get_node_id():
     return os.environ.get("NODE_ID", socket.gethostname())
 
 
+def _config_limits(name: str) -> dict:
+    """Read a {tag: limit} mapping from config; tolerate missing/invalid values."""
+    try:
+        from sqlery.compat import get_config
+
+        value = get_config(name, {})
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def check_tag_concurrency_limits(job, tag_limits: dict, backend) -> bool:
     """Check if job's tags would exceed configured concurrency limits.
 
@@ -204,26 +215,25 @@ def claim_next_job_with_queue_priority(
     Returns:
         Job instance if claimed, None if no jobs available
     """
+    # Limits come from config (TAG_CONCURRENCY_LIMITS / TAG_RATE_LIMITS) unless given.
+    # Callers historically passed nothing, which silently disabled both features.
     if tag_concurrency_limits is None:
-        tag_concurrency_limits = {}
+        tag_concurrency_limits = _config_limits("TAG_CONCURRENCY_LIMITS")
     if tag_rate_limits is None:
-        tag_rate_limits = {}
+        tag_rate_limits = _config_limits("TAG_RATE_LIMITS")
 
     # Expire TTL jobs before claiming
     expire_ttl_jobs(backend)
 
-    for attempt in range(max_attempts):
-        # Get next claimable job(s)
-        candidates = backend.get_claimable_jobs(
-            queues=queues,
-            priority_weights=queue_priorities,
-            limit=1,
-        )
+    # Fetch a window of candidates once. Re-fetching limit=1 each attempt returned the
+    # same blocked job every time, so one tag-limited job starved everything behind it.
+    candidates = backend.get_claimable_jobs(
+        queues=queues,
+        priority_weights=queue_priorities,
+        limit=max_attempts,
+    )
 
-        if not candidates:
-            return None
-
-        job = candidates[0]
+    for job in candidates:
 
         # Acquire exclusive locks on tag coordination rows
         tags = getattr(job, 'tags', None)

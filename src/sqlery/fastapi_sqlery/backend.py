@@ -251,6 +251,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         result_ttl: int | None = None,
         failure_ttl: int | None = None,
         parent_job_id: int | None = None,
+        tags: list | None = None,
     ):
         """Create a new job in the database."""
         # Named job support: new job always wins, stop conflicting jobs
@@ -298,6 +299,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                     "result_ttl": result_ttl,
                     "failure_ttl": failure_ttl,
                     "parent_job_id": parent_job_id,
+                    "tags": list(tags or []),
                 },
             }
             staging_row = ScheduledJob(
@@ -337,6 +339,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             result_ttl=result_ttl,
             failure_ttl=failure_ttl,
             parent_job_id=parent_job_id,
+            tags=list(tags or []),
             status="queued",
         )
 
@@ -403,7 +406,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 if candidate is None:
                     return None
                 # Enforce depends_on / ttl like the shared Django claiming path.
-                if self._claim_blocked(session, candidate, now):
+                if self._claim_blocked(session, candidate, now) or self._tag_limited(
+                    session, candidate, now
+                ):
                     skipped_ids.append(candidate.id)
                     session.commit()  # release the row lock / persist a dependency failure
                     continue
@@ -442,6 +447,41 @@ class SQLAlchemyBackend(DatabaseBackend):
                 return None
             refreshed = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
             return refreshed
+
+    def _tag_limited(self, session, job, now) -> bool:
+        """True if claiming ``job`` now would exceed a tag concurrency/rate limit."""
+        tags = getattr(job, "tags", None)
+        if not tags:
+            return False
+        from sqlery.core.claiming import _config_limits
+        from sqlery.core.utils import parse_rate_limit
+
+        conc = _config_limits("TAG_CONCURRENCY_LIMITS")
+        rate = _config_limits("TAG_RATE_LIMITS")
+        limited = sorted(t for t in tags if t in conc or t in rate)
+        if not limited:
+            return False
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            # Serialize limit check + claim per tag until this transaction ends.
+            for tag in limited:
+                session.exec(text("SELECT pg_advisory_xact_lock(hashtext(:t))").bindparams(t=tag))
+        for tag in limited:
+            limit = conc.get(tag)
+            if limit is not None and self._count_tag_in_session(
+                session, tag, ["running"]
+            ) >= limit:
+                return True
+            if rate.get(tag):
+                try:
+                    count, window = parse_rate_limit(rate[tag])
+                except ValueError:
+                    continue
+                started = self._count_tag_in_session(
+                    session, tag, ["running", "success", "failed"], since=now - window
+                )
+                if started >= count:
+                    return True
+        return False
 
     @staticmethod
     def _claim_blocked(session, job, now) -> bool:
@@ -1937,29 +1977,26 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.refresh(db_job)
             return db_job
 
+    @staticmethod
+    def _count_tag_in_session(session, tag: str, statuses: list[str], since=None) -> int:
+        """Count jobs carrying ``tag``. Filters in Python: JSON ``contains`` is not portable
+        (unsupported on SQLite, wrong operator on PostgreSQL ``json``)."""
+        stmt = select(QueuedJob.tags).where(QueuedJob.status.in_(statuses))
+        if since is not None:
+            stmt = stmt.where(QueuedJob.started_at != None, QueuedJob.started_at >= since)  # noqa: E711
+        return sum(1 for tags in session.exec(stmt).all() if tags and tag in tags)
+
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""
         with self._get_session() as session:
-            stmt = select(func.count(QueuedJob.id)).where(
-                and_(
-                    QueuedJob.status == "running",
-                    QueuedJob.tags.contains([tag]),
-                )
-            )
-            return session.exec(stmt).one()
+            return self._count_tag_in_session(session, tag, ["running"])
 
     def count_started_with_tag_since(self, tag: str, threshold: datetime) -> int:
         """Count jobs with the given tag that started since threshold."""
         with self._get_session() as session:
-            stmt = select(func.count(QueuedJob.id)).where(
-                and_(
-                    QueuedJob.status.in_(["running", "success", "failed"]),
-                    QueuedJob.tags.contains([tag]),
-                    QueuedJob.started_at >= threshold,
-                    QueuedJob.started_at != None,
-                )
+            return self._count_tag_in_session(
+                session, tag, ["running", "success", "failed"], since=threshold
             )
-            return session.exec(stmt).one()
 
     def get_expired_ttl_jobs(self) -> list:
         """Get queued jobs whose TTL has expired."""

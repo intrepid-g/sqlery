@@ -14,12 +14,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were never applied: the shared claim path defaulted both to `{}` and the standalone claim path skipped them entirely. Both now read config and enforce the limits (standalone serializes the check with a per-tag advisory lock on PostgreSQL).
+- A tag-limited job at the head of the queue no longer starves everything behind it; the claim loop now walks a window of candidates instead of re-fetching the same blocked job.
+- Tag counting no longer uses JSON `contains`, which is unsupported on SQLite (Django raised `NotSupportedError`) and wrong for PostgreSQL `json` columns in standalone mode.
 - HTTP-trigger and serverless `job_id` paths now claim the job atomically (`DatabaseBackend.claim_job_by_id`) before executing, instead of running it without a claim; a duplicate trigger or an already-running job is rejected (409) rather than executed twice.
 - Standalone `claim_job` now enforces `dependencies` (`depends_on`) and `ttl`, matching Django mode: a child no longer runs before its parent, and failed/missing dependencies fail the child.
 - Standalone job retries now honour `retry_intervals`.
 
 ### Added
 
+- `@job(tags=[...])` (core and Django decorators) and `create_job(tags=...)` on both backends, so `TAG_CONCURRENCY_LIMITS` / `TAG_RATE_LIMITS` are usable from the public API. Core `enqueue` takes the tags as `_tags` so a task's own `tags` kwarg is never shadowed. Staged (far-future) jobs keep their tags on promotion.
 - Opt-in Celery-style retry tuning via config: `RETRY_BACKOFF_MAX` (cap) and `RETRY_JITTER` (full jitter). Defaults leave behaviour unchanged.
 
 ## [0.24.14] - 2026-08-13
