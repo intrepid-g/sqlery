@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Falsy task results (`0`, `False`, `[]`) were recorded as empty output (`result or ""`). Results are now stored via `serialize_result`: strings verbatim, `None` as empty, everything else as JSON (dict results appear in the dashboard as JSON rather than a Python repr).
 - `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were never applied: the shared claim path defaulted both to `{}` and the standalone claim path skipped them entirely. Both now read config and enforce the limits (standalone serializes the check with a per-tag advisory lock on PostgreSQL).
 - A tag-limited job at the head of the queue no longer starves everything behind it; the claim loop now walks a window of candidates instead of re-fetching the same blocked job.
 - Tag counting no longer uses JSON `contains`, which is unsupported on SQLite (Django raised `NotSupportedError`) and wrong for PostgreSQL `json` columns in standalone mode.
@@ -23,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Celery-style results API: `job.apply_async(args, kwargs, countdown=, eta=, expires=, ...)` returns an `AsyncResult` (`sqlery.AsyncResult`) with `state`/`status`, `ready()`, `successful()`, `failed()`, `result`, `error`, `traceback` and a blocking `get(timeout=, propagate=)` that follows retry attempts. Available on core `@job` and Django `@job` functions. `expires` maps to the job `ttl`. Task arguments are passed explicitly, so option names can't collide with task kwargs. `.delay()`/`.enqueue()` are unchanged. New non-abstract `DatabaseBackend.get_latest_retry()` (both backends).
 - `@job(tags=[...])` (core and Django decorators) and `create_job(tags=...)` on both backends, so `TAG_CONCURRENCY_LIMITS` / `TAG_RATE_LIMITS` are usable from the public API. Core `enqueue` takes the tags as `_tags` so a task's own `tags` kwarg is never shadowed. Staged (far-future) jobs keep their tags on promotion.
 - Opt-in Celery-style retry tuning via config: `RETRY_BACKOFF_MAX` (cap) and `RETRY_JITTER` (full jitter). Defaults leave behaviour unchanged.
 

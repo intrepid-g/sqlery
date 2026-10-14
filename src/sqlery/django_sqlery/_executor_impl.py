@@ -26,6 +26,7 @@ from .models import ScheduledTask, QueuedJob, Worker
 from .subprocess_executor import get_manage_py_path
 from .settings import get_setting
 from .utils import import_task, calculate_next_run
+from sqlery.core.result import serialize_result
 
 # Use the canonical ContextVar from sqlery.core.worker so context sharing
 # across the standalone + Django code paths uses ONE instance.
@@ -364,7 +365,7 @@ class TaskExecutor:
                     _current_job_var.reset(_token)
 
                 # Mark success
-                job.mark_success(output=result or "")
+                job.mark_success(output=serialize_result(result))
                 logger.info(f"Job {job.id} completed successfully")
 
                 # Invoke on_success callback if configured

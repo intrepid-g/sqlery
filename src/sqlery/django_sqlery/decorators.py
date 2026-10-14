@@ -177,6 +177,40 @@ class JobFunction:
         """
         return self.enqueue(*args, queue=queue, priority=priority, max_retries=max_retries, **kwargs)
 
+    def apply_async(
+        self,
+        args: tuple | list | None = None,
+        kwargs: dict | None = None,
+        *,
+        countdown: float | None = None,
+        eta: Any = None,
+        expires: Any = None,
+        queue: str | None = None,
+        priority: int | None = None,
+    ):
+        """Celery-style enqueue returning an ``AsyncResult`` (see ``sqlery.core.result``)."""
+        from sqlery.core.result import apply_async_job
+
+        payload = dict(kwargs or {})
+        if args:
+            bound = inspect.signature(self.func).bind_partial(*args, **payload)
+            bound.apply_defaults()
+            payload = dict(bound.arguments)
+        return apply_async_job(
+            self.task_path,
+            payload,
+            queue=queue if queue is not None else self.queue_name,
+            priority=priority if priority is not None else self.priority,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+            allow_parallel=self.allow_parallel,
+            timeout_seconds=self.timeout,
+            tags=self.tags,
+            countdown=countdown,
+            eta=eta,
+            expires=expires,
+        )
+
     def enqueue_at(self, scheduled_at, *args: Any, queue: str | None = None, priority: int | None = None, **kwargs: Any) -> Any:
         """Enqueue the job to run at a specific time.
 

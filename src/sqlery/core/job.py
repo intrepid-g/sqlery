@@ -201,6 +201,60 @@ class JobWrapper:
             **kwargs,
         )
 
+    def apply_async(
+        self,
+        args: tuple | list | None = None,
+        kwargs: dict | None = None,
+        *,
+        countdown: float | None = None,
+        eta: datetime | None = None,
+        expires: float | datetime | None = None,
+        queue: str | None = None,
+        priority: int | None = None,
+        max_retries: int | None = None,
+        retry_backoff: float | None = None,
+        allow_parallel: bool | None = None,
+        timeout_seconds: int | None = None,
+    ):
+        """Celery-style enqueue returning an :class:`~sqlery.core.result.AsyncResult`.
+
+        Unlike :meth:`enqueue`, task arguments are passed explicitly (``args``/``kwargs``),
+        so option names can never collide with a task's own keyword arguments.
+
+        Args:
+            args: Positional arguments for the task.
+            kwargs: Keyword arguments for the task.
+            countdown: Delay execution by this many seconds.
+            eta: Run at this datetime (naive values are treated as UTC).
+            expires: Seconds (or a datetime) after which a still-queued job is failed, not run.
+
+        Example:
+            >>> res = add.apply_async(args=(2, 3), countdown=10, expires=300)
+            >>> res.get(timeout=60)
+            5
+        """
+        from .result import apply_async_job
+
+        payload = dict(kwargs or {})
+        if args:
+            payload["_args"] = list(args)
+        return apply_async_job(
+            self.task_path,
+            payload,
+            queue=queue if queue is not None else self.queue,
+            priority=priority if priority is not None else self.priority,
+            max_retries=max_retries if max_retries is not None else self.max_retries,
+            retry_backoff=retry_backoff if retry_backoff is not None else self.retry_backoff,
+            allow_parallel=allow_parallel if allow_parallel is not None else self.allow_parallel,
+            timeout_seconds=(
+                timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+            ),
+            tags=self.tags,
+            countdown=countdown,
+            eta=eta,
+            expires=expires,
+        )
+
     def __repr__(self) -> str:
         """String representation of the job wrapper."""
         return f"<JobWrapper: {self.task_path} queue={self.queue} priority={self.priority}>"
