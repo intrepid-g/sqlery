@@ -27,6 +27,12 @@ from .subprocess_executor import get_manage_py_path
 from .settings import get_setting
 from .utils import import_task, calculate_next_run
 from sqlery.core.result import serialize_result
+from sqlery.core.retry import (
+    invoke_task,
+    policy_allows_retry,
+    retry_countdown,
+    shape_retry_delay,
+)
 
 # Use the canonical ContextVar from sqlery.core.worker so context sharing
 # across the standalone + Django code paths uses ONE instance.
@@ -355,7 +361,7 @@ class TaskExecutor:
                 logger.info(f"Executing job {job.id}: {job.task_path} with kwargs={kwargs}")
                 _token = _current_job_var.set(job)
                 try:
-                    result = task_func(**kwargs)
+                    result = invoke_task(task_func, job, (), kwargs)
                     # REGRESSION 2026-05-25: @async_job silently "succeeded" without running
                     # Root cause: coroutine returned by async task was never awaited
                     # Fix: detect coroutine result and run it to completion via asyncio.run()
@@ -414,8 +420,8 @@ class TaskExecutor:
                     logger.exception(f"on_failure callback failed for job {job.id}")
 
             # Check if job should be retried
-            if job.should_retry():
-                retry_job = self._retry_job(job)
+            if job.should_retry() and policy_allows_retry(job, e):
+                retry_job = self._retry_job(job, exc=e)
                 logger.info(
                     f"Job {job.id} will be retried as job {retry_job.id} "
                     f"(attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
@@ -423,11 +429,12 @@ class TaskExecutor:
 
         return job
 
-    def _retry_job(self, failed_job):
+    def _retry_job(self, failed_job, exc=None):
         """Create a retry job for a failed job.
 
         Args:
             failed_job: The failed QueuedJob instance
+            exc: The exception that failed it (drives Retry(countdown=) / task policy)
 
         Returns:
             QueuedJob: The new retry job
@@ -435,7 +442,9 @@ class TaskExecutor:
         # from datetime import timedelta  # moved to top-level
 
         # Calculate retry delay
-        delay_seconds = failed_job.calculate_retry_delay()
+        delay_seconds = shape_retry_delay(
+            failed_job.calculate_retry_delay(), failed_job, countdown=retry_countdown(exc)
+        )
         scheduled_at = timezone.now() + timedelta(seconds=delay_seconds)
 
         # Create new job for retry (job_name=None to avoid unique constraint collision)
@@ -449,6 +458,18 @@ class TaskExecutor:
             max_retries=failed_job.max_retries,
             retry_backoff=failed_job.retry_backoff,
             retry_intervals=failed_job.retry_intervals,
+            # Carry the rest of the job spec: these were silently dropped on retry.
+            timeout_seconds=failed_job.timeout_seconds,
+            allow_parallel=failed_job.allow_parallel,
+            tags=failed_job.tags,
+            meta=failed_job.meta,
+            on_success_path=failed_job.on_success_path,
+            on_failure_path=failed_job.on_failure_path,
+            result_ttl=failed_job.result_ttl,
+            failure_ttl=failed_job.failure_ttl,
+            webhook_url=failed_job.webhook_url,
+            webhook_events=failed_job.webhook_events,
+            parent_job_id=failed_job.id,
             scheduled_at=scheduled_at,
             runs=failed_job.runs.copy() if isinstance(failed_job.runs, list) else [],
             job_name=None,

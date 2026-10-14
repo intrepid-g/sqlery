@@ -32,6 +32,10 @@ class JobFunction:
         retry_backoff: float = 1.0,
         allow_parallel: bool = True,
         tags: list[str] | None = None,
+        autoretry_for: tuple | list | None = None,
+        retry_backoff_max: float | None = None,
+        retry_jitter: bool | None = None,
+        bind: bool = False,
     ):
         """Initialize job function wrapper.
 
@@ -52,10 +56,22 @@ class JobFunction:
         self.retry_backoff = retry_backoff
         self.allow_parallel = allow_parallel
         self.tags = list(tags) if tags else []
+        # Retry policy (read by the executors; see sqlery.core.retry)
+        self.autoretry_for = tuple(autoretry_for) if autoretry_for else None
+        self.retry_backoff_max = retry_backoff_max
+        self.retry_jitter = retry_jitter
+        self.bind = bind
 
         # Copy function metadata
         functools.update_wrapper(self, func)
         self.__annotations__ = getattr(func, "__annotations__", {})
+
+    def _bind_partial(self, args, kwargs):
+        """Bind call args to the task signature, skipping the injected ctx of ``bind=True``."""
+        sig = inspect.signature(self.func)
+        if self.bind:
+            sig = sig.replace(parameters=list(sig.parameters.values())[1:])
+        return sig.bind_partial(*args, **kwargs)
 
     @property
     def queue(self):
@@ -72,7 +88,11 @@ class JobFunction:
         return f"JobWrapper({self.task_path}, queue={self.queue_name}, priority={self.priority})"
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Call the original function directly."""
+        """Call the original function directly (``bind=True`` gets a detached context)."""
+        if self.bind:
+            from sqlery.core.retry import TaskContext
+
+            return self.func(TaskContext(task_path=self.task_path), *args, **kwargs)
         return self.func(*args, **kwargs)
 
     def enqueue(self, *args: Any, queue: str | None = None, priority: int | None = None, max_retries: int | None = None, retry_backoff: float | None = None, **kwargs: Any) -> Any:
@@ -110,8 +130,7 @@ class JobFunction:
 
         # Handle positional arguments by binding them to the function signature
         if args:
-            sig = inspect.signature(self.func)
-            bound = sig.bind_partial(*args, **kwargs)
+            bound = self._bind_partial(args, kwargs)
             bound.apply_defaults()
             job_kwargs = dict(bound.arguments)
 
@@ -193,7 +212,7 @@ class JobFunction:
 
         payload = dict(kwargs or {})
         if args:
-            bound = inspect.signature(self.func).bind_partial(*args, **payload)
+            bound = self._bind_partial(args, payload)
             bound.apply_defaults()
             payload = dict(bound.arguments)
         return apply_async_job(
@@ -233,8 +252,7 @@ class JobFunction:
         job_kwargs = kwargs.copy()
 
         if args:
-            sig = inspect.signature(self.func)
-            bound = sig.bind_partial(*args, **kwargs)
+            bound = self._bind_partial(args, kwargs)
             bound.apply_defaults()
             job_kwargs = dict(bound.arguments)
 
@@ -388,6 +406,10 @@ def job(
     retry: Any = None,  # d-t-s / RQ Retry compat
     allow_parallel: bool = True,
     tags: list[str] | None = None,
+    autoretry_for: tuple | list | None = None,
+    retry_backoff_max: float | None = None,
+    retry_jitter: bool | None = None,
+    bind: bool = False,
 ) -> Callable[[Callable], JobFunction] | JobFunction:
     """Decorator for marking sync functions as enqueueable jobs.
 
@@ -447,6 +469,10 @@ def job(
             retry_backoff=effective_retry_backoff,
             allow_parallel=allow_parallel,
             tags=tags,
+            autoretry_for=autoretry_for,
+            retry_backoff_max=retry_backoff_max,
+            retry_jitter=retry_jitter,
+            bind=bind,
         )
 
     if func is not None and callable(func):
@@ -457,7 +483,9 @@ def job(
         return job(queue=func, priority=priority, timeout=timeout,
                    timeout_seconds=timeout_seconds, max_retries=max_retries,
                    retry_backoff=retry_backoff, retry=retry,
-                   allow_parallel=allow_parallel, tags=tags)
+                   allow_parallel=allow_parallel, tags=tags,
+                   autoretry_for=autoretry_for, retry_backoff_max=retry_backoff_max,
+                   retry_jitter=retry_jitter, bind=bind)
     else:
         # Called as @job() or @job(queue='name') with parentheses
         return decorator
