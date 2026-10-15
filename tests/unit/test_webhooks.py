@@ -31,12 +31,13 @@ import pytest
 # import quirks tracked elsewhere (Phase 4 cleanup):
 #   1. `from .settings import get_setting` — `sqlery/settings.py` is an empty
 #      backward-compat stub that no longer re-exports `get_setting`.
-#   2. `import requests` — not declared in `pyproject.toml` deps.
+#   2. (historical) `requests` was undeclared; webhooks now use `httpx`, available
+#      through the `sqlery[webhooks]` extra.
 # To unit-test the module in isolation without modifying production code,
 # we install a minimal stub for `sqlery.settings.get_setting` BEFORE the
-# `from sqlery import webhooks` line. The `requests` import is wrapped in
-# try/except inside the module itself, so we don't need to stub it (we
-# patch it per-test via `unittest.mock.patch`).
+# `from sqlery import webhooks` line. The `httpx` import is wrapped in
+# try/except inside the module itself, and we mock the network layer per test
+# by patching `_post_pinned` with `unittest.mock.patch`.
 import sys as _sys
 import sqlery.settings as _sqlery_settings  # empty stub module
 
