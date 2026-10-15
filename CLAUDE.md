@@ -45,7 +45,6 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 - ruff >= 0.1.0 - Linter (line-length 100, target py310)
 - uv - Package management and virtual environment
 ## Key Dependencies
-- `croniter` >= 2.0.0 - Cron expression parsing and next-occurrence calculation
 - `uuid6` >= 2024.1.0 - UUID v7 generation for time-sortable worker IDs
 - `psycopg` >= 3.1 - PostgreSQL adapter (psycopg3, async-capable)
 - `django` >= 4.2 - Full Django framework
