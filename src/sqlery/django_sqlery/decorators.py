@@ -198,6 +198,18 @@ class JobFunction:
         """
         return self.enqueue(*args, queue=queue, priority=priority, max_retries=max_retries, **kwargs)
 
+    def s(self, *args: Any, **kwargs: Any):
+        """Task signature for ``chain`` / ``group`` / ``chord``; upstream results are prepended."""
+        from sqlery.core.canvas import Signature
+
+        return Signature(self, args, kwargs)
+
+    def si(self, *args: Any, **kwargs: Any):
+        """Immutable signature: ignores upstream results."""
+        from sqlery.core.canvas import Signature
+
+        return Signature(self, args, kwargs, immutable=True)
+
     def apply_async(
         self,
         args: tuple | list | None = None,

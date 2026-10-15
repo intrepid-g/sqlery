@@ -462,6 +462,7 @@ class TaskExecutor:
             # Carry the rest of the job spec: these were silently dropped on retry.
             timeout_seconds=failed_job.timeout_seconds,
             allow_parallel=failed_job.allow_parallel,
+            dependencies=failed_job.dependencies,
             tags=failed_job.tags,
             meta=failed_job.meta,
             on_success_path=failed_job.on_success_path,
