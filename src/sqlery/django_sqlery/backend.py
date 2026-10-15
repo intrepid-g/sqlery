@@ -345,6 +345,22 @@ class DjangoBackend(DatabaseBackend):
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     @retry_on_db_error()
+    def claim_job_by_id(self, job_id: int, worker_id: str):
+        """Atomically claim one specific queued job via a compare-and-set UPDATE."""
+        from django.db.models import F
+
+        with transaction.atomic():
+            updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+                status="running",
+                started_at=timezone.now(),
+                worker_pid=os.getpid(),
+                version=F("version") + 1,
+            )
+            if updated != 1:
+                return None
+        return self.QueuedJob.objects.filter(id=job_id).first()
+
+    @retry_on_db_error()
     def release_claimed_job(
         self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
     ):

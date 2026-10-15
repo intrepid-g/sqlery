@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Security
+
+- Webhook delivery no longer follows HTTP redirects, closing an SSRF bypass where a validated public URL redirected to an internal address.
+- HTTP trigger signatures can now bind the request body (`X-Signature-Version: 2`, `make_signed_request_headers(secret, body=...)`), so a captured header pair cannot be replayed with a different payload. Legacy timestamp-only signatures keep working; set `REQUIRE_BODY_SIGNATURE` (or `SQLERY_REQUIRE_BODY_SIGNATURE=1`) to reject them.
+- Lambda handler no longer logs the full invocation event (only action and keys).
+
+### Fixed
+
+- HTTP-trigger and serverless `job_id` paths now claim the job atomically (`DatabaseBackend.claim_job_by_id`) before executing, instead of running it without a claim; a duplicate trigger or an already-running job is rejected (409) rather than executed twice.
+- Standalone `claim_job` now enforces `dependencies` (`depends_on`) and `ttl`, matching Django mode: a child no longer runs before its parent, and failed/missing dependencies fail the child.
+- Standalone job retries now honour `retry_intervals`.
+
+### Added
+
+- Opt-in Celery-style retry tuning via config: `RETRY_BACKOFF_MAX` (cap) and `RETRY_JITTER` (full jitter). Defaults leave behaviour unchanged.
+
 ## [0.24.14] - 2026-08-13
 
 ### Fixed
