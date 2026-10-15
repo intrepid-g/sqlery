@@ -144,7 +144,7 @@ def next_cron_occurrence(
     Returns:
         datetime.datetime: The next occurrence of the cron schedule (UTC).
     """
-    crontab = parse_cron_string(cron_string)
+    crontab = parse_cron_string(cron_string)  # a SolarSchedule for "solar:..." specs
 
     if base_date is None:
         base_date = datetime.datetime.now(datetime.timezone.utc)
@@ -155,7 +155,10 @@ def next_cron_occurrence(
 
     # The calculation is done starting from the next minute
     base_date += datetime.timedelta(minutes=1)
-    next_time = crontab.next_from(base_date)
+    try:
+        next_time = crontab.next_from(base_date)
+    except ValueError as e:  # InvalidSolarSpec: event never occurs here (subclass of ValueError)
+        raise InvalidExpression(str(e)) from e
 
     return next_time
 
@@ -167,6 +170,15 @@ def parse_cron_string(expression: str) -> Crontab:
     >>> parse_cron_string("*/10 * * * *")
     Crontab(...)
     """
+    # Solar schedules ("solar:sunset 40.7 -74.0 -15m") share the cron_expression field.
+    from . import solar
+
+    if solar.is_solar(expression):
+        try:
+            return solar.parse_solar(expression)  # has the same next_from() as Crontab
+        except solar.InvalidSolarSpec as e:
+            raise InvalidExpression(str(e)) from e
+
     # Resolve macros (@hourly etc) to equivalent cron expressions
     expression = MACROS.get(expression, expression)
 

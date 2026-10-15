@@ -100,6 +100,18 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def request_job_revoke(self, job_id: int) -> bool:
+        """Ask the worker running ``job_id`` to terminate it. True if the job was running.
+
+        Cooperative: the owning worker polls ``is_job_revoke_requested`` and kills the job's
+        process group, so it works across hosts.
+        """
+        raise NotImplementedError
+
+    def is_job_revoke_requested(self, job_id: int) -> bool:
+        """Whether a terminate request is pending for the running job."""
+        return False
+
     def get_latest_retry(self, job_id: int):
         """Return the newest retry attempt created for ``job_id`` (child via
         ``parent_job_id``), or ``None``. Used by ``AsyncResult`` to follow retries."""

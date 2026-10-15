@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AsyncResult",
     "TaskFailedError",
+    "TaskRevokedError",
+    "revoke",
+    "REVOKED_ERROR",
     "apply_async_job",
     "serialize_result",
     "deserialize_result",
@@ -33,7 +36,15 @@ _STATE_MAP = {
     "failed": "FAILURE",
     "archived": "RETRY",
 }
-_READY_STATES = frozenset({"SUCCESS", "FAILURE"})
+_READY_STATES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
+
+REVOKED_ERROR = "Revoked by user"
+# Error texts that mark a failed job as revoked (cancel_job writes the first).
+_REVOKED_ERRORS = frozenset({"Cancelled by user", REVOKED_ERROR})
+
+
+class TaskRevokedError(Exception):
+    """Raised by :meth:`AsyncResult.get` when the job was revoked."""
 
 
 class TaskFailedError(Exception):
@@ -122,8 +133,10 @@ class AsyncResult:
         job = self._job()
         if job is None:
             return "PENDING"  # Celery semantics: unknown ids look pending
-        # Staged (far-future) jobs have no status attribute yet.
-        return _STATE_MAP.get(getattr(job, "status", "queued"), "PENDING")
+        status = getattr(job, "status", "queued")  # staged (far-future) jobs have none yet
+        if status == "failed" and getattr(job, "error", "") in _REVOKED_ERRORS:
+            return "REVOKED"
+        return _STATE_MAP.get(status, "PENDING")
 
     status = state
 
@@ -164,6 +177,11 @@ class AsyncResult:
             return getattr(job, "traceback", "") or ""
         return None
 
+    def revoke(self, terminate: bool = False) -> bool:
+        """Revoke this job. See :func:`revoke`."""
+        job = self._job()
+        return revoke(job.id if job is not None else self.id, terminate=terminate, backend=self.backend)
+
     def get(self, timeout: float | None = None, interval: float = 0.2, propagate: bool = True):
         """Block until the job finishes and return its result.
 
@@ -181,6 +199,8 @@ class AsyncResult:
             state = self.state
             if state == "SUCCESS":
                 return self.result
+            if state == "REVOKED":
+                raise TaskRevokedError(f"Job {self.id} was revoked")
             if state == "FAILURE":
                 if propagate:
                     raise TaskFailedError(self.error or "task failed", self.traceback or "")
@@ -197,6 +217,28 @@ class AsyncResult:
 
     def __hash__(self) -> int:
         return hash(("AsyncResult", self.id))
+
+
+def revoke(job_id: int, terminate: bool = False, backend: Any = None) -> bool:
+    """Revoke a job (Celery's ``revoke``).
+
+    * queued / scheduled job: cancelled, it will never run;
+    * running job: only with ``terminate=True`` -- the worker executing it kills the job's
+      process group within ``REVOKE_POLL_INTERVAL`` seconds (default 2) and the job is
+      marked failed with ``REVOKED`` state and no retry. Needs the job to run under a
+      ``WorkerProcess`` (daemon / ``sqlery-worker``); inline execution cannot be interrupted;
+    * already finished job: nothing happens.
+
+    Returns True if the revoke was applied or requested.
+    """
+    from sqlery.compat import get_backend
+
+    backend = backend or get_backend()
+    if backend.cancel_job(job_id):
+        return True
+    if terminate:
+        return backend.request_job_revoke(job_id)
+    return False
 
 
 def apply_async_job(
