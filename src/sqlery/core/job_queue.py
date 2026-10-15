@@ -138,9 +138,13 @@ def enqueue(
     retry_backoff: float | None = None,
     allow_parallel: bool | None = None,
     timeout_seconds: int | None = None,
+    _tags: list[str] | None = None,
     **kwargs,
 ):
     """Enqueue a job for immediate execution.
+
+    ``_tags`` sets job tags for ``TAG_CONCURRENCY_LIMITS`` / ``TAG_RATE_LIMITS``. It is
+    underscore-prefixed so it can never collide with a task's own ``tags`` kwarg.
 
     Works in both Django and standalone modes by delegating to the active backend.
 
@@ -204,6 +208,7 @@ def enqueue(
         retry_backoff=retry_backoff,
         allow_parallel=allow_parallel,
         timeout_seconds=timeout_seconds,
+        **({"tags": list(_tags)} if _tags else {}),
     )
 
     # Trigger worker if configured
@@ -221,6 +226,7 @@ def enqueue_at(
     retry_backoff: float | None = None,
     allow_parallel: bool | None = None,
     timeout_seconds: int | None = None,
+    _tags: list[str] | None = None,
     **kwargs,
 ):
     """Enqueue a job to run at a specific datetime.
@@ -291,6 +297,7 @@ def enqueue_at(
         retry_backoff=retry_backoff,
         allow_parallel=allow_parallel,
         timeout_seconds=timeout_seconds,
+        **({"tags": list(_tags)} if _tags else {}),
     )
 
     # Note: Worker will skip this until scheduled_at is reached
