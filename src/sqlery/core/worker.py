@@ -17,7 +17,9 @@ from datetime import datetime, timezone, timedelta
 from ..compat import get_backend, get_config, JobFencingError
 from .utils import import_task
 from .result import serialize_result
-from .retry import invoke_task, policy_allows_retry, retry_countdown, shape_retry_delay
+from .execution import invoke_task
+from .retry import policy_allows_retry, retry_countdown, shape_retry_delay
+from .signals import task_retry
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
@@ -408,6 +410,7 @@ class JobExecutor:
             f"scheduled in {delay_seconds}s (attempt {retry_count + 2}/{failed_job.max_retries + 1})"
         )
 
+        task_retry.send(failed_job.task_path, job=failed_job, retry_job=retry_job, exc=exc)
         return retry_job
 
     def cleanup_stale_jobs(self, queue_name: str | None = None):
