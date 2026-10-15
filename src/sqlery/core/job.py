@@ -23,6 +23,7 @@ class JobWrapper:
         retry_backoff: float | None = None,
         allow_parallel: bool | None = None,
         timeout_seconds: int | None = None,
+        tags: list[str] | None = None,
     ):
         """Initialize job wrapper.
 
@@ -42,6 +43,7 @@ class JobWrapper:
         self.retry_backoff = retry_backoff
         self.allow_parallel = allow_parallel
         self.timeout_seconds = timeout_seconds
+        self.tags = list(tags) if tags else []
 
         # Calculate task path (module.path.to.function)
         self.task_path = f"{func.__module__}.{func.__qualname__}"
@@ -105,6 +107,7 @@ class JobWrapper:
             retry_backoff=retry_backoff if retry_backoff is not None else self.retry_backoff,
             allow_parallel=allow_parallel if allow_parallel is not None else self.allow_parallel,
             timeout_seconds=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
+            _tags=self.tags or None,
             **kwargs,
         )
 
@@ -194,6 +197,7 @@ class JobWrapper:
             retry_backoff=retry_backoff if retry_backoff is not None else self.retry_backoff,
             allow_parallel=allow_parallel if allow_parallel is not None else self.allow_parallel,
             timeout_seconds=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
+            _tags=self.tags or None,
             **kwargs,
         )
 
@@ -211,6 +215,7 @@ def job(
     retry_backoff: float | None = None,
     allow_parallel: bool | None = None,
     timeout_seconds: int | None = None,
+    tags: list[str] | None = None,
 ) -> JobWrapper | Callable:
     """Decorator to mark a function as an enqueueable job.
 
@@ -247,6 +252,7 @@ def job(
         retry_backoff: Default retry backoff multiplier
         allow_parallel: Default allow parallel execution in same queue
         timeout_seconds: Default maximum execution time in seconds
+        tags: Tags for TAG_CONCURRENCY_LIMITS / TAG_RATE_LIMITS (e.g. ['acme-api'])
 
     Returns:
         JobWrapper instance with .enqueue(), .delay(), and .enqueue_at() methods
@@ -261,6 +267,7 @@ def job(
             retry_backoff=retry_backoff,
             allow_parallel=allow_parallel,
             timeout_seconds=timeout_seconds,
+            tags=tags,
         )
 
     # Handle both @job and @job(...) syntax

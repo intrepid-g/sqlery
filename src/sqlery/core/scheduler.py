@@ -516,6 +516,7 @@ def promote_due_scheduled_jobs(cur) -> int:
                 result_ttl = spec.get("result_ttl", None)
                 failure_ttl = spec.get("failure_ttl", None)
                 parent_job_id = spec.get("parent_job_id", None)
+                tags = spec.get("tags") or []
 
                 cur.execute(
                     "INSERT INTO sqlery_queued_job"
@@ -533,7 +534,7 @@ def promote_due_scheduled_jobs(cur) -> int:
                     "  %s, %s, %s::jsonb, %s::jsonb,"
                     "  %s::jsonb, %s, %s,"
                     "  %s, %s, %s, %s,"
-                    "  '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '', '', '',"
+                    "  '[]'::jsonb, %s::jsonb, '[]'::jsonb, '', '', '',"
                     "  '', %s)",
                     [
                         job_id, queue_name, task_path,
@@ -546,6 +547,7 @@ def promote_due_scheduled_jobs(cur) -> int:
                         json.dumps(dependencies),
                         on_success_path, on_failure_path,
                         ttl, result_ttl, failure_ttl, parent_job_id,
+                        json.dumps(tags),
                         created_at,
                     ],
                 )

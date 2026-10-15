@@ -31,6 +31,7 @@ class JobFunction:
         max_retries: int = 0,
         retry_backoff: float = 1.0,
         allow_parallel: bool = True,
+        tags: list[str] | None = None,
     ):
         """Initialize job function wrapper.
 
@@ -50,6 +51,7 @@ class JobFunction:
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.allow_parallel = allow_parallel
+        self.tags = list(tags) if tags else []
 
         # Copy function metadata
         functools.update_wrapper(self, func)
@@ -144,6 +146,7 @@ class JobFunction:
             retry_backoff=effective_retry_backoff,
             allow_parallel=self.allow_parallel,
             timeout_seconds=self.timeout,
+            **({"tags": self.tags} if self.tags else {}),
         )
 
         return job
@@ -228,6 +231,7 @@ class JobFunction:
             retry_backoff=self.retry_backoff,
             allow_parallel=self.allow_parallel,
             timeout_seconds=self.timeout,
+            **({"tags": self.tags} if self.tags else {}),
         )
 
         return job
@@ -349,6 +353,7 @@ def job(
     retry_backoff: float = 1.0,
     retry: Any = None,  # d-t-s / RQ Retry compat
     allow_parallel: bool = True,
+    tags: list[str] | None = None,
 ) -> Callable[[Callable], JobFunction] | JobFunction:
     """Decorator for marking sync functions as enqueueable jobs.
 
@@ -407,6 +412,7 @@ def job(
             max_retries=effective_max_retries,
             retry_backoff=effective_retry_backoff,
             allow_parallel=allow_parallel,
+            tags=tags,
         )
 
     if func is not None and callable(func):
@@ -417,7 +423,7 @@ def job(
         return job(queue=func, priority=priority, timeout=timeout,
                    timeout_seconds=timeout_seconds, max_retries=max_retries,
                    retry_backoff=retry_backoff, retry=retry,
-                   allow_parallel=allow_parallel)
+                   allow_parallel=allow_parallel, tags=tags)
     else:
         # Called as @job() or @job(queue='name') with parentheses
         return decorator

@@ -179,6 +179,7 @@ class DjangoBackend(DatabaseBackend):
         result_ttl: int | None = None,
         failure_ttl: int | None = None,
         parent_job_id: int | None = None,
+        tags: list | None = None,
     ):
         """Create a new job in the database."""
         # If a named job is requested, the new job always wins.  Stop any running
@@ -227,6 +228,7 @@ class DjangoBackend(DatabaseBackend):
                     "result_ttl": result_ttl,
                     "failure_ttl": failure_ttl,
                     "parent_job_id": parent_job_id,
+                    "tags": list(tags or []),
                 },
             }
             return self.ScheduledJob.objects.create(
@@ -261,6 +263,7 @@ class DjangoBackend(DatabaseBackend):
             result_ttl=result_ttl,
             failure_ttl=failure_ttl,
             parent_job_id=parent_job_id,
+            tags=list(tags or []),
             status="queued",
         )
         # Phase 18 (D1): emit pg_notify after commit when flag is on + PG.
@@ -1204,21 +1207,29 @@ class DjangoBackend(DatabaseBackend):
             filter_kwargs["created_at"] = created_at
         self.QueuedJob.objects.filter(**filter_kwargs).update(child_pid=child_pid)
 
+    def _count_with_tag(self, queryset, tag: str) -> int:
+        """Count rows carrying ``tag``; SQL ``contains`` where supported, Python otherwise
+        (SQLite has no JSON ``contains`` lookup)."""
+        from django.db import connection
+
+        if connection.features.supports_json_field_contains:
+            return queryset.filter(tags__contains=[tag]).count()
+        return sum(1 for tags in queryset.values_list("tags", flat=True) if tags and tag in tags)
+
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""
-        return self.QueuedJob.objects.filter(
-            status="running",
-            tags__contains=[tag],
-        ).count()
+        return self._count_with_tag(self.QueuedJob.objects.filter(status="running"), tag)
 
     def count_started_with_tag_since(self, tag: str, threshold) -> int:
         """Count jobs with the given tag that started since threshold."""
-        return self.QueuedJob.objects.filter(
-            status__in=["running", "success", "failed"],
-            tags__contains=[tag],
-            started_at__gte=threshold,
-            started_at__isnull=False,
-        ).count()
+        return self._count_with_tag(
+            self.QueuedJob.objects.filter(
+                status__in=["running", "success", "failed"],
+                started_at__gte=threshold,
+                started_at__isnull=False,
+            ),
+            tag,
+        )
 
     def get_expired_ttl_jobs(self) -> list:
         """Get queued jobs whose TTL has expired."""
