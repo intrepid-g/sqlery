@@ -19,6 +19,54 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _canonical_event_bytes(event: dict) -> bytes:
+    import json
+
+    body = {k: v for k, v in event.items() if k != "auth"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def sign_event(event: dict, secret: str) -> dict:
+    """Return a copy of ``event`` carrying an ``auth`` block (timestamp + body-bound HMAC).
+
+    Use it in whatever invokes the function (EventBridge target transformer, a scheduler
+    Lambda, tests) when ``LAMBDA_SHARED_SECRET`` is configured on the worker.
+    """
+    from sqlery.core.signature import generate_signature
+
+    signature, timestamp = generate_signature(secret, body=_canonical_event_bytes(event))
+    return {**event, "auth": {"version": 2, "timestamp": timestamp, "signature": signature}}
+
+
+def verify_event_auth(event: dict) -> str | None:
+    """Check the optional shared-secret signature on a Lambda event.
+
+    Off by default (``LAMBDA_SHARED_SECRET`` / ``SQLERY_LAMBDA_SECRET`` unset): returns None,
+    relying on IAM invoke permissions as before. When a secret is configured, an event
+    without a valid, fresh ``auth`` block is rejected. Returns an error string, or None if OK.
+    """
+    import os
+
+    from sqlery.compat import get_config
+    from sqlery.core.signature import verify_signature
+
+    secret = get_config("LAMBDA_SHARED_SECRET", None) or os.environ.get("SQLERY_LAMBDA_SECRET")
+    if not secret:
+        return None
+    auth = event.get("auth") if isinstance(event, dict) else None
+    if not isinstance(auth, dict) or not auth.get("signature") or not auth.get("timestamp"):
+        return "missing event signature"
+    try:
+        max_age = int(get_config("LAMBDA_SIGNATURE_MAX_AGE", 300))
+    except (TypeError, ValueError):
+        max_age = 300
+    ok = verify_signature(
+        str(auth["signature"]), str(auth["timestamp"]), secret, max_age=max_age,
+        body=_canonical_event_bytes(event),
+    )
+    return None if ok else "invalid event signature"
+
+
 def process_event(event: dict, backend) -> dict:
     """Dispatch a single Lambda invocation.
 
@@ -42,6 +90,11 @@ def process_event(event: dict, backend) -> dict:
         this return value (per PLAN-CHECKER-FIXES B1).
     """
     from sqlery.core.worker import JobExecutor
+
+    auth_error = verify_event_auth(event)
+    if auth_error:
+        logger.warning(f"lambda_core: rejected event: {auth_error}")
+        return {"statusCode": 403, "body": f'{{"error": "{auth_error}"}}'}
 
     action = event.get("action", "process_queue")
     queue_name = event.get("queue_name") or "default"

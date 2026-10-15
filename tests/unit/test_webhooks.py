@@ -7,7 +7,7 @@ Covers:
 - Event filtering (skip when event not in ``webhook_events``).
 - Payload shape (documented fields are present).
 
-No real network calls — ``sqlery.webhooks.requests`` is patched.
+No real network calls — ``sqlery.webhooks._post_pinned`` is patched.
 ``time.sleep`` is patched defensively (the current module does not call it
 in-process, but the patch protects against future regressions if backoff
 is added inline).
@@ -22,6 +22,8 @@ import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import httpx
 
 import pytest
 
@@ -54,14 +56,16 @@ from sqlery.webhooks import (  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _bypass_ssrf_validation():
-    """Bypass SSRF validation in unit tests.
+    """Bypass SSRF resolution in unit tests.
 
-    The SSRF module resolves DNS for the webhook URL before ``requests.post``
-    is called.  Test URLs use ``example.test`` which cannot be resolved, so
-    the validation blocks all deliveries.  We patch it to a no-op for the
-    unit-test module where ``requests`` is already fully mocked.
+    The SSRF module resolves DNS for the webhook URL before the request is sent. Test
+    URLs use ``example.test`` which cannot be resolved, so we return a fixed public
+    target; the HTTP layer (``_post_pinned``) is mocked per test.
     """
-    with patch("sqlery.security.ssrf.validate_webhook_url", return_value=None):
+    from sqlery.security.ssrf import ResolvedTarget
+
+    target = ResolvedTarget("https", "example.test", None, "93.184.216.34")
+    with patch("sqlery.security.ssrf.resolve_webhook_url", return_value=target):
         yield
 
 
@@ -152,16 +156,16 @@ class TestHMACSigning:
         """Header is emitted as ``X-Sqlery-Signature: sha256=<hex>``."""
         job = make_job()
         fake_resp = MagicMock(status_code=200, text="OK")
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting"
         ) as fake_setting:
             fake_setting.side_effect = lambda name, default=None: {
                 "WEBHOOK_SECRET": "topsecret",
                 "WEBHOOK_TIMEOUT": 10,
             }.get(name, default)
-            fake_requests.post.return_value = fake_resp
+            fake_post.return_value = fake_resp
             assert send_webhook(job, event="success") is True
-            _, kwargs = fake_requests.post.call_args
+            _, kwargs = fake_post.call_args
             headers = kwargs["headers"]
             assert "X-Sqlery-Signature" in headers
             assert headers["X-Sqlery-Signature"].startswith("sha256=")
@@ -180,10 +184,10 @@ class TestHTTPDelivery:
 
     def test_post_2xx_marks_sent(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             assert send_webhook(job, event="success") is True
             assert job.webhook_status == "sent"
             job.save.assert_called_with(update_fields=["webhook_status"])
@@ -191,97 +195,68 @@ class TestHTTPDelivery:
     @pytest.mark.parametrize("code", [201, 202, 204])
     def test_accepts_other_2xx_codes(self, code):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=code, text="")
+            fake_post.return_value = MagicMock(status_code=code, text="")
             assert send_webhook(job, event="success") is True
 
     def test_4xx_returns_false_without_save(self):
         """4xx is a delivery failure but the policy here does NOT auto-retry."""
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=404, text="nope")
+            fake_post.return_value = MagicMock(status_code=404, text="nope")
             assert send_webhook(job, event="success") is False
             # No 'sent' transition.
             assert job.webhook_status != "sent"
 
     def test_5xx_returns_false(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=503, text="busy")
+            fake_post.return_value = MagicMock(status_code=503, text="busy")
             assert send_webhook(job, event="success") is False
 
     def test_timeout_returns_false(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            # Build a fake `requests.exceptions.Timeout` that satisfies the
-            # `except requests.exceptions.Timeout` clause in webhooks.py.
-            class _Timeout(Exception):
-                pass
-
-            class _ReqExc(Exception):
-                pass
-
-            fake_requests.exceptions = SimpleNamespace(
-                Timeout=_Timeout, RequestException=_ReqExc
-            )
-            fake_requests.post.side_effect = _Timeout()
+            fake_post.side_effect = httpx.TimeoutException("slow")
             assert send_webhook(job, event="success") is False
 
     def test_connection_error_returns_false(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            class _Timeout(Exception):
-                pass
-
-            class _ReqExc(Exception):
-                pass
-
-            fake_requests.exceptions = SimpleNamespace(
-                Timeout=_Timeout, RequestException=_ReqExc
-            )
-            fake_requests.post.side_effect = _ReqExc("conn refused")
+            fake_post.side_effect = httpx.ConnectError("conn refused")
             assert send_webhook(job, event="success") is False
 
     def test_unexpected_exception_returns_false(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            class _Timeout(Exception):
-                pass
-
-            class _ReqExc(Exception):
-                pass
-
-            fake_requests.exceptions = SimpleNamespace(
-                Timeout=_Timeout, RequestException=_ReqExc
-            )
-            fake_requests.post.side_effect = RuntimeError("boom")
+            fake_post.side_effect = RuntimeError("boom")
             assert send_webhook(job, event="success") is False
 
-    def test_requests_unavailable_returns_false(self):
-        """If the `requests` import failed at module load, delivery returns False."""
+    def test_httpx_unavailable_returns_false(self):
+        """If the `httpx` import failed at module load, delivery returns False."""
         job = make_job()
-        with patch.object(webhooks_mod, "requests", None), patch.object(
+        with patch.object(webhooks_mod, "httpx", None), patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
             assert send_webhook(job, event="success") is False
 
     def test_no_webhook_url_short_circuits(self):
         job = make_job(webhook_url="")
-        with patch.object(webhooks_mod, "requests") as fake_requests:
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post:
             assert send_webhook(job, event="success") is True
-            fake_requests.post.assert_not_called()
+            fake_post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +274,10 @@ class TestRetryBackoff:
 
     def test_retry_increments_counter_on_failure(self):
         job = make_job(webhook_retries=0, webhook_max_retries=3)
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ), patch("time.sleep") as fake_sleep:
-            fake_requests.post.return_value = MagicMock(status_code=500, text="err")
+            fake_post.return_value = MagicMock(status_code=500, text="err")
             result = send_webhook_with_retry(job, event="success")
             assert result is False
             assert job.webhook_retries == 1
@@ -317,10 +292,10 @@ class TestRetryBackoff:
     def test_retry_caps_at_max(self):
         """When retries == max, status flips to 'failed' and we stop."""
         job = make_job(webhook_retries=2, webhook_max_retries=3)
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ), patch("time.sleep"):
-            fake_requests.post.return_value = MagicMock(status_code=500, text="err")
+            fake_post.return_value = MagicMock(status_code=500, text="err")
             result = send_webhook_with_retry(job, event="success")
             assert result is False
             assert job.webhook_retries == 3
@@ -328,10 +303,10 @@ class TestRetryBackoff:
 
     def test_first_attempt_marks_pending(self):
         job = make_job(webhook_retries=0, webhook_max_retries=3)
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             assert send_webhook_with_retry(job, event="success") is True
             # First call into the function marks status=pending before delivery.
             statuses = [c.kwargs.get("update_fields") for c in job.save.call_args_list]
@@ -339,10 +314,10 @@ class TestRetryBackoff:
 
     def test_success_short_circuits_retry_path(self):
         job = make_job(webhook_retries=1, webhook_max_retries=3)
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             assert send_webhook_with_retry(job, event="success") is True
             # On success, the retry counter MUST NOT advance.
             assert job.webhook_retries == 1
@@ -359,28 +334,28 @@ class TestEventFiltering:
 
     def test_event_not_subscribed_is_skipped(self):
         job = make_job(webhook_events=["success"])  # not subscribed to 'failure'
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
             assert send_webhook(job, event="failure") is True
-            fake_requests.post.assert_not_called()
+            fake_post.assert_not_called()
 
     def test_event_subscribed_triggers_post(self):
         job = make_job(webhook_events=["success", "failure"])
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             assert send_webhook(job, event="failure") is True
-            fake_requests.post.assert_called_once()
+            fake_post.assert_called_once()
 
     def test_empty_events_list_skips_all(self):
         job = make_job(webhook_events=[])
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
             assert send_webhook(job, event="success") is True
-            fake_requests.post.assert_not_called()
+            fake_post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -411,13 +386,13 @@ class TestPayloadShape:
 
     def test_payload_contains_documented_fields(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             send_webhook(job, event="success")
-            _, kwargs = fake_requests.post.call_args
-            body = json.loads(kwargs["data"])
+            _, kwargs = fake_post.call_args
+            body = json.loads(kwargs["body"])
             assert self.EXPECTED_FIELDS.issubset(body.keys())
             assert body["event"] == "success"
             assert body["job_id"] == 42
@@ -425,24 +400,24 @@ class TestPayloadShape:
 
     def test_payload_handles_none_timestamps(self):
         job = make_job(started_at=None, finished_at=None)
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             send_webhook(job, event="success")
-            _, kwargs = fake_requests.post.call_args
-            body = json.loads(kwargs["data"])
+            _, kwargs = fake_post.call_args
+            body = json.loads(kwargs["body"])
             assert body["started_at"] is None
             assert body["finished_at"] is None
 
     def test_user_agent_header_set(self):
         job = make_job()
-        with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+        with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
-            fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+            fake_post.return_value = MagicMock(status_code=200, text="OK")
             send_webhook(job, event="success")
-            _, kwargs = fake_requests.post.call_args
+            _, kwargs = fake_post.call_args
             assert kwargs["headers"]["User-Agent"].startswith("Sqlery-Webhooks/")
             assert kwargs["headers"]["Content-Type"] == "application/json"
 
@@ -543,19 +518,19 @@ class TestRetryFailedWebhooks:
         skipped_job = make_job(status="running", webhook_url="https://example.test/c")
 
         with patch.object(webhooks_mod, "QueuedJob") as fake_qj, patch.object(
-            webhooks_mod, "requests"
-        ) as fake_requests, patch.object(
+            webhooks_mod, "_post_pinned"
+        ) as fake_post, patch.object(
             webhooks_mod, "get_setting", side_effect=self._settings
         ):
             fake_qj.objects.filter.return_value = [success_job, failed_job, skipped_job]
 
             # success_job -> 200, failed_job -> 500
-            def post(url, **kw):
+            def post(*, url, **kw):
                 if url.endswith("/a"):
                     return MagicMock(status_code=200, text="OK")
                 return MagicMock(status_code=500, text="err")
 
-            fake_requests.post.side_effect = post
+            fake_post.side_effect = post
 
             stats = retry_failed_webhooks()
             assert stats["total"] == 3
@@ -572,9 +547,9 @@ def test_ssrf_blocks_loopback_destinations():
     rather than silently passing.
     """
     job = make_job(webhook_url="http://127.0.0.1:80/hook")
-    with patch.object(webhooks_mod, "requests") as fake_requests, patch.object(
+    with patch.object(webhooks_mod, "_post_pinned") as fake_post, patch.object(
         webhooks_mod, "get_setting", side_effect=lambda n, d=None: d
     ):
-        fake_requests.post.return_value = MagicMock(status_code=200, text="OK")
+        fake_post.return_value = MagicMock(status_code=200, text="OK")
         assert send_webhook(job, event="success") is False
-        fake_requests.post.assert_not_called()
+        fake_post.assert_not_called()

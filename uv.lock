@@ -963,6 +963,9 @@ standalone = [
 tasks = [
     { name = "django-tasks" },
 ]
+webhooks = [
+    { name = "httpx" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1000,6 +1003,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'all-standalone'", specifier = ">=0.24.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "httpx", marker = "extra == 'http'", specifier = ">=0.24.0" },
+    { name = "httpx", marker = "extra == 'webhooks'", specifier = ">=0.24.0" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.92.0" },
     { name = "jinja2", marker = "extra == 'all'", specifier = ">=3.1.0" },
     { name = "jinja2", marker = "extra == 'all-standalone'", specifier = ">=3.1.0" },
@@ -1034,7 +1038,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'standalone'", specifier = ">=0.24.0" },
 ]
-provides-extras = ["postgres", "cli", "django", "standalone", "tasks", "http", "eventbridge", "all-django", "all-standalone", "all", "dev"]
+provides-extras = ["postgres", "cli", "django", "standalone", "tasks", "http", "webhooks", "eventbridge", "all-django", "all-standalone", "all", "dev"]
 
 [[package]]
 name = "sqlmodel"

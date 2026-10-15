@@ -109,6 +109,13 @@ def handler(event, context):
         f"keys={sorted(str(k) for k in event)}"
     )
 
+    from sqlery.core.lambda_core import verify_event_auth
+
+    auth_error = verify_event_auth(event)
+    if auth_error:
+        logger.warning(f"Lambda event rejected: {auth_error}")
+        return {"statusCode": 403, "body": json.dumps({"error": auth_error})}
+
     action = event.get("action", "process_queue")
 
     # Plan 02-08 (DMOD-04): for the common queue-processing actions, delegate

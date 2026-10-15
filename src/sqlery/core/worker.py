@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, JobFencingError
-from .utils import import_task
+from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task
 from .retry import policy_allows_retry, retry_countdown, shape_retry_delay
@@ -135,7 +135,7 @@ class JobExecutor:
 
                 kwargs = job.kwargs if isinstance(job.kwargs, dict) else {}
                 positional_args = kwargs.pop('_args', ())
-                logger.info(f"Job {job.id} executing with args={positional_args}, kwargs={kwargs}")
+                logger.info(f"Job {job.id} executing with {describe_task_args(positional_args, kwargs)}")
                 _token = _current_job_var.set(job)
                 try:
                     result = invoke_task(task_func, job, positional_args, kwargs)
@@ -239,7 +239,7 @@ class JobExecutor:
             task_func = self._import_task(job.task_path)
             kwargs = job.kwargs if isinstance(job.kwargs, dict) else {}
             positional_args = kwargs.pop('_args', ())
-            logger.info(f"Job {job.id} executing with args={positional_args}, kwargs={kwargs}")
+            logger.info(f"Job {job.id} executing with {describe_task_args(positional_args, kwargs)}")
 
             _token = _current_job_var.set(job)
             try:
