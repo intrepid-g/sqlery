@@ -52,6 +52,31 @@ _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job',
 logger = logging.getLogger(__name__)
 
 
+def compute_retry_delay(
+    backoff: float, retry_count: int, retry_intervals: list | None = None
+) -> float:
+    """Delay (seconds) before the next retry attempt.
+
+    Fixed ``retry_intervals`` win; otherwise ``backoff * 2**retry_count``. Celery-style
+    ``RETRY_BACKOFF_MAX`` (cap) and ``RETRY_JITTER`` (full jitter, avoids thundering herd)
+    are opt-in via config; defaults leave the delay unchanged.
+    """
+    import random
+
+    if retry_intervals:
+        return float(retry_intervals[min(retry_count, len(retry_intervals) - 1)])
+    delay = backoff * (2 ** retry_count)
+    try:
+        cap = get_config("RETRY_BACKOFF_MAX", None)
+        if cap:
+            delay = min(delay, float(cap))
+        if get_config("RETRY_JITTER", False):
+            delay = random.uniform(0, delay)
+    except Exception:
+        pass
+    return delay
+
+
 class JobExecutor:
     """Executes jobs with retry logic, timeout support, and crash recovery.
 
@@ -319,7 +344,9 @@ class JobExecutor:
     def _retry_job(self, failed_job):
         retry_count = failed_job.retry_count if failed_job.retry_count is not None else 0
         backoff = failed_job.retry_backoff if failed_job.retry_backoff else 1.0
-        delay_seconds = backoff * (2 ** retry_count)
+        delay_seconds = compute_retry_delay(
+            backoff, retry_count, getattr(failed_job, "retry_intervals", None)
+        )
 
         scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 

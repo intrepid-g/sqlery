@@ -121,6 +121,23 @@ def _resolve_secret() -> str | None:
     return secret
 
 
+def _require_body_signature() -> bool:
+    """True when legacy timestamp-only signatures must be rejected.
+
+    Opt-in (``REQUIRE_BODY_SIGNATURE`` setting or ``SQLERY_REQUIRE_BODY_SIGNATURE=1``)
+    to keep existing signers working.
+    """
+    import os
+    try:
+        from sqlery.compat import get_config
+        value = get_config("REQUIRE_BODY_SIGNATURE", None)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.environ.get("SQLERY_REQUIRE_BODY_SIGNATURE", "")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _resolve_max_age() -> int:
     try:
         from sqlery.compat import get_config
@@ -209,7 +226,19 @@ def handle(envelope: TriggerEnvelope) -> TriggerResult:
         logger.error("INTERNAL_SECRET not configured for HTTP trigger")
         return TriggerResult(500, {"error": "server misconfigured"})
 
-    if not verify_signature(signature, timestamp, secret, max_age=_resolve_max_age()):
+    version = envelope.headers.get("X-Signature-Version") or envelope.headers.get(
+        "x-signature-version"
+    )
+    if version == "2":
+        # Body-bound signature: the payload cannot be swapped under a captured header pair.
+        valid = verify_signature(
+            signature, timestamp, secret, max_age=_resolve_max_age(), body=envelope.body or b""
+        )
+    elif _require_body_signature():
+        return TriggerResult(401, {"error": "body-bound signature (v2) required"})
+    else:
+        valid = verify_signature(signature, timestamp, secret, max_age=_resolve_max_age())
+    if not valid:
         return TriggerResult(401, {"error": "invalid signature"})
 
     if _idempotency_seen((timestamp, signature)):
@@ -232,6 +261,8 @@ def handle(envelope: TriggerEnvelope) -> TriggerResult:
 def _dispatch_process_queue(payload: dict) -> TriggerResult:
     """Claim and execute one job from the requested queue (or by job_id)."""
     from sqlery.compat import get_backend
+    import uuid
+
     from sqlery.core.worker import JobExecutor
 
     backend = get_backend()
@@ -247,6 +278,12 @@ def _dispatch_process_queue(payload: dict) -> TriggerResult:
             return TriggerResult(404, {"error": f"job {job_id} not found: {e}"})
         if job is None:
             return TriggerResult(404, {"error": f"job {job_id} not found"})
+        # Claim atomically (queued -> running) so a duplicate trigger, or a job a worker
+        # already holds, cannot execute twice and bypass claiming.
+        claimed = backend.claim_job_by_id(job.id, f"trigger-{uuid.uuid4()}")
+        if claimed is None:
+            return TriggerResult(409, {"error": f"job {job_id} is not claimable"})
+        job = claimed
     else:
         # Fall back to claim-from-queue.
         import uuid
