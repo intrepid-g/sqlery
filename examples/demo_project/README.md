@@ -6,7 +6,7 @@ This is a minimal Django project demonstrating sqlery.
 
 ```bash
 # Install dependencies
-pip install django croniter
+pip install django
 
 # Install sqlery in development mode
 cd ../..

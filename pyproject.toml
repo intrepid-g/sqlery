@@ -31,7 +31,6 @@ classifiers = [
 ]
 dependencies = [
     # Core dependencies (always required)
-    "croniter>=2.0.0",
     "uuid6>=2024.1.0",
 ]
 
