@@ -101,6 +101,7 @@ asyncio.run(main())
 - [API Reference](docs/api-reference.md) - Complete API documentation
 - [Examples](examples/) - Working example projects
 - [Migration from Celery](docs/migration-from-celery.md) - How to migrate
+- [Celery parity](docs/CELERY_PARITY.md) - Results, workflows, retries, signals, revoke, solar schedules
 - [Migration from RQ](docs/migration-from-rq.md) - How to migrate
 
 ## 🔒 Security

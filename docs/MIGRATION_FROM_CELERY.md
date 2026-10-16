@@ -2,6 +2,8 @@
 
 Complete guide for migrating from Celery to sqlery.
 
+Looking for the Celery feature you use (chains, chords, `AsyncResult`, `autoretry_for`, signals, revoke, solar schedules)? See [CELERY_PARITY.md](CELERY_PARITY.md) for the mapping and examples.
+
 ## Why Migrate?
 
 **Benefits of switching to sqlery:**
