@@ -347,6 +347,12 @@ class DjangoBackend(DatabaseBackend):
         with transaction.atomic():
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
+    def get_latest_retry(self, job_id: int):
+        """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
+        return (
+            self.QueuedJob.objects.filter(parent_job_id=job_id).order_by("-created_at", "-id").first()
+        )
+
     @retry_on_db_error()
     def claim_job_by_id(self, job_id: int, worker_id: str):
         """Atomically claim one specific queued job via a compare-and-set UPDATE."""
