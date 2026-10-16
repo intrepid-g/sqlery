@@ -24,6 +24,10 @@ class JobWrapper:
         allow_parallel: bool | None = None,
         timeout_seconds: int | None = None,
         tags: list[str] | None = None,
+        autoretry_for: tuple | list | None = None,
+        retry_backoff_max: float | None = None,
+        retry_jitter: bool | None = None,
+        bind: bool = False,
     ):
         """Initialize job wrapper.
 
@@ -44,6 +48,11 @@ class JobWrapper:
         self.allow_parallel = allow_parallel
         self.timeout_seconds = timeout_seconds
         self.tags = list(tags) if tags else []
+        # Retry policy (read by the executors; see sqlery.core.retry)
+        self.autoretry_for = tuple(autoretry_for) if autoretry_for else None
+        self.retry_backoff_max = retry_backoff_max
+        self.retry_jitter = retry_jitter
+        self.bind = bind
 
         # Calculate task path (module.path.to.function)
         self.task_path = f"{func.__module__}.{func.__qualname__}"
@@ -59,7 +68,13 @@ class JobWrapper:
 
         This allows decorated functions to still be called normally:
         >>> send_email()  # Direct call
+
+        For ``bind=True`` tasks a detached context is injected as the first argument.
         """
+        if self.bind:
+            from .retry import TaskContext
+
+            return self.func(TaskContext(task_path=self.task_path), *args, **kwargs)
         return self.func(*args, **kwargs)
 
     def enqueue(
@@ -270,6 +285,10 @@ def job(
     allow_parallel: bool | None = None,
     timeout_seconds: int | None = None,
     tags: list[str] | None = None,
+    autoretry_for: tuple | list | None = None,
+    retry_backoff_max: float | None = None,
+    retry_jitter: bool | None = None,
+    bind: bool = False,
 ) -> JobWrapper | Callable:
     """Decorator to mark a function as an enqueueable job.
 
@@ -307,6 +326,11 @@ def job(
         allow_parallel: Default allow parallel execution in same queue
         timeout_seconds: Default maximum execution time in seconds
         tags: Tags for TAG_CONCURRENCY_LIMITS / TAG_RATE_LIMITS (e.g. ['acme-api'])
+        autoretry_for: Exception classes that trigger a retry (needs max_retries > 0).
+            Unset keeps the legacy behaviour of retrying on any exception.
+        retry_backoff_max: Cap (seconds) on the exponential retry delay
+        retry_jitter: Randomise the retry delay (full jitter)
+        bind: Pass a ``TaskContext`` as the first argument; ``self.retry(...)`` retries the job
 
     Returns:
         JobWrapper instance with .enqueue(), .delay(), and .enqueue_at() methods
@@ -322,6 +346,10 @@ def job(
             allow_parallel=allow_parallel,
             timeout_seconds=timeout_seconds,
             tags=tags,
+            autoretry_for=autoretry_for,
+            retry_backoff_max=retry_backoff_max,
+            retry_jitter=retry_jitter,
+            bind=bind,
         )
 
     # Handle both @job and @job(...) syntax

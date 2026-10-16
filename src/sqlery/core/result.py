@@ -104,7 +104,8 @@ class AsyncResult:
     def _job(self):
         job = self.backend.get_job_by_id(self.id)
         hops = 0
-        while job is not None and getattr(job, "status", None) == "archived":
+        # A failed/archived attempt with a retry child: report on the newest attempt.
+        while job is not None and getattr(job, "status", None) in ("archived", "failed"):
             child = self.backend.get_latest_retry(job.id)
             hops += 1
             if child is None or hops > self._MAX_RETRY_HOPS:
