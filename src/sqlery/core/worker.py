@@ -20,6 +20,7 @@ from .result import serialize_result
 from .execution import invoke_task
 from .retry import policy_allows_retry, retry_countdown, shape_retry_delay
 from .signals import task_retry
+from .result import REVOKED_ERROR
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
@@ -861,6 +862,13 @@ class WorkerProcess:
         # the parent is alive and polling waitpid) instead of relying on a
         # fixed poll_interval*3 window with no relation to job runtime.
         last_lease_heartbeat = time.monotonic()
+        # Revoke polling: a flag set by revoke(job_id, terminate=True), possibly from another
+        # host, is noticed here and the child's process group is killed.
+        try:
+            revoke_poll = float(get_config("REVOKE_POLL_INTERVAL", 2.0) or 0)
+        except (TypeError, ValueError):
+            revoke_poll = 2.0
+        last_revoke_check = time.monotonic()
 
         while not child_exited:
             try:
@@ -897,6 +905,25 @@ class WorkerProcess:
             # Sleep briefly so parent stays responsive to signals
             time.sleep(0.5)
             self._check_heartbeat()
+            if revoke_poll > 0 and time.monotonic() - last_revoke_check >= revoke_poll:
+                last_revoke_check = time.monotonic()
+                try:
+                    revoked = self.backend.is_job_revoke_requested(job_id)
+                except Exception as e:  # never let a poll error abort the wait loop
+                    logger.warning(f"Revoke poll for job {job_id} failed: {e}")
+                    revoked = False
+                if revoked:
+                    logger.warning(f"Job {job_id} revoked, killing child PID {child_pid}")
+                    self._kill_child(child_pid)
+                    try:
+                        self.backend.mark_job_failed(
+                            job_id,
+                            error=REVOKED_ERROR,
+                            traceback=f"Child PID {child_pid} terminated on revoke request",
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to mark revoked job {job_id}: {e}")
+                    return {'success': False, 'error': REVOKED_ERROR}
             # Send an unconditional liveness heartbeat every heartbeat_interval
             # (not gated on SIGUSR1/_heartbeat_due — see comment above the loop
             # init) so the job's effective lease renews at the worker's actual

@@ -347,6 +347,20 @@ class DjangoBackend(DatabaseBackend):
         with transaction.atomic():
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
+    def request_job_revoke(self, job_id: int) -> bool:
+        """Flag a running job for termination (see DatabaseBackend.request_job_revoke)."""
+        return (
+            self.QueuedJob.objects.filter(id=job_id, status="running").update(
+                termination_reason="revoke_requested"
+            )
+            > 0
+        )
+
+    def is_job_revoke_requested(self, job_id: int) -> bool:
+        return self.QueuedJob.objects.filter(
+            id=job_id, status="running", termination_reason="revoke_requested"
+        ).exists()
+
     def get_latest_retry(self, job_id: int):
         """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
         return (

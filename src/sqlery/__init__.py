@@ -42,7 +42,7 @@ from .core.job_queue import (
     retry_failed_jobs,
 )
 from .core.canvas import chain, chord, group
-from .core.result import AsyncResult
+from .core.result import AsyncResult, revoke
 from .core.worker import JobExecutor, WorkerProcess
 
 # Alias WorkerProcess as Worker for backward compatibility
@@ -74,6 +74,7 @@ __all__ = [
     "__version__",
     "Queue",
     "AsyncResult",
+    "revoke",
     "chain",
     "group",
     "chord",

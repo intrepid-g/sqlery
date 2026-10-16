@@ -528,6 +528,30 @@ class SQLAlchemyBackend(DatabaseBackend):
             return True
         return any(d.status != "success" for d in dep_rows)
 
+    def request_job_revoke(self, job_id: int) -> bool:
+        """Flag a running job for termination (see DatabaseBackend.request_job_revoke)."""
+        with self._get_session() as session:
+            res = session.exec(
+                update(QueuedJob)
+                .where(QueuedJob.id == job_id)
+                .where(QueuedJob.status == "running")
+                .values(termination_reason="revoke_requested")
+            )
+            session.commit()
+            return res.rowcount > 0
+
+    def is_job_revoke_requested(self, job_id: int) -> bool:
+        with self._get_session() as session:
+            return (
+                session.exec(
+                    select(QueuedJob.id)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.status == "running")
+                    .where(QueuedJob.termination_reason == "revoke_requested")
+                ).first()
+                is not None
+            )
+
     def get_latest_retry(self, job_id: int):
         """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
         with self._get_session() as session:
