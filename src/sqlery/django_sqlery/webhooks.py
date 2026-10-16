@@ -14,9 +14,9 @@ from .models import QueuedJob
 from .settings import get_setting
 
 try:
-    import requests
-except ImportError:
-    requests = None
+    import httpx
+except ImportError:  # optional: pip install sqlery[webhooks]
+    httpx = None
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,25 @@ def generate_webhook_signature(payload, secret):
     return signature
 
 
+def _post_pinned(*, url, target, body, headers, timeout):
+    """POST to the SSRF-validated address in ``target`` (no second DNS lookup).
+
+    Connects to ``target.ip``, sends the original ``Host`` header and, for https, verifies the
+    certificate against the original hostname via the SNI override. Never follows redirects.
+    """
+    from sqlery.security.ssrf import pin_url
+
+    pinned_url, host_header = pin_url(url, target)
+    extensions = {"sni_hostname": target.host} if target.scheme == "https" else None
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        return client.post(
+            pinned_url,
+            content=body,
+            headers={**headers, "Host": host_header},
+            extensions=extensions,
+        )
+
+
 def send_webhook(job, event='success'):
     """Send webhook notification for job completion.
 
@@ -86,9 +105,9 @@ def send_webhook(job, event='success'):
 
     # SSRF defense (SEC-02): block private/link-local/metadata/loopback targets
     # before any HTTP work. WebhookURLBlocked is a ValueError subclass.
-    from sqlery.security.ssrf import validate_webhook_url, WebhookURLBlocked
+    from sqlery.security.ssrf import resolve_webhook_url, WebhookURLBlocked
     try:
-        validate_webhook_url(job.webhook_url)
+        target = resolve_webhook_url(job.webhook_url)
     except WebhookURLBlocked as e:
         logger.warning(f"Webhook blocked by SSRF policy for job {job.id}: {e}")
         return False
@@ -129,26 +148,22 @@ def send_webhook(job, event='success'):
     # Send webhook
     timeout = get_setting('WEBHOOK_TIMEOUT', 10)  # 10 second default timeout
 
-    # try:
-    #     import requests  # moved to top-level
-    # except ImportError:
-    #     ...
-    if requests is None:
+    if httpx is None:
         logger.error(
-            "Cannot send webhook: requests library not installed. "
+            "Cannot send webhook: httpx library not installed. "
             "Install with: pip install sqlery[webhooks]"
         )
         return False
 
     try:
-        response = requests.post(
-            job.webhook_url,
-            data=json.dumps(payload, cls=_SafeEncoder),
+        # Connect to the validated IP (DNS-rebinding safe) and never follow redirects: a 3xx
+        # to an internal address would bypass the SSRF validation done on the original URL.
+        response = _post_pinned(
+            url=job.webhook_url,
+            target=target,
+            body=json.dumps(payload, cls=_SafeEncoder),
             headers=headers,
             timeout=timeout,
-            # Never follow redirects: a 3xx to an internal address would bypass the
-            # SSRF validation done on the original URL.
-            allow_redirects=False,
         )
 
         if response.status_code in (200, 201, 202, 204):
@@ -162,11 +177,11 @@ def send_webhook(job, event='success'):
             )
             return False
 
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         logger.warning(f"Webhook timeout for job {job.id} after {timeout}s")
         return False
 
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         logger.warning(f"Webhook request failed for job {job.id}: {e}")
         return False
 

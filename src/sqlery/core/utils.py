@@ -75,6 +75,25 @@ def validate_cron_expression(cron_expression):
         return False, str(e)
 
 
+# ===== Logging =====
+
+def describe_task_args(args, kwargs) -> str:
+    """Log-safe description of task arguments.
+
+    Task arguments routinely carry secrets/PII (tokens, emails), so by default only the
+    *shape* is logged: positional count and keyword names. Set ``LOG_TASK_ARGUMENTS=True``
+    to log the values (debugging only).
+    """
+    from ..compat import get_config
+
+    try:
+        if get_config("LOG_TASK_ARGUMENTS", False):
+            return f"args={args}, kwargs={kwargs}"
+    except Exception:
+        pass
+    return f"{len(args or ())} positional arg(s), kwargs={sorted(kwargs or {})}"
+
+
 # ===== Task import =====
 
 def import_task(task_path):

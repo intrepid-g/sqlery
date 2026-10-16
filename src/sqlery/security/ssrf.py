@@ -7,15 +7,15 @@ Pattern: resolve-then-check. We call ``socket.getaddrinfo`` to obtain ALL IP
 families/addresses the host resolves to, then check each against the
 denylists. Any single private match rejects the URL.
 
-Known v1 limitation: there is a ~50ms DNS-rebinding window between our
-validation resolution and the underlying HTTP client's own resolution. A
-malicious authoritative resolver can flip the answer in between. v2 hardening
-(pinning the resolved IP via a custom ``HTTPAdapter`` that connects to the
-already-resolved address) is out of scope.
+DNS-rebinding defense: :func:`resolve_webhook_url` returns the validated IP,
+and the caller connects to *that address* (see :func:`pin_url`) while keeping
+the original ``Host`` header and TLS SNI/certificate hostname, so the HTTP
+client never performs a second, attacker-influenced DNS lookup.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import logging
 import socket
@@ -89,8 +89,41 @@ def _ip_blocked(
         return False
 
 
+@dataclasses.dataclass(frozen=True)
+class ResolvedTarget:
+    """A webhook destination whose IP has passed the SSRF checks."""
+
+    scheme: str
+    host: str  # original hostname (for the Host header and TLS SNI)
+    port: int | None  # explicit port from the URL, if any
+    ip: str  # validated address to connect to
+
+
 def validate_webhook_url(url: str, *, allow_loopback: bool = False) -> None:
-    """Validate a webhook URL against the SSRF denylist.
+    """Validate a webhook URL against the SSRF denylist (see :func:`resolve_webhook_url`)."""
+    resolve_webhook_url(url, allow_loopback=allow_loopback)
+
+
+def pin_url(url: str, target: ResolvedTarget) -> tuple[str, str]:
+    """Rewrite ``url`` to connect to ``target.ip``.
+
+    Returns ``(pinned_url, host_header)``. The caller must send ``Host: host_header`` and,
+    for https, use ``target.host`` as the TLS server name so certificate verification still
+    checks the original hostname.
+    """
+    parsed = urlparse(url)
+    ip_part = f"[{target.ip}]" if ":" in target.ip else target.ip
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = parsed.username + (f":{parsed.password}" if parsed.password else "") + "@"
+    port_part = f":{target.port}" if target.port else ""
+    pinned = parsed._replace(netloc=f"{userinfo}{ip_part}{port_part}").geturl()
+    host_part = f"[{target.host}]" if ":" in target.host else target.host
+    return pinned, f"{host_part}{port_part}"
+
+
+def resolve_webhook_url(url: str, *, allow_loopback: bool = False) -> ResolvedTarget:
+    """Validate a webhook URL against the SSRF denylist and return the address to connect to.
 
     Raises :class:`WebhookURLBlocked` if the URL targets a forbidden host or
     resolves (entirely or partially) into a denylisted IP range.
@@ -123,7 +156,7 @@ def validate_webhook_url(url: str, *, allow_loopback: bool = False) -> None:
     if literal_ip is not None:
         if _ip_blocked(literal_ip, allow_loopback=allow_loopback):
             raise WebhookURLBlocked(f"ip blocked: {literal_ip}")
-        return
+        return ResolvedTarget(parsed.scheme, host, _explicit_port(parsed), str(literal_ip))
 
     # 4. Resolve and check ALL returned addresses (defends against single-
     #    resolution DNS rebinding by rejecting if ANY answer is private).
@@ -132,6 +165,7 @@ def validate_webhook_url(url: str, *, allow_loopback: bool = False) -> None:
     except socket.gaierror as e:
         raise WebhookURLBlocked(f"dns failure: {host}: {e}") from e
 
+    chosen: str | None = None
     for info in infos:
         sockaddr = info[4]
         ip_str = sockaddr[0]
@@ -144,3 +178,16 @@ def validate_webhook_url(url: str, *, allow_loopback: bool = False) -> None:
             raise WebhookURLBlocked(
                 f"resolved address blocked: {host} -> {ip}"
             )
+        if chosen is None:
+            chosen = str(ip)
+
+    if chosen is None:
+        raise WebhookURLBlocked(f"dns returned no addresses: {host}")
+    return ResolvedTarget(parsed.scheme, host, _explicit_port(parsed), chosen)
+
+
+def _explicit_port(parsed) -> int | None:
+    try:
+        return parsed.port
+    except ValueError as e:
+        raise WebhookURLBlocked(f"invalid port: {e}") from e

@@ -63,6 +63,7 @@ standalone = [
 # Additional features
 tasks = ["django-tasks>=0.1.0"]
 http = ["httpx>=0.24.0"]
+webhooks = ["httpx>=0.24.0"]
 eventbridge = ["boto3>=1.34.0"]
 
 # Combined extras
