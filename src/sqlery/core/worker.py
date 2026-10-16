@@ -387,6 +387,7 @@ class JobExecutor:
         # backend's create_job accepts, so custom/older DatabaseBackend subclasses keep working.
         carried = dict(
             retry_intervals=getattr(failed_job, "retry_intervals", None),
+            dependencies=list(getattr(failed_job, "dependencies", None) or []),
             tags=list(getattr(failed_job, "tags", None) or []),
             meta=getattr(failed_job, "meta", None),
             on_success_path=getattr(failed_job, "on_success_path", "") or "",

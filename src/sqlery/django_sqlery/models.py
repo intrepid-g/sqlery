@@ -939,9 +939,22 @@ class QueuedJob(models.Model):
             logger.warning(f"Job {self.id} has missing dependencies: {missing}")
             return False, list(missing)
 
-        # Check statuses
+        # Check statuses. A dependency that failed/was archived but has a retry attempt is
+        # judged by its newest attempt, so a retrying step neither fails nor blocks forever.
         failed_deps = []
         for dep in dependency_jobs:
+            hops = 0
+            while dep.status in ("failed", "archived") and hops < 1000:
+                child = (
+                    QueuedJob.objects.filter(parent_job_id=dep.id)
+                    .order_by("-created_at", "-id")
+                    .first()
+                )
+                if child is None:
+                    break
+                dep, hops = child, hops + 1
+            if dep.status == "archived":
+                return False, []  # archived with no retry found: treat as not complete
             if dep.status == "failed":
                 failed_deps.append(dep.id)
             elif dep.status != "success":
