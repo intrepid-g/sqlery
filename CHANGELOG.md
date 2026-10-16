@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 Read these before upgrading; each is a deliberate behaviour change.
 
+- **Webhooks use `httpx`, not `requests`.** `requests` was imported but never declared (and the error message pointed at a `sqlery[webhooks]` extra that did not exist). Webhooks now use `httpx`, which is already a declared dependency; install with `pip install sqlery[webhooks]`. Code or tests that patched `sqlery.webhooks.requests` must patch `sqlery.webhooks._post_pinned` (or `httpx`) instead.
 - **Tag limits are now enforced.** `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were silently ignored in both modes. A deployment that already has them configured will start being throttled. Set tags with `@job(tags=[...])`.
 - **Dashboard auth behind a proxy.** The FastAPI dashboard used to skip its API-key auth whenever `scope["root_path"]` was non-empty, so `uvicorn --root-path /x` left the admin API open. Only a real Starlette `Mount` (or `SQLERY_DASHBOARD_AUTH=inherit`) disables it now. If you relied on a bare `root_path` to skip auth, set `SQLERY_DASHBOARD_AUTH=inherit` or `disabled` explicitly.
 - **Result output format.** Dict/list results are stored in `output` as JSON instead of a Python repr; strings are unchanged and falsy results (`0`, `False`, `[]`) are now kept.
@@ -17,6 +18,9 @@ Read these before upgrading; each is a deliberate behaviour change.
 
 ### Security
 
+- Webhook delivery is now DNS-rebinding safe: the URL is resolved and validated once, and the request connects to *that* IP (original `Host` header and TLS SNI/certificate hostname preserved, redirects off). Previously the HTTP client re-resolved the name after validation.
+- Task arguments are no longer written to the logs by default (only the number of positional args and the keyword *names*); set `LOG_TASK_ARGUMENTS=True` to log values while debugging.
+- Optional Lambda event authentication: set `LAMBDA_SHARED_SECRET` (or `SQLERY_LAMBDA_SECRET`) on the worker and invoke with `sqlery.core.lambda_core.sign_event(event, secret)`; unsigned, tampered or stale (`LAMBDA_SIGNATURE_MAX_AGE`, default 300s) events get a 403. Off by default, so IAM-only setups are unchanged.
 - Webhook delivery no longer follows HTTP redirects, closing an SSRF bypass where a validated public URL redirected to an internal address.
 - HTTP trigger signatures can now bind the request body (`X-Signature-Version: 2`, `make_signed_request_headers(secret, body=...)`), so a captured header pair cannot be replayed with a different payload. Legacy timestamp-only signatures keep working; set `REQUIRE_BODY_SIGNATURE` (or `SQLERY_REQUIRE_BODY_SIGNATURE=1`) to reject them.
 - Lambda handler no longer logs the full invocation event (only action and keys).

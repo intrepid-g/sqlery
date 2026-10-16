@@ -26,6 +26,7 @@ from .models import ScheduledTask, QueuedJob, Worker
 from .subprocess_executor import get_manage_py_path
 from .settings import get_setting
 from .utils import import_task, calculate_next_run
+from sqlery.core.utils import describe_task_args
 from sqlery.core.result import serialize_result
 from sqlery.core.execution import invoke_task
 from sqlery.core.signals import task_retry
@@ -359,7 +360,9 @@ class TaskExecutor:
 
                 # Execute with kwargs
                 kwargs = job.kwargs if isinstance(job.kwargs, dict) else {}
-                logger.info(f"Executing job {job.id}: {job.task_path} with kwargs={kwargs}")
+                logger.info(
+                    f"Executing job {job.id}: {job.task_path} with {describe_task_args((), kwargs)}"
+                )
                 _token = _current_job_var.set(job)
                 try:
                     result = invoke_task(task_func, job, (), kwargs)
