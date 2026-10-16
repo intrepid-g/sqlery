@@ -92,6 +92,7 @@ class AsyncResult:
     def __init__(self, job_id: int, backend: Any = None):
         self.id = job_id
         self._backend = backend
+        self.parent: Any = None  # previous step / header group, set by canvas primitives
 
     @property
     def backend(self):
@@ -212,6 +213,8 @@ def apply_async_job(
     countdown: float | None = None,
     eta: datetime | None = None,
     expires: float | datetime | None = None,
+    dependencies: list | None = None,
+    meta: dict | None = None,
     backend: Any = None,
 ) -> AsyncResult:
     """Create a job with Celery-style scheduling options and return its :class:`AsyncResult`.
@@ -244,6 +247,10 @@ def apply_async_job(
         extra["tags"] = list(tags)
     if ttl is not None:
         extra["ttl"] = ttl
+    if dependencies:
+        extra["dependencies"] = list(dependencies)
+    if meta:
+        extra["meta"] = dict(meta)
     job = backend.create_job(
         task_path=task_path,
         kwargs=payload,

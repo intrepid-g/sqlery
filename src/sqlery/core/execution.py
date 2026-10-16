@@ -55,8 +55,26 @@ def _arm_soft_limit(task_func: Any, job: Any) -> None:
         logger.warning(f"Job {job.id}: soft_time_limit ignored (not in main thread)")
 
 
+def _with_upstream_results(job: Any, args: tuple | list) -> tuple:
+    """Prepend upstream results for canvas steps (chain/chord body).
+
+    ``meta["canvas"]["pass_result"]`` is ``"single"`` (previous result as first argument) or
+    ``"list"`` (list of all dependency results, in dependency order, as first argument).
+    """
+    meta = getattr(job, "meta", None)
+    mode = (meta.get("canvas") or {}).get("pass_result") if isinstance(meta, dict) else None
+    if not mode:
+        return tuple(args)
+    from .result import AsyncResult
+
+    results = [AsyncResult(dep).result for dep in (getattr(job, "dependencies", None) or [])]
+    lead = results[0] if mode == "single" and results else results
+    return (lead, *args)
+
+
 def invoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dict) -> Any:
     """Run the task and emit lifecycle signals. Re-raises task exceptions unchanged."""
+    args = _with_upstream_results(job, args)
     sender = getattr(job, "task_path", "") or ""
     task_prerun.send(sender, job=job, args=tuple(args), kwargs=dict(kwargs))
     try:

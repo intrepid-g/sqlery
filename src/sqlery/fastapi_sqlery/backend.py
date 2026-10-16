@@ -501,6 +501,22 @@ class SQLAlchemyBackend(DatabaseBackend):
             return False
         dep_rows = session.exec(select(QueuedJob).where(QueuedJob.id.in_(deps))).all()
         found = {d.id for d in dep_rows}
+        # Judge a failed/archived dependency by its newest retry attempt, if one exists.
+        resolved = []
+        for d in dep_rows:
+            hops = 0
+            while d.status in ("failed", "archived") and hops < 1000:
+                child = session.exec(
+                    select(QueuedJob)
+                    .where(QueuedJob.parent_job_id == d.id)
+                    .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
+                    .limit(1)
+                ).first()
+                if child is None:
+                    break
+                d, hops = child, hops + 1
+            resolved.append(d)
+        dep_rows = resolved
         failed = [d.id for d in dep_rows if d.status == "failed"] + [
             d for d in deps if d not in found
         ]
