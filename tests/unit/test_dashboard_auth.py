@@ -194,12 +194,33 @@ class _FakeRequest:
         self.scope = scope
 
 
-def test_resolve_mode_root_path_fallback(monkeypatch):
-    """When scope['app'] is None but root_path is set → inherit."""
+def test_resolve_mode_bare_root_path_is_not_a_mount(monkeypatch):
+    """A server/proxy root_path alone (uvicorn --root-path) must keep auth ON."""
     monkeypatch.delenv("SQLERY_DASHBOARD_AUTH", raising=False)
     our_app = object()
-    req = _FakeRequest({"app": None, "root_path": "/sub"})
-    assert resolve_auth_mode(our_app, req) == "inherit"
+    req = _FakeRequest({"app": our_app, "root_path": "/x"})
+    assert resolve_auth_mode(our_app, req) == "standalone"
+    assert resolve_auth_mode(our_app, _FakeRequest({"app": None, "root_path": "/x"})) == "standalone"
+
+
+def test_resolve_mode_real_mount_scope_inherits(monkeypatch):
+    """Starlette Mount sets app_root_path and extends root_path."""
+    monkeypatch.delenv("SQLERY_DASHBOARD_AUTH", raising=False)
+    our_app = object()
+    mounted = _FakeRequest({"app": our_app, "root_path": "/sub", "app_root_path": ""})
+    assert resolve_auth_mode(our_app, mounted) == "inherit"
+    behind_proxy_and_mounted = _FakeRequest(
+        {"app": our_app, "root_path": "/x/sub", "app_root_path": "/x"})
+    assert resolve_auth_mode(our_app, behind_proxy_and_mounted) == "inherit"
+
+
+def test_proxy_root_path_still_requires_api_key(monkeypatch):
+    """End to end: --root-path behind a proxy must not open the API."""
+    monkeypatch.setenv("SQLERY_DASHBOARD_API_KEY", "secret-key")
+    monkeypatch.delenv("SQLERY_DASHBOARD_AUTH", raising=False)
+    client = TestClient(_make_app(), root_path="/x")
+    assert client.get("/protected").status_code == 401
+    assert client.get("/protected", headers={"X-Sqlery-Key": "secret-key"}).status_code == 200
 
 
 def test_resolve_mode_default_standalone(monkeypatch):

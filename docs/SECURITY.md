@@ -48,7 +48,7 @@ runs in one of three modes.
 | `standalone` (default) | top-level ASGI app, no env override                                                           | Every request must carry the `X-Sqlery-Key` header. Unauthenticated requests get `401 {"detail":"unauthorized"}`. |
 | `disabled`            | `SQLERY_DASHBOARD_AUTH=disabled`                                                              | Pass-through. A single `WARNING` is logged at install time.                                           |
 | `inherit` (explicit)  | `SQLERY_DASHBOARD_AUTH=inherit`                                                               | Pass-through. The parent application owns authentication.                                             |
-| `inherit` (automatic) | Sqlery is mounted under a parent ASGI app (`scope["root_path"]` is non-empty at request time) | Pass-through. Detected via Starlette's request scope, regardless of how the parent mounts the sub-app. |
+| `inherit` (automatic) | Sqlery is mounted under a parent ASGI app (Starlette `Mount` sets `scope["app_root_path"]` and extends `scope["root_path"]`) | Pass-through. A server/proxy `root_path` alone (`uvicorn --root-path /x`) is **not** a mount and keeps auth on. |
 
 **Precedence:** an explicit `SQLERY_DASHBOARD_AUTH` env value always wins. If
 you mount Sqlery inside a parent app but explicitly set

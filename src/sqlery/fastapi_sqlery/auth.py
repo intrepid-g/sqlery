@@ -4,7 +4,8 @@ Three modes:
 - standalone (default): require ``X-Sqlery-Key`` header; reject otherwise with 401.
 - disabled: opt-out via ``SQLERY_DASHBOARD_AUTH=disabled``; pass-through; one WARNING at install.
 - inherit: trust parent app's auth. Explicit via ``SQLERY_DASHBOARD_AUTH=inherit`` or auto-detected
-  when the app is mounted under another ASGI app (Starlette ``scope['app']`` differs).
+  when the app is mounted under another ASGI app (Starlette's ``Mount`` sets ``scope['app_root_path']``).
+  A bare ``root_path`` (``uvicorn --root-path /x`` behind a proxy) is NOT a mount and keeps auth on.
 
 Explicit env value always wins over auto-detection.
 
@@ -40,21 +41,20 @@ def resolve_auth_mode(our_app, request) -> AuthMode:
     Order of precedence:
     1. Explicit ``SQLERY_DASHBOARD_AUTH`` env var (case-insensitive). Valid values:
        ``standalone``, ``disabled``, ``inherit``.
-    2. Auto-detect: if ``request.scope['app']`` exists and is not our app, we're mounted
-       under a parent ASGI app → ``inherit``.
-    3. Fallback: if ``scope['app']`` is None but ``scope['root_path']`` is non-empty,
-       also assume mounted → ``inherit``.
+    2. Auto-detect a real mount: Starlette's ``Mount`` records ``scope['app_root_path']`` (the
+       root path before the mount) and extends ``scope['root_path']`` -> ``inherit``. A server
+       or proxy ``root_path`` alone does not set ``app_root_path`` and is never treated as a
+       mount: trusting it left the dashboard unauthenticated behind ``--root-path``.
+    3. ``scope['app']`` differing from ours -> ``inherit`` (non-Starlette parents).
     4. Default: ``standalone``.
     """
     explicit = os.environ.get(_AUTH_ENV_VAR, "").strip().lower()
     if explicit in ("standalone", "disabled", "inherit"):
         return explicit  # type: ignore[return-value]
 
-    # When mounted under a parent ASGI app, Starlette populates `root_path` on the inner
-    # request scope with the mount prefix (e.g. "/sub"). This is the most reliable mount
-    # signal — `scope['app']` is rewritten to the inner app once routed, so comparing it
-    # to ``our_app`` does not work after the route dispatch.
-    if request.scope.get("root_path"):
+    scope = request.scope
+    app_root = scope.get("app_root_path")
+    if app_root is not None and scope.get("root_path", "") != app_root:
         return "inherit"
     scope_app = request.scope.get("app")
     if scope_app is not None and scope_app is not our_app:

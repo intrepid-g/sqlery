@@ -4,7 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.25.0] - 2026-10-15
+
+### Upgrade notes
+
+Read these before upgrading; each is a deliberate behaviour change.
+
+- **Tag limits are now enforced.** `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were silently ignored in both modes. A deployment that already has them configured will start being throttled. Set tags with `@job(tags=[...])`.
+- **Dashboard auth behind a proxy.** The FastAPI dashboard used to skip its API-key auth whenever `scope["root_path"]` was non-empty, so `uvicorn --root-path /x` left the admin API open. Only a real Starlette `Mount` (or `SQLERY_DASHBOARD_AUTH=inherit`) disables it now. If you relied on a bare `root_path` to skip auth, set `SQLERY_DASHBOARD_AUTH=inherit` or `disabled` explicitly.
+- **Result output format.** Dict/list results are stored in `output` as JSON instead of a Python repr; strings are unchanged and falsy results (`0`, `False`, `[]`) are now kept.
+- **Still opt-in (recommended):** `ALLOWED_TASK_MODULES` defaults to allow-all (anyone able to write job rows can run any importable function); set it. `REQUIRE_BODY_SIGNATURE=True` rejects legacy timestamp-only trigger signatures; enable it once your signers send `X-Signature-Version: 2`.
 
 ### Security
 
@@ -14,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Dashboard authentication was skipped for any non-empty `root_path` (e.g. `uvicorn --root-path /x` behind a proxy). Auto-`inherit` now requires a real Starlette `Mount` (`scope["app_root_path"]`).
 - A job whose dependency failed and has a pending retry (or was archived after retrying) was either failed immediately or blocked forever. Dependencies are now judged by their newest retry attempt in both modes. Retry jobs also keep their `dependencies`.
 - Retry jobs dropped part of the original job spec. Standalone retries lost `retry_intervals`, `tags`, `meta`, `on_success_path`/`on_failure_path`, `result_ttl` and `failure_ttl`; Django retries lost `timeout_seconds`, `allow_parallel`, `tags`, `meta`, callbacks, TTLs and webhook settings (so a retried job could lose its timeout or tag limits). All are now carried over, and Django retries record `parent_job_id` so `AsyncResult` can follow them. Extra fields are only passed to backends whose `create_job` accepts them.
 - Falsy task results (`0`, `False`, `[]`) were recorded as empty output (`result or ""`). Results are now stored via `serialize_result`: strings verbatim, `None` as empty, everything else as JSON (dict results appear in the dashboard as JSON rather than a Python repr).
