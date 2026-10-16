@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from ..compat import get_backend, get_config, JobFencingError
 from .utils import import_task
 from .result import serialize_result
+from .retry import invoke_task, policy_allows_retry, retry_countdown, shape_retry_delay
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
@@ -134,7 +135,7 @@ class JobExecutor:
                 logger.info(f"Job {job.id} executing with args={positional_args}, kwargs={kwargs}")
                 _token = _current_job_var.set(job)
                 try:
-                    result = task_func(*positional_args, **kwargs)
+                    result = invoke_task(task_func, job, positional_args, kwargs)
                     # REGRESSION 2026-05-25: @async_job silently "succeeded" without running
                     # Root cause: coroutine returned by async task was never awaited
                     # Fix: detect coroutine result and run it to completion via asyncio.run()
@@ -181,8 +182,8 @@ class JobExecutor:
                 return job
             logger.error(f"Job {job.id} failed: {error_msg}")
 
-            if self._should_retry(job):
-                retry_job = self._retry_job(job)
+            if self._should_retry(job, e):
+                retry_job = self._retry_job(job, exc=e)
                 logger.info(
                     f"Job {job.id} will be retried as job {retry_job.id} "
                     f"(attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
@@ -294,8 +295,8 @@ class JobExecutor:
                 )
 
                 # Handle retry in child (it has the DB connection)
-                if self._should_retry(failed_job):
-                    retry_job = self._retry_job(failed_job)
+                if self._should_retry(failed_job, e):
+                    retry_job = self._retry_job(failed_job, exc=e)
                     logger.info(
                         f"Job {job.id} will be retried as job {retry_job.id} "
                         f"(attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
@@ -335,18 +336,22 @@ class JobExecutor:
         # SEC-04 is now enforced inside import_task() itself.
         return import_task(task_path)
 
-    def _should_retry(self, job) -> bool:
+    def _should_retry(self, job, exc: BaseException | None = None) -> bool:
         if job.max_retries is None or job.max_retries <= 0:
             return False
-        if job.retry_count is None:
-            return True
-        return job.retry_count < job.max_retries
+        if job.retry_count is not None and job.retry_count >= job.max_retries:
+            return False
+        # Task-declared policy (autoretry_for / Retry); crash-recovery callers pass no exc.
+        return policy_allows_retry(job, exc)
 
-    def _retry_job(self, failed_job):
+    def _retry_job(self, failed_job, exc: BaseException | None = None):
         retry_count = failed_job.retry_count if failed_job.retry_count is not None else 0
         backoff = failed_job.retry_backoff if failed_job.retry_backoff else 1.0
         delay_seconds = compute_retry_delay(
             backoff, retry_count, getattr(failed_job, "retry_intervals", None)
+        )
+        delay_seconds = shape_retry_delay(
+            delay_seconds, failed_job, countdown=retry_countdown(exc)
         )
 
         scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
@@ -362,7 +367,7 @@ class JobExecutor:
             base_name = re.sub(r':retry:\d+', '', original_name)
             retry_job_name = f"{base_name}:retry:{retry_count + 1}"
 
-        retry_job = self.backend.create_job(
+        retry_kwargs = dict(
             task_path=failed_job.task_path,
             kwargs=failed_job.kwargs.copy() if isinstance(failed_job.kwargs, dict) else {},
             queue_name=failed_job.queue_name,
@@ -376,6 +381,21 @@ class JobExecutor:
             retry_count=retry_count + 1,
             parent_job_id=failed_job.id,
         )
+        # Carry the rest of the job spec (previously dropped on retry). Only pass fields the
+        # backend's create_job accepts, so custom/older DatabaseBackend subclasses keep working.
+        carried = dict(
+            retry_intervals=getattr(failed_job, "retry_intervals", None),
+            tags=list(getattr(failed_job, "tags", None) or []),
+            meta=getattr(failed_job, "meta", None),
+            on_success_path=getattr(failed_job, "on_success_path", "") or "",
+            on_failure_path=getattr(failed_job, "on_failure_path", "") or "",
+            result_ttl=getattr(failed_job, "result_ttl", None),
+            failure_ttl=getattr(failed_job, "failure_ttl", None),
+        )
+        accepted = inspect.signature(self.backend.create_job).parameters
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
+            carried = {k: v for k, v in carried.items() if k in accepted}
+        retry_job = self.backend.create_job(**retry_kwargs, **carried)
 
         # Mark original failed job as archived (retry created, no longer relevant to dashboard)
         try:

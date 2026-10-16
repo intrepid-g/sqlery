@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Retry jobs dropped part of the original job spec. Standalone retries lost `retry_intervals`, `tags`, `meta`, `on_success_path`/`on_failure_path`, `result_ttl` and `failure_ttl`; Django retries lost `timeout_seconds`, `allow_parallel`, `tags`, `meta`, callbacks, TTLs and webhook settings (so a retried job could lose its timeout or tag limits). All are now carried over, and Django retries record `parent_job_id` so `AsyncResult` can follow them. Extra fields are only passed to backends whose `create_job` accepts them.
 - Falsy task results (`0`, `False`, `[]`) were recorded as empty output (`result or ""`). Results are now stored via `serialize_result`: strings verbatim, `None` as empty, everything else as JSON (dict results appear in the dashboard as JSON rather than a Python repr).
 - `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were never applied: the shared claim path defaulted both to `{}` and the standalone claim path skipped them entirely. Both now read config and enforce the limits (standalone serializes the check with a per-tag advisory lock on PostgreSQL).
 - A tag-limited job at the head of the queue no longer starves everything behind it; the claim loop now walks a window of candidates instead of re-fetching the same blocked job.
@@ -24,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Celery-style retry policy on `@job` (core and Django): `autoretry_for=(Exc, ...)` (retry only matching exceptions; unset keeps retry-on-any), `retry_backoff_max`, `retry_jitter`, and `bind=True` which passes a `TaskContext` as the first argument (`self.request.retries`, `self.retry(exc=, countdown=)`). The `sqlery.core.retry.Retry` exception can also be raised directly. Retries still honour `max_retries`. The policy is read from the task function when a job fails, so it applies to enqueue, `delay`, `apply_async` and scheduled runs without extra storage.
 - Celery-style results API: `job.apply_async(args, kwargs, countdown=, eta=, expires=, ...)` returns an `AsyncResult` (`sqlery.AsyncResult`) with `state`/`status`, `ready()`, `successful()`, `failed()`, `result`, `error`, `traceback` and a blocking `get(timeout=, propagate=)` that follows retry attempts. Available on core `@job` and Django `@job` functions. `expires` maps to the job `ttl`. Task arguments are passed explicitly, so option names can't collide with task kwargs. `.delay()`/`.enqueue()` are unchanged. New non-abstract `DatabaseBackend.get_latest_retry()` (both backends).
 - `@job(tags=[...])` (core and Django decorators) and `create_job(tags=...)` on both backends, so `TAG_CONCURRENCY_LIMITS` / `TAG_RATE_LIMITS` are usable from the public API. Core `enqueue` takes the tags as `_tags` so a task's own `tags` kwarg is never shadowed. Staged (far-future) jobs keep their tags on promotion.
 - Opt-in Celery-style retry tuning via config: `RETRY_BACKOFF_MAX` (cap) and `RETRY_JITTER` (full jitter). Defaults leave behaviour unchanged.
