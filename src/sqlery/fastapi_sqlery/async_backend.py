@@ -30,6 +30,7 @@ from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.utils import reject_unawaited_coroutine
 
 from .database import get_async_session_factory
@@ -60,8 +61,8 @@ class Lease(SQLModel, table=True):
     daemon_id: str = Field(max_length=255)
     node_id: str = Field(default="", max_length=255)
     pid: int = Field(default=0)
-    acquired_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    expires_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    acquired_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
+    expires_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
 
 
 def _utcnow() -> datetime:
