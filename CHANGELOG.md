@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 Read these before upgrading; each is a deliberate behaviour change.
 
+- **`croniter` is no longer a dependency.** It was declared but never imported: cron parsing and next-run calculation have always been done by Sqlery's own `sqlery.crontab`. If your own code imports `croniter`, install it yourself.
 - **Webhooks use `httpx`, not `requests`.** `requests` was imported but never declared (and the error message pointed at a `sqlery[webhooks]` extra that did not exist). Webhooks now use `httpx`, which is already a declared dependency; install with `pip install sqlery[webhooks]`. Code or tests that patched `sqlery.webhooks.requests` must patch `sqlery.webhooks._post_pinned` (or `httpx`) instead.
 - **Tag limits are now enforced.** `TAG_CONCURRENCY_LIMITS` and `TAG_RATE_LIMITS` were silently ignored in both modes. A deployment that already has them configured will start being throttled. Set tags with `@job(tags=[...])`.
 - **Dashboard auth behind a proxy.** The FastAPI dashboard used to skip its API-key auth whenever `scope["root_path"]` was non-empty, so `uvicorn --root-path /x` left the admin API open. Only a real Starlette `Mount` (or `SQLERY_DASHBOARD_AUTH=inherit`) disables it now. If you relied on a bare `root_path` to skip auth, set `SQLERY_DASHBOARD_AUTH=inherit` or `disabled` explicitly.
