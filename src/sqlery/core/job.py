@@ -28,6 +28,7 @@ class JobWrapper:
         retry_backoff_max: float | None = None,
         retry_jitter: bool | None = None,
         bind: bool = False,
+        soft_time_limit: float | None = None,
     ):
         """Initialize job wrapper.
 
@@ -53,6 +54,7 @@ class JobWrapper:
         self.retry_backoff_max = retry_backoff_max
         self.retry_jitter = retry_jitter
         self.bind = bind
+        self.soft_time_limit = soft_time_limit
 
         # Calculate task path (module.path.to.function)
         self.task_path = f"{func.__module__}.{func.__qualname__}"
@@ -289,6 +291,7 @@ def job(
     retry_backoff_max: float | None = None,
     retry_jitter: bool | None = None,
     bind: bool = False,
+    soft_time_limit: float | None = None,
 ) -> JobWrapper | Callable:
     """Decorator to mark a function as an enqueueable job.
 
@@ -330,6 +333,8 @@ def job(
             Unset keeps the legacy behaviour of retrying on any exception.
         retry_backoff_max: Cap (seconds) on the exponential retry delay
         retry_jitter: Randomise the retry delay (full jitter)
+        soft_time_limit: Seconds after which ``SoftTimeLimitExceeded`` is raised inside the task
+            (catchable, for cleanup). ``timeout_seconds`` stays the hard limit that follows.
         bind: Pass a ``TaskContext`` as the first argument; ``self.retry(...)`` retries the job
 
     Returns:
@@ -350,6 +355,7 @@ def job(
             retry_backoff_max=retry_backoff_max,
             retry_jitter=retry_jitter,
             bind=bind,
+            soft_time_limit=soft_time_limit,
         )
 
     # Handle both @job and @job(...) syntax

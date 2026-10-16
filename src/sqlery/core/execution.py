@@ -1,0 +1,79 @@
+"""Single call site that actually runs a task body for both executors.
+
+Adds, around the user's function: ``bind=True`` context injection, the soft time limit, and
+the ``task_prerun`` / ``task_success`` / ``task_failure`` / ``task_postrun`` signals.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import traceback as tb
+from typing import Any
+
+from .retry import TaskContext
+from .signals import task_failure, task_postrun, task_prerun, task_success
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["SoftTimeLimitExceeded", "invoke_task"]
+
+
+class SoftTimeLimitExceeded(Exception):
+    """Raised inside a task when its ``soft_time_limit`` elapses.
+
+    Catch it to clean up; the hard limit (the job's ``timeout_seconds``) still fires
+    afterwards if the task keeps running.
+    """
+
+
+def _arm_soft_limit(task_func: Any, job: Any) -> None:
+    """Two-phase SIGALRM: soft limit raises SoftTimeLimitExceeded, then the remainder of
+    the hard limit raises TimeoutError (same error the executors already produce)."""
+    soft = getattr(task_func, "soft_time_limit", None)
+    if not soft or not hasattr(signal, "setitimer"):
+        return
+    hard = getattr(job, "timeout_seconds", None)
+    if hard and soft >= hard:
+        return  # the hard limit fires first anyway
+
+    state = {"soft_fired": False}
+
+    def handler(signum, frame):
+        if not state["soft_fired"]:
+            state["soft_fired"] = True
+            if hard:
+                signal.setitimer(signal.ITIMER_REAL, max(hard - soft, 0.001))
+            raise SoftTimeLimitExceeded(f"Job {job.id} exceeded soft time limit of {soft} seconds")
+        raise TimeoutError(f"Job {job.id} exceeded timeout of {hard} seconds")
+
+    try:
+        signal.signal(signal.SIGALRM, handler)
+        signal.setitimer(signal.ITIMER_REAL, float(soft))
+    except ValueError:
+        # Not the main thread: signals unavailable, same limitation as the hard timeout.
+        logger.warning(f"Job {job.id}: soft_time_limit ignored (not in main thread)")
+
+
+def invoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dict) -> Any:
+    """Run the task and emit lifecycle signals. Re-raises task exceptions unchanged."""
+    sender = getattr(job, "task_path", "") or ""
+    task_prerun.send(sender, job=job, args=tuple(args), kwargs=dict(kwargs))
+    try:
+        _arm_soft_limit(task_func, job)
+        if getattr(task_func, "bind", False):
+            inner = getattr(task_func, "func", task_func)
+            result = inner(TaskContext.from_job(job), *args, **kwargs)
+        else:
+            result = task_func(*args, **kwargs)
+    except BaseException as exc:
+        task_failure.send(sender, job=job, exc=exc, traceback=tb.format_exc())
+        task_postrun.send(
+            sender, job=job, args=tuple(args), kwargs=dict(kwargs), state="FAILURE", retval=exc
+        )
+        raise
+    task_success.send(sender, job=job, result=result)
+    task_postrun.send(
+        sender, job=job, args=tuple(args), kwargs=dict(kwargs), state="SUCCESS", retval=result
+    )
+    return result

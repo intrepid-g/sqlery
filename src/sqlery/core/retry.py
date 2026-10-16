@@ -23,7 +23,6 @@ __all__ = [
     "policy_allows_retry",
     "retry_countdown",
     "shape_retry_delay",
-    "invoke_task",
 ]
 
 
@@ -157,11 +156,3 @@ def shape_retry_delay(delay: float, job: Any, *, countdown: float | None = None)
     if policy.jitter and not _global_jitter():
         delay = random.uniform(0, delay)  # (global RETRY_JITTER already jittered upstream)
     return delay
-
-
-def invoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dict) -> Any:
-    """Call the task, injecting a :class:`TaskContext` first when it is ``bind=True``."""
-    if getattr(task_func, "bind", False):
-        inner = getattr(task_func, "func", task_func)
-        return inner(TaskContext.from_job(job), *args, **kwargs)
-    return task_func(*args, **kwargs)

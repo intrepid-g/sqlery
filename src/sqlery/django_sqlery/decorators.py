@@ -36,6 +36,7 @@ class JobFunction:
         retry_backoff_max: float | None = None,
         retry_jitter: bool | None = None,
         bind: bool = False,
+        soft_time_limit: float | None = None,
     ):
         """Initialize job function wrapper.
 
@@ -61,6 +62,7 @@ class JobFunction:
         self.retry_backoff_max = retry_backoff_max
         self.retry_jitter = retry_jitter
         self.bind = bind
+        self.soft_time_limit = soft_time_limit
 
         # Copy function metadata
         functools.update_wrapper(self, func)
@@ -410,6 +412,7 @@ def job(
     retry_backoff_max: float | None = None,
     retry_jitter: bool | None = None,
     bind: bool = False,
+    soft_time_limit: float | None = None,
 ) -> Callable[[Callable], JobFunction] | JobFunction:
     """Decorator for marking sync functions as enqueueable jobs.
 
@@ -473,6 +476,7 @@ def job(
             retry_backoff_max=retry_backoff_max,
             retry_jitter=retry_jitter,
             bind=bind,
+            soft_time_limit=soft_time_limit,
         )
 
     if func is not None and callable(func):
@@ -485,7 +489,8 @@ def job(
                    retry_backoff=retry_backoff, retry=retry,
                    allow_parallel=allow_parallel, tags=tags,
                    autoretry_for=autoretry_for, retry_backoff_max=retry_backoff_max,
-                   retry_jitter=retry_jitter, bind=bind)
+                   retry_jitter=retry_jitter, bind=bind,
+                   soft_time_limit=soft_time_limit)
     else:
         # Called as @job() or @job(queue='name') with parentheses
         return decorator

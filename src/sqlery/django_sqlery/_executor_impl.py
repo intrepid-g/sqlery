@@ -27,8 +27,9 @@ from .subprocess_executor import get_manage_py_path
 from .settings import get_setting
 from .utils import import_task, calculate_next_run
 from sqlery.core.result import serialize_result
+from sqlery.core.execution import invoke_task
+from sqlery.core.signals import task_retry
 from sqlery.core.retry import (
-    invoke_task,
     policy_allows_retry,
     retry_countdown,
     shape_retry_delay,
@@ -480,6 +481,7 @@ class TaskExecutor:
             f"scheduled in {delay_seconds}s (attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
         )
 
+        task_retry.send(failed_job.task_path, job=failed_job, retry_job=retry_job, exc=exc)
         return retry_job
 
     def run_queue_workers(self, queue_name=None, once=False, max_jobs=None):
