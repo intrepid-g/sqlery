@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, JobFencingError
 from .utils import import_task
+from .result import serialize_result
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
@@ -144,7 +145,7 @@ class JobExecutor:
 
                 try:
                     job = self.backend.mark_job_success(
-                        job.id, output=result or "", expected_version=expected_version
+                        job.id, output=serialize_result(result), expected_version=expected_version
                     )
                 except JobFencingError as e:
                     logger.warning(
@@ -251,7 +252,7 @@ class JobExecutor:
             # instead of clobbering the reclaiming worker's outcome.
             try:
                 job = self.backend.mark_job_success(
-                    job.id, output=result or "", expected_version=expected_version
+                    job.id, output=serialize_result(result), expected_version=expected_version
                 )
             except JobFencingError as e:
                 logger.warning(

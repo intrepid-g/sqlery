@@ -512,6 +512,16 @@ class SQLAlchemyBackend(DatabaseBackend):
             return True
         return any(d.status != "success" for d in dep_rows)
 
+    def get_latest_retry(self, job_id: int):
+        """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
+        with self._get_session() as session:
+            return session.exec(
+                select(QueuedJob)
+                .where(QueuedJob.parent_job_id == job_id)
+                .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
+                .limit(1)
+            ).first()
+
     def claim_job_by_id(self, job_id, worker_id: str):
         """Atomically claim one specific queued job via a compare-and-set UPDATE."""
         with self._get_session() as session:

@@ -100,6 +100,11 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def get_latest_retry(self, job_id: int):
+        """Return the newest retry attempt created for ``job_id`` (child via
+        ``parent_job_id``), or ``None``. Used by ``AsyncResult`` to follow retries."""
+        raise NotImplementedError
+
     def claim_job_by_id(self, job_id: int, worker_id: str):
         """Atomically claim one specific *queued* job (queued -> running).
 

@@ -41,6 +41,7 @@ from .core.job_queue import (
     cancel_job,
     retry_failed_jobs,
 )
+from .core.result import AsyncResult
 from .core.worker import JobExecutor, WorkerProcess
 
 # Alias WorkerProcess as Worker for backward compatibility
@@ -71,6 +72,7 @@ except ImportError:
 __all__ = [
     "__version__",
     "Queue",
+    "AsyncResult",
     "Worker",
     "WorkerProcess",
     "JobExecutor",
