@@ -252,13 +252,6 @@ class TestRetryAndTTL:
             sync_backend.mark_job_failed(j.id, "x")
         assert sync_backend.retry_failed_jobs(max_jobs=2) == 2
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: SQLite stores created_at as naive while "
-        "backend uses datetime.now(UTC) (aware); arithmetic raises TypeError. "
-        "Out of scope for plan 03-04; tracked as backend bug.",
-        raises=TypeError,
-        strict=False,
-    )
     def test_get_expired_ttl_jobs(self, sync_backend):
         j = _create_basic_job(sync_backend, ttl=1)
         with sync_backend._get_session() as session:
@@ -267,17 +260,12 @@ class TestRetryAndTTL:
             # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
             from sqlmodel import select as _select
             row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
-            row.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
+            row.created_at = datetime.now(UTC) - timedelta(seconds=10)
             session.add(row)
             session.commit()
         expired = sync_backend.get_expired_ttl_jobs()
         assert any(e.id == j.id for e in expired)
 
-    @pytest.mark.xfail(
-        reason="Same pre-existing naive/aware datetime bug as above.",
-        raises=TypeError,
-        strict=False,
-    )
     def test_get_expired_ttl_excludes_unexpired(self, sync_backend):
         j = _create_basic_job(sync_backend, ttl=3600)
         expired = sync_backend.get_expired_ttl_jobs()
