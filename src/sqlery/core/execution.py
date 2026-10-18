@@ -18,7 +18,69 @@ from .signals import task_failure, task_postrun, task_prerun, task_success
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SoftTimeLimitExceeded", "ainvoke_task", "invoke_task"]
+__all__ = [
+    "SoftTimeLimitExceeded",
+    "ainvoke_task",
+    "invoke_task",
+    "RQCompatJob",
+    "run_success_callback",
+    "run_failure_callback",
+]
+
+
+class RQCompatJob:
+    """Makes a job look like an RQ ``Job`` for ``on_success`` / ``on_failure`` callbacks.
+
+    RQ callbacks see ``job.id`` as the string id given at enqueue time. In sqlery that string
+    is ``job.job_name``; ``job.id`` is the integer primary key. This wrapper proxies every
+    attribute to the real job but returns ``job_name`` (falling back to ``str(pk)``) for ``.id``.
+    """
+
+    def __init__(self, job):
+        object.__setattr__(self, "_job", job)
+
+    @property
+    def id(self):
+        job = object.__getattribute__(self, "_job")
+        name = getattr(job, "job_name", None)
+        if name:
+            return name
+        pk = getattr(job, "pk", None)  # Django models; SQLModel rows only have ``id``
+        return str(pk if pk is not None else job.id)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_job"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_job"), name, value)
+
+
+def _run_callback(path: str, job: Any, result: Any, kind: str) -> None:
+    from .utils import import_task
+
+    try:
+        cb = import_task(path)
+        cb(RQCompatJob(job), None, result)
+    except Exception:
+        # A broken callback must never change the job's outcome.
+        logger.exception(f"{kind} callback failed for job {getattr(job, 'id', '?')}")
+
+
+def run_success_callback(job: Any, result: Any) -> None:
+    """Invoke the job's ``on_success_path`` callback as ``cb(job, None, result)``, if set."""
+    path = getattr(job, "on_success_path", "") or ""
+    if path:
+        _run_callback(path, job, result, "on_success")
+
+
+def run_failure_callback(job: Any) -> None:
+    """Invoke the job's ``on_failure_path`` callback as ``cb(job, None, None)``, if set.
+
+    Runs on every failed attempt (before the retry decision), as the Django executor always has.
+    """
+    path = getattr(job, "on_failure_path", "") or ""
+    if path:
+        _run_callback(path, job, None, "on_failure")
 
 
 class SoftTimeLimitExceeded(Exception):
