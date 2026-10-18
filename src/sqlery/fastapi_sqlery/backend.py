@@ -569,6 +569,38 @@ class SQLAlchemyBackend(DatabaseBackend):
                 is not None
             )
 
+    def get_jobs_pending_retry(self, older_than_seconds: float = 60, limit: int = 100) -> list:
+        """Failed jobs whose retry was never created (see DatabaseBackend)."""
+        from sqlery.core.retry import RETRY_PENDING
+
+        cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+        with self._get_session() as session:
+            return list(
+                session.exec(
+                    select(QueuedJob)
+                    .where(QueuedJob.status == "failed")
+                    .where(QueuedJob.termination_reason.like(f"{RETRY_PENDING}%"))
+                    .where(QueuedJob.finished_at != None, QueuedJob.finished_at <= cutoff)  # noqa: E711
+                    .order_by(QueuedJob.finished_at)
+                    .limit(limit)
+                ).all()
+            )
+
+    def settle_retry_pending(self, job_id: int) -> None:
+        from sqlery.core.retry import settled_reason
+
+        with self._get_session() as session:
+            reason = session.exec(
+                select(QueuedJob.termination_reason).where(QueuedJob.id == job_id)
+            ).first()
+            if reason is not None:
+                session.exec(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .values(termination_reason=settled_reason(reason))
+                )
+                session.commit()
+
     def get_latest_retry(self, job_id: int):
         """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
         with self._get_session() as session:
@@ -1583,6 +1615,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         error: str,
         traceback: str = "",
         expected_version: int | None = None,
+        termination_reason: str = "",
     ):
         """Mark job as failed.
 
@@ -1598,7 +1631,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
                     session.expunge(db_job)
-                    db_job.mark_failed(error=error, traceback=traceback)
+                    db_job.mark_failed(
+                        error=error, traceback=traceback, termination_reason=termination_reason
+                    )
                     values = {
                         "status": db_job.status,
                         "finished_at": db_job.finished_at,

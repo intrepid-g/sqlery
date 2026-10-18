@@ -148,6 +148,24 @@ class TestStandalonePostgres:
         assert pg_backend.request_job_revoke(j.id) is True
         assert pg_backend.is_job_revoke_requested(j.id) is True
 
+    def test_lost_retry_is_recovered_exactly_once(self, pg_backend):
+        from unittest.mock import patch
+
+        from sqlery.core.retry import is_retry_pending
+
+        j = _mk(pg_backend, task_path="operator.truediv", kwargs={"_args": [1, 0]}, max_retries=3)
+        claimed = pg_backend.claim_job_by_id(j.id, "w")
+        ex = JobExecutor(backend=pg_backend)
+        with patch.object(JobExecutor, "_retry_job", side_effect=SystemExit("worker killed")):
+            with pytest.raises(SystemExit):
+                ex.execute_job(claimed)
+        row = pg_backend.get_job_by_id(j.id)
+        assert row.status == "failed" and is_retry_pending(row.termination_reason)
+        assert pg_backend.get_latest_retry(j.id) is None
+        assert ex.recover_lost_retries(grace_seconds=0) == 1
+        assert ex.recover_lost_retries(grace_seconds=0) == 0
+        assert pg_backend.get_latest_retry(j.id).parent_job_id == j.id
+
     def test_apply_async_and_chain_end_to_end(self, pg_backend):
         from sqlery import chain, chord, group
         from sqlery.core.result import apply_async_job
@@ -226,6 +244,24 @@ class TestDjangoPostgres:
         retry.status = "success"
         retry.save(update_fields=["status"])
         assert child.check_dependencies_met() == (True, [])
+
+    def test_lost_retry_is_recovered_exactly_once(self, django_pg):
+        from unittest.mock import patch
+
+        from sqlery.core.retry import is_retry_pending
+        from sqlery.executor import TaskExecutor
+        from sqlery.models import QueuedJob
+
+        j = _dj_job(task_path="tests.test_retry_recovery.always_fails", max_retries=3)
+        ex = TaskExecutor()
+        with patch.object(TaskExecutor, "_retry_job", side_effect=SystemExit("worker killed")):
+            with pytest.raises(SystemExit):
+                ex.execute_job(j)
+        j.refresh_from_db()
+        assert j.status == "failed" and is_retry_pending(j.termination_reason)
+        assert ex.recover_lost_retries(grace_seconds=0) == 1
+        assert ex.recover_lost_retries(grace_seconds=0) == 0
+        assert QueuedJob.objects.filter(parent_job_id=j.id).count() == 1
 
     def test_revoke_flag(self, django_pg):
         from sqlery.compat import get_backend
