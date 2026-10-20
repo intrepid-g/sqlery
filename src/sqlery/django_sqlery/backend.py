@@ -578,8 +578,10 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str,
         priority: int,
         enabled: bool = True,
+        next_run_at: datetime | None = None,
     ):
         """Create a new scheduled task."""
+        extra = {"next_run_at": next_run_at} if next_run_at is not None else {}
         task = self.ScheduledTask.objects.create(
             name=name,
             task_path=task_path,
@@ -587,6 +589,7 @@ class DjangoBackend(DatabaseBackend):
             queue_name=queue_name,
             priority=priority,
             enabled=enabled,
+            **extra,
         )
         return task
 

@@ -357,8 +357,12 @@ class DatabaseBackend(ABC):
         queue_name: str,
         priority: int,
         enabled: bool = True,
+        next_run_at: datetime | None = None,
     ):
         """Create a new scheduled task.
+
+        Args:
+            next_run_at: Initial next run time (defaults to next cron occurrence)
 
         Returns:
             ScheduledTask instance
