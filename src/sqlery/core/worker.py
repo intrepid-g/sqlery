@@ -993,7 +993,9 @@ class WorkerProcess:
         refreshed = self.backend.get_job_by_id(job_id)
         if refreshed and refreshed.status == 'success':
             return {'success': True, 'output': refreshed.output or ''}
-        elif refreshed and refreshed.status == 'failed':
+        elif refreshed and refreshed.status in ('failed', 'archived'):
+            # 'archived': the child failed, queued a retry and archived the original;
+            # that outcome is already recorded, so don't overwrite it as a crash.
             return {'success': False, 'error': refreshed.error or ''}
         elif exit_status == 0:
             return {'success': True, 'output': ''}

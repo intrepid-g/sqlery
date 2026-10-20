@@ -6,7 +6,7 @@ import pytest
 
 from sqlery.core.job import job
 from sqlery.core.retry import Retry, TaskContext, get_retry_policy
-from sqlery.core.worker import JobExecutor, compute_retry_delay
+from sqlery.core.worker import JobExecutor, WorkerProcess, compute_retry_delay
 
 
 # ---- tasks (module-level so import_task("tests.test_retry_policy.X") resolves) ----------
@@ -150,3 +150,32 @@ def test_django_executor_autoretry_and_countdown():
     child, parent = run("retry")
     assert child is not None
     assert 9 <= (child.scheduled_at - datetime.now(timezone.utc)).total_seconds() <= 12
+
+
+# ---- retried original is archived, not overwritten as failed (#58) ----------------------
+@job(max_retries=1, retry_backoff=0.1)
+def boom_with_retry():
+    raise RuntimeError("boom")
+
+
+def test_retried_job_original_stays_archived(tmp_path):
+    from sqlery import compat
+    from sqlery.fastapi_sqlery import database
+    from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
+
+    database.init_database(f"sqlite:///{tmp_path / 'r58.db'}")
+    backend = SQLAlchemyBackend()
+    compat._backend = backend
+    try:
+        boom_with_retry.enqueue()
+        worker = WorkerProcess(queues=["default"], backend=backend)
+        claimed = backend.claim_job(["default"], worker.worker_id)
+        assert claimed is not None
+        worker._fork_and_execute(claimed)
+
+        first = backend.get_job_by_id(claimed.id)
+        assert backend.get_latest_retry(first.id) is not None
+        assert first.status == "archived", (first.status, first.error)
+        assert "boom" in (first.error or "")
+    finally:
+        compat._backend = None
