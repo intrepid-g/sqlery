@@ -253,7 +253,7 @@ class JobExecutor:
 
             _token = _current_job_var.set(job)
             try:
-                result = task_func(*positional_args, **kwargs)
+                result = invoke_task(task_func, job, positional_args, kwargs)
                 if inspect.iscoroutine(result):
                     result = asyncio.run(result)
             finally:
