@@ -789,11 +789,17 @@ def tasks_run(
 ):
     """Trigger due scheduled tasks (or a specific task by name)."""
     # from ..compat import is_django_mode, get_backend  # moved to top-level
-    # Lazy: sqlery.triggers needs Django-only helpers, so keep it out of CLI import time
-    from ..triggers import trigger_due_tasks
-
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py run_scheduled_tasks' in Django mode[/red]")
+        raise typer.Exit(1)
+
+    # Lazy: sqlery.triggers needs Django-only helpers, so keep it out of CLI import time
+    try:
+        from ..triggers import trigger_due_tasks
+    except ImportError as e:
+        console.print(
+            f"[red]Error: scheduled task triggering is unavailable in standalone mode: {e}[/red]"
+        )
         raise typer.Exit(1)
 
     if task_name:

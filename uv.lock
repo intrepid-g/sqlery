@@ -910,8 +910,10 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-django" },
     { name = "pytest-timeout" },
+    { name = "rich" },
     { name = "ruff" },
     { name = "sqlmodel" },
+    { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 django = [
@@ -998,6 +1000,7 @@ requires-dist = [
     { name = "rich", marker = "extra == 'all'", specifier = ">=13.0.0" },
     { name = "rich", marker = "extra == 'all-standalone'", specifier = ">=13.0.0" },
     { name = "rich", marker = "extra == 'cli'", specifier = ">=13.0.0" },
+    { name = "rich", marker = "extra == 'dev'", specifier = ">=13.0.0" },
     { name = "rich", marker = "extra == 'standalone'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "sqlmodel", marker = "extra == 'all'", specifier = ">=0.0.14" },
@@ -1007,6 +1010,7 @@ requires-dist = [
     { name = "typer", marker = "extra == 'all'", specifier = ">=0.9.0" },
     { name = "typer", marker = "extra == 'all-standalone'", specifier = ">=0.9.0" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.9.0" },
+    { name = "typer", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "typer", marker = "extra == 'standalone'", specifier = ">=0.9.0" },
     { name = "uuid6", specifier = ">=2024.1.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'all'", specifier = ">=0.24.0" },
