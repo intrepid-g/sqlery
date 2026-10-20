@@ -15,7 +15,6 @@ from unittest.mock import patch, MagicMock
 
 from sqlery.compat import DatabaseBackend
 
-
 # ---------------------------------------------------------------------------
 # Helpers: FakeJob, MockBackend
 # ---------------------------------------------------------------------------
@@ -349,3 +348,15 @@ def test_job_fetch_found_standalone(standalone_backend):
     assert isinstance(job, Job)
     assert job.id == "42"
     assert job.get_status() == "success"
+
+
+def test_rq_retry_accepts_rqs_interval_keyword():
+    from sqlery.compat.rq import Retry
+
+    retry = Retry(max=3, interval=[1, 2, 4])
+    assert retry.max == 3
+    assert retry.intervals == [1, 2, 4]
+    assert Retry(3, 5).intervals == [5, 5, 5]
+    assert Retry(max=2).intervals == [0, 0]
+    # legacy keyword still works
+    assert Retry(max=2, intervals=[7, 8]).intervals == [7, 8]
