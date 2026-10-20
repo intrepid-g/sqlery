@@ -131,13 +131,11 @@ def process_event(event: dict, backend) -> dict:
         # mode is non-fatal.
         try:
             from sqlery.core.scheduler import Scheduler
-            sched = Scheduler()
-            if hasattr(sched, "run_once"):
-                enqueued = sched.run_once() or []
-                for j in enqueued:
-                    job_ids.append(getattr(j, "id", j))
+            sched = Scheduler(backend=backend)
+            for j in sched.run_due_tasks() or []:
+                job_ids.append(getattr(j, "id", j))
         except Exception:
-            logger.exception("lambda_core: scheduler run_once failed")
+            logger.exception("lambda_core: scheduler run_due_tasks failed")
 
     else:
         logger.warning(f"lambda_core: unknown action {action!r}")

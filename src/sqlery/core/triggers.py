@@ -310,7 +310,7 @@ def _dispatch_process_scheduled(payload: dict) -> TriggerResult:
     try:
         from sqlery.core.scheduler import Scheduler
         scheduler = Scheduler()
-        enqueued = scheduler.run_once() if hasattr(scheduler, "run_once") else []
+        enqueued = scheduler.run_due_tasks()
     except Exception as e:  # pragma: no cover
         logger.exception("scheduler dispatch failed inside HTTP trigger")
         return TriggerResult(500, {"error": str(e)})
