@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import BigInteger, Index, DateTime
+from sqlalchemy import BigInteger, ForeignKey, Index, DateTime
 
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.worker_admin import is_worker_beating
@@ -377,7 +377,11 @@ class Worker(SQLModel, table=True):
 
     # Status
     status: str = Field(default="idle", max_length=10, index=True, description="Worker status (idle/busy/dead)")
-    current_job_id: int | None = Field(default=None, foreign_key="sqlery_queued_job.id")
+    # BigInteger: standalone job ids are 62-bit (UUIDv7-derived), too big for INTEGER on PG.
+    current_job_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, ForeignKey("sqlery_queued_job.id"), nullable=True),
+    )
 
     # Configuration
     queues: list = Field(default_factory=list, sa_column=Column(JSON), description="List of queue names this worker handles")
