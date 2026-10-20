@@ -831,6 +831,10 @@ class WorkerProcess:
 
         return self.jobs_processed
 
+    # Parent wait-loop tick bounds (seconds) in _fork_and_execute.
+    WAIT_TICK_MIN = 0.005
+    WAIT_TICK_MAX = 0.5
+
     def _fork_and_execute(self, job) -> dict:
         """Fork a child process to execute the job.
 
@@ -894,6 +898,13 @@ class WorkerProcess:
         except (TypeError, ValueError):
             revoke_poll = 2.0
         last_revoke_check = time.monotonic()
+        # The wait starts with a few-ms sleep and backs off (doubling) to
+        # WAIT_TICK_MAX so trivial jobs are reaped promptly; the per-tick DB
+        # duties below run once the accumulated sleep reaches WAIT_TICK_MAX (the
+        # old 0.5 s cadence). Because 5+10+...+320 ms is the first total past
+        # 0.5 s, the first DB pass lands ~0.635 s into a job.
+        wait_sleep = self.WAIT_TICK_MIN
+        slept_since_duties = 0.0
 
         while not child_exited:
             try:
@@ -928,8 +939,13 @@ class WorkerProcess:
                 return {'success': False, 'error': f'Timeout after {int(elapsed)}s'}
 
             # Sleep briefly so parent stays responsive to signals
-            time.sleep(0.5)
+            time.sleep(wait_sleep)
+            slept_since_duties += wait_sleep
+            wait_sleep = min(wait_sleep * 2, self.WAIT_TICK_MAX)
             self._check_heartbeat()
+            if slept_since_duties < self.WAIT_TICK_MAX:
+                continue  # fast early tick: just re-poll waitpid
+            slept_since_duties = 0.0
             if revoke_poll > 0 and time.monotonic() - last_revoke_check >= revoke_poll:
                 last_revoke_check = time.monotonic()
                 try:
