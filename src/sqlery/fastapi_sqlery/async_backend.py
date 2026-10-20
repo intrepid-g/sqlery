@@ -22,6 +22,8 @@ table. Alembic migration will follow in a later plan.
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
@@ -134,6 +136,8 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         now = _utcnow()  # captured BEFORE await
         async with factory() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
+            owner_id = await self._registered_worker_id(session, worker_id)
+            owner = {"worker_id": owner_id, "worker_pid": os.getpid()} if owner_id else {}
             stmt = (
                 select(QueuedJob)
                 .where(QueuedJob.queue_name.in_(list(queues)))
@@ -153,6 +157,8 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 # Row is locked by SELECT FOR UPDATE; update inline.
                 job.status = "running"
                 job.started_at = now
+                for key, value in owner.items():
+                    setattr(job, key, value)
                 job.version = (job.version or 0) + 1
                 session.add(job)
                 await session.commit()
@@ -169,6 +175,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                     status="running",
                     started_at=now,
                     version=current_version + 1,
+                    **owner,
                 )
             )
             res = await session.execute(cas_stmt)
@@ -180,6 +187,83 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 select(QueuedJob).where(QueuedJob.id == job.id)
             )
             return refreshed.scalars().first()
+
+    @staticmethod
+    async def _registered_worker_id(session, worker_id) -> uuid.UUID | None:
+        """Return ``worker_id`` as a UUID if it names a registered Worker row, else ``None``.
+
+        Recording the owner on the claimed job lets the zombie sweep tell a live worker's
+        job from an orphan (dead worker / stale heartbeat) instead of by age alone.
+        """
+        try:
+            wid = worker_id if isinstance(worker_id, uuid.UUID) else uuid.UUID(str(worker_id))
+        except (ValueError, TypeError):
+            return None
+        res = await session.execute(select(Worker.id).where(Worker.id == wid))
+        return wid if res.first() else None
+
+    # ----- zombie sweep (async mirror of SQLAlchemyBackend liveness) -------
+
+    async def aget_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        """Async twin of ``SQLAlchemyBackend.get_running_jobs_for_liveness``."""
+        from sqlery.core.liveness import RunningJobLiveness
+        from sqlery.django_sqlery.friendly_name import uuid_to_friendly
+
+        def _aware(dt):
+            if dt is None:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            stmt = select(QueuedJob).where(QueuedJob.status == "running")
+            if queue_names:
+                stmt = stmt.where(QueuedJob.queue_name.in_(list(queue_names)))
+            jobs = list((await session.execute(stmt)).scalars().all())
+            worker_ids = {j.worker_id for j in jobs if j.worker_id is not None}
+            workers: dict[Any, Worker] = {}
+            if worker_ids:
+                res = await session.execute(select(Worker).where(Worker.id.in_(worker_ids)))
+                workers = {w.id: w for w in res.scalars().all()}
+
+        records = []
+        for job in jobs:
+            worker = workers.get(job.worker_id)
+            if worker is not None:
+                try:
+                    friendly = uuid_to_friendly(worker.id)
+                except (ValueError, TypeError):
+                    friendly = str(worker.id)
+            else:
+                friendly = None
+            records.append(
+                RunningJobLiveness(
+                    job_id=job.id,
+                    started_at=_aware(job.started_at),
+                    worker_pid=job.worker_pid,
+                    worker_node_id=worker.node_id if worker else None,
+                    worker_status=worker.status if worker else None,
+                    worker_current_job_id=worker.current_job_id if worker else None,
+                    worker_last_heartbeat=_aware(worker.last_heartbeat) if worker else None,
+                    worker_friendly_name=friendly,
+                    has_worker=worker is not None,
+                )
+            )
+        return records
+
+    async def afail_zombie_job(self, job_id, reason: str) -> bool:
+        """Async twin of ``SQLAlchemyBackend.fail_zombie_job`` (still-running jobs only)."""
+        factory = get_async_session_factory()
+        async with factory() as session:
+            res = await session.execute(select(QueuedJob).where(QueuedJob.id == job_id))
+            job = res.scalars().first()
+            if job is None or job.status != "running":
+                return False
+            job.mark_failed(error=reason, termination_reason="zombie_job")
+            job.version = (job.version or 0) + 1
+            session.add(job)
+            await session.commit()
+            return True
 
     # ----- terminal-status writes -----------------------------------------
 
