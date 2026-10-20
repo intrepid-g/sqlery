@@ -16,7 +16,6 @@ from rich.table import Table
 
 from ..compat import is_django_mode, get_backend, get_config, initialize as compat_initialize
 from ..crontab import parse_cron_string
-from ..triggers import trigger_due_tasks
 from .cleanup import CleanupManager
 from .daemon import DaemonManager
 
@@ -790,10 +789,17 @@ def tasks_run(
 ):
     """Trigger due scheduled tasks (or a specific task by name)."""
     # from ..compat import is_django_mode, get_backend  # moved to top-level
-    # from ..triggers import trigger_due_tasks  # moved to top-level
-
     if is_django_mode():
         console.print("[red]Error: Use 'python manage.py run_scheduled_tasks' in Django mode[/red]")
+        raise typer.Exit(1)
+
+    # Lazy: sqlery.triggers needs Django-only helpers, so keep it out of CLI import time
+    try:
+        from ..triggers import trigger_due_tasks
+    except ImportError as e:
+        console.print(
+            f"[red]Error: scheduled task triggering is unavailable in standalone mode: {e}[/red]"
+        )
         raise typer.Exit(1)
 
     if task_name:
