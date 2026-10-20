@@ -366,3 +366,120 @@ async def test_bind_task_gets_context_and_signals_fire(backend, make_job, sessio
     assert (done.status, done.output) == ("success", "7"), done.error
     assert isinstance(_bound_seen[-1], TaskContext)
     assert seen == ["pre", "SUCCESS"]
+
+
+# ---------------------------------------------------------------------------
+# Orphan recovery (#71)
+# ---------------------------------------------------------------------------
+
+
+async def _make_worker_row(session_factory, **kw) -> Worker:
+    import uuid
+
+    fields: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "node_id": "other-node",
+        "pid": 1,
+        "status": "idle",
+    }
+    fields.update(kw)
+    async with session_factory() as s:
+        row = Worker(**fields)
+        s.add(row)
+        await s.commit()
+        return row
+
+
+async def _status(session_factory, job_id) -> str:
+    async with session_factory() as s:
+        res = await s.execute(select(QueuedJob.status).where(QueuedJob.id == job_id))
+        return res.scalar_one()
+
+
+async def test_aclaim_job_records_registered_worker_on_job(backend, make_job, session_factory):
+    import os
+
+    worker = await _make_worker_row(session_factory)
+    job = await make_job()
+    claimed = await backend.aclaim_job(["default"], str(worker.id))
+    assert claimed.id == job.id
+    assert claimed.worker_id == worker.id
+    assert claimed.worker_pid == os.getpid()
+
+
+async def test_startup_sweep_fails_orphan_of_dead_worker(backend, make_job, session_factory):
+    from datetime import UTC, datetime
+
+    dead = await _make_worker_row(session_factory, status="dead")
+    orphan = await make_job(
+        status="running", started_at=datetime(2020, 1, 1, tzinfo=UTC), worker_id=dead.id
+    )
+    await AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01).run(max_polls=1)
+    assert await _status(session_factory, orphan.id) == "failed"
+
+
+async def test_startup_sweep_fails_orphan_of_stale_worker(backend, make_job, session_factory):
+    from datetime import UTC, datetime, timedelta
+
+    stale = await _make_worker_row(
+        session_factory, last_heartbeat=datetime.now(UTC) - timedelta(hours=1)
+    )
+    orphan = await make_job(
+        status="running", started_at=datetime(2020, 1, 1, tzinfo=UTC), worker_id=stale.id
+    )
+    await AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01).run(max_polls=1)
+    assert await _status(session_factory, orphan.id) == "failed"
+
+
+def _update_started(job_id, when):
+    from sqlalchemy import update
+
+    return update(QueuedJob).where(QueuedJob.id == job_id).values(started_at=when)
+
+
+async def test_sweep_spares_own_inflight_job_with_non_uuid_worker_id(
+    backend, make_job, session_factory
+):
+    """A worker that cannot register (non-UUID id) must not fail its own long-running job."""
+    from datetime import UTC, datetime, timedelta
+
+    job = await make_job()
+    me = AsyncWorker(backend=backend, queues=["default"], worker_id="wkr-x", poll_interval=0.01)
+    claimed = await backend.aclaim_job(["default"], me.worker_id)
+    assert claimed.id == job.id
+    async with session_factory() as s:
+        await s.execute(_update_started(claimed.id, datetime.now(UTC) - timedelta(hours=1)))
+        await s.commit()
+    me._inflight[claimed.id] = asyncio.ensure_future(asyncio.sleep(0))
+    await me._recover_orphans()
+    assert await _status(session_factory, claimed.id) == "running"
+    me._inflight.clear()
+    await me._recover_orphans()
+    assert await _status(session_factory, claimed.id) == "failed"
+
+
+async def test_sweep_spares_long_running_job_of_live_worker(backend, make_job, session_factory):
+    """A job older than WORKER_ALIVE_TIMEOUT owned by a live worker must survive the sweep."""
+    from datetime import UTC, datetime, timedelta
+
+    live = await _make_worker_row(
+        session_factory, node_id="other-node", last_heartbeat=datetime.now(UTC)
+    )
+    long_job = await make_job(
+        status="running",
+        started_at=datetime.now(UTC) - timedelta(hours=1),
+        worker_id=live.id,
+    )
+    # A second job claimed by a live async worker through the real claim path, then aged.
+    claimed_job = await make_job()
+    me = AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01)
+    await backend.aregister_worker(me.worker_id, {"node_id": "n", "pid": 1, "queues": []})
+    claimed = await backend.aclaim_job(["default"], str(me.worker_id))
+    assert claimed.id == claimed_job.id
+    async with session_factory() as s:
+        await s.execute(_update_started(claimed.id, datetime.now(UTC) - timedelta(hours=1)))
+        await s.commit()
+    await me._recover_orphans()
+    assert await _status(session_factory, long_job.id) == "running"
+    assert await _status(session_factory, claimed.id) == "running"
+

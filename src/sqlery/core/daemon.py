@@ -826,7 +826,7 @@ class DaemonManager:
     # Workers now run as independent subprocesses via worker_runner.
 
     @staticmethod
-    def _fail_zombie_running_jobs(backend, queue_names=None):
+    def _fail_zombie_running_jobs(backend, queue_names=None, concurrent_workers=False):
         """Fail running jobs that are no longer being executed.
 
         Mode-agnostic: operates on ``RunningJobLiveness`` records supplied by
@@ -844,6 +844,10 @@ class DaemonManager:
             backend: Database backend instance
             queue_names: If provided, only check jobs in these queues.
                          None means check all queues.
+            concurrent_workers: Set by async workers, which run many jobs at once, so a
+                worker's single ``current_job`` says nothing about the others (check 4 is
+                skipped), and a job without a worker is only a zombie once it has been
+                running longer than ``WORKER_ALIVE_TIMEOUT`` (claim→register window).
         """
         # Heartbeat stale threshold: the daemon sends SIGUSR1 every cycle
         # (~DAEMON_CHECK_INTERVAL seconds). If the worker can't respond for
@@ -873,6 +877,10 @@ class DaemonManager:
 
             # Check 2: running job has no worker assigned
             if not reason and not rec.has_worker:
+                if concurrent_workers and rec.started_at and rec.started_at >= now - timedelta(
+                    seconds=alive_timeout
+                ):
+                    continue
                 reason = "Running job has no worker assigned"
 
             # Check 3: assigned worker is marked dead
@@ -880,7 +888,12 @@ class DaemonManager:
                 reason = f"Assigned worker {rec.worker_friendly_name} is dead"
 
             # Check 4: worker moved on to a different job or is idle (this job is abandoned)
-            if not reason and rec.has_worker and rec.worker_current_job_id != rec.job_id:
+            if (
+                not reason
+                and rec.has_worker
+                and not concurrent_workers
+                and rec.worker_current_job_id != rec.job_id
+            ):
                 if rec.worker_current_job_id:
                     reason = (
                         f"Worker {rec.worker_friendly_name} moved on to job "
@@ -917,6 +930,7 @@ class DaemonManager:
 
         if failed_count > 0:
             logger.info(f"Cleaned up {failed_count} zombie running jobs")
+        return failed_count
 
     def _fail_orphaned_jobs_for_worker(self, backend, inline_worker_id):
         """Fail running jobs assigned to our worker from a previous process life.
