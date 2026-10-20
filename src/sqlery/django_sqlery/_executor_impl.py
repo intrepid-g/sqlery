@@ -535,6 +535,16 @@ class TaskExecutor:
                 logger.info(f"Reached max_jobs limit ({max_jobs})")
                 break
 
+            # Expire queued jobs past their ttl before claiming, as the daemon claim path
+            # does; otherwise run_jobs would happily run an already-expired job.
+            try:
+                from sqlery.compat import get_backend
+                from sqlery.core.claiming import expire_ttl_jobs
+
+                expire_ttl_jobs(get_backend())
+            except Exception as e:
+                logger.warning(f"TTL expiry failed, continuing to claim: {e}")
+
             # Atomically claim one job
             with transaction.atomic():
                 # Get next job (atomically locked via select_for_update)
