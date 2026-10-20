@@ -106,6 +106,13 @@ async def ainvoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dic
     body is awaited (coroutine functions) or off-loaded to a thread (sync functions), and
     blocking DB lookups never run on the event loop. The soft time limit is not armed: it relies
     on SIGALRM, which would interrupt every other in-flight job on the loop.
+
+    Note:
+        ``task_prerun`` / ``task_postrun`` / ``task_success`` / ``task_failure`` receivers and
+        the start of a ``bind=True`` context (``TaskContext.from_job``) run on the event loop.
+        A receiver that does Django ORM work must use async-safe APIs (``a``-prefixed queryset
+        methods, or ``sync_to_async``), since sync ORM calls raise ``SynchronousOnlyOperation``
+        inside a running loop and a blocking receiver stalls every in-flight job.
     """
     meta = getattr(job, "meta", None)
     if isinstance(meta, dict) and (meta.get("canvas") or {}).get("pass_result"):
