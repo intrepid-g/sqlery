@@ -1,30 +1,12 @@
 """DjangoAsyncBackend — native-async Django implementation of AsyncDatabaseBackend (ASYN-02).
 
-[ASSUMED — RESEARCH §A2 — transaction.aatomic availability]
-This module was implemented against Django 5.2.14. As of that release,
-`django.db.transaction.aatomic` is NOT available (`hasattr` check returned
-False). Per plan 02-04 the project rule forbids thread-offload helpers, so
-we adopt fallback option 1: drop to raw ``await connection.acursor()``
-with explicit ``BEGIN``/``COMMIT``/``ROLLBACK`` statements around the
-multi-statement claim sequence on PostgreSQL. SQLite uses a single-
-statement ``aupdate()`` CAS on the ``version`` column — atomic by virtue
-of being one statement — so no explicit transaction wrapper is required.
+Django has neither ``transaction.aatomic`` nor ``connection.acursor`` (checked on
+Django 5.2 and 6.x), so the multi-statement claim cannot be native async. ``aclaim_job``
+therefore runs the shared sync claiming algorithm through ``sync_to_async``; all other
+methods use the native async ORM (``aget``/``acreate``/``aupdate``/``adelete``/...).
 
-The project rule (plan 02-04) forbids wrapping sync ORM in a thread-
-offload helper from asgiref; this implementation uses native async ORM
-methods (``aget``/``acreate``/``aupdate``/``adelete``/``aupdate_or_create``
-/``afirst``/``async for``) and raw ``acursor()`` exclusively.
-
-[ASSUMED — version backfill]
-The SQLite claim path relies on every QueuedJob row having a non-NULL
-``version``. Tests apply a one-line idempotent backfill in
-``tests/test_django_async_backend.py``. The model declares
-``version = IntegerField(default=0)`` so newly-created rows are safe; only
-legacy/migrated rows would require this fixup in production.
-
-Concurrency contract:
-- PostgreSQL: ``SELECT ... FOR UPDATE SKIP LOCKED`` via raw acursor.
-- SQLite: optimistic ``version``-CAS via filter(pk, version).aupdate().
+Concurrency contract: see ``DjangoBackend.claim_job`` (PostgreSQL ``FOR UPDATE SKIP
+LOCKED``; SQLite optimistic ``version`` CAS).
 """
 
 from __future__ import annotations
@@ -97,98 +79,40 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
 
-        Postgres branch uses raw ``acursor()`` with ``FOR UPDATE SKIP LOCKED``.
-        SQLite branch uses optimistic locking on the ``version`` column.
-        Returns the claimed ``QueuedJob`` instance with status='running', or
-        ``None`` if nothing was available.
+        Runs the same claiming algorithm as the sync path
+        (``claim_next_job_with_queue_priority``: TTL expiry, dependency checks, tag limits,
+        ``SELECT FOR UPDATE SKIP LOCKED`` on PostgreSQL, version CAS on SQLite) through
+        ``sync_to_async``: Django has neither ``acursor`` nor ``transaction.aatomic``, so the
+        multi-statement claim cannot be native async.
+
+        Returns the claimed ``QueuedJob`` with status='running', or ``None`` if nothing
+        was available.
         """
-        now = timezone.now()  # capture BEFORE await (RESEARCH §9 pitfall)
+        from asgiref.sync import sync_to_async
 
-        if connection.vendor == "postgresql":
-            return await self._aclaim_job_postgres(queues, worker_id, now)
-        # SQLite (and any other vendor) → CAS retry loop.
-        return await self._aclaim_job_sqlite(queues, worker_id, now)
+        return await sync_to_async(self._claim_job_sync)(list(queues), worker_id)
 
-    async def _aclaim_job_postgres(
-        self, queues: list[str], worker_id: str, now
-    ) -> QueuedJob | None:
-        """Postgres claim path: raw SQL, SELECT FOR UPDATE SKIP LOCKED."""
-        sql = (
-            "SELECT id FROM sqlery_queued_job "
-            "WHERE queue_name = ANY(%s) AND status = 'queued' "
-            "  AND (scheduled_at IS NULL OR scheduled_at <= NOW()) "
-            "ORDER BY priority DESC, created_at "
-            "FOR UPDATE SKIP LOCKED LIMIT 1"
-        )
-        async with connection.acursor() as cur:
-            # Explicit BEGIN/COMMIT (no transaction.aatomic in Django 5.2).
-            await cur.execute("BEGIN")
-            try:
-                await cur.execute(sql, [list(queues)])
-                row = await cur.fetchone()
-                if row is None:
-                    await cur.execute("COMMIT")
-                    return None
-                job_id = row[0]
-                await cur.execute(
-                    "UPDATE sqlery_queued_job "
-                    "SET status='running', started_at=%s, version=version+1 "
-                    "WHERE id=%s",
-                    [now, job_id],
-                )
-                await cur.execute("COMMIT")
-            except Exception:
-                await cur.execute("ROLLBACK")
-                raise
-        # Old: return await QueuedJob.objects.aget(pk=job_id)
-        # pk is now a composite (created_at, id); look up by id only.
-        return await QueuedJob.objects.aget(id=job_id)
+    @staticmethod
+    def _claim_job_sync(queues: list[str], worker_id: str):
+        """Sync claim body for :meth:`aclaim_job`.
 
-    async def _aclaim_job_sqlite(
-        self, queues: list[str], worker_id: str, now
-    ) -> QueuedJob | None:
-        """SQLite claim path: optimistic version-CAS via single aupdate()."""
-        # Find a candidate (filtered by queue/status/scheduled_at).
-        qs = (
-            QueuedJob.objects.filter(
-                queue_name__in=list(queues),
-                status="queued",
-            )
-            .filter(scheduled_at__isnull=True)
-            .order_by("-priority", "created_at")
-        )
-        # Also include rows whose scheduled_at <= now.
-        # NOTE: Django's `|` on querysets short-circuits via UNION at SQL
-        # level; safer to do two filters and combine in Python via afirst().
-        job = await qs.afirst()
-        if job is None:
-            qs2 = (
-                QueuedJob.objects.filter(
-                    queue_name__in=list(queues),
-                    status="queued",
-                    scheduled_at__lte=now,
-                ).order_by("-priority", "created_at")
-            )
-            job = await qs2.afirst()
-        if job is None:
-            return None
+        Unlike ``DjangoBackend.claim_job`` this does not require ``worker_id`` to name a
+        registered Worker row (async workers use arbitrary ids); an unresolvable id claims
+        with ``worker=None``.
+        """
+        from django.db import transaction
 
-        rowcount = await QueuedJob.objects.filter(
-            # Old: pk=job.pk, version=job.version
-            # pk is now a composite (created_at, id); filter by id for clarity.
-            id=job.id, version=job.version
-        ).aupdate(
-            status="running",
-            version=(job.version or 0) + 1,
-            started_at=now,
-        )
-        if rowcount != 1:
-            # Lost CAS — another claimer won this row. Return None; the
-            # caller's poll loop will retry on the next tick.
-            return None
-        # Re-fetch to return current state.
-        # Old: return await QueuedJob.objects.aget(pk=job.pk)
-        return await QueuedJob.objects.aget(id=job.id)
+        from sqlery.core.claiming import claim_next_job_with_queue_priority
+
+        from .backend import DjangoBackend
+
+        backend = DjangoBackend()
+        try:
+            worker_row = backend._resolve_worker(str(worker_id))
+        except (ValueError, TypeError):
+            worker_row = None
+        with transaction.atomic():
+            return claim_next_job_with_queue_priority(worker_row, backend, queues=queues)
 
     # ----- cleanup routing (async mirror of DjangoBackend.cleanup_jobs) -----
 
