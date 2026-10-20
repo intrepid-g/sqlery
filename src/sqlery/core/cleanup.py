@@ -242,6 +242,12 @@ class CleanupManager:
                             'result': result
                         })
 
+        # Per-job result_ttl / failure_ttl (backends without support skip this)
+        if not _in_partition_mode and hasattr(self.backend, 'cleanup_per_job_ttl'):
+            result = self.backend.cleanup_per_job_ttl(dry_run=dry_run)
+            if result.get('deleted', 0) > 0 or result.get('would_delete', 0) > 0:
+                results['actions'].append({'action': 'cleanup_per_job_ttl', 'result': result})
+
         # Cleanup old registries
         auto_cleanup_registries = get_config('AUTO_CLEANUP_REGISTRIES', True)
         if auto_cleanup_registries:
