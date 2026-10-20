@@ -2,7 +2,7 @@
 
 Covers happy paths (async + sync job), failure path with traceback,
 retry-on-failure with max_retries > 0, and heartbeat updates between polls.
-Uses SQLAlchemyAsyncBackend on ``sqlite+aiosqlite:///:memory:``.
+Uses SQLAlchemyAsyncBackend on a temporary ``sqlite+aiosqlite`` file.
 """
 
 from __future__ import annotations
@@ -47,15 +47,33 @@ async def _async_job_boom() -> None:
     raise RuntimeError("kaboom")
 
 
+async def _async_nap(seconds: float = 0.3) -> str:
+    await asyncio.sleep(seconds)
+    return "done"
+
+
+async def _plus_one(previous: int) -> int:
+    return previous + 1
+
+
+_bound_seen: list[Any] = []
+
+
+async def _bound_task(ctx, x: int = 0) -> int:
+    _bound_seen.append(ctx)
+    return x
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
 @pytest_asyncio.fixture
-async def engine():
+async def engine(tmp_path):
+    # File-backed SQLite: concurrent sessions each need their own connection.
     _db_mod.reset_async_engine()
-    eng = _db_mod.get_async_engine("sqlite+aiosqlite:///:memory:")
+    eng = _db_mod.get_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'w.db'}")
     async with eng.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     yield eng
@@ -231,3 +249,98 @@ def test_no_signal_dot_signal_in_source():
     import sqlery.core.async_worker as mod
     src = inspect.getsource(mod)
     assert "signal.signal(" not in src, "Must use loop.add_signal_handler, not signal.signal()"
+
+
+async def test_jobs_run_concurrently(backend, make_job, session_factory):
+    """Four jobs that each await 0.3 s overlap on one worker instead of queueing up."""
+    import time
+
+    for _ in range(4):
+        await make_job(task_path=f"{__name__}._async_nap", kwargs={"seconds": 0.3})
+    worker = AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01)
+    started = time.monotonic()
+    await asyncio.wait_for(worker.run(max_jobs=4), timeout=10)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.9, f"jobs ran one after another ({elapsed:.2f}s)"
+    async with session_factory() as s:
+        rows = (await s.execute(select(QueuedJob))).scalars().all()
+    assert [r.status for r in rows] == ["success"] * 4
+
+
+async def test_concurrency_limit_is_respected(backend, make_job):
+    peak = 0
+    current = 0
+
+    class Probe(AsyncWorker):
+        async def _execute_job(self, job):
+            nonlocal peak, current
+            current += 1
+            peak = max(peak, current)
+            await asyncio.sleep(0.1)
+            await super()._execute_job(job)
+            current -= 1
+
+    for _ in range(6):
+        await make_job(task_path=f"{__name__}._async_nap", kwargs={"seconds": 0})
+    worker = Probe(backend=backend, queues=["default"], poll_interval=0.01, concurrency=2)
+    await asyncio.wait_for(worker.run(max_jobs=6), timeout=10)
+    assert peak == 2
+
+
+def test_concurrency_must_be_positive():
+    with pytest.raises(ValueError):
+        AsyncWorker(backend=object(), concurrency=0)
+
+
+async def test_chain_step_receives_upstream_result(
+    backend, make_job, session_factory, monkeypatch
+):
+    class _Result:
+        def __init__(self, job_id):
+            self.result = 1
+
+    monkeypatch.setattr("sqlery.core.result.AsyncResult", _Result)
+    upstream = await make_job(
+        task_path=f"{__name__}._async_nap", status="success", output="1", kwargs={}
+    )
+    step = await make_job(
+        task_path=f"{__name__}._plus_one",
+        kwargs={},
+        meta={"canvas": {"pass_result": "single"}},
+        dependencies=[upstream.id],
+    )
+    worker = AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01)
+    await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
+    async with session_factory() as s:
+        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == step.id))).scalars().first()
+    assert (row.status, row.output) == ("success", "2"), row.error
+
+
+async def test_bind_task_gets_context_and_signals_fire(backend, make_job, session_factory):
+    from sqlery.core.job import job as job_decorator
+    from sqlery.core.retry import TaskContext
+    from sqlery.core.signals import task_postrun, task_prerun
+
+    globals()["bound_job"] = job_decorator(bind=True)(_bound_task)
+    seen: list[str] = []
+
+    def pre(sender, **kw):
+        seen.append("pre")
+
+    def post(sender, **kw):
+        seen.append(kw["state"])
+
+    task_prerun.connect(pre)
+    task_postrun.connect(post)
+    try:
+        row = await make_job(task_path=f"{__name__}.bound_job", kwargs={"x": 7})
+        worker = AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01)
+        await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
+    finally:
+        task_prerun.disconnect(pre)
+        task_postrun.disconnect(post)
+    async with session_factory() as s:
+        done = (await s.execute(select(QueuedJob).where(QueuedJob.id == row.id))).scalars().first()
+    assert (done.status, done.output) == ("success", "7"), done.error
+    assert isinstance(_bound_seen[-1], TaskContext)
+    assert seen == ["pre", "SUCCESS"]
