@@ -211,23 +211,6 @@ async def test_async_e2e_django():
 
 @pytest.mark.postgres
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.xfail(
-    reason=(
-        "Real bug (found by this cell, not introduced by it): "
-        "DjangoAsyncBackend._aclaim_job_postgres "
-        "(src/sqlery/django_sqlery/async_backend.py:121) calls "
-        "`connection.acursor()`, which does not exist on Django's "
-        "DatabaseWrapper in any released version (confirmed absent on "
-        "Django 6.0.5 here; the module's own docstring assumed it against "
-        "5.2.14 but it was never verified against real PG until this test). "
-        "A correct fix needs either a sync_to_async thread-offload of "
-        "connection.cursor() (forbidden by the project rule documented in "
-        "this module's docstring) or a separate native-async psycopg "
-        "connection outside Django's ORM connection wrapper — both are "
-        "architectural decisions, not a quick-task fix."
-    ),
-    strict=True,
-)
 async def test_async_e2e_django_pg():
     """(async, django, postgres) — same cell as test_async_e2e_django, on the PG rail.
 
