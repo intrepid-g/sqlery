@@ -143,3 +143,28 @@ async def test_django_async_worker_runs_waiting_jobs_concurrently_pg():
 @pytest.mark.postgres
 async def test_django_async_worker_passes_upstream_results_to_chain_steps_pg():
     await _check_chain_passes_result()
+
+
+# --- orphan recovery (#71) -------------------------------------------------
+
+
+async def test_django_async_worker_fails_orphaned_running_job_at_startup():
+    from datetime import datetime, timezone
+
+    orphan = await _enqueue("one")
+    await QueuedJob.objects.filter(id=orphan.id).aupdate(
+        status="running", started_at=datetime(2020, 1, 1, tzinfo=timezone.utc), worker=None
+    )
+    await _run(max_polls=2)
+    assert (await QueuedJob.objects.aget(id=orphan.id)).status == "failed"
+
+
+async def test_django_async_worker_sweep_spares_fresh_and_live_jobs():
+    from datetime import datetime, timezone
+
+    fresh = await _enqueue("one")
+    await QueuedJob.objects.filter(id=fresh.id).aupdate(
+        status="running", started_at=datetime.now(timezone.utc), worker=None
+    )
+    await _run(max_polls=2)
+    assert (await QueuedJob.objects.aget(id=fresh.id)).status == "running"

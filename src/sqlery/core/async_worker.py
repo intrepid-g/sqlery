@@ -159,6 +159,8 @@ class AsyncWorker:
         self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()
+        await self._recover_orphans()
+        last_sweep = time.monotonic()
         jobs_started = 0
         polls = 0
         running: set[asyncio.Task] = set()
@@ -169,6 +171,9 @@ class AsyncWorker:
                 if max_jobs is not None and jobs_started >= max_jobs:
                     break
                 polls += 1
+                if time.monotonic() - last_sweep >= self._orphan_sweep_interval():
+                    last_sweep = time.monotonic()
+                    await self._recover_orphans()
                 try:
                     await self.backend.aupdate_heartbeat(self.worker_id)
                 except Exception as e:  # pragma: no cover - heartbeat is best-effort
@@ -393,6 +398,40 @@ class AsyncWorker:
                     logger.exception(f"Shutdown retry-requeue failed: {e}")
 
         self._inflight.pop(job_id, None)
+
+    # ------------------------------------------------------------ recovery
+
+    @staticmethod
+    def _orphan_sweep_interval() -> float:
+        from sqlery.compat import get_config
+
+        return float(get_config("WORKER_ALIVE_TIMEOUT", 30))
+
+    async def _recover_orphans(self) -> None:
+        """Fail ``running`` jobs whose worker died (e.g. ``kill -9``) without finishing them.
+
+        There is no daemon in async mode, so each worker runs the daemon's zombie sweep at
+        start-up and then periodically. Failing the row lets retries and interval
+        ``ScheduledTask`` enqueueing continue. Best-effort: never stops the worker.
+        """
+        try:
+            from sqlery.compat import get_backend
+
+            from .daemon import DaemonManager
+
+            def sweep() -> None:
+                DaemonManager._fail_zombie_running_jobs(
+                    get_backend(), list(self.queues), concurrent_workers=True
+                )
+
+            try:
+                from asgiref.sync import sync_to_async
+            except ImportError:  # standalone install without Django/asgiref
+                await asyncio.to_thread(sweep)
+            else:
+                await sync_to_async(sweep)()
+        except Exception as e:
+            logger.warning(f"Orphaned-job recovery failed: {e}")
 
     # ------------------------------------------------------------ registry
 
