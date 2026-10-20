@@ -900,9 +900,11 @@ class WorkerProcess:
         last_revoke_check = time.monotonic()
         # The wait starts with a few-ms sleep and backs off (doubling) to
         # WAIT_TICK_MAX so trivial jobs are reaped promptly; the per-tick DB
-        # duties below still run at the WAIT_TICK_MAX cadence, as before.
+        # duties below run once the accumulated sleep reaches WAIT_TICK_MAX (the
+        # old 0.5 s cadence). Because 5+10+...+320 ms is the first total past
+        # 0.5 s, the first DB pass lands ~0.635 s into a job.
         wait_sleep = self.WAIT_TICK_MIN
-        last_duties = time.monotonic()
+        slept_since_duties = 0.0
 
         while not child_exited:
             try:
@@ -938,11 +940,12 @@ class WorkerProcess:
 
             # Sleep briefly so parent stays responsive to signals
             time.sleep(wait_sleep)
+            slept_since_duties += wait_sleep
             wait_sleep = min(wait_sleep * 2, self.WAIT_TICK_MAX)
             self._check_heartbeat()
-            if time.monotonic() - last_duties < self.WAIT_TICK_MAX:
+            if slept_since_duties < self.WAIT_TICK_MAX:
                 continue  # fast early tick: just re-poll waitpid
-            last_duties = time.monotonic()
+            slept_since_duties = 0.0
             if revoke_poll > 0 and time.monotonic() - last_revoke_check >= revoke_poll:
                 last_revoke_check = time.monotonic()
                 try:
