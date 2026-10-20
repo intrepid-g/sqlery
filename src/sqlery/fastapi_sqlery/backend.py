@@ -1025,8 +1025,13 @@ class SQLAlchemyBackend(DatabaseBackend):
         status: str,
         current_job_id: int | None = None,
         jobs_processed: int | None = None,
+        total_busy_seconds: float | None = None,
     ):
-        """Update or create worker heartbeat."""
+        """Update or create worker heartbeat.
+
+        ``total_busy_seconds`` is accepted for parity with the Django backend (the worker
+        always sends it); the standalone worker table has no column for it, so it is ignored.
+        """
         # import socket  # moved to top-level
 
         with self._get_session() as session:
