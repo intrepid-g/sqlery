@@ -30,23 +30,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(init=False)
 class Retry:
-    """RQ-compatible Retry descriptor.
+    """RQ-compatible Retry descriptor (``Retry(max, interval=0)``).
 
     Args:
         max: Maximum number of retries.
-        intervals: List of seconds between retries (or a single int broadcast to all).
+        interval: Seconds between retries: a single int (broadcast to all retries)
+            or a list of seconds.
+        intervals: Backward-compatible alias for ``interval``.
     """
 
     max: int = 0
     intervals: list[int] = field(default_factory=lambda: [0])
 
-    def __post_init__(self):
-        if isinstance(self.intervals, int):
-            self.intervals = [self.intervals] * max(self.max, 1)
-        if not self.intervals:
-            self.intervals = [0]
+    def __init__(
+        self,
+        max: int = 0,
+        interval: int | list[int] = 0,
+        *,
+        intervals: int | list[int] | None = None,
+    ):
+        self.max = max
+        if intervals is not None:
+            interval = intervals
+        if isinstance(interval, int):
+            interval = [interval] * (max if max > 1 else 1)
+        self.intervals = list(interval) or [0]
 
 
 class JobStatus(str, Enum):
