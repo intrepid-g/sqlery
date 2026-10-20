@@ -25,6 +25,9 @@ console = Console()
 def worker_command(
     queues: str = typer.Option("default", "--queues", "-q", help="Comma-separated queue names"),
     max_jobs: int = typer.Option(0, "--max-jobs", "-m", help="Max jobs to process (0=unlimited)"),
+    database_url: str | None = typer.Option(
+        None, "--database-url", envvar="SQLERY_DATABASE_URL", help="Database URL"
+    ),
 ):
     """Run a standalone worker process."""
     # from ..compat import is_django_mode  # moved to top-level
@@ -39,6 +42,10 @@ def worker_command(
     console.print(f"[bold blue]Starting worker for queues: {', '.join(queue_list)}[/bold blue]")
 
     try:
+        if database_url:
+            from ..compat import initialize
+
+            initialize(database_url=database_url, enable_daemon=False)
         worker = Worker(queues=queue_list)
         worker.run(max_jobs=max_jobs)
     except KeyboardInterrupt:

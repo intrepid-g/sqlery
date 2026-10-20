@@ -14,7 +14,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 
-from ..compat import get_backend, get_config, JobFencingError
+from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
 from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task
@@ -545,6 +545,15 @@ class WorkerProcess:
         if backend is None:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
+            # Fresh standalone process (e.g. `sqlery worker`): nothing initialised the
+            # database yet, so do what core/worker_runner.py does and use the env URL.
+            database_url = os.environ.get("SQLERY_DATABASE_URL")
+            if database_url and is_standalone_mode():
+                from ..fastapi_sqlery import database as _standalone_db
+
+                if _standalone_db._engine is None:
+                    initialize(database_url=database_url, enable_daemon=False)
+                    backend = get_backend()
 
         self.backend = backend
         self.queues = queues or ['default']
@@ -575,8 +584,12 @@ class WorkerProcess:
         # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
         self._listen_conn = None
 
-    def run(self):
-        """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
+    def run(self, max_jobs: int | None = None):
+        """Run worker loop: claim jobs, fork children, monitor, heartbeat.
+
+        Args:
+            max_jobs: Stop after processing this many jobs (None or 0 = unlimited).
+        """
         # import sys  # moved to top-level
 
         # SEC-04 (W3): production-shaped + unset = one WARNING per worker run.
@@ -668,6 +681,8 @@ class WorkerProcess:
 
         try:
             while not self.shutdown_requested:
+                if max_jobs and self.jobs_processed >= max_jobs:
+                    break
                 try:
                     # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
                     # from django.db import close_old_connections  # moved to top-level (try/except)
