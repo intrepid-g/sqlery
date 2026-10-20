@@ -930,6 +930,7 @@ class DaemonManager:
 
         if failed_count > 0:
             logger.info(f"Cleaned up {failed_count} zombie running jobs")
+        return failed_count
 
     def _fail_orphaned_jobs_for_worker(self, backend, inline_worker_id):
         """Fail running jobs assigned to our worker from a previous process life.

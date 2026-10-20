@@ -431,6 +431,33 @@ async def test_startup_sweep_fails_orphan_of_stale_worker(backend, make_job, ses
     assert await _status(session_factory, orphan.id) == "failed"
 
 
+def _update_started(job_id, when):
+    from sqlalchemy import update
+
+    return update(QueuedJob).where(QueuedJob.id == job_id).values(started_at=when)
+
+
+async def test_sweep_spares_own_inflight_job_with_non_uuid_worker_id(
+    backend, make_job, session_factory
+):
+    """A worker that cannot register (non-UUID id) must not fail its own long-running job."""
+    from datetime import UTC, datetime, timedelta
+
+    job = await make_job()
+    me = AsyncWorker(backend=backend, queues=["default"], worker_id="wkr-x", poll_interval=0.01)
+    claimed = await backend.aclaim_job(["default"], me.worker_id)
+    assert claimed.id == job.id
+    async with session_factory() as s:
+        await s.execute(_update_started(claimed.id, datetime.now(UTC) - timedelta(hours=1)))
+        await s.commit()
+    me._inflight[claimed.id] = asyncio.ensure_future(asyncio.sleep(0))
+    await me._recover_orphans()
+    assert await _status(session_factory, claimed.id) == "running"
+    me._inflight.clear()
+    await me._recover_orphans()
+    assert await _status(session_factory, claimed.id) == "failed"
+
+
 async def test_sweep_spares_long_running_job_of_live_worker(backend, make_job, session_factory):
     """A job older than WORKER_ALIVE_TIMEOUT owned by a live worker must survive the sweep."""
     from datetime import UTC, datetime, timedelta
@@ -450,16 +477,9 @@ async def test_sweep_spares_long_running_job_of_live_worker(backend, make_job, s
     claimed = await backend.aclaim_job(["default"], str(me.worker_id))
     assert claimed.id == claimed_job.id
     async with session_factory() as s:
-        await s.execute(
-            _update_started(claimed.id, datetime.now(UTC) - timedelta(hours=1))
-        )
+        await s.execute(_update_started(claimed.id, datetime.now(UTC) - timedelta(hours=1)))
         await s.commit()
     await me._recover_orphans()
     assert await _status(session_factory, long_job.id) == "running"
     assert await _status(session_factory, claimed.id) == "running"
 
-
-def _update_started(job_id, when):
-    from sqlalchemy import update
-
-    return update(QueuedJob).where(QueuedJob.id == job_id).values(started_at=when)

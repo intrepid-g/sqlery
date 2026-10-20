@@ -113,6 +113,26 @@ class _SyncLivenessAdapter:
         return self._call(self._backend.afail_zombie_job(job_id, reason))
 
 
+class _SkipJobsBackend:
+    """Backend view for the zombie sweep that hides jobs this worker is running itself.
+
+    A worker whose id is not a UUID cannot register, so its claims carry no owner and the
+    sweep would otherwise fail its own live jobs once they outlive ``WORKER_ALIVE_TIMEOUT``.
+    """
+
+    def __init__(self, backend: Any, skip_ids: Any) -> None:
+        self._backend = backend
+        self._skip_ids = skip_ids
+
+    def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        records = self._backend.get_running_jobs_for_liveness(queue_names)
+        skip = set(self._skip_ids())
+        return [r for r in records if r.job_id not in skip]
+
+    def fail_zombie_job(self, job_id: Any, reason: str) -> bool:
+        return self._backend.fail_zombie_job(job_id, reason)
+
+
 class AsyncWorker:
     """Coroutine-based worker (one OS process, many in-flight asyncio jobs).
 
@@ -182,6 +202,7 @@ class AsyncWorker:
         await self._register()
         await self._recover_orphans()
         last_sweep = time.monotonic()
+        sweep_interval = self._orphan_sweep_interval()
         jobs_started = 0
         polls = 0
         running: set[asyncio.Task] = set()
@@ -192,7 +213,7 @@ class AsyncWorker:
                 if max_jobs is not None and jobs_started >= max_jobs:
                     break
                 polls += 1
-                if time.monotonic() - last_sweep >= self._orphan_sweep_interval():
+                if time.monotonic() - last_sweep >= sweep_interval:
                     last_sweep = time.monotonic()
                     await self._recover_orphans()
                 try:
@@ -450,10 +471,14 @@ class AsyncWorker:
 
                 sync_backend = get_backend()
 
+            sync_backend = _SkipJobsBackend(sync_backend, lambda: list(self._inflight))
+
             def sweep() -> None:
-                DaemonManager._fail_zombie_running_jobs(
+                failed = DaemonManager._fail_zombie_running_jobs(
                     sync_backend, queues, concurrent_workers=True
                 )
+                if failed:
+                    logger.info(f"AsyncWorker {self.worker_id} failed {failed} orphaned job(s)")
 
             if use_thread:
                 await asyncio.to_thread(sweep)

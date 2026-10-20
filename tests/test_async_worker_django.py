@@ -186,3 +186,20 @@ async def test_django_async_worker_sweep_spares_long_job_of_live_worker():
     )
     await worker._recover_orphans()
     assert (await QueuedJob.objects.aget(id=job.id)).status == "running"
+
+
+async def test_django_async_worker_sweep_spares_own_job_with_unresolvable_worker_id():
+    """A worker id that doesn't resolve to a Worker row claims with worker=None; the sweep
+    must not fail that worker's own in-flight job."""
+    from datetime import datetime, timedelta, timezone
+
+    job = await _enqueue("one")
+    worker = AsyncWorker(DjangoAsyncBackend(), ["default"], worker_id="wkr-x", poll_interval=0.05)
+    claimed = await worker.backend.aclaim_job(["default"], worker.worker_id)
+    assert claimed.id == job.id
+    await QueuedJob.objects.filter(id=job.id).aupdate(
+        started_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    worker._inflight[job.id] = asyncio.ensure_future(asyncio.sleep(0))
+    await worker._recover_orphans()
+    assert (await QueuedJob.objects.aget(id=job.id)).status == "running"
