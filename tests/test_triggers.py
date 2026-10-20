@@ -207,7 +207,7 @@ class TestDjangoTasksMode:
         task_kwargs = (
             {"enqueue_on_commit": False} if django_tasks_supports_enqueue_on_commit() else {}
         )
-        result = django_tasks_task(_run_queue_job, **task_kwargs).enqueue("test")
+        result = django_tasks_task(_run_queue_job.func, **task_kwargs).enqueue("test")
 
         job.refresh_from_db()
         assert job.status == "success"
@@ -319,3 +319,21 @@ class TestErrorHandling:
 
         with pytest.raises(Exception, match="Test error"):
             _enqueue_synchronously()
+
+
+@pytest.mark.skipif(not HAS_DJANGO_TASKS, reason="django-tasks not installed")
+class TestDjangoTasksWorkerResolution:
+    """A stored trigger task must resolve to a Task via its module_path (db_worker)."""
+
+    @pytest.mark.parametrize("attr", ["_queue_task", "_due_tasks_task"])
+    def test_module_path_resolves_to_task(self, attr):
+        from django.utils.module_loading import import_string
+        from django_tasks.base import Task
+
+        import sqlery.triggers as triggers
+
+        trigger_task = getattr(triggers, attr)
+        assert trigger_task is not None
+        resolved = import_string(trigger_task.module_path)
+        assert isinstance(resolved, Task)
+        assert resolved is trigger_task

@@ -132,6 +132,12 @@ if task is not None:
     try:
         _due_tasks_task = task(_run_due_tasks_job)
         _queue_task = task(_run_queue_job)
+        # django-tasks resolves a stored task with import_string(module_path) and requires a
+        # Task there, so the module attributes named by the functions must be the Tasks
+        # (db_worker otherwise fails with SuspiciousOperation). The plain functions stay
+        # reachable as ``_run_due_tasks_job.func`` / ``_run_queue_job.func``.
+        _run_due_tasks_job = _due_tasks_task
+        _run_queue_job = _queue_task
     except Exception as e:
         # A broken TASKS setting must not crash importers (middleware, CLI) of
         # modes that never use django-tasks; fall back to synchronous triggers.
