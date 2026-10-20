@@ -4,14 +4,14 @@ Provides web UI and REST API for job queue management.
 """
 
 import inspect
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Body
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ..compat import get_backend, is_standalone_mode
@@ -58,10 +58,13 @@ _REQUEST_FIRST = next(iter(inspect.signature(templates.TemplateResponse).paramet
 
 
 def _render(name: str, context: dict, status_code: int = 200):
-    """Render a template; supports the request-first (starlette 1.x) and legacy TemplateResponse forms."""
+    """Render a template using the request-first (starlette 1.x) or legacy TemplateResponse form."""
     if _REQUEST_FIRST:
-        return templates.TemplateResponse(context["request"], name, context, status_code=status_code)
+        return templates.TemplateResponse(
+            context["request"], name, context, status_code=status_code
+        )
     return templates.TemplateResponse(name, context, status_code=status_code)
+
 
 # Mount static files (if directory exists and has content)
 if STATIC_DIR.exists():
