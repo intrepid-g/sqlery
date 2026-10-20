@@ -11,6 +11,7 @@ import sys
 import traceback as tb
 import signal
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -119,8 +120,17 @@ class JobExecutor:
                 # from ..compat import get_config  # moved to top-level
                 job.timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
-            # Set up timeout
-            if job.timeout_seconds:
+            # Set up timeout. SIGALRM can only be installed from the main thread; threaded
+            # callers (e.g. an HTTP trigger under runserver/gthread) run without a hard timeout.
+            use_alarm = bool(job.timeout_seconds) and (
+                threading.current_thread() is threading.main_thread()
+            )
+            if job.timeout_seconds and not use_alarm:
+                logger.warning(
+                    f"Job {job.id} is running outside the main thread; the "
+                    f"{job.timeout_seconds}s hard timeout cannot be enforced"
+                )
+            if use_alarm:
                 def timeout_handler(signum, frame):
                     raise TimeoutError(
                         f"Job {job.id} exceeded timeout of {job.timeout_seconds} seconds"
@@ -166,7 +176,7 @@ class JobExecutor:
                 logger.info(f"Job {job.id} completed successfully")
 
             finally:
-                if job.timeout_seconds:
+                if use_alarm:
                     signal.alarm(0)
 
         except Exception as e:
