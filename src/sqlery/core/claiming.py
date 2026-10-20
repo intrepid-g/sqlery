@@ -131,6 +131,11 @@ def check_tag_rate_limits(job, tag_rate_limits: dict, backend) -> bool:
     return True
 
 
+def _is_lost_race(exc: Exception) -> bool:
+    """True if exc is an optimistic-lock/fencing conflict (another worker handled the job)."""
+    return type(exc).__name__ in ("ConcurrentModificationError", "JobFencingError")
+
+
 def check_job_dependencies(job) -> bool:
     """Check if all job dependencies have completed successfully.
 
@@ -149,10 +154,16 @@ def check_job_dependencies(job) -> bool:
     all_met, failed_deps = job.check_dependencies_met()
 
     if failed_deps:
-        job.mark_failed(
-            error=f"Dependencies failed: {failed_deps}",
-            termination_reason="dependency_failed"
-        )
+        try:
+            job.mark_failed(
+                error=f"Dependencies failed: {failed_deps}",
+                termination_reason="dependency_failed"
+            )
+        except Exception as e:
+            if not _is_lost_race(e):
+                raise
+            logger.debug(f"Job {job.id} was modified concurrently; skipping: {e}")
+            return False
         logger.info(f"Failed job {job.id} due to failed dependencies: {failed_deps}")
         return False
 
@@ -176,10 +187,16 @@ def expire_ttl_jobs(backend) -> int:
 
     expired_count = 0
     for job in expired_jobs:
-        job.mark_failed(
-            error=f"Job expired after {job.ttl}s in queue",
-            termination_reason="expired",
-        )
+        try:
+            job.mark_failed(
+                error=f"Job expired after {job.ttl}s in queue",
+                termination_reason="expired",
+            )
+        except Exception as e:
+            if not _is_lost_race(e):
+                raise
+            logger.debug(f"Job {job.id} was modified concurrently; skipping expiry: {e}")
+            continue
         expired_count += 1
         logger.info(f"Expired job {job.id} (ttl={job.ttl}s)")
 
