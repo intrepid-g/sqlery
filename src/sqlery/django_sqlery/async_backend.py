@@ -316,23 +316,21 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
 
     async def arequeue_retry(self, failed_job) -> None:
         """Insert a fresh ``queued`` row carrying the retry chain."""
-        retry_count = (getattr(failed_job, "retry_count", 0) or 0) + 1
-        backoff = float(getattr(failed_job, "retry_backoff", 1.0) or 1.0)
-        delay = backoff * (2 ** (retry_count - 1))
+        from sqlery.core.retry import retry_job_fields
+
+        fields, delay = retry_job_fields(failed_job)
         scheduled_at = timezone.now() + timedelta(seconds=delay)
 
-        await QueuedJob.objects.acreate(
-            task_path=failed_job.task_path,
-            kwargs=dict(failed_job.kwargs) if isinstance(failed_job.kwargs, dict) else {},
-            queue_name=getattr(failed_job, "queue_name", "default"),
-            priority=getattr(failed_job, "priority", 0) or 0,
-            status="queued",
-            parent_job_id=failed_job.id,
-            retry_count=retry_count,
-            max_retries=getattr(failed_job, "max_retries", 0) or 0,
-            retry_backoff=backoff,
-            scheduled_at=scheduled_at,
-        )
+        await QueuedJob.objects.acreate(status="queued", scheduled_at=scheduled_at, **fields)
+
+        # The failed attempt is superseded by the retry (as in the sync worker).
+        row = await QueuedJob.objects.filter(id=failed_job.id, status="failed").values(
+            "created_at"
+        ).afirst()
+        if row:
+            await QueuedJob.objects.filter(
+                id=failed_job.id, created_at=row["created_at"], status="failed"
+            ).aupdate(status="archived")
 
     # ----- registry --------------------------------------------------------
 
