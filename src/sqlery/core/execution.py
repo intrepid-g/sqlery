@@ -6,6 +6,8 @@ the ``task_prerun`` / ``task_success`` / ``task_failure`` / ``task_postrun`` sig
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import signal
 import traceback as tb
@@ -16,7 +18,7 @@ from .signals import task_failure, task_postrun, task_prerun, task_success
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SoftTimeLimitExceeded", "invoke_task"]
+__all__ = ["SoftTimeLimitExceeded", "ainvoke_task", "invoke_task"]
 
 
 class SoftTimeLimitExceeded(Exception):
@@ -93,5 +95,44 @@ def invoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dict) -> A
     task_success.send(sender, job=job, result=result)
     task_postrun.send(
         sender, job=job, args=tuple(args), kwargs=dict(kwargs), state="SUCCESS", retval=result
+    )
+    return result
+
+
+async def ainvoke_task(task_func: Any, job: Any, args: tuple | list, kwargs: dict) -> Any:
+    """Async counterpart of :func:`invoke_task` for the AsyncWorker.
+
+    Same upstream-result injection, ``bind=True`` context and lifecycle signals, but the task
+    body is awaited (coroutine functions) or off-loaded to a thread (sync functions), and
+    blocking DB lookups never run on the event loop. The soft time limit is not armed: it relies
+    on SIGALRM, which would interrupt every other in-flight job on the loop.
+    """
+    meta = getattr(job, "meta", None)
+    if isinstance(meta, dict) and (meta.get("canvas") or {}).get("pass_result"):
+        args = await asyncio.to_thread(_with_upstream_results, job, args)
+    else:
+        args = tuple(args)
+    sender = getattr(job, "task_path", "") or ""
+    task_prerun.send(sender, job=job, args=args, kwargs=dict(kwargs))
+    try:
+        inner = getattr(task_func, "func", task_func)
+        call_args = (
+            (TaskContext.from_job(job), *args) if getattr(task_func, "bind", False) else args
+        )
+        if inspect.iscoroutinefunction(inner):
+            result = await inner(*call_args, **kwargs)
+        else:
+            result = await asyncio.to_thread(inner, *call_args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+    except BaseException as exc:
+        task_failure.send(sender, job=job, exc=exc, traceback=tb.format_exc())
+        task_postrun.send(
+            sender, job=job, args=args, kwargs=dict(kwargs), state="FAILURE", retval=exc
+        )
+        raise
+    task_success.send(sender, job=job, result=result)
+    task_postrun.send(
+        sender, job=job, args=args, kwargs=dict(kwargs), state="SUCCESS", retval=result
     )
     return result

@@ -6,8 +6,10 @@ when ``AsyncStorageBackend`` was removed). Built directly on the new
 ``sqlery.core.worker``.
 
 Key design points:
-- Async-defined jobs run as ``asyncio.create_task(coro)``; sync-defined jobs
-  are off-loaded via ``loop.run_in_executor(None, fn, *args, **kwargs)``.
+- Up to ``concurrency`` claimed jobs run at once, each as its own asyncio task.
+- Every job body goes through :func:`sqlery.core.execution.ainvoke_task` (upstream results,
+  ``bind=True`` context, task signals). Async-defined jobs are awaited; sync-defined jobs
+  are off-loaded to a thread.
 - Signal handling uses ``loop.add_signal_handler`` — NEVER ````signal.signal`` (the sync API)``
   (which races with the event loop, RESEARCH §9 pitfall).
 - On SIGTERM / SIGINT polling stops, and for each in-flight job the worker
@@ -25,7 +27,6 @@ Key design points:
 from __future__ import annotations
 
 import asyncio
-import importlib
 import logging
 import os
 import signal
@@ -100,6 +101,7 @@ class AsyncWorker:
         worker_id: Optional explicit worker id; auto-generated via uuid7 by
             default.
         poll_interval: Sleep seconds between empty polls. Default 1.0.
+        concurrency: Maximum number of jobs in flight at once. Default 10.
         shutdown_deadline_seconds: Grace period for in-flight jobs on
             SIGTERM/SIGINT. Default reads ``$SQLERY_ASYNC_SHUTDOWN_DEADLINE_SECONDS``
             or 60.
@@ -112,9 +114,13 @@ class AsyncWorker:
         worker_id: str | None = None,
         poll_interval: float = 1.0,
         shutdown_deadline_seconds: int | float | None = None,
+        concurrency: int = 10,
     ) -> None:
         if backend is None:
             raise ValueError("backend is required")
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        self.concurrency = int(concurrency)
         self.backend = backend
         self.queues: list[str] = list(queues or ["default"])
         self.worker_id = worker_id or _generate_worker_id()
@@ -131,7 +137,7 @@ class AsyncWorker:
 
         self._shutting_down: bool = False
         self._shutdown_event: asyncio.Event | None = None
-        # Map of job_id -> asyncio.Task for in-flight jobs (currently single-job).
+        # Map of job_id -> asyncio.Task for in-flight jobs (up to ``concurrency``).
         self._inflight: dict[Any, asyncio.Task] = {}
 
     # ------------------------------------------------------------------ run
@@ -153,19 +159,27 @@ class AsyncWorker:
         self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()
-        jobs_done = 0
+        jobs_started = 0
         polls = 0
+        running: set[asyncio.Task] = set()
         try:
             while not self._shutting_down:
                 if max_polls is not None and polls >= max_polls:
                     break
-                if max_jobs is not None and jobs_done >= max_jobs:
+                if max_jobs is not None and jobs_started >= max_jobs:
                     break
                 polls += 1
                 try:
                     await self.backend.aupdate_heartbeat(self.worker_id)
                 except Exception as e:  # pragma: no cover - heartbeat is best-effort
                     logger.warning(f"Heartbeat update failed: {e}")
+
+                if len(running) >= self.concurrency:
+                    # At capacity: wait for a slot (or the next heartbeat tick).
+                    await asyncio.wait(
+                        running, timeout=self.poll_interval, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    continue
 
                 try:
                     job = await self.backend.aclaim_job(self.queues, self.worker_id)
@@ -178,9 +192,14 @@ class AsyncWorker:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                await self._execute_job(job)
-                jobs_done += 1
+                runner = asyncio.create_task(self._execute_job(job))
+                running.add(runner)
+                runner.add_done_callback(running.discard)
+                jobs_started += 1
         finally:
+            # Let started jobs finish (or hand over to the drain on shutdown).
+            if running:
+                await asyncio.gather(*list(running), return_exceptions=True)
             # On shutdown, drain in-flight jobs with deadline (Task 2 logic).
             if self._shutting_down and self._inflight:
                 await self._drain_with_deadline()
@@ -195,22 +214,20 @@ class AsyncWorker:
         """Dispatch a single claimed job. Cooperates with shutdown drain."""
         job_id = job.id
         try:
-            func = _load_task(job.task_path)
+            from .utils import import_task
+
+            func = import_task(job.task_path)
             args, kwargs = _deserialize_kwargs(getattr(job, "kwargs", {}))
         except Exception as e:
             tb = tb_module.format_exc()
             await self.backend.amark_failed(job_id, error=str(e), traceback=tb)
             return
 
-        loop = asyncio.get_running_loop()
-        if asyncio.iscoroutinefunction(func):
-            task = asyncio.create_task(func(*args, **kwargs))
-        else:
-            # Sync function: offload to default executor (thread pool).
-            def _runner() -> Any:
-                return func(*args, **kwargs)
+        from .execution import ainvoke_task
+        from .worker import _current_job_var
 
-            task = asyncio.ensure_future(loop.run_in_executor(None, _runner))
+        _current_job_var.set(job)  # per-task context; visible to the job body
+        task = asyncio.create_task(ainvoke_task(func, job, args, kwargs))
 
         self._inflight[job_id] = task
 
