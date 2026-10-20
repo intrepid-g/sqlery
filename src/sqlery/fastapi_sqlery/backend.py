@@ -1234,6 +1234,41 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             return {"deleted": total_deleted, "count": total_deleted}
 
+    def cleanup_per_job_ttl(self, dry_run: bool = False) -> dict:
+        """Delete finished jobs whose per-job result_ttl / failure_ttl has elapsed.
+
+        A TTL of None or -1 keeps the job forever (RQ semantics).
+        """
+        now = datetime.now(UTC)
+        total = 0
+        with self._get_session() as session:
+            for statuses, ttl_col in (
+                (["success"], QueuedJob.result_ttl),
+                (["failed", "archived"], QueuedJob.failure_ttl),
+            ):
+                rows = session.exec(
+                    select(QueuedJob.id, QueuedJob.finished_at, ttl_col).where(
+                        QueuedJob.status.in_(statuses),
+                        ttl_col.is_not(None),
+                        ttl_col != -1,
+                        QueuedJob.finished_at.is_not(None),
+                    )
+                ).all()
+                expired = [
+                    job_id
+                    for job_id, finished_at, ttl in rows
+                    # SQLite returns naive datetimes; treat them as UTC.
+                    if (finished_at if finished_at.tzinfo else finished_at.replace(tzinfo=UTC))
+                    + timedelta(seconds=ttl)
+                    < now
+                ]
+                total += len(expired)
+                if expired and not dry_run:
+                    session.exec(delete(QueuedJob).where(QueuedJob.id.in_(expired)))
+            if not dry_run:
+                session.commit()
+        return {"deleted" if not dry_run else "would_delete": total}
+
     def cleanup_jobs_by_count(
         self,
         status: str | None = None,
