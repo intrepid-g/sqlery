@@ -197,5 +197,6 @@ def _process_queue_synchronously(queue_name: str | None = None):
     # from .executor import TaskExecutor  # moved to top-level
 
     executor = TaskExecutor()
-    executor.run_queue_workers(queue_name=queue_name)
+    # once=True: never spawn a run_jobs subprocess for the next job; one job per trigger.
+    executor.run_queue_workers(queue_name=queue_name, once=True, max_jobs=1)
     logger.info("Processed queue synchronously")
