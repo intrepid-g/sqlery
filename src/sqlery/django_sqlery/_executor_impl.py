@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -451,7 +452,13 @@ class TaskExecutor:
         )
         scheduled_at = timezone.now() + timedelta(seconds=delay_seconds)
 
-        # Create new job for retry (job_name=None to avoid unique constraint collision)
+        # Name the retry "<base>:retry:<n>" (same as core/worker.py) so it stays findable by
+        # name and cannot collide with the failed attempt's unique job_name.
+        retry_job_name = None
+        if failed_job.job_name:
+            base_name = re.sub(r":retry:\d+", "", failed_job.job_name)
+            retry_job_name = f"{base_name}:retry:{failed_job.retry_count + 1}"
+
         retry_job = QueuedJob.objects.create(
             task_path=failed_job.task_path,
             kwargs=failed_job.kwargs.copy() if isinstance(failed_job.kwargs, dict) else {},
@@ -477,7 +484,7 @@ class TaskExecutor:
             parent_job_id=failed_job.id,
             scheduled_at=scheduled_at,
             runs=failed_job.runs.copy() if isinstance(failed_job.runs, list) else [],
-            job_name=None,
+            job_name=retry_job_name,
         )
 
         logger.info(
