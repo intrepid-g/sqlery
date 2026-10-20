@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- `AsyncWorker` now keeps up to `concurrency` jobs in flight (default 10, new constructor argument) as documented, instead of running one at a time, so I/O-bound coroutine jobs overlap on a single worker. Its jobs also go through `invoke_task` semantics (new `ainvoke_task`): chain/chord steps built with `.s()` receive the upstream result, `bind=True` tasks get a `TaskContext`, and `task_prerun`/`task_postrun`/`task_success`/`task_failure` fire. Signal receivers run on the event loop, so ORM work in them must be async-safe.
+
 ## [0.25.0] - 2026-10-15
 
 ### Upgrade notes
