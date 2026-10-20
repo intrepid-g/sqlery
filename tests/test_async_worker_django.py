@@ -32,6 +32,10 @@ async def plus_one(previous: int) -> int:
     return previous + 1
 
 
+async def boom() -> None:
+    raise RuntimeError("boom")
+
+
 _bound_seen: list[Any] = []
 
 
@@ -71,6 +75,30 @@ async def _check_chain_passes_result() -> None:
     await _run(max_jobs=2)
     last = await QueuedJob.objects.order_by("-created_at").afirst()
     assert (last.status, last.output) == ("success", "2"), (last.status, last.error)
+
+
+async def _check_retry_keeps_spec() -> None:
+    first = await QueuedJob.objects.acreate(
+        task_path=f"{__name__}.boom", kwargs={}, queue_name="default", status="queued",
+        job_name="my-job", max_retries=1, retry_backoff=0.1, failure_ttl=60, result_ttl=60,
+        tags=["t"], meta={"k": "v"}, dependencies=[], retry_intervals=[0.1],
+    )
+    await _run(max_jobs=1)
+    first = await QueuedJob.objects.aget(id=first.id)
+    retry = await QueuedJob.objects.aget(parent_job_id=first.id)
+    assert (retry.job_name, retry.failure_ttl, retry.result_ttl) == ("my-job:retry:1", 60, 60)
+    assert (retry.tags, retry.meta, retry.retry_intervals) == (["t"], {"k": "v"}, [0.1])
+    assert retry.retry_count == 1
+    assert first.status == "archived"
+
+
+async def test_django_async_retry_keeps_spec_and_archives_failed_attempt():
+    await _check_retry_keeps_spec()
+
+
+@pytest.mark.postgres
+async def test_django_async_retry_keeps_spec_and_archives_failed_attempt_pg():
+    await _check_retry_keeps_spec()
 
 
 async def test_django_async_worker_runs_waiting_jobs_concurrently():

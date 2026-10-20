@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,7 @@ __all__ = [
     "get_retry_policy",
     "policy_allows_retry",
     "retry_countdown",
+    "retry_job_fields",
     "shape_retry_delay",
 ]
 
@@ -156,3 +158,50 @@ def shape_retry_delay(delay: float, job: Any, *, countdown: float | None = None)
     if policy.jitter and not _global_jitter():
         delay = random.uniform(0, delay)  # (global RETRY_JITTER already jittered upstream)
     return delay
+
+
+def retry_job_fields(failed_job: Any) -> tuple[dict[str, Any], float]:
+    """Job-spec columns for the retry row of ``failed_job``, plus its delay in seconds.
+
+    Mirrors ``JobExecutor._retry_job`` for backends that insert the row themselves (the async
+    backends): ``job_name`` becomes ``<name>:retry:<n>``, and TTLs, dependencies, tags, meta,
+    retry intervals and callbacks carry over. Excludes ``status`` and ``scheduled_at``.
+    """
+    retry_count = getattr(failed_job, "retry_count", None) or 0
+    backoff = float(getattr(failed_job, "retry_backoff", None) or 1.0)
+    intervals = getattr(failed_job, "retry_intervals", None)
+    if intervals:
+        delay = float(intervals[min(retry_count, len(intervals) - 1)])
+    else:
+        delay = backoff * (2**retry_count)
+
+    original_name = getattr(failed_job, "job_name", None)
+    retry_name = None
+    if original_name:
+        # Strip every ":retry:N" segment (may sit mid-name), then append the next one.
+        base_name = re.sub(r":retry:\d+", "", original_name)
+        retry_name = f"{base_name}:retry:{retry_count + 1}"
+
+    kwargs = failed_job.kwargs
+    fields = {
+        "task_path": failed_job.task_path,
+        "kwargs": dict(kwargs) if isinstance(kwargs, dict) else {},
+        "queue_name": getattr(failed_job, "queue_name", "default"),
+        "priority": getattr(failed_job, "priority", 0) or 0,
+        "parent_job_id": failed_job.id,
+        "retry_count": retry_count + 1,
+        "max_retries": getattr(failed_job, "max_retries", 0) or 0,
+        "retry_backoff": backoff,
+        "allow_parallel": bool(getattr(failed_job, "allow_parallel", False)),
+        "timeout_seconds": getattr(failed_job, "timeout_seconds", None),
+        "job_name": retry_name,
+        "retry_intervals": intervals,
+        "dependencies": list(getattr(failed_job, "dependencies", None) or []),
+        "tags": list(getattr(failed_job, "tags", None) or []),
+        "meta": getattr(failed_job, "meta", None),
+        "on_success_path": getattr(failed_job, "on_success_path", "") or "",
+        "on_failure_path": getattr(failed_job, "on_failure_path", "") or "",
+        "result_ttl": getattr(failed_job, "result_ttl", None),
+        "failure_ttl": getattr(failed_job, "failure_ttl", None),
+    }
+    return fields, delay

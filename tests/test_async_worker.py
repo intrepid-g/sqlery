@@ -220,6 +220,28 @@ async def test_failure_with_max_retries_requeues(backend, make_job, session_fact
     assert retry.max_retries == 2
 
 
+async def test_retry_keeps_job_spec_and_archives_failed_attempt(
+    backend, make_job, session_factory
+):
+    job = await make_job(
+        task_path=f"{__name__}._async_job_boom", kwargs={}, max_retries=1,
+        job_name="my-job", failure_ttl=60, result_ttl=60, tags=["t"], meta={"k": "v"},
+        retry_intervals=[0.1],
+    )
+    worker = AsyncWorker(
+        backend=backend, queues=["default"], worker_id="wkr-spec", poll_interval=0.01
+    )
+    await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(QueuedJob))).scalars().all()
+    first = next(r for r in rows if r.id == job.id)
+    retry = next(r for r in rows if r.parent_job_id == job.id)
+    assert (retry.job_name, retry.failure_ttl, retry.result_ttl) == ("my-job:retry:1", 60, 60)
+    assert (retry.tags, retry.meta, retry.retry_intervals) == (["t"], {"k": "v"}, [0.1])
+    assert first.status == "archived"
+
+
 async def test_heartbeat_updates_between_polls(backend, session_factory):
     # Spy on aupdate_heartbeat to confirm it's called once per poll cycle.
     import uuid
