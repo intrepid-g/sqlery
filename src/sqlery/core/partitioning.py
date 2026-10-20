@@ -182,26 +182,20 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
 
     created = 0
     try:
-        sub_daily = _is_sub_daily_interval(interval_str)
-        if sub_daily:
+        if _is_sub_daily_interval(interval_str):
             # Anchor at the current interval bucket (epoch-aligned), not at midnight, so the
             # first partition contains now().
-            cur.execute(
+            lo_sql = (
                 "SELECT to_timestamp(floor(extract(epoch FROM now())"
-                " / extract(epoch FROM %s::interval))"
-                " * extract(epoch FROM %s::interval))",
-                [interval_str, interval_str],
+                " / extract(epoch FROM %(iv)s::interval))"
+                " * extract(epoch FROM %(iv)s::interval))"
+                " + (%(i)s * %(iv)s::interval)"
             )
-            (base,) = cur.fetchone()
         else:
-            cur.execute("SELECT date_trunc('day', now())")
-            (base,) = cur.fetchone()
+            lo_sql = "SELECT date_trunc('day', now()) + (%(i)s * %(iv)s::interval)"
         existing = _list_partition_ranges(cur, table)
         for i in range(premake + 1):
-            cur.execute(
-                "SELECT %s::timestamptz + (%s * %s::interval)",
-                [base, i, interval_str],
-            )
+            cur.execute(lo_sql, {"i": i, "iv": interval_str})
             (lo,) = cur.fetchone()
             # Compute hi in Python to avoid an extra round-trip
             cur.execute(
