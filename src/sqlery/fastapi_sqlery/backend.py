@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend, JobFencingError, get_config
+from ..crontab import next_cron_occurrence
 from ..core.models import QueuedJob, ScheduledJob, ScheduledTask, JobRegistry, Worker, DaemonLease
 from .database import get_engine, get_session
 
@@ -978,7 +979,10 @@ class SQLAlchemyBackend(DatabaseBackend):
         priority: int,
         enabled: bool = True,
     ):
-        """Create a new scheduled task."""
+        """Create a new scheduled task.
+
+        ``next_run_at`` is initialised to the next cron occurrence so the task becomes due.
+        """
         task = ScheduledTask(
             name=name,
             task_path=task_path,
@@ -986,6 +990,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             queue_name=queue_name,
             priority=priority,
             enabled=enabled,
+            next_run_at=next_cron_occurrence(cron_expression, datetime.now(UTC)),
         )
 
         with self._get_session() as session:
