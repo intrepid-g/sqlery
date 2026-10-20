@@ -33,6 +33,7 @@ ADVISORY_LOCK_RECLAIM: int = int.from_bytes(b"SQLERCLA", "big")  # partition rec
 
 # Regex to extract the TO ('...') timestamp from a partition bound expression.
 _BOUND_TO_RE = re.compile(r"TO \('([^']+)'\)")
+_BOUND_FROM_RE = re.compile(r"FROM \('([^']+)'\)")
 
 # Regex to detect sub-daily interval strings (hours or minutes).
 _SUB_DAILY_RE = re.compile(r'\b(hour|minute)s?\b', re.IGNORECASE)
@@ -85,6 +86,27 @@ def _list_partitions(cur, table: str) -> list[tuple[str, datetime | None]]:
     return result
 
 
+def _list_partition_ranges(cur, table: str) -> list[tuple[datetime, datetime]]:
+    """Return (lower, upper) bounds for every range child partition of *table*."""
+    cur.execute(
+        """
+        SELECT pg_get_expr(c.relpartbound, c.oid)
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        WHERE i.inhparent = %s::regclass
+        """,
+        [table],
+    )
+    ranges: list[tuple[datetime, datetime]] = []
+    for (expr,) in cur.fetchall():
+        match = _BOUND_FROM_RE.search(expr or "")
+        lower = _parse_ts(match.group(1)) if match else None
+        upper = _parse_upper_bound(expr)
+        if lower is not None and upper is not None:
+            ranges.append((lower, upper))
+    return ranges
+
+
 def _parse_upper_bound(expr: str) -> datetime | None:
     """Parse the TO timestamp from a partition bound expression.
 
@@ -95,7 +117,11 @@ def _parse_upper_bound(expr: str) -> datetime | None:
     match = _BOUND_TO_RE.search(expr)
     if not match:
         return None
-    ts_str = match.group(1)
+    return _parse_ts(match.group(1))
+
+
+def _parse_ts(ts_str: str) -> datetime | None:
+    """Parse a timestamp literal from a partition bound expression."""
     # Parse ISO-style timestamps; handle +00 suffix variants.
     # Try common formats produced by pg_get_expr.
     for fmt in (
@@ -131,7 +157,7 @@ def _parse_upper_bound(expr: str) -> datetime | None:
 
 
 def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -> int:
-    """Create the next *premake + 1* daily partitions of *table* if absent.
+    """Create the next *premake + 1* partitions of *table* if absent.
 
     Uses pg_try_advisory_lock so concurrent daemons skip rather than race.
     Catches the attach-conflict error (rows in DEFAULT overlapping the new
@@ -156,10 +182,25 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
 
     created = 0
     try:
+        sub_daily = _is_sub_daily_interval(interval_str)
+        if sub_daily:
+            # Anchor at the current interval bucket (epoch-aligned), not at midnight, so the
+            # first partition contains now().
+            cur.execute(
+                "SELECT to_timestamp(floor(extract(epoch FROM now())"
+                " / extract(epoch FROM %s::interval))"
+                " * extract(epoch FROM %s::interval))",
+                [interval_str, interval_str],
+            )
+            (base,) = cur.fetchone()
+        else:
+            cur.execute("SELECT date_trunc('day', now())")
+            (base,) = cur.fetchone()
+        existing = _list_partition_ranges(cur, table)
         for i in range(premake + 1):
             cur.execute(
-                "SELECT date_trunc('day', now()) + (%s * %s::interval)",
-                [i, interval_str],
+                "SELECT %s::timestamptz + (%s * %s::interval)",
+                [base, i, interval_str],
             )
             (lo,) = cur.fetchone()
             # Compute hi in Python to avoid an extra round-trip
@@ -172,6 +213,11 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
             # Sub-daily intervals need time precision to avoid same-day name collisions (WR-01).
             _suffix_fmt = "%Y%m%d_%H%M" if _is_sub_daily_interval(interval_str) else "%Y%m%d"
             name = table + "_" + lo.strftime(_suffix_fmt)
+            # Skip ranges already covered by an existing partition (e.g. the daily partitions
+            # created by migration 0030): CREATE ... PARTITION OF would fail with an overlap
+            # error and abort the surrounding transaction.
+            if any(elo < hi and lo < ehi for elo, ehi in existing):
+                continue
             try:
                 cur.execute(
                     pgsql.SQL(
@@ -185,6 +231,7 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
                     [lo, hi],
                 )
                 created += 1
+                existing.append((lo, hi))
             # Old: except Exception as exc: if not isinstance(exc, psycopg.DatabaseError): raise
             # Re-raise connection-level errors so callers see real failures (WR-03).
             except (psycopg.OperationalError, psycopg.InterfaceError):
