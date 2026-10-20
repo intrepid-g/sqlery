@@ -6,6 +6,7 @@ as a separate subprocess. It works in both Django and standalone modes.
 The worker runs persistently, polling for jobs until terminated by the daemon.
 """
 
+import json
 import sys
 import os
 
@@ -48,7 +49,18 @@ def main():
     from sqlery.core.worker import WorkerProcess
 
     # Get queue configuration
-    queues = get_config('WORKER_QUEUES', ['default'])
+    # The spawning pool passes its queues via env (may differ from settings, e.g. rqworker).
+    queues = None
+    env_queues = os.environ.get('SQLERY_WORKER_QUEUES')
+    if env_queues:
+        try:
+            parsed = json.loads(env_queues)
+            if isinstance(parsed, list) and parsed and all(isinstance(q, str) for q in parsed):
+                queues = parsed
+        except ValueError:
+            pass
+    if queues is None:
+        queues = get_config('WORKER_QUEUES', ['default'])
 
     # Create and run persistent worker (blocks until SIGTERM/SIGINT)
     worker = WorkerProcess(queues=queues)
