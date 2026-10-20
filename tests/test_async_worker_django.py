@@ -168,3 +168,21 @@ async def test_django_async_worker_sweep_spares_fresh_and_live_jobs():
     )
     await _run(max_polls=2)
     assert (await QueuedJob.objects.aget(id=fresh.id)).status == "running"
+
+
+async def test_django_async_worker_sweep_spares_long_job_of_live_worker():
+    """A job older than WORKER_ALIVE_TIMEOUT claimed by a live async worker survives."""
+    from datetime import datetime, timedelta, timezone
+
+    job = await _enqueue("one")
+    worker = AsyncWorker(DjangoAsyncBackend(), ["default"], poll_interval=0.05)
+    await worker.backend.aregister_worker(
+        worker.worker_id, {"node_id": "n", "pid": 1, "status": "busy", "queues": ["default"]}
+    )
+    claimed = await worker.backend.aclaim_job(["default"], str(worker.worker_id))
+    assert claimed.id == job.id
+    await QueuedJob.objects.filter(id=job.id).aupdate(
+        started_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    await worker._recover_orphans()
+    assert (await QueuedJob.objects.aget(id=job.id)).status == "running"

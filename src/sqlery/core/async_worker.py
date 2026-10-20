@@ -92,6 +92,27 @@ def _deserialize_kwargs(kwargs: Any) -> tuple[tuple, dict]:
     return (kwargs,), {}
 
 
+class _SyncLivenessAdapter:
+    """Sync view of an async backend's liveness methods, for the daemon's zombie sweep.
+
+    The sweep runs in a helper thread; each call is marshalled back onto the worker's
+    event loop so the async backend's sessions stay on the loop that created them.
+    """
+
+    def __init__(self, backend: Any, loop: asyncio.AbstractEventLoop) -> None:
+        self._backend = backend
+        self._loop = loop
+
+    def _call(self, coro: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        return self._call(self._backend.aget_running_jobs_for_liveness(queue_names))
+
+    def fail_zombie_job(self, job_id: Any, reason: str) -> bool:
+        return self._call(self._backend.afail_zombie_job(job_id, reason))
+
+
 class AsyncWorker:
     """Coroutine-based worker (one OS process, many in-flight asyncio jobs).
 
@@ -415,15 +436,28 @@ class AsyncWorker:
         ``ScheduledTask`` enqueueing continue. Best-effort: never stops the worker.
         """
         try:
-            from sqlery.compat import get_backend
-
             from .daemon import DaemonManager
+
+            queues = list(self.queues)
+            use_thread = False
+            if hasattr(self.backend, "aget_running_jobs_for_liveness"):
+                # Use the worker's own (async) backend: the global sync backend may not be
+                # configured in an async-only standalone deployment.
+                sync_backend = _SyncLivenessAdapter(self.backend, asyncio.get_running_loop())
+                use_thread = True  # the adapter needs no Django thread affinity
+            else:
+                from sqlery.compat import get_backend
+
+                sync_backend = get_backend()
 
             def sweep() -> None:
                 DaemonManager._fail_zombie_running_jobs(
-                    get_backend(), list(self.queues), concurrent_workers=True
+                    sync_backend, queues, concurrent_workers=True
                 )
 
+            if use_thread:
+                await asyncio.to_thread(sweep)
+                return
             try:
                 from asgiref.sync import sync_to_async
             except ImportError:  # standalone install without Django/asgiref
