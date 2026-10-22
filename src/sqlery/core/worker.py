@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
 from .utils import describe_task_args, import_task
 from .result import serialize_result
-from .execution import invoke_task
+from .execution import invoke_task, run_failure_callback, run_success_callback
 from .retry import policy_allows_retry, retry_countdown, shape_retry_delay
 from .signals import task_retry
 from .result import REVOKED_ERROR
@@ -177,6 +177,7 @@ class JobExecutor:
                         self.backend.cascade_ancestor_status(job.id, 'success')
                     except Exception as e:
                         logger.warning(f"Failed to cascade success for job {job.id}: {e}")
+                run_success_callback(job, result)
                 logger.info(f"Job {job.id} completed successfully")
 
             finally:
@@ -198,6 +199,7 @@ class JobExecutor:
                 )
                 return job
             logger.error(f"Job {job.id} failed: {error_msg}")
+            run_failure_callback(job)
 
             if self._should_retry(job, e):
                 retry_job = self._retry_job(job, exc=e)
@@ -284,6 +286,7 @@ class JobExecutor:
                     self.backend.cascade_ancestor_status(job.id, 'success')
                 except Exception as e:
                     logger.warning(f"Failed to cascade success for job {job.id}: {e}")
+            run_success_callback(job, result)
             logger.info(f"Job {job.id} completed successfully")
 
             # # Pipe write removed — parent reads status from DB
@@ -310,6 +313,8 @@ class JobExecutor:
                     job.id, error=error_msg, traceback=error_traceback,
                     expected_version=expected_version,
                 )
+
+                run_failure_callback(failed_job)
 
                 # Handle retry in child (it has the DB connection)
                 if self._should_retry(failed_job, e):

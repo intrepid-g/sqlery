@@ -29,7 +29,12 @@ from .settings import get_setting
 from .utils import import_task, calculate_next_run
 from sqlery.core.utils import describe_task_args
 from sqlery.core.result import serialize_result
-from sqlery.core.execution import invoke_task
+from sqlery.core.execution import (
+    RQCompatJob,
+    invoke_task,
+    run_failure_callback,
+    run_success_callback,
+)
 from sqlery.core.signals import task_retry
 from sqlery.core.retry import (
     policy_allows_retry,
@@ -68,29 +73,8 @@ def _claimer_process_is_gone(pid: int) -> bool:
     return False
 
 
-class _RQCompatJob:
-    """Thin wrapper that makes a QueuedJob look like an RQ Job for callbacks.
-
-    RQ callbacks receive a job where job.id is the string job_id passed at
-    enqueue time. In sqlery, that string lives in job.job_name while job.id
-    is an auto-incrementing integer PK. This wrapper proxies all attribute
-    access to the real job but overrides .id to return job_name (falling
-    back to str(pk) when no job_name was set).
-    """
-
-    def __init__(self, job):
-        object.__setattr__(self, '_job', job)
-
-    @property
-    def id(self):
-        job = object.__getattribute__(self, '_job')
-        return job.job_name if job.job_name else str(job.pk)
-
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, '_job'), name)
-
-    def __setattr__(self, name, value):
-        setattr(object.__getattribute__(self, '_job'), name, value)
+# Moved to sqlery.core.execution so every executor shares it; alias kept for BC.
+_RQCompatJob = RQCompatJob
 
 
 class TaskExecutor:
@@ -379,13 +363,7 @@ class TaskExecutor:
                 job.mark_success(output=serialize_result(result))
                 logger.info(f"Job {job.id} completed successfully")
 
-                # Invoke on_success callback if configured
-                if job.on_success_path:
-                    try:
-                        cb = import_task(job.on_success_path)
-                        cb(_RQCompatJob(job), None, result)
-                    except Exception:
-                        logger.exception(f"on_success callback failed for job {job.id}")
+                run_success_callback(job, result)
             finally:
                 # Cancel alarm if it was set
                 if job.timeout_seconds:
@@ -416,13 +394,7 @@ class TaskExecutor:
             )
             logger.error(f"Job {job.id} failed: {human_error}")
 
-            # Invoke on_failure callback if configured
-            if job.on_failure_path:
-                try:
-                    cb = import_task(job.on_failure_path)
-                    cb(_RQCompatJob(job), None, None)
-                except Exception:
-                    logger.exception(f"on_failure callback failed for job {job.id}")
+            run_failure_callback(job)
 
             # Check if job should be retried
             if job.should_retry() and policy_allows_retry(job, e):

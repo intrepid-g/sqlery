@@ -39,6 +39,7 @@ Read these before upgrading; each is a deliberate behaviour change.
 ### Fixed
 
 - Django mode: `claim_job` returned nothing for any claimer whose id was not `worker_<node>_<pid>` or a registered UUID, so the Lambda handler's and the HTTP trigger's queue claims (`lambda-<uuid>`, `trigger-<uuid>`) silently processed no jobs. The Lambda and HTTP-trigger claimers now claim normally; any other unregistered worker id is still refused.
+- `on_success` / `on_failure` job callbacks never ran under the standalone `JobExecutor`, which also serves `WorkerProcess` (daemon and `sqlery-worker`), the HTTP trigger and Lambda; only the Django `TaskExecutor` invoked them. Both executors now share `run_success_callback` / `run_failure_callback` (`sqlery.core.execution`) with identical semantics: `cb(job, None, result)` after success and `cb(job, None, None)` after each failed attempt, before the retry decision, with `job.id` returning the `job_name`. A callback that raises is logged and never changes the job's outcome. `_RQCompatJob` moved to `sqlery.core.execution.RQCompatJob` (the old name is kept as an alias).
 
 - Dashboard authentication was skipped for any non-empty `root_path` (e.g. `uvicorn --root-path /x` behind a proxy). Auto-`inherit` now requires a real Starlette `Mount` (`scope["app_root_path"]`).
 - A job whose dependency failed and has a pending retry (or was archived after retrying) was either failed immediately or blocked forever. Dependencies are now judged by their newest retry attempt in both modes. Retry jobs also keep their `dependencies`.
