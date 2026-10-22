@@ -284,6 +284,13 @@ class DjangoBackend(DatabaseBackend):
         return job
 
     @retry_on_db_error()
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        now = timezone.now()
+        nxt = self.QueuedJob.objects.filter(
+            queue_name__in=queues, status="queued", scheduled_at__gt=now
+        ).aggregate(m=db_models.Min("scheduled_at"))["m"]
+        return None if nxt is None else (nxt - now).total_seconds()
+
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job using the unified claiming path.
 

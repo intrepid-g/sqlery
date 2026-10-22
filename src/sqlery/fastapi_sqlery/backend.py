@@ -369,6 +369,22 @@ class SQLAlchemyBackend(DatabaseBackend):
 
         return job
 
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        now = datetime.now(UTC)
+        with self._get_session() as session:
+            nxt = session.exec(
+                select(func.min(QueuedJob.scheduled_at)).where(
+                    QueuedJob.queue_name.in_(queues),
+                    QueuedJob.status == "queued",
+                    QueuedJob.scheduled_at > now,
+                )
+            ).first()
+        if nxt is None:
+            return None
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=UTC)
+        return (nxt - now).total_seconds()
+
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job.
 
