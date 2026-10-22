@@ -24,7 +24,7 @@ from django.utils import timezone
 
 from .db_compat import atomic_claim_job_queryset
 from .models import ScheduledTask, QueuedJob, Worker
-from .subprocess_executor import get_manage_py_path
+from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .settings import get_setting
 from .utils import import_task, calculate_next_run
 from sqlery.core.utils import describe_task_args
@@ -495,7 +495,7 @@ class TaskExecutor:
         task_retry.send(failed_job.task_path, job=failed_job, retry_job=retry_job, exc=exc)
         return retry_job
 
-    def run_queue_workers(self, queue_name=None, once=False, max_jobs=None):
+    def run_queue_workers(self, queue_name=None, once=False, max_jobs=None, idle_linger=0):
         """Process jobs from the queue.
 
         By default, processes one job then spawns another worker for memory safety.
@@ -505,7 +505,11 @@ class TaskExecutor:
         Args:
             queue_name (str, optional): Process specific queue only
             once (bool): If True, process jobs until empty without spawning subprocesses
-            max_jobs (int, optional): Maximum number of jobs to process (None = unlimited)
+            max_jobs (int, optional): Maximum number of jobs to process (None = unlimited).
+                Without ``once`` it is also how many jobs this process runs before it
+                hands over to a fresh one (default: 1, the memory-safe behaviour).
+            idle_linger (float): Without ``once``, seconds to keep waiting for a new job
+                after the queue empties while still below ``max_jobs`` (default: 0).
 
         Returns:
             list: List of processed QueuedJob instances
@@ -528,6 +532,9 @@ class TaskExecutor:
 
         processed_jobs = []
         jobs_processed = 0
+        # Non-once mode hands over after ``per_process`` jobs (1 unless max_jobs is given).
+        per_process = max_jobs if (max_jobs and not once) else 1
+        linger_deadline = None
 
         while True:
             # Check max_jobs limit
@@ -550,14 +557,10 @@ class TaskExecutor:
                 # Get next job (atomically locked via select_for_update)
                 queued_jobs = self.get_queued_jobs(queue_name=queue_name, limit=1)
 
-                if not queued_jobs.exists():
-                    logger.info("No queued jobs found - worker exiting")
-                    break
-
-                job = queued_jobs.first()
+                job = queued_jobs.first() if queued_jobs.exists() else None
 
                 # Check concurrency BEFORE marking as running
-                if not self.can_execute_job(job):
+                if job is not None and not self.can_execute_job(job):
                     logger.info(
                         f"Job {job.id} in queue '{job.queue_name}' blocked by running job "
                         f"(allow_parallel={job.allow_parallel}) - leaving queued, worker exiting"
@@ -566,7 +569,21 @@ class TaskExecutor:
                     break
 
                 # Mark as running within the same transaction (releases lock after commit)
-                job.mark_running()
+                if job is not None:
+                    job.mark_running()
+
+            if job is None:
+                # Queue empty. A multi-job process may linger for newcomers before exiting.
+                if not once and idle_linger and jobs_processed < per_process:
+                    if linger_deadline is None:
+                        linger_deadline = time.monotonic() + idle_linger
+                    remaining = linger_deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(0.5, remaining))
+                        continue
+                logger.info("No queued jobs found - worker exiting")
+                break
+            linger_deadline = None
 
             # Execute the job (outside transaction, don't hold lock during execution)
             logger.info(f"Worker processing job {job.id}: {job.task_path}")
@@ -580,6 +597,8 @@ class TaskExecutor:
 
             # If not in "once" mode, process just one job and spawn next worker
             if not once:
+                if jobs_processed < per_process:
+                    continue
                 # Check if more jobs exist - spawn next worker immediately if so
                 # Old: get_queued_jobs(...).exists() — that queryset carries
                 # SELECT FOR UPDATE SKIP LOCKED and .exists() outside a txn raised
@@ -860,7 +879,7 @@ class TaskExecutor:
             manage_py = get_manage_py_path()
 
             # Build command arguments
-            cmd = [sys.executable, manage_py, "run_jobs", "--worker-only"]
+            cmd = [sys.executable, manage_py, "run_jobs", "--worker-only", *run_jobs_extra_args()]
             if queue_name:
                 cmd.extend(["--queue", queue_name])
 
