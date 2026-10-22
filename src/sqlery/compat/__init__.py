@@ -827,6 +827,14 @@ class AsyncDatabaseBackend(ABC):
     and SQLAlchemyAsyncBackend (ASYN-03).
     """
 
+    async def anext_due_delay(self, queues: list[str]) -> float | None:
+        """Async analog of DatabaseBackend.next_due_delay.
+
+        ``None`` (the default) means "nothing scheduled" or "unknown", so the
+        AsyncWorker keeps its normal poll interval.
+        """
+        return None
+
     @abstractmethod
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Async analog of DatabaseBackend.claim_job."""

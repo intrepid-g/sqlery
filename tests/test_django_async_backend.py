@@ -349,3 +349,18 @@ def test_no_acursor_in_implementation():
     ).parent.parent / "src" / "sqlery" / "django_sqlery" / "async_backend.py"
     text = src.read_text()
     assert "acursor()" not in text
+
+
+# ----- anext_due_delay (#115) ----------------------------------------------
+
+
+async def test_anext_due_delay_none_then_future(backend, make_job):
+    from datetime import timedelta
+
+    assert await backend.anext_due_delay(["default"]) is None
+    await asyncio.to_thread(make_job)  # due now: does not count
+    assert await backend.anext_due_delay(["default"]) is None
+    await asyncio.to_thread(make_job, scheduled_at=timezone.now() + timedelta(seconds=3))
+    delay = await backend.anext_due_delay(["default"])
+    assert delay is not None and 0 < delay <= 3
+    assert await backend.anext_due_delay(["other"]) is None
