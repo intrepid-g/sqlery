@@ -37,7 +37,9 @@ from sqlery.core.execution import (
 )
 from sqlery.core.signals import task_retry
 from sqlery.core.retry import (
+    pending_reason,
     policy_allows_retry,
+    retry_budget_left,
     retry_countdown,
     shape_retry_delay,
 )
@@ -387,17 +389,22 @@ class TaskExecutor:
                 termination_reason = "exception"
                 human_error = error_msg
 
+            # Decide BEFORE failing: a job that will be retried carries the retry_pending marker
+            # so a crash before the retry exists is recoverable (recover_lost_retries).
+            will_retry = retry_budget_left(job) and policy_allows_retry(job, e)
             job.mark_failed(
                 error=human_error,
                 traceback=error_traceback,
-                termination_reason=termination_reason
+                termination_reason=(
+                    pending_reason(termination_reason) if will_retry else termination_reason
+                ),
             )
             logger.error(f"Job {job.id} failed: {human_error}")
 
             run_failure_callback(job)
 
             # Check if job should be retried
-            if job.should_retry() and policy_allows_retry(job, e):
+            if will_retry:
                 retry_job = self._retry_job(job, exc=e)
                 logger.info(
                     f"Job {job.id} will be retried as job {retry_job.id} "
@@ -417,6 +424,13 @@ class TaskExecutor:
             QueuedJob: The new retry job
         """
         # from datetime import timedelta  # moved to top-level
+
+        # Idempotent: reuse an existing retry (crash recovery, or a stale-job sweep racing the
+        # worker that failed it) instead of creating a duplicate.
+        existing = QueuedJob.objects.filter(parent_job_id=failed_job.id).order_by("-created_at").first()
+        if existing is not None:
+            self._settle_retry_marker(failed_job)
+            return existing
 
         # Calculate retry delay
         delay_seconds = shape_retry_delay(
@@ -459,6 +473,7 @@ class TaskExecutor:
             job_name=retry_job_name,
         )
 
+        self._settle_retry_marker(failed_job)
         logger.info(
             f"Created retry job {retry_job.id} for failed job {failed_job.id}, "
             f"scheduled in {delay_seconds}s (attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
@@ -466,6 +481,49 @@ class TaskExecutor:
 
         task_retry.send(failed_job.task_path, job=failed_job, retry_job=retry_job, exc=exc)
         return retry_job
+
+    def _settle_retry_marker(self, failed_job):
+        """The retry exists: restore the job's original termination_reason."""
+        from sqlery.core.retry import settled_reason
+
+        reason = settled_reason(failed_job.termination_reason or "")
+        if reason != (failed_job.termination_reason or ""):
+            QueuedJob.objects.filter(id=failed_job.id).update(termination_reason=reason)
+            failed_job.termination_reason = reason
+
+    def recover_lost_retries(self, grace_seconds=60, limit=100):
+        """Create the retry for jobs whose worker died between failing them and retrying them.
+
+        Finds failed jobs tagged ``retry_pending`` for longer than ``grace_seconds`` and calls the
+        (idempotent) :meth:`_retry_job`. Returns how many were recovered. Never raises.
+        """
+        from sqlery.core.retry import RETRY_PENDING
+
+        recovered = 0
+        try:
+            cutoff = timezone.now() - timedelta(seconds=grace_seconds)
+            pending = list(
+                QueuedJob.objects.filter(
+                    status="failed",
+                    termination_reason__startswith=RETRY_PENDING,
+                    finished_at__isnull=False,
+                    finished_at__lte=cutoff,
+                ).order_by("finished_at")[:limit]
+            )
+        except Exception as e:
+            logger.warning(f"Could not look for lost retries: {e}")
+            return 0
+        for job in pending:
+            try:
+                if retry_budget_left(job):
+                    self._retry_job(job)
+                    recovered += 1
+                    logger.warning(f"Recovered lost retry for failed job {job.id}")
+                else:
+                    self._settle_retry_marker(job)
+            except Exception as e:
+                logger.error(f"Failed to recover retry for job {job.id}: {e}")
+        return recovered
 
     def run_queue_workers(self, queue_name=None, once=False, max_jobs=None, idle_linger=0):
         """Process jobs from the queue.
@@ -625,14 +683,18 @@ class TaskExecutor:
                     "container restart, OOM, or crash"
                 ),
                 traceback="Job stuck in 'running' with a dead owner PID and no worker row",
-                termination_reason="orphaned_claimer",
+                termination_reason=(
+                    pending_reason("orphaned_claimer")
+                    if retry_budget_left(job)
+                    else "orphaned_claimer"
+                ),
             )
         except Exception as e:
             # One unreapable row must never block claiming for everything else.
             logger.warning(f"Could not reap orphaned job {job.id}: {e}")
             return
         logger.warning(f"Reaped orphaned job {job.id} (dead pid {job.worker_pid})")
-        if job.should_retry():
+        if retry_budget_left(job):
             self._retry_job(job)
 
     def _reap_dead_worker_rows(self):
@@ -685,6 +747,7 @@ class TaskExecutor:
         # would otherwise stay invisible forever to a worker started with --queue Y.
         # Only the time-threshold pass below stays queue-scoped.
         self._reap_orphaned_running_jobs()
+        self.recover_lost_retries()
 
         for job in queryset:
             if not job.started_at:
@@ -729,14 +792,18 @@ class TaskExecutor:
                 job.mark_failed(
                     error=error_msg,
                     traceback="Job was stuck in 'running' state - likely worker process crashed, killed by OOM, or terminated by signal",
-                    termination_reason=termination_reason
+                    termination_reason=(
+                        pending_reason(termination_reason)
+                        if retry_budget_left(job)
+                        else termination_reason
+                    ),
                 )
                 logger.warning(
                     f"Cleaned up stale job {job.id} (running {int(running_duration)}s > {threshold_seconds}s threshold)"
                 )
 
                 # Retry if configured
-                if job.should_retry():
+                if retry_budget_left(job):
                     retry_job = self._retry_job(job)
                     logger.info(
                         f"Stale job {job.id} will be retried as job {retry_job.id}"

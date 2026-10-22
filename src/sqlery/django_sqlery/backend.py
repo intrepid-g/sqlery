@@ -377,6 +377,29 @@ class DjangoBackend(DatabaseBackend):
             id=job_id, status="running", termination_reason="revoke_requested"
         ).exists()
 
+    def get_jobs_pending_retry(self, older_than_seconds: float = 60, limit: int = 100) -> list:
+        """Failed jobs whose retry was never created (see DatabaseBackend)."""
+        from sqlery.core.retry import RETRY_PENDING
+
+        cutoff = timezone.now() - timedelta(seconds=older_than_seconds)
+        return list(
+            self.QueuedJob.objects.filter(
+                status="failed",
+                termination_reason__startswith=RETRY_PENDING,
+                finished_at__isnull=False,
+                finished_at__lte=cutoff,
+            ).order_by("finished_at")[:limit]
+        )
+
+    def settle_retry_pending(self, job_id: int) -> None:
+        from sqlery.core.retry import settled_reason
+
+        reason = (
+            self.QueuedJob.objects.filter(id=job_id).values_list("termination_reason", flat=True).first()
+        )
+        if reason is not None:
+            self.QueuedJob.objects.filter(id=job_id).update(termination_reason=settled_reason(reason))
+
     def get_latest_retry(self, job_id: int):
         """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
         return (
@@ -1020,6 +1043,7 @@ class DjangoBackend(DatabaseBackend):
         error: str,
         traceback: str = "",
         expected_version: int | None = None,
+        termination_reason: str = "",
     ):
         """Mark job as failed.
 
@@ -1034,7 +1058,9 @@ class DjangoBackend(DatabaseBackend):
             if expected_version is not None:
                 job.version = expected_version
             try:
-                job.mark_failed(error=error, traceback=traceback)
+                job.mark_failed(
+                    error=error, traceback=traceback, termination_reason=termination_reason
+                )
             except ConcurrentModificationError as e:
                 raise JobFencingError(str(e)) from e
         return job
