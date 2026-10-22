@@ -202,6 +202,7 @@ class AsyncWorker:
         await self._register()
         await self._recover_orphans()
         last_sweep = time.monotonic()
+        last_heartbeat = float("-inf")
         sweep_interval = self._orphan_sweep_interval()
         jobs_started = 0
         polls = 0
@@ -216,10 +217,12 @@ class AsyncWorker:
                 if time.monotonic() - last_sweep >= sweep_interval:
                     last_sweep = time.monotonic()
                     await self._recover_orphans()
-                try:
-                    await self.backend.aupdate_heartbeat(self.worker_id)
-                except Exception as e:  # pragma: no cover - heartbeat is best-effort
-                    logger.warning(f"Heartbeat update failed: {e}")
+                if time.monotonic() - last_heartbeat >= self._heartbeat_interval():
+                    last_heartbeat = time.monotonic()
+                    try:
+                        await self.backend.aupdate_heartbeat(self.worker_id)
+                    except Exception as e:  # pragma: no cover - heartbeat is best-effort
+                        logger.warning(f"Heartbeat update failed: {e}")
 
                 if len(running) >= self.concurrency:
                     # At capacity: wait for a slot (or the next heartbeat tick).
@@ -232,11 +235,11 @@ class AsyncWorker:
                     job = await self.backend.aclaim_job(self.queues, self.worker_id)
                 except Exception as e:
                     logger.exception(f"aclaim_job failed: {e}")
-                    await asyncio.sleep(self.poll_interval)
+                    await self._idle_wait(self.poll_interval)
                     continue
 
                 if job is None:
-                    await asyncio.sleep(self.poll_interval)
+                    await self._idle_wait(await self._idle_timeout())
                     continue
 
                 runner = asyncio.create_task(self._execute_job(job))
@@ -254,6 +257,42 @@ class AsyncWorker:
                 await self.backend.aunregister_worker(self.worker_id)
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
+
+    # ------------------------------------------------------------- idle wait
+
+    def _heartbeat_interval(self) -> float:
+        """Minimum seconds between heartbeats: the configured interval, capped at
+        (roughly) one poll interval so a normal poll cycle still beats once, while
+        passes shortened by a due-job wake-up do not beat every time."""
+        try:
+            from sqlery.compat import get_config
+
+            interval = float(get_config("WORKER_HEARTBEAT_INTERVAL", 5))
+        except Exception:
+            interval = 5.0
+        return max(min(interval, self.poll_interval * 0.9), 0.0)
+
+    async def _idle_timeout(self) -> float:
+        """poll_interval, shortened to the earliest queued job that is not due yet."""
+        try:
+            delay = await self.backend.anext_due_delay(self.queues)
+        except Exception as e:  # best-effort: fall back to the plain poll interval
+            logger.debug(f"AsyncWorker {self.worker_id}: anext_due_delay failed: {e}")
+            return self.poll_interval
+        if delay is None:
+            return self.poll_interval
+        return min(self.poll_interval, max(delay + 0.05, 0.1))
+
+    async def _idle_wait(self, timeout: float) -> None:
+        """Sleep up to ``timeout`` seconds, waking at once on shutdown."""
+        event = self._shutdown_event
+        if event is None:
+            await asyncio.sleep(timeout)
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
     # ----------------------------------------------------------- execution
 
