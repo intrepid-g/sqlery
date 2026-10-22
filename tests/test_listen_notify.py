@@ -59,6 +59,7 @@ def _make_worker_process(queues=None):
     mock_backend = MagicMock()
     # update_worker_heartbeat is called during construction indirectly; mock safely.
     mock_backend.update_worker_heartbeat.return_value = None
+    mock_backend.next_due_delay.return_value = None  # _idle_timeout compares it to poll_interval
     mock_backend.claim_queue_leases.return_value = []
 
     worker = WorkerProcess.__new__(WorkerProcess)
@@ -656,3 +657,108 @@ class TestSQLAlchemyNotifyDeliveryPG:
             finally:
                 _reset_pg_schema(listen_dsn)
                 engine.dispose()
+
+
+# ===========================================================================
+# #117: LISTEN connection survives forks; opened lazily
+# ===========================================================================
+
+
+def _notify_on(flag=True):
+    return patch(
+        "sqlery.core.worker.get_config",
+        side_effect=lambda key, default=None: flag if key == "SQLERY_PG_NOTIFY" else default,
+    )
+
+
+class TestListenConnAcrossFork:
+    def test_fork_does_not_close_or_reopen_in_parent(self):
+        """The parent keeps the very same LISTEN connection across a fork (no close, no reopen)."""
+        worker = _make_worker_process()
+        conn = MagicMock()
+        worker._listen_conn = conn
+        worker._fork_ctx.register_post_fork_child(worker._orphan_listen_conn)
+
+        pid = worker._fork_ctx.fork()
+        if pid == 0:
+            ok = worker._listen_conn is None and not conn.close.called
+            os._exit(0 if ok else 3)
+        _, status = os.waitpid(pid, 0)
+
+        assert os.WEXITSTATUS(status) == 0, "child must disown the conn without closing it"
+        assert worker._listen_conn is conn
+        conn.close.assert_not_called()
+
+    def test_orphaned_conn_is_kept_alive_and_never_closed(self):
+        from sqlery.core import worker as worker_mod
+
+        worker = _make_worker_process()
+        conn = MagicMock()
+        worker._listen_conn = conn
+        worker._orphan_listen_conn()
+        assert worker._listen_conn is None
+        assert conn in worker_mod._ORPHANED_LISTEN_CONNS
+        conn.close.assert_not_called()
+        worker_mod._ORPHANED_LISTEN_CONNS.remove(conn)
+
+    @_SKIP_NO_PG
+    def test_child_exit_does_not_kill_parent_listen_session(self):
+        """Real PG: after a forked child exits, the parent's LISTEN still receives NOTIFY."""
+        import gc
+
+        import psycopg
+        import psycopg.sql as _sql
+
+        pg_url = os.environ["SQLERY_TEST_PG_URL"]
+        channel = sanitize_queue_name_to_channel("default")
+        worker = _make_worker_process()
+        conn = psycopg.connect(pg_url, autocommit=True)
+        conn.execute(_sql.SQL("LISTEN {}").format(_sql.Identifier(channel)))
+        worker._listen_conn = conn
+        worker._fork_ctx.register_post_fork_child(worker._orphan_listen_conn)
+
+        pid = worker._fork_ctx.fork()
+        if pid == 0:
+            gc.collect()  # would PQfinish the shared socket if the child had dropped it
+            os._exit(0)
+        os.waitpid(pid, 0)
+
+        try:
+            other = psycopg.connect(pg_url, autocommit=True)
+            other.execute("SELECT pg_notify(%s, 'x')", [channel])
+            other.close()
+            got = list(conn.notifies(timeout=2, stop_after=1))
+            assert len(got) == 1, "parent LISTEN session must survive the child's exit"
+        finally:
+            conn.close()
+
+
+class TestLazyListenOpen:
+    def test_idle_wait_opens_listen_and_returns_without_sleeping(self):
+        worker = _make_worker_process()
+        opened = MagicMock()
+
+        def fake_open():
+            worker._listen_conn = opened
+
+        with _notify_on(), patch.object(worker, "_open_listen_conn", side_effect=fake_open), patch(
+            "sqlery.core.worker.time.sleep"
+        ) as sleep:
+            worker._wait_for_notify()
+        assert worker._listen_conn is opened
+        sleep.assert_not_called()
+
+    def test_flag_off_never_opens(self):
+        worker = _make_worker_process()
+        worker.poll_interval = 0.01
+        with _notify_on(False), patch.object(worker, "_open_listen_conn") as op:
+            worker._wait_for_notify()
+        op.assert_not_called()
+
+    def test_failed_open_backs_off_and_falls_back_to_polling(self):
+        worker = _make_worker_process()
+        worker.poll_interval = 0.01
+        with _notify_on(), patch.object(worker, "_open_listen_conn") as op:
+            worker._wait_for_notify()  # tries once, fails, polls
+            worker._wait_for_notify()  # within backoff: no second attempt
+        assert op.call_count == 1

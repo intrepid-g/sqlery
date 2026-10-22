@@ -28,7 +28,41 @@ try:
 except ImportError:
     _sa_text = None  # type: ignore[assignment]
 
-__all__ = ["sanitize_queue_name_to_channel", "notify_queue_django", "notify_queue_sqlalchemy"]
+__all__ = ["resolve_pg_dsn", "sanitize_queue_name_to_channel", "notify_queue_django", "notify_queue_sqlalchemy"]
+
+
+def resolve_pg_dsn() -> str | None:
+    """A plain libpq DSN for the configured PostgreSQL database, or ``None``.
+
+    ``None`` means "not PostgreSQL / unknown", so callers fall back to polling.
+    Standalone mode reads ``DATABASE_URL`` (a ``+driver`` suffix such as
+    ``postgresql+psycopg://`` is stripped, libpq does not know it); Django mode builds
+    the DSN from ``connections['default']``.
+    """
+    from sqlery.compat import get_config
+
+    url = get_config("DATABASE_URL", None)
+    if url:
+        if not str(url).startswith(("postgresql", "postgres")):
+            return None
+        return re.sub(r"^(postgres(?:ql)?)\+[a-z0-9_]+://", r"\1://", str(url))
+    try:
+        from django.db import connections
+        import psycopg
+
+        cfg = connections["default"].settings_dict
+    except Exception:
+        return None
+    engine = cfg.get("ENGINE", "")
+    if "postgresql" not in engine and "psycopg" not in engine:
+        return None
+    return psycopg.conninfo.make_conninfo(
+        dbname=cfg.get("NAME", ""),
+        host=cfg.get("HOST", "") or None,
+        port=cfg.get("PORT", "") or None,
+        user=cfg.get("USER", "") or None,
+        password=cfg.get("PASSWORD", "") or None,
+    )
 
 
 def sanitize_queue_name_to_channel(queue_name: str) -> str:

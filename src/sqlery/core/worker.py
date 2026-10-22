@@ -53,6 +53,10 @@ except ImportError:
     sanitize_queue_name_to_channel = None  # type: ignore[assignment]
     _pg_notify_import_ok = False
 
+# Inherited LISTEN connections disowned by a forked child (see WorkerProcess._orphan_listen_conn).
+# Held here so they are never garbage-collected (PQfinish) in the child.
+_ORPHANED_LISTEN_CONNS: list = []
+
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
 
 logger = logging.getLogger(__name__)
@@ -682,12 +686,13 @@ class WorkerProcess:
 
         # Phase 18: open LISTEN connection (no-op when SQLERY_PG_NOTIFY=False or SQLite).
         self._open_listen_conn()
-        # FORK-SAFETY: _close_listen_conn runs as pre_fork hook in ForkSafeExecutor.fork()
-        # before os.fork() so the LISTEN connection is never inherited by child processes.
-        # _open_listen_conn re-opens in the parent via post_fork_parent so LISTEN resumes
-        # after each fork without blocking the child.
-        self._fork_ctx.register_pre_fork(self._close_listen_conn)
-        self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+        # FORK-SAFETY (#117): the LISTEN connection stays open across forks, so a NOTIFY
+        # that lands while a job runs is not lost and each job costs no reconnect. The
+        # child gets an inherited copy of the socket, so it must never close or finalise
+        # it (that would send Terminate and kill the parent's session).
+        # Old: self._fork_ctx.register_pre_fork(self._close_listen_conn)
+        # Old: self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+        self._fork_ctx.register_post_fork_child(self._orphan_listen_conn)
 
         try:
             while not self.shutdown_requested:
@@ -1137,6 +1142,21 @@ class WorkerProcess:
                     pass
             self._listen_conn = None
 
+    def _orphan_listen_conn(self) -> None:
+        """Forked child only: disown the inherited LISTEN connection WITHOUT closing it.
+
+        The child shares the parent's socket. Closing the psycopg connection (or letting
+        it be garbage-collected, which runs PQfinish) would send a Terminate message on
+        that shared socket and end the parent's LISTEN session. So the child only drops
+        its own attribute (nothing in the child can reach it) and parks the object in a
+        module-level list so it is never finalised; the child leaves via ``os._exit``.
+        """
+        conn = self._listen_conn
+        if conn is None:
+            return
+        _ORPHANED_LISTEN_CONNS.append(conn)
+        self._listen_conn = None
+
     def _close_listen_conn(self) -> None:
         """Close the LISTEN connection. Safe to call when connection is None.
 
@@ -1153,6 +1173,26 @@ class WorkerProcess:
         self._listen_conn = None
         logger.debug(f"Worker {self.worker_id}: LISTEN connection closed")
 
+    _LISTEN_RETRY_SECONDS = 30.0
+
+    def _lazy_open_listen_conn(self) -> bool:
+        """Open the LISTEN connection on demand; True only if it is open afterwards.
+
+        No-op unless SQLERY_PG_NOTIFY is on. A failed attempt is not retried for
+        ``_LISTEN_RETRY_SECONDS`` so a down or non-PG database costs one try, not one
+        per idle pass.
+        """
+        if not get_config('SQLERY_PG_NOTIFY', False):
+            return False
+        now = time.monotonic()
+        if now < getattr(self, '_listen_retry_at', 0.0):
+            return False
+        self._open_listen_conn()
+        if self._listen_conn is None:
+            self._listen_retry_at = now + self._LISTEN_RETRY_SECONDS
+            return False
+        return True
+
     def _wait_for_notify(self) -> None:
         """Block up to poll_interval for a NOTIFY, in <=1s slices.
 
@@ -1166,6 +1206,10 @@ class WorkerProcess:
         delayed enqueue), so such a job starts when due, not a poll interval later.
         """
         timeout = self._idle_timeout()
+        if self._listen_conn is None and self._lazy_open_listen_conn():
+            # Just subscribed: return so the loop re-claims. A job enqueued before the
+            # LISTEN took effect is found by that claim; one after it is NOTIFYed.
+            return
         if self._listen_conn is None:
             # Flag-off / SQLite / no connection — original 1s-slice sleep loop
             end = time.monotonic() + timeout

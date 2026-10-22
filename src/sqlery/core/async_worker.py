@@ -178,6 +178,9 @@ class AsyncWorker:
 
         self._shutting_down: bool = False
         self._shutdown_event: asyncio.Event | None = None
+        # Set by the optional LISTEN task (SQLERY_PG_NOTIFY + PostgreSQL) on each NOTIFY.
+        self._notify_event: asyncio.Event | None = None
+        self._listen_task: asyncio.Task | None = None
         # Map of job_id -> asyncio.Task for in-flight jobs (up to ``concurrency``).
         self._inflight: dict[Any, asyncio.Task] = {}
 
@@ -201,6 +204,7 @@ class AsyncWorker:
         self._install_signal_handlers()
         await self._register()
         await self._recover_orphans()
+        self._start_listener()
         last_sweep = time.monotonic()
         last_heartbeat = float("-inf")
         sweep_interval = self._orphan_sweep_interval()
@@ -231,6 +235,10 @@ class AsyncWorker:
                     )
                     continue
 
+                if self._notify_event is not None:
+                    # Cleared BEFORE claiming: a NOTIFY landing after this point still
+                    # cuts the idle wait short, so no wake-up is lost between claim and wait.
+                    self._notify_event.clear()
                 try:
                     job = await self.backend.aclaim_job(self.queues, self.worker_id)
                 except Exception as e:
@@ -247,6 +255,7 @@ class AsyncWorker:
                 runner.add_done_callback(running.discard)
                 jobs_started += 1
         finally:
+            await self._stop_listener()
             # Let started jobs finish (or hand over to the drain on shutdown).
             if running:
                 await asyncio.gather(*list(running), return_exceptions=True)
@@ -284,14 +293,86 @@ class AsyncWorker:
         return min(self.poll_interval, max(delay + 0.05, 0.1))
 
     async def _idle_wait(self, timeout: float) -> None:
-        """Sleep up to ``timeout`` seconds, waking at once on shutdown."""
+        """Sleep up to ``timeout`` seconds, waking at once on shutdown or NOTIFY."""
         event = self._shutdown_event
         if event is None:
             await asyncio.sleep(timeout)
             return
+        notify = self._notify_event
+        if notify is None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+            return
+        waiters = {asyncio.ensure_future(event.wait()), asyncio.ensure_future(notify.wait())}
         try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+            await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waiters:
+                w.cancel()
+
+    # ------------------------------------------------------- LISTEN / NOTIFY
+
+    def _start_listener(self) -> None:
+        """Start the optional LISTEN task. Opt-in, PostgreSQL only, never fatal."""
+        try:
+            from sqlery.compat import get_config
+
+            if not get_config("SQLERY_PG_NOTIFY", False):
+                return
+            import psycopg  # noqa: F401
+            from .pg_notify import resolve_pg_dsn, sanitize_queue_name_to_channel
+
+            dsn = resolve_pg_dsn()
+            if not dsn:
+                return
+            channels = [sanitize_queue_name_to_channel(q) for q in self.queues]
+        except Exception as e:
+            logger.debug(f"AsyncWorker {self.worker_id}: LISTEN unavailable ({e}); polling")
+            return
+        self._notify_event = asyncio.Event()
+        self._listen_task = asyncio.create_task(self._listen_loop(dsn, channels))
+
+    async def _listen_loop(self, dsn: str, channels: list[str]) -> None:
+        """LISTEN on ``channels`` and set ``_notify_event`` on every NOTIFY.
+
+        Any failure is logged and retried with backoff; meanwhile the worker simply keeps
+        polling, so a broken LISTEN connection costs latency, never correctness.
+        """
+        import psycopg
+        import psycopg.sql as psql
+
+        delay = 1.0
+        while not self._shutting_down:
+            try:
+                async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+                    for channel in channels:
+                        await conn.execute(psql.SQL("LISTEN {}").format(psql.Identifier(channel)))
+                    delay = 1.0
+                    logger.info(f"AsyncWorker {self.worker_id}: LISTEN on {channels}")
+                    # A job enqueued while we were not listening produces no NOTIFY.
+                    self._notify_event.set()
+                    async for _ in conn.notifies():
+                        self._notify_event.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"AsyncWorker {self.worker_id}: LISTEN connection error: {e}; "
+                    f"polling, retry in {delay:.0f}s"
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+    async def _stop_listener(self) -> None:
+        task, self._listen_task = self._listen_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except BaseException:  # CancelledError or a last listener error
             pass
 
     # ----------------------------------------------------------- execution
