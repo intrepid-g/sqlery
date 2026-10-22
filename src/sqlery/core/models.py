@@ -16,6 +16,7 @@ from sqlmodel import Field, SQLModel, Column, JSON, Relationship
 from sqlalchemy import BigInteger, ForeignKey, Index, DateTime
 
 from sqlery.core.utils import reject_unawaited_coroutine
+from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.worker_admin import is_worker_beating
 from sqlery.compat import get_config
 
@@ -41,12 +42,12 @@ class ScheduledTask(SQLModel, table=True):
     enabled: bool = Field(default=True, description="Whether this task should run")
 
     # Execution tracking
-    last_run_at: datetime | None = Field(default=None, description="Last successful execution time (UTC)")
-    next_run_at: datetime | None = Field(default=None, description="Next scheduled execution time (UTC)")
+    last_run_at: datetime | None = Field(sa_type=UTCDateTime, default=None, description="Last successful execution time (UTC)")
+    next_run_at: datetime | None = Field(sa_type=UTCDateTime, default=None, description="Next scheduled execution time (UTC)")
 
     # Metadata
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
 
     # Relationships
     jobs: list["QueuedJob"] = Relationship(back_populates="scheduled_task")
@@ -156,13 +157,14 @@ class QueuedJob(SQLModel, table=True):
 
     # Timing — created_at is part of the composite PK (created_at, id)
     created_at: datetime = Field(
+        sa_type=UTCDateTime,
         default_factory=lambda: datetime.now(UTC),
         primary_key=True,
         description="When job was enqueued (also part of composite PK for partitioning)",
     )
-    scheduled_at: datetime | None = Field(default=None, index=True, description="When job should run (NULL = run immediately)")
-    started_at: datetime | None = Field(default=None, description="When execution began")
-    finished_at: datetime | None = Field(default=None, description="When execution completed")
+    scheduled_at: datetime | None = Field(sa_type=UTCDateTime, default=None, index=True, description="When job should run (NULL = run immediately)")
+    started_at: datetime | None = Field(sa_type=UTCDateTime, default=None, description="When execution began")
+    finished_at: datetime | None = Field(sa_type=UTCDateTime, default=None, description="When execution completed")
     duration_seconds: float | None = Field(default=None)
 
     # Results
@@ -284,6 +286,7 @@ class ScheduledJob(SQLModel, table=True):
         sa_column=Column(BigInteger, primary_key=True, nullable=False),
     )
     created_at: datetime = Field(
+        sa_type=UTCDateTime,
         default_factory=lambda: datetime.now(UTC),
         primary_key=True,
         description="When the scheduled job was created (also part of composite PK)",
@@ -310,6 +313,7 @@ class ScheduledJob(SQLModel, table=True):
 
     # Scheduling
     scheduled_at: datetime = Field(
+        sa_type=UTCDateTime,
         description="When the job should be promoted to QueuedJob and executed",
     )
 
@@ -344,8 +348,8 @@ class JobRegistry(SQLModel, table=True):
     registry_type: str = Field(max_length=20, index=True, description="Registry type (started/finished/failed/etc)")
 
     # Timing
-    entered_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="When job entered this registry")
-    exited_at: datetime | None = Field(default=None, description="When job exited this registry (NULL = still active)")
+    entered_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC), description="When job entered this registry")
+    exited_at: datetime | None = Field(sa_type=UTCDateTime, default=None, description="When job exited this registry (NULL = still active)")
 
     # Metadata — renamed from 'metadata' which is reserved by SQLAlchemy's Declarative API
     extra_data: dict = Field(default_factory=dict, sa_column=Column("metadata", JSON), description="Additional metadata")
@@ -387,8 +391,8 @@ class Worker(SQLModel, table=True):
     queues: list = Field(default_factory=list, sa_column=Column(JSON), description="List of queue names this worker handles")
 
     # Heartbeat and lifecycle
-    last_heartbeat: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True, description="Last time worker sent heartbeat")
-    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_heartbeat: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC), index=True, description="Last time worker sent heartbeat")
+    started_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
 
     # Statistics
     jobs_processed: int = Field(default=0, description="Total number of jobs processed by this worker")
@@ -441,8 +445,8 @@ class DaemonLease(SQLModel, table=True):
     # New (WR-04): timezone-aware columns so Postgres stores timestamptz and
     # reads come back aware (SQLite still returns naive; comparison sites keep
     # the UTC-normalization helper for that case).
-    acquired_at: datetime = Field(sa_column=Column(DateTime(timezone=True)))
-    expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), index=True))
+    acquired_at: datetime = Field(sa_column=Column(UTCDateTime()))
+    expires_at: datetime = Field(sa_column=Column(UTCDateTime(), index=True))
     # Optimistic locking (SQLite CAS) — mirrors QueuedJob.version (models.py:113-114)
     version: int = Field(default=0, description="Version counter for optimistic locking (SQLite CAS)")
 
