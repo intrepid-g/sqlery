@@ -258,8 +258,26 @@ def handle(envelope: TriggerEnvelope) -> TriggerResult:
 # ---------------------------------------------------------------------------
 
 
+MAX_JOBS_PER_REQUEST = 100  # hard cap on payload["max_jobs"]: one request never runs unbounded work
+
+
+def _positive_number(value: Any, default: float | None, cap: float | None = None) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number <= 0:
+        return default
+    return min(number, cap) if cap is not None else number
+
+
 def _dispatch_process_queue(payload: dict) -> TriggerResult:
-    """Claim and execute one job from the requested queue (or by job_id)."""
+    """Claim and execute jobs from the requested queue (or one job by job_id).
+
+    Without ``job_id`` the request runs up to ``payload["max_jobs"]`` jobs (default 1, cap
+    ``MAX_JOBS_PER_REQUEST``), stopping early when the queue is empty or ``payload["budget_s"]``
+    seconds have passed (checked between jobs; a job already started always finishes).
+    """
     from sqlery.compat import get_backend
     import uuid
 
@@ -270,7 +288,6 @@ def _dispatch_process_queue(payload: dict) -> TriggerResult:
     job_id = payload.get("job_id")
     queue_name = payload.get("queue_name") or "default"
 
-    job: Any = None
     if job_id is not None:
         try:
             job = backend.get_job_by_id(int(job_id))
@@ -283,10 +300,21 @@ def _dispatch_process_queue(payload: dict) -> TriggerResult:
         claimed = backend.claim_job_by_id(job.id, f"trigger-{uuid.uuid4()}")
         if claimed is None:
             return TriggerResult(409, {"error": f"job {job_id} is not claimable"})
-        job = claimed
-    else:
-        # Fall back to claim-from-queue.
-        import uuid
+        try:
+            JobExecutor(backend=backend).execute_job(claimed)
+        except Exception as e:  # pragma: no cover
+            logger.exception("execute_job failed inside HTTP trigger")
+            return TriggerResult(500, {"error": str(e)})
+        return TriggerResult(200, {"ok": True, "claimed": True, "job_ids": [claimed.id]})
+
+    max_jobs = int(_positive_number(payload.get("max_jobs"), 1, MAX_JOBS_PER_REQUEST))
+    budget_s = _positive_number(payload.get("budget_s"), None)
+    deadline = None if budget_s is None else time.monotonic() + budget_s
+
+    job_ids: list = []
+    while len(job_ids) < max_jobs:
+        if job_ids and deadline is not None and time.monotonic() >= deadline:
+            break
         worker_id = f"trigger-{uuid.uuid4()}"
         try:
             job = backend.claim_job([queue_name], worker_id)
@@ -294,15 +322,15 @@ def _dispatch_process_queue(payload: dict) -> TriggerResult:
             logger.exception("claim_job failed inside HTTP trigger")
             return TriggerResult(500, {"error": str(e)})
         if job is None:
-            return TriggerResult(200, {"ok": True, "claimed": False, "job_ids": []})
+            break
+        try:
+            JobExecutor(backend=backend).execute_job(job)
+        except Exception as e:  # pragma: no cover
+            logger.exception("execute_job failed inside HTTP trigger")
+            return TriggerResult(500, {"error": str(e), "job_ids": job_ids + [job.id]})
+        job_ids.append(job.id)
 
-    try:
-        JobExecutor(backend=backend).execute_job(job)
-    except Exception as e:  # pragma: no cover
-        logger.exception("execute_job failed inside HTTP trigger")
-        return TriggerResult(500, {"error": str(e)})
-
-    return TriggerResult(200, {"ok": True, "claimed": True, "job_ids": [job.id]})
+    return TriggerResult(200, {"ok": True, "claimed": bool(job_ids), "job_ids": job_ids})
 
 
 def _dispatch_process_scheduled(payload: dict) -> TriggerResult:
