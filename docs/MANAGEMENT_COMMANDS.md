@@ -36,7 +36,8 @@ python manage.py run_jobs --once -v 2
 **Options:**
 - `--once` - Process pending jobs once and exit (for serverless)
 - `--queue QUEUE` - Process jobs from specific queue only
-- `--max-jobs N` - Maximum jobs to process (default: 100)
+- `--max-jobs N` - Jobs this process runs before exiting (default: 1; a fresh process is spawned if more are queued)
+- `--idle-linger S` - Once the queue is empty and fewer than `--max-jobs` have run, wait up to S seconds for new jobs (default: 0). The subprocess trigger passes both through from the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings.
 - `-v {0,1,2,3}` - Verbosity level
 
 **Use cases:**

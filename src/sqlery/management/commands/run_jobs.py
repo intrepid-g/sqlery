@@ -1,8 +1,10 @@
 """Management command to run both scheduler and queue workers.
 
-NOTE: Each invocation processes EXACTLY ONE job (memory leak prevention).
-For multiple jobs, invoke this command multiple times or use middleware
-to spawn multiple worker subprocesses.
+NOTE: By default each invocation processes EXACTLY ONE job (memory leak
+prevention). Pass --max-jobs N to process up to N jobs in one process, and
+--idle-linger S to wait up to S seconds for new jobs once the queue is empty
+(only while below N). The subprocess trigger passes these through from the
+SUBPROCESS_JOBS_PER_PROCESS / SUBPROCESS_IDLE_LINGER_S settings.
 """
 
 from django.core.management.base import BaseCommand
@@ -29,6 +31,20 @@ class Command(BaseCommand):
             help="Only process queue, don't check scheduled tasks",
         )
 
+        parser.add_argument(
+            "--max-jobs",
+            type=int,
+            default=1,
+            help="Jobs to process in this process before exiting (default: 1)",
+        )
+        parser.add_argument(
+            "--idle-linger",
+            type=float,
+            default=0,
+            help="Seconds to wait for new jobs when the queue is empty and fewer than "
+            "--max-jobs have run (default: 0 = exit immediately)",
+        )
+
     def handle(self, *args, **options):
         executor = TaskExecutor()
 
@@ -44,8 +60,14 @@ class Command(BaseCommand):
         # Run workers (unless --scheduler-only)
         # NOTE: Processes exactly ONE job per invocation
         if not options["scheduler_only"]:
+            max_jobs = options["max_jobs"]
+            kwargs = {}
+            if max_jobs > 1:
+                kwargs["max_jobs"] = max_jobs
+            if options["idle_linger"] > 0:
+                kwargs["idle_linger"] = options["idle_linger"]
             processed = executor.run_queue_workers(
-                queue_name=options.get("queue")
+                queue_name=options.get("queue"), **kwargs
             )
             self.stdout.write(
                 self.style.SUCCESS(f"Worker: Processed {len(processed)} jobs")

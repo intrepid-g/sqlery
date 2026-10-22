@@ -32,6 +32,11 @@ DEFAULTS = {
     # behaviour) — not recommended: in subprocess mode this file is the only place
     # a crashed run_jobs child leaves a traceback.
     "SUBPROCESS_TRIGGER_LOG": None,
+    # Jobs one spawned run_jobs child processes before exiting (1 = one job per
+    # process, the memory-safe default) and how long (seconds) it lingers for a new
+    # job once the queue is empty while it is still below that cap (0 = exit at once).
+    "SUBPROCESS_JOBS_PER_PROCESS": 1,
+    "SUBPROCESS_IDLE_LINGER_S": 0,
     "INTERNAL_BASE_URL": None,  # e.g., 'http://127.0.0.1:8000' (required for http mode)
     "INTERNAL_SECRET": None,  # Shared secret for HMAC signatures (required for http mode)
     "SIGNATURE_MAX_AGE": 5,  # Signature validity in seconds

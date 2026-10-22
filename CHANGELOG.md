@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `run_jobs --max-jobs N` and `--idle-linger S`, plus the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings passed through by the subprocess trigger. Defaults keep one job per process.
+
 ### Fixed
 
 - `AsyncWorker` now keeps up to `concurrency` jobs in flight (default 10, new constructor argument) as documented, instead of running one at a time, so I/O-bound coroutine jobs overlap on a single worker. Its jobs also go through `invoke_task` semantics (new `ainvoke_task`): chain/chord steps built with `.s()` receive the upstream result, `bind=True` tasks get a `TaskContext`, and `task_prerun`/`task_postrun`/`task_success`/`task_failure` fire. Signal receivers run on the event loop, so ORM work in them must be async-safe.
