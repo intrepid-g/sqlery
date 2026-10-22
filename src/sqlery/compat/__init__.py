@@ -121,10 +121,22 @@ class DatabaseBackend(ABC):
         """Whether a terminate request is pending for the running job."""
         return False
 
+    def get_jobs_pending_retry(self, older_than_seconds: float = 60, limit: int = 100) -> list:
+        """Failed jobs marked ``retry_pending`` (see ``sqlery.core.retry``) that failed more than
+        ``older_than_seconds`` ago, i.e. whose retry was never created (worker died in between)."""
+        return []
+
+    def settle_retry_pending(self, job_id: int) -> None:
+        """Clear the ``retry_pending`` marker once the retry exists (restores the original
+        ``termination_reason``)."""
+        return None
+
     def get_latest_retry(self, job_id: int):
         """Return the newest retry attempt created for ``job_id`` (child via
-        ``parent_job_id``), or ``None``. Used by ``AsyncResult`` to follow retries."""
-        raise NotImplementedError
+        ``parent_job_id``), or ``None``. Used by ``AsyncResult`` and to make retry creation
+        idempotent. Backends that do not implement it return ``None`` (retries are then simply not
+        de-duplicated or followed)."""
+        return None
 
     def claim_job_by_id(self, job_id: int, worker_id: str):
         """Atomically claim one specific *queued* job (queued -> running).

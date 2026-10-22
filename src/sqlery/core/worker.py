@@ -19,7 +19,13 @@ from ..compat import get_backend, get_config, initialize, is_standalone_mode, Jo
 from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task, run_failure_callback, run_success_callback
-from .retry import policy_allows_retry, retry_countdown, shape_retry_delay
+from .retry import (
+    pending_reason,
+    policy_allows_retry,
+    retry_budget_left,
+    retry_countdown,
+    shape_retry_delay,
+)
 from .signals import task_retry
 from .result import REVOKED_ERROR
 from .scheduler import Scheduler
@@ -187,10 +193,12 @@ class JobExecutor:
         except Exception as e:
             error_msg = str(e)
             error_traceback = tb.format_exc()
+            # Decide BEFORE failing the job: a job that will be retried is failed with the
+            # retry_pending marker so a crash before the retry exists can be recovered.
+            will_retry = self._should_retry(job, e)
             try:
-                job = self.backend.mark_job_failed(
-                    job.id, error=error_msg, traceback=error_traceback,
-                    expected_version=expected_version,
+                job = self._mark_failed(
+                    job.id, error_msg, error_traceback, expected_version, will_retry
                 )
             except JobFencingError as fence_err:
                 logger.warning(
@@ -201,7 +209,7 @@ class JobExecutor:
             logger.error(f"Job {job.id} failed: {error_msg}")
             run_failure_callback(job)
 
-            if self._should_retry(job, e):
+            if will_retry:
                 retry_job = self._retry_job(job, exc=e)
                 logger.info(
                     f"Job {job.id} will be retried as job {retry_job.id} "
@@ -309,15 +317,15 @@ class JobExecutor:
                 # (e.g. a ProgrammingError in bulk_insert), which would cause
                 # mark_job_failed to fail on the same broken connection.
                 self._reset_db_connections()
-                failed_job = self.backend.mark_job_failed(
-                    job.id, error=error_msg, traceback=error_traceback,
-                    expected_version=expected_version,
+                will_retry = self._should_retry(job, e)
+                failed_job = self._mark_failed(
+                    job.id, error_msg, error_traceback, expected_version, will_retry
                 )
 
                 run_failure_callback(failed_job)
 
                 # Handle retry in child (it has the DB connection)
-                if self._should_retry(failed_job, e):
+                if will_retry:
                     retry_job = self._retry_job(failed_job, exc=e)
                     logger.info(
                         f"Job {job.id} will be retried as job {retry_job.id} "
@@ -358,6 +366,58 @@ class JobExecutor:
         # SEC-04 is now enforced inside import_task() itself.
         return import_task(task_path)
 
+    def _mark_failed(self, job_id, error, traceback, expected_version=None, will_retry=False,
+                     reason=""):
+        """Fail a job; if it will be retried, tag it ``retry_pending`` in the same write.
+
+        Custom/older backends whose ``mark_job_failed`` lacks ``termination_reason`` are called
+        the old way (no marker, so no crash recovery for them, but nothing breaks).
+        """
+        kwargs = {"error": error, "traceback": traceback}
+        if expected_version is not None:
+            kwargs["expected_version"] = expected_version
+        if will_retry and "termination_reason" in inspect.signature(
+            self.backend.mark_job_failed
+        ).parameters:
+            kwargs["termination_reason"] = pending_reason(reason)
+        return self.backend.mark_job_failed(job_id, **kwargs)
+
+    def _finish_retry_bookkeeping(self, failed_job):
+        """The retry exists: archive the original and clear its ``retry_pending`` marker."""
+        # Mark original failed job as archived (retry created, no longer relevant to dashboard)
+        try:
+            self.backend.mark_job_archived(failed_job.id)
+        except Exception as e:
+            logger.warning(f"Failed to mark job {failed_job.id} as archived: {e}")
+        try:
+            self.backend.settle_retry_pending(failed_job.id)
+        except Exception as e:
+            logger.warning(f"Failed to clear retry marker on job {failed_job.id}: {e}")
+
+    def recover_lost_retries(self, grace_seconds: float = 60, limit: int = 100) -> int:
+        """Create the retry for jobs whose worker died between failing them and retrying them.
+
+        Finds failed jobs tagged ``retry_pending`` for longer than ``grace_seconds`` and calls
+        the (idempotent) :meth:`_retry_job`. Returns how many were recovered. Never raises.
+        """
+        recovered = 0
+        try:
+            pending = self.backend.get_jobs_pending_retry(grace_seconds, limit)
+        except Exception as e:
+            logger.warning(f"Could not look for lost retries: {e}")
+            return 0
+        for job in pending:
+            try:
+                if retry_budget_left(job):
+                    self._retry_job(job)
+                    recovered += 1
+                    logger.warning(f"Recovered lost retry for failed job {job.id}")
+                else:
+                    self.backend.settle_retry_pending(job.id)
+            except Exception as e:
+                logger.error(f"Failed to recover retry for job {job.id}: {e}")
+        return recovered
+
     def _should_retry(self, job, exc: BaseException | None = None) -> bool:
         if job.max_retries is None or job.max_retries <= 0:
             return False
@@ -367,6 +427,12 @@ class JobExecutor:
         return policy_allows_retry(job, exc)
 
     def _retry_job(self, failed_job, exc: BaseException | None = None):
+        # Idempotent: if a retry already exists (e.g. recovery after a crash, or a stale-job
+        # sweep racing the worker that failed it), reuse it instead of creating a duplicate.
+        existing = self.backend.get_latest_retry(failed_job.id)
+        if existing is not None:
+            self._finish_retry_bookkeeping(failed_job)
+            return existing
         retry_count = failed_job.retry_count if failed_job.retry_count is not None else 0
         backoff = failed_job.retry_backoff if failed_job.retry_backoff else 1.0
         delay_seconds = compute_retry_delay(
@@ -420,11 +486,7 @@ class JobExecutor:
             carried = {k: v for k, v in carried.items() if k in accepted}
         retry_job = self.backend.create_job(**retry_kwargs, **carried)
 
-        # Mark original failed job as archived (retry created, no longer relevant to dashboard)
-        try:
-            self.backend.mark_job_archived(failed_job.id)
-        except Exception as e:
-            logger.warning(f"Failed to mark job {failed_job.id} as archived: {e}")
+        self._finish_retry_bookkeeping(failed_job)
 
         logger.info(
             f"Created retry job {retry_job.id} for failed job {failed_job.id}, "
@@ -467,10 +529,11 @@ class JobExecutor:
                             f"Killed hung worker process {job.worker_pid} for job {job.id}"
                         )
 
-                self.backend.mark_job_failed(
+                self._mark_failed(
                     job.id,
-                    error=f"Worker crashed or was killed (running for {int(running_duration)}s, threshold {threshold_seconds}s)",
-                    traceback="Job was stuck in 'running' state - likely worker process crashed, killed by OOM, or terminated by signal"
+                    f"Worker crashed or was killed (running for {int(running_duration)}s, threshold {threshold_seconds}s)",
+                    "Job was stuck in 'running' state - likely worker process crashed, killed by OOM, or terminated by signal",
+                    will_retry=self._should_retry(job),
                 )
                 logger.warning(
                     f"Cleaned up stale job {job.id} (running {int(running_duration)}s > {threshold_seconds}s threshold)"
@@ -749,6 +812,8 @@ class WorkerProcess:
                     except Exception as e:
                         logger.error(f"Scheduler-election error: {e}", exc_info=True)
 
+                    self._maybe_recover_lost_retries()
+
                     job = self.backend.claim_job(self.queues, self.worker_id)
 
                     if not job:
@@ -844,6 +909,18 @@ class WorkerProcess:
     # Parent wait-loop tick bounds (seconds) in _fork_and_execute.
     WAIT_TICK_MIN = 0.005
     WAIT_TICK_MAX = 0.5
+
+    def _maybe_recover_lost_retries(self):
+        """Throttled sweep for retries lost to a crash between failing a job and retrying it."""
+        try:
+            interval = float(get_config("RETRY_RECOVERY_INTERVAL", 30) or 0)
+        except (TypeError, ValueError):
+            interval = 30.0
+        now = time.monotonic()
+        if interval <= 0 or now - getattr(self, "_last_retry_recovery", -interval) < interval:
+            return
+        self._last_retry_recovery = now
+        self.executor.recover_lost_retries()
 
     def _fork_and_execute(self, job) -> dict:
         """Fork a child process to execute the job.

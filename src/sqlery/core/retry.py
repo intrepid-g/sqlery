@@ -17,6 +17,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "RETRY_PENDING",
+    "pending_reason",
+    "settled_reason",
+    "is_retry_pending",
+    "retry_budget_left",
     "Retry",
     "TaskContext",
     "RetryPolicy",
@@ -26,6 +31,38 @@ __all__ = [
     "retry_job_fields",
     "shape_retry_delay",
 ]
+
+
+# A job that failed and WILL be retried is failed with this ``termination_reason`` (optionally
+# ``retry_pending:<original reason>``). The failure write and the retry's creation are two
+# separate writes; if the worker dies between them, this marker is what lets the sweeper find the
+# job and create the retry it was owed (see ``recover_lost_retries``). It is cleared when the retry
+# exists. No schema change: it lives in the existing ``termination_reason`` column.
+RETRY_PENDING = "retry_pending"
+
+
+def pending_reason(reason: str = "") -> str:
+    """``termination_reason`` to store when failing a job that will be retried."""
+    return RETRY_PENDING + (f":{reason}" if reason else "")
+
+
+def settled_reason(reason: str) -> str:
+    """The original reason once the retry exists (``retry_pending:timeout`` -> ``timeout``)."""
+    if reason == RETRY_PENDING:
+        return ""
+    if reason.startswith(RETRY_PENDING + ":"):
+        return reason[len(RETRY_PENDING) + 1:]
+    return reason
+
+
+def is_retry_pending(reason: str | None) -> bool:
+    return bool(reason) and (reason == RETRY_PENDING or reason.startswith(RETRY_PENDING + ":"))
+
+
+def retry_budget_left(job: Any) -> bool:
+    """True if ``max_retries`` allows another attempt (ignores the exception policy)."""
+    max_retries = getattr(job, "max_retries", 0) or 0
+    return max_retries > 0 and (getattr(job, "retry_count", 0) or 0) < max_retries
 
 
 class Retry(Exception):
