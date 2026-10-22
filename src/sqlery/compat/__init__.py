@@ -89,6 +89,15 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        """Seconds until the earliest queued-but-not-yet-due job on ``queues``.
+
+        Lets an idle worker wake for a retry or delayed job instead of sleeping a
+        whole poll interval. ``None`` means "nothing scheduled" (or "unknown"), so
+        the caller keeps its normal poll interval.
+        """
+        return None
+
     @abstractmethod
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job from specified queues.
