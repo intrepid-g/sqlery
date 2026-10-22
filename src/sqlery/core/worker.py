@@ -1161,17 +1161,23 @@ class WorkerProcess:
         is checked between slices so the worker stays responsive to SIGUSR1.
 
         Mirrors the pgwq reference Worker._wait() pattern exactly.
+
+        The wait is capped at the earliest not-yet-due job (a retry's backoff, a
+        delayed enqueue), so such a job starts when due, not a poll interval later.
         """
+        timeout = self._idle_timeout()
         if self._listen_conn is None:
             # Flag-off / SQLite / no connection — original 1s-slice sleep loop
-            elapsed = 0
-            while elapsed < self.poll_interval and not self.shutdown_requested:
-                time.sleep(1)
-                elapsed += 1
+            end = time.monotonic() + timeout
+            while not self.shutdown_requested:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(1.0, remaining))
                 self._check_heartbeat()
             return
-        # Flag-on + PG: wait for NOTIFY with poll_interval timeout, in 1s slices
-        end = time.monotonic() + self.poll_interval
+        # Flag-on + PG: wait for NOTIFY with the idle timeout, in 1s slices
+        end = time.monotonic() + timeout
         while not self.shutdown_requested:
             remaining = end - time.monotonic()
             if remaining <= 0:
@@ -1191,6 +1197,17 @@ class WorkerProcess:
             self._check_heartbeat()
             if self.shutdown_requested:
                 return
+
+    def _idle_timeout(self) -> float:
+        """poll_interval, shortened to the earliest queued job that is not due yet."""
+        try:
+            delay = self.backend.next_due_delay(self.queues)
+        except Exception as e:  # best-effort: fall back to the plain poll interval
+            logger.debug(f"Worker {self.worker_id}: next_due_delay failed: {e}")
+            return self.poll_interval
+        if delay is None:
+            return self.poll_interval
+        return min(self.poll_interval, max(delay + 0.05, 0.1))
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""
