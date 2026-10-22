@@ -22,10 +22,12 @@ table. Alembic migration will follow in a later plan.
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, or_, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
@@ -124,6 +126,27 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     # ----- claim path ------------------------------------------------------
 
+    async def anext_due_delay(self, queues: list[str]) -> float | None:
+        """Seconds until the earliest queued-but-not-yet-due job on ``queues``."""
+        from sqlalchemy import func
+
+        now = _utcnow()
+        factory = get_async_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(func.min(QueuedJob.scheduled_at)).where(
+                    QueuedJob.queue_name.in_(list(queues)),
+                    QueuedJob.status == "queued",
+                    QueuedJob.scheduled_at > now,
+                )
+            )
+            nxt = result.scalar()
+        if nxt is None:
+            return None
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=UTC)
+        return (nxt - now).total_seconds()
+
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
 
@@ -135,10 +158,13 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         now = _utcnow()  # captured BEFORE await
         async with factory() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
+            owner_id = await self._registered_worker_id(session, worker_id)
+            owner = {"worker_id": owner_id, "worker_pid": os.getpid()} if owner_id else {}
             stmt = (
                 select(QueuedJob)
                 .where(QueuedJob.queue_name.in_(list(queues)))
                 .where(QueuedJob.status == "queued")
+                .where(or_(QueuedJob.scheduled_at.is_(None), QueuedJob.scheduled_at <= now))
                 .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
                 .limit(1)
             )
@@ -154,6 +180,8 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 # Row is locked by SELECT FOR UPDATE; update inline.
                 job.status = "running"
                 job.started_at = now
+                for key, value in owner.items():
+                    setattr(job, key, value)
                 job.version = (job.version or 0) + 1
                 session.add(job)
                 await session.commit()
@@ -170,6 +198,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                     status="running",
                     started_at=now,
                     version=current_version + 1,
+                    **owner,
                 )
             )
             res = await session.execute(cas_stmt)
@@ -181,6 +210,83 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 select(QueuedJob).where(QueuedJob.id == job.id)
             )
             return refreshed.scalars().first()
+
+    @staticmethod
+    async def _registered_worker_id(session, worker_id) -> uuid.UUID | None:
+        """Return ``worker_id`` as a UUID if it names a registered Worker row, else ``None``.
+
+        Recording the owner on the claimed job lets the zombie sweep tell a live worker's
+        job from an orphan (dead worker / stale heartbeat) instead of by age alone.
+        """
+        try:
+            wid = worker_id if isinstance(worker_id, uuid.UUID) else uuid.UUID(str(worker_id))
+        except (ValueError, TypeError):
+            return None
+        res = await session.execute(select(Worker.id).where(Worker.id == wid))
+        return wid if res.first() else None
+
+    # ----- zombie sweep (async mirror of SQLAlchemyBackend liveness) -------
+
+    async def aget_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
+        """Async twin of ``SQLAlchemyBackend.get_running_jobs_for_liveness``."""
+        from sqlery.core.liveness import RunningJobLiveness
+        from sqlery.django_sqlery.friendly_name import uuid_to_friendly
+
+        def _aware(dt):
+            if dt is None:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            stmt = select(QueuedJob).where(QueuedJob.status == "running")
+            if queue_names:
+                stmt = stmt.where(QueuedJob.queue_name.in_(list(queue_names)))
+            jobs = list((await session.execute(stmt)).scalars().all())
+            worker_ids = {j.worker_id for j in jobs if j.worker_id is not None}
+            workers: dict[Any, Worker] = {}
+            if worker_ids:
+                res = await session.execute(select(Worker).where(Worker.id.in_(worker_ids)))
+                workers = {w.id: w for w in res.scalars().all()}
+
+        records = []
+        for job in jobs:
+            worker = workers.get(job.worker_id)
+            if worker is not None:
+                try:
+                    friendly = uuid_to_friendly(worker.id)
+                except (ValueError, TypeError):
+                    friendly = str(worker.id)
+            else:
+                friendly = None
+            records.append(
+                RunningJobLiveness(
+                    job_id=job.id,
+                    started_at=_aware(job.started_at),
+                    worker_pid=job.worker_pid,
+                    worker_node_id=worker.node_id if worker else None,
+                    worker_status=worker.status if worker else None,
+                    worker_current_job_id=worker.current_job_id if worker else None,
+                    worker_last_heartbeat=_aware(worker.last_heartbeat) if worker else None,
+                    worker_friendly_name=friendly,
+                    has_worker=worker is not None,
+                )
+            )
+        return records
+
+    async def afail_zombie_job(self, job_id, reason: str) -> bool:
+        """Async twin of ``SQLAlchemyBackend.fail_zombie_job`` (still-running jobs only)."""
+        factory = get_async_session_factory()
+        async with factory() as session:
+            res = await session.execute(select(QueuedJob).where(QueuedJob.id == job_id))
+            job = res.scalars().first()
+            if job is None or job.status != "running":
+                return False
+            job.mark_failed(error=reason, termination_reason="zombie_job")
+            job.version = (job.version or 0) + 1
+            session.add(job)
+            await session.commit()
+            return True
 
     # ----- terminal-status writes -----------------------------------------
 
@@ -430,26 +536,29 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     async def arequeue_retry(self, failed_job) -> None:
         """Insert a fresh ``queued`` row carrying the retry chain."""
-        retry_count = (getattr(failed_job, "retry_count", 0) or 0) + 1
-        backoff = float(getattr(failed_job, "retry_backoff", 1.0) or 1.0)
-        delay = backoff * (2 ** (retry_count - 1))
+        from sqlery.core.retry import retry_job_fields
+
+        fields, delay = retry_job_fields(failed_job)
         scheduled_at = _utcnow() + timedelta(seconds=delay)
 
         factory = get_async_session_factory()
         async with factory() as session:
-            retry_row = QueuedJob(
-                task_path=failed_job.task_path,
-                kwargs=dict(failed_job.kwargs) if isinstance(failed_job.kwargs, dict) else {},
-                queue_name=getattr(failed_job, "queue_name", "default"),
-                priority=getattr(failed_job, "priority", 0) or 0,
-                status="queued",
-                parent_job_id=failed_job.id,
-                retry_count=retry_count,
-                max_retries=getattr(failed_job, "max_retries", 0) or 0,
-                retry_backoff=backoff,
-                scheduled_at=scheduled_at,
+            session.add(QueuedJob(status="queued", scheduled_at=scheduled_at, **fields))
+            # The failed attempt is superseded by the retry (as in the sync worker).
+            res = await session.execute(
+                select(QueuedJob.created_at).where(
+                    QueuedJob.id == failed_job.id, QueuedJob.status == "failed"
+                )
             )
-            session.add(retry_row)
+            row = res.first()
+            if row is not None:
+                await session.execute(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == failed_job.id)
+                    .where(QueuedJob.created_at == row[0])
+                    .where(QueuedJob.status == "failed")
+                    .values(status="archived")
+                )
             await session.commit()
 
     async def aregistry_add(self, registry_name: str, job_id) -> None:

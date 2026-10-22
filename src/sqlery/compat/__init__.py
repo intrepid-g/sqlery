@@ -89,6 +89,15 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        """Seconds until the earliest queued-but-not-yet-due job on ``queues``.
+
+        Lets an idle worker wake for a retry or delayed job instead of sleeping a
+        whole poll interval. ``None`` means "nothing scheduled" (or "unknown"), so
+        the caller keeps its normal poll interval.
+        """
+        return None
+
     @abstractmethod
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job from specified queues.
@@ -357,8 +366,12 @@ class DatabaseBackend(ABC):
         queue_name: str,
         priority: int,
         enabled: bool = True,
+        next_run_at: datetime | None = None,
     ):
         """Create a new scheduled task.
+
+        Args:
+            next_run_at: Initial next run time (defaults to next cron occurrence)
 
         Returns:
             ScheduledTask instance
@@ -813,6 +826,14 @@ class AsyncDatabaseBackend(ABC):
     return). Concrete implementations live in DjangoAsyncBackend (ASYN-02)
     and SQLAlchemyAsyncBackend (ASYN-03).
     """
+
+    async def anext_due_delay(self, queues: list[str]) -> float | None:
+        """Async analog of DatabaseBackend.next_due_delay.
+
+        ``None`` (the default) means "nothing scheduled" or "unknown", so the
+        AsyncWorker keeps its normal poll interval.
+        """
+        return None
 
     @abstractmethod
     async def aclaim_job(self, queues: list[str], worker_id: str):

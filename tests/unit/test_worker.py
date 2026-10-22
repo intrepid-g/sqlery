@@ -323,7 +323,9 @@ class TestForkLifecycle:
         # reports the child exited — so the wait loop iterates several times and
         # the in-wait renewal runs at least once.
         monkeypatch.setattr(os, "fork", lambda: 4242)
-        poll_results = iter([(0, 0), (0, 0), (0, 0), (4242, 0)])
+        # Eight "running" polls: the wait backs off 5, 10, ... 320 ms, and the
+        # DB duties run once accumulated sleep reaches 0.5 s (8th tick).
+        poll_results = iter([(0, 0)] * 8 + [(4242, 0)])
         monkeypatch.setattr(os, "waitpid", lambda pid, opts: next(poll_results))
         monkeypatch.setattr(os, "WIFEXITED", lambda s: True)
         monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)

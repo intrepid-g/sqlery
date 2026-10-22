@@ -18,6 +18,7 @@ from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend, JobFencingError, get_config
 from ..core.models import QueuedJob, ScheduledJob, ScheduledTask, JobRegistry, Worker, DaemonLease
+from ..crontab import next_cron_occurrence
 from .database import get_engine, get_session
 
 # Partition maintenance helpers — guarded against psycopg absence (SQLite installs)
@@ -367,6 +368,22 @@ class SQLAlchemyBackend(DatabaseBackend):
             _notify_queue_sqlalchemy(queue_name, get_engine())
 
         return job
+
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        now = datetime.now(UTC)
+        with self._get_session() as session:
+            nxt = session.exec(
+                select(func.min(QueuedJob.scheduled_at)).where(
+                    QueuedJob.queue_name.in_(queues),
+                    QueuedJob.status == "queued",
+                    QueuedJob.scheduled_at > now,
+                )
+            ).first()
+        if nxt is None:
+            return None
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=UTC)
+        return (nxt - now).total_seconds()
 
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job.
@@ -977,8 +994,12 @@ class SQLAlchemyBackend(DatabaseBackend):
         queue_name: str,
         priority: int,
         enabled: bool = True,
+        next_run_at: datetime | None = None,
     ):
-        """Create a new scheduled task."""
+        """Create a new scheduled task.
+
+        ``next_run_at`` defaults to the next cron occurrence so the task becomes due.
+        """
         task = ScheduledTask(
             name=name,
             task_path=task_path,
@@ -986,6 +1007,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             queue_name=queue_name,
             priority=priority,
             enabled=enabled,
+            next_run_at=next_run_at or next_cron_occurrence(cron_expression, datetime.now(UTC)),
         )
 
         with self._get_session() as session:
@@ -1019,8 +1041,13 @@ class SQLAlchemyBackend(DatabaseBackend):
         status: str,
         current_job_id: int | None = None,
         jobs_processed: int | None = None,
+        total_busy_seconds: float | None = None,
     ):
-        """Update or create worker heartbeat."""
+        """Update or create worker heartbeat.
+
+        ``total_busy_seconds`` is accepted for parity with the Django backend (the worker
+        always sends it); the standalone worker table has no column for it, so it is ignored.
+        """
         # import socket  # moved to top-level
 
         with self._get_session() as session:
@@ -1222,6 +1249,41 @@ class SQLAlchemyBackend(DatabaseBackend):
                 time.sleep(0.1)
 
             return {"deleted": total_deleted, "count": total_deleted}
+
+    def cleanup_per_job_ttl(self, dry_run: bool = False) -> dict:
+        """Delete finished jobs whose per-job result_ttl / failure_ttl has elapsed.
+
+        A TTL of None or -1 keeps the job forever (RQ semantics).
+        """
+        now = datetime.now(UTC)
+        total = 0
+        with self._get_session() as session:
+            for statuses, ttl_col in (
+                (["success"], QueuedJob.result_ttl),
+                (["failed", "archived"], QueuedJob.failure_ttl),
+            ):
+                rows = session.exec(
+                    select(QueuedJob.id, QueuedJob.finished_at, ttl_col).where(
+                        QueuedJob.status.in_(statuses),
+                        ttl_col.is_not(None),
+                        ttl_col != -1,
+                        QueuedJob.finished_at.is_not(None),
+                    )
+                ).all()
+                expired = [
+                    job_id
+                    for job_id, finished_at, ttl in rows
+                    # SQLite returns naive datetimes; treat them as UTC.
+                    if (finished_at if finished_at.tzinfo else finished_at.replace(tzinfo=UTC))
+                    + timedelta(seconds=ttl)
+                    < now
+                ]
+                total += len(expired)
+                if expired and not dry_run:
+                    session.exec(delete(QueuedJob).where(QueuedJob.id.in_(expired)))
+            if not dry_run:
+                session.commit()
+        return {"deleted" if not dry_run else "would_delete": total}
 
     def cleanup_jobs_by_count(
         self,

@@ -9,7 +9,7 @@ from pathlib import Path
 from django.conf import settings as django_settings
 from django.core.cache import cache
 
-from .subprocess_executor import get_manage_py_path
+from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .settings import get_setting
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,8 @@ class SubprocessTriggerMiddleware:
                 sys.executable,
                 manage_py,
                 "run_jobs",
-                # No --once flag - command now always processes ONE job
+                # No --once flag - one job per process unless SUBPROCESS_JOBS_PER_PROCESS > 1
+                *run_jobs_extra_args(),
             ],
             stdout=child_output,
             stderr=subprocess.STDOUT,

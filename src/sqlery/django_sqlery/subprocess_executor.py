@@ -64,6 +64,25 @@ def get_manage_py_path() -> str:
         )
 
 
+def run_jobs_extra_args() -> list[str]:
+    """Extra ``run_jobs`` flags from SUBPROCESS_JOBS_PER_PROCESS / SUBPROCESS_IDLE_LINGER_S.
+
+    Empty with the defaults (1 job, no linger), so the spawned command line is
+    exactly what it always was.
+    """
+    args: list[str] = []
+    try:
+        per_process = int(get_setting("SUBPROCESS_JOBS_PER_PROCESS", 1) or 1)
+        linger = float(get_setting("SUBPROCESS_IDLE_LINGER_S", 0) or 0)
+    except (TypeError, ValueError):
+        return args
+    if per_process > 1:
+        args += ["--max-jobs", str(per_process)]
+    if linger > 0:
+        args += ["--idle-linger", str(linger)]
+    return args
+
+
 def run_scheduler_subprocess() -> dict[str, int]:
     """Run scheduler in subprocess to prevent memory leaks.
 

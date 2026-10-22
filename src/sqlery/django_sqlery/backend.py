@@ -56,6 +56,10 @@ CLEANUP_BATCH_SIZE = 500
 FINISHED_STATUSES = ("success", "failed", "archived")
 
 
+# Claimer ids minted internally by the Lambda and HTTP-trigger paths (no Worker row).
+_EPHEMERAL_CLAIMER_PREFIXES = ("lambda-", "trigger-")
+
+
 class DjangoBackend(DatabaseBackend):
     """Django ORM implementation of DatabaseBackend.
 
@@ -280,6 +284,13 @@ class DjangoBackend(DatabaseBackend):
         return job
 
     @retry_on_db_error()
+    def next_due_delay(self, queues: list[str]) -> float | None:
+        now = timezone.now()
+        nxt = self.QueuedJob.objects.filter(
+            queue_name__in=queues, status="queued", scheduled_at__gt=now
+        ).aggregate(m=db_models.Min("scheduled_at"))["m"]
+        return None if nxt is None else (nxt - now).total_seconds()
+
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job using the unified claiming path.
 
@@ -342,8 +353,13 @@ class DjangoBackend(DatabaseBackend):
             # I wish I had the time to: add a retry loop with exponential backoff
             # before auto-registering, to handle transient visibility delays
             worker_row = self._auto_register_worker(worker_id)
-            if not worker_row:
+            if not worker_row and not worker_id.startswith(_EPHEMERAL_CLAIMER_PREFIXES):
                 return None
+            # Ephemeral claimers (Lambda "lambda-<uuid>", HTTP trigger "trigger-<uuid>") never
+            # have a Worker row, and the claim itself does not need one (worker=None is handled
+            # by the shared claiming path). Before, they matched neither the UUID nor the
+            # "worker_<node>_<pid>" format and silently claimed nothing in Django mode. Any
+            # other unregistered worker id is still refused.
         with transaction.atomic():
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
@@ -569,8 +585,10 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str,
         priority: int,
         enabled: bool = True,
+        next_run_at: datetime | None = None,
     ):
         """Create a new scheduled task."""
+        extra = {"next_run_at": next_run_at} if next_run_at is not None else {}
         task = self.ScheduledTask.objects.create(
             name=name,
             task_path=task_path,
@@ -578,6 +596,7 @@ class DjangoBackend(DatabaseBackend):
             queue_name=queue_name,
             priority=priority,
             enabled=enabled,
+            **extra,
         )
         return task
 

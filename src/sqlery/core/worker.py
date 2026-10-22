@@ -11,10 +11,11 @@ import sys
 import traceback as tb
 import signal
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
-from ..compat import get_backend, get_config, JobFencingError
+from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
 from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task
@@ -51,6 +52,10 @@ try:
 except ImportError:
     sanitize_queue_name_to_channel = None  # type: ignore[assignment]
     _pg_notify_import_ok = False
+
+# Inherited LISTEN connections disowned by a forked child (see WorkerProcess._orphan_listen_conn).
+# Held here so they are never garbage-collected (PQfinish) in the child.
+_ORPHANED_LISTEN_CONNS: list = []
 
 _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job', default=None)
 
@@ -119,8 +124,17 @@ class JobExecutor:
                 # from ..compat import get_config  # moved to top-level
                 job.timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
-            # Set up timeout
-            if job.timeout_seconds:
+            # Set up timeout. SIGALRM can only be installed from the main thread; threaded
+            # callers (e.g. an HTTP trigger under runserver/gthread) run without a hard timeout.
+            use_alarm = bool(job.timeout_seconds) and (
+                threading.current_thread() is threading.main_thread()
+            )
+            if job.timeout_seconds and not use_alarm:
+                logger.warning(
+                    f"Job {job.id} is running outside the main thread; the "
+                    f"{job.timeout_seconds}s hard timeout cannot be enforced"
+                )
+            if use_alarm:
                 def timeout_handler(signum, frame):
                     raise TimeoutError(
                         f"Job {job.id} exceeded timeout of {job.timeout_seconds} seconds"
@@ -166,7 +180,7 @@ class JobExecutor:
                 logger.info(f"Job {job.id} completed successfully")
 
             finally:
-                if job.timeout_seconds:
+                if use_alarm:
                     signal.alarm(0)
 
         except Exception as e:
@@ -243,7 +257,7 @@ class JobExecutor:
 
             _token = _current_job_var.set(job)
             try:
-                result = task_func(*positional_args, **kwargs)
+                result = invoke_task(task_func, job, positional_args, kwargs)
                 if inspect.iscoroutine(result):
                     result = asyncio.run(result)
             finally:
@@ -545,6 +559,15 @@ class WorkerProcess:
         if backend is None:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
+            # Fresh standalone process (e.g. `sqlery worker`): nothing initialised the
+            # database yet, so do what core/worker_runner.py does and use the env URL.
+            database_url = os.environ.get("SQLERY_DATABASE_URL")
+            if database_url and is_standalone_mode():
+                from ..fastapi_sqlery import database as _standalone_db
+
+                if _standalone_db._engine is None:
+                    initialize(database_url=database_url, enable_daemon=False)
+                    backend = get_backend()
 
         self.backend = backend
         self.queues = queues or ['default']
@@ -575,8 +598,12 @@ class WorkerProcess:
         # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
         self._listen_conn = None
 
-    def run(self):
-        """Run worker loop: claim jobs, fork children, monitor, heartbeat."""
+    def run(self, max_jobs: int | None = None):
+        """Run worker loop: claim jobs, fork children, monitor, heartbeat.
+
+        Args:
+            max_jobs: Stop after processing this many jobs (None or 0 = unlimited).
+        """
         # import sys  # moved to top-level
 
         # SEC-04 (W3): production-shaped + unset = one WARNING per worker run.
@@ -659,15 +686,18 @@ class WorkerProcess:
 
         # Phase 18: open LISTEN connection (no-op when SQLERY_PG_NOTIFY=False or SQLite).
         self._open_listen_conn()
-        # FORK-SAFETY: _close_listen_conn runs as pre_fork hook in ForkSafeExecutor.fork()
-        # before os.fork() so the LISTEN connection is never inherited by child processes.
-        # _open_listen_conn re-opens in the parent via post_fork_parent so LISTEN resumes
-        # after each fork without blocking the child.
-        self._fork_ctx.register_pre_fork(self._close_listen_conn)
-        self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+        # FORK-SAFETY (#117): the LISTEN connection stays open across forks, so a NOTIFY
+        # that lands while a job runs is not lost and each job costs no reconnect. The
+        # child gets an inherited copy of the socket, so it must never close or finalise
+        # it (that would send Terminate and kill the parent's session).
+        # Old: self._fork_ctx.register_pre_fork(self._close_listen_conn)
+        # Old: self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
+        self._fork_ctx.register_post_fork_child(self._orphan_listen_conn)
 
         try:
             while not self.shutdown_requested:
+                if max_jobs and self.jobs_processed >= max_jobs:
+                    break
                 try:
                     # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
                     # from django.db import close_old_connections  # moved to top-level (try/except)
@@ -806,6 +836,10 @@ class WorkerProcess:
 
         return self.jobs_processed
 
+    # Parent wait-loop tick bounds (seconds) in _fork_and_execute.
+    WAIT_TICK_MIN = 0.005
+    WAIT_TICK_MAX = 0.5
+
     def _fork_and_execute(self, job) -> dict:
         """Fork a child process to execute the job.
 
@@ -869,6 +903,13 @@ class WorkerProcess:
         except (TypeError, ValueError):
             revoke_poll = 2.0
         last_revoke_check = time.monotonic()
+        # The wait starts with a few-ms sleep and backs off (doubling) to
+        # WAIT_TICK_MAX so trivial jobs are reaped promptly; the per-tick DB
+        # duties below run once the accumulated sleep reaches WAIT_TICK_MAX (the
+        # old 0.5 s cadence). Because 5+10+...+320 ms is the first total past
+        # 0.5 s, the first DB pass lands ~0.635 s into a job.
+        wait_sleep = self.WAIT_TICK_MIN
+        slept_since_duties = 0.0
 
         while not child_exited:
             try:
@@ -903,8 +944,13 @@ class WorkerProcess:
                 return {'success': False, 'error': f'Timeout after {int(elapsed)}s'}
 
             # Sleep briefly so parent stays responsive to signals
-            time.sleep(0.5)
+            time.sleep(wait_sleep)
+            slept_since_duties += wait_sleep
+            wait_sleep = min(wait_sleep * 2, self.WAIT_TICK_MAX)
             self._check_heartbeat()
+            if slept_since_duties < self.WAIT_TICK_MAX:
+                continue  # fast early tick: just re-poll waitpid
+            slept_since_duties = 0.0
             if revoke_poll > 0 and time.monotonic() - last_revoke_check >= revoke_poll:
                 last_revoke_check = time.monotonic()
                 try:
@@ -968,7 +1014,9 @@ class WorkerProcess:
         refreshed = self.backend.get_job_by_id(job_id)
         if refreshed and refreshed.status == 'success':
             return {'success': True, 'output': refreshed.output or ''}
-        elif refreshed and refreshed.status == 'failed':
+        elif refreshed and refreshed.status in ('failed', 'archived'):
+            # 'archived': the child failed, queued a retry and archived the original;
+            # that outcome is already recorded, so don't overwrite it as a crash.
             return {'success': False, 'error': refreshed.error or ''}
         elif exit_status == 0:
             return {'success': True, 'output': ''}
@@ -1094,6 +1142,21 @@ class WorkerProcess:
                     pass
             self._listen_conn = None
 
+    def _orphan_listen_conn(self) -> None:
+        """Forked child only: disown the inherited LISTEN connection WITHOUT closing it.
+
+        The child shares the parent's socket. Closing the psycopg connection (or letting
+        it be garbage-collected, which runs PQfinish) would send a Terminate message on
+        that shared socket and end the parent's LISTEN session. So the child only drops
+        its own attribute (nothing in the child can reach it) and parks the object in a
+        module-level list so it is never finalised; the child leaves via ``os._exit``.
+        """
+        conn = self._listen_conn
+        if conn is None:
+            return
+        _ORPHANED_LISTEN_CONNS.append(conn)
+        self._listen_conn = None
+
     def _close_listen_conn(self) -> None:
         """Close the LISTEN connection. Safe to call when connection is None.
 
@@ -1110,6 +1173,26 @@ class WorkerProcess:
         self._listen_conn = None
         logger.debug(f"Worker {self.worker_id}: LISTEN connection closed")
 
+    _LISTEN_RETRY_SECONDS = 30.0
+
+    def _lazy_open_listen_conn(self) -> bool:
+        """Open the LISTEN connection on demand; True only if it is open afterwards.
+
+        No-op unless SQLERY_PG_NOTIFY is on. A failed attempt is not retried for
+        ``_LISTEN_RETRY_SECONDS`` so a down or non-PG database costs one try, not one
+        per idle pass.
+        """
+        if not get_config('SQLERY_PG_NOTIFY', False):
+            return False
+        now = time.monotonic()
+        if now < getattr(self, '_listen_retry_at', 0.0):
+            return False
+        self._open_listen_conn()
+        if self._listen_conn is None:
+            self._listen_retry_at = now + self._LISTEN_RETRY_SECONDS
+            return False
+        return True
+
     def _wait_for_notify(self) -> None:
         """Block up to poll_interval for a NOTIFY, in <=1s slices.
 
@@ -1118,17 +1201,27 @@ class WorkerProcess:
         is checked between slices so the worker stays responsive to SIGUSR1.
 
         Mirrors the pgwq reference Worker._wait() pattern exactly.
+
+        The wait is capped at the earliest not-yet-due job (a retry's backoff, a
+        delayed enqueue), so such a job starts when due, not a poll interval later.
         """
+        timeout = self._idle_timeout()
+        if self._listen_conn is None and self._lazy_open_listen_conn():
+            # Just subscribed: return so the loop re-claims. A job enqueued before the
+            # LISTEN took effect is found by that claim; one after it is NOTIFYed.
+            return
         if self._listen_conn is None:
             # Flag-off / SQLite / no connection — original 1s-slice sleep loop
-            elapsed = 0
-            while elapsed < self.poll_interval and not self.shutdown_requested:
-                time.sleep(1)
-                elapsed += 1
+            end = time.monotonic() + timeout
+            while not self.shutdown_requested:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(1.0, remaining))
                 self._check_heartbeat()
             return
-        # Flag-on + PG: wait for NOTIFY with poll_interval timeout, in 1s slices
-        end = time.monotonic() + self.poll_interval
+        # Flag-on + PG: wait for NOTIFY with the idle timeout, in 1s slices
+        end = time.monotonic() + timeout
         while not self.shutdown_requested:
             remaining = end - time.monotonic()
             if remaining <= 0:
@@ -1148,6 +1241,17 @@ class WorkerProcess:
             self._check_heartbeat()
             if self.shutdown_requested:
                 return
+
+    def _idle_timeout(self) -> float:
+        """poll_interval, shortened to the earliest queued job that is not due yet."""
+        try:
+            delay = self.backend.next_due_delay(self.queues)
+        except Exception as e:  # best-effort: fall back to the plain poll interval
+            logger.debug(f"Worker {self.worker_id}: next_due_delay failed: {e}")
+            return self.poll_interval
+        if delay is None:
+            return self.poll_interval
+        return min(self.poll_interval, max(delay + 0.05, 0.1))
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""

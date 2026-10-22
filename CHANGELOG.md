@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- `run_jobs --max-jobs N` and `--idle-linger S`, plus the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings passed through by the subprocess trigger. Defaults keep one job per process.
+
+### Fixed
+
+- `AsyncWorker` now keeps up to `concurrency` jobs in flight (default 10, new constructor argument) as documented, instead of running one at a time, so I/O-bound coroutine jobs overlap on a single worker. Its jobs also go through `invoke_task` semantics (new `ainvoke_task`): chain/chord steps built with `.s()` receive the upstream result, `bind=True` tasks get a `TaskContext`, and `task_prerun`/`task_postrun`/`task_success`/`task_failure` fire. Signal receivers run on the event loop, so ORM work in them must be async-safe.
+
 ## [0.25.0] - 2026-10-15
 
 ### Upgrade notes
@@ -27,6 +37,8 @@ Read these before upgrading; each is a deliberate behaviour change.
 - Lambda handler no longer logs the full invocation event (only action and keys).
 
 ### Fixed
+
+- Django mode: `claim_job` returned nothing for any claimer whose id was not `worker_<node>_<pid>` or a registered UUID, so the Lambda handler's and the HTTP trigger's queue claims (`lambda-<uuid>`, `trigger-<uuid>`) silently processed no jobs. The Lambda and HTTP-trigger claimers now claim normally; any other unregistered worker id is still refused.
 
 - Dashboard authentication was skipped for any non-empty `root_path` (e.g. `uvicorn --root-path /x` behind a proxy). Auto-`inherit` now requires a real Starlette `Mount` (`scope["app_root_path"]`).
 - A job whose dependency failed and has a pending retry (or was archived after retrying) was either failed immediately or blocked forever. Dependencies are now judged by their newest retry attempt in both modes. Retry jobs also keep their `dependencies`.

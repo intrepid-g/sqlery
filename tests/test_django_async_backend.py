@@ -2,8 +2,8 @@
 
 Covers every async method declared on AsyncDatabaseBackend, exercised
 against SQLite via Django's pytest-django + pytest-asyncio integration.
-All methods must use the native async ORM — `sync_to_async` is forbidden
-in the implementation.
+All methods use the native async ORM except aclaim_job, which runs the shared sync
+claiming algorithm through `sync_to_async` (Django has no acursor/aatomic).
 """
 
 import asyncio
@@ -94,6 +94,54 @@ async def test_aclaim_job_concurrent_only_one_wins(backend, make_job):
     )
     winners = [r for r in results if r is not None]
     assert len(winners) == 1
+
+
+@pytest.mark.postgres
+async def test_aclaim_job_works_on_postgresql(backend, make_job):
+    """#66: the PG claim must not use the non-existent connection.acursor()."""
+    from asgiref.sync import sync_to_async
+    from django.db import connection
+
+    if connection.vendor != "postgresql":
+        pytest.skip("needs a PostgreSQL Django database (SQLERY_TEST_PG_URL)")
+
+    assert await backend.aclaim_job(["default"], "wkr-pg") is None
+    job = await sync_to_async(make_job)()
+    claimed = await backend.aclaim_job(["default"], "wkr-pg")
+    assert claimed is not None and claimed.id == job.id
+    assert claimed.status == "running"
+
+
+async def test_aclaim_job_waits_for_dependencies(backend, make_job):
+    """#67: a job whose dependency has not succeeded must not be claimed."""
+    from asgiref.sync import sync_to_async
+    from sqlery.django_sqlery.models import QueuedJob
+
+    later = timezone.now() + timezone.timedelta(hours=1)
+    blocker = await sync_to_async(make_job)(scheduled_at=later)
+    dependent = await sync_to_async(make_job)(dependencies=[blocker.id])
+
+    assert await backend.aclaim_job(["default"], "wkr-1") is None
+    assert (await QueuedJob.objects.aget(id=dependent.id)).status == "queued"
+
+    await QueuedJob.objects.filter(id=blocker.id).aupdate(status="success")
+    claimed = await backend.aclaim_job(["default"], "wkr-1")
+    assert claimed is not None and claimed.id == dependent.id
+
+
+async def test_aclaim_job_expires_jobs_past_ttl(backend, make_job):
+    """#67: a queued job older than its ttl fails as expired instead of running."""
+    from asgiref.sync import sync_to_async
+    from sqlery.django_sqlery.models import QueuedJob
+
+    job = await sync_to_async(make_job)(ttl=1)
+    await QueuedJob.objects.filter(id=job.id).aupdate(
+        created_at=timezone.now() - timezone.timedelta(seconds=30)
+    )
+
+    assert await backend.aclaim_job(["default"], "wkr-1") is None
+    fresh = await QueuedJob.objects.aget(id=job.id)
+    assert (fresh.status, fresh.termination_reason) == ("failed", "expired")
 
 
 # ----- amark_running / amark_success / amark_failed / amark_shutting_down ---
@@ -289,14 +337,30 @@ async def test_aregistry_add_and_remove(backend, make_job):
     ).aexists()
 
 
-# ----- no sync_to_async in implementation -----------------------------------
+# ----- no acursor in implementation -----------------------------------
 
 
-def test_no_sync_to_async_in_implementation():
+def test_no_acursor_in_implementation():
+    """Django has no ``connection.acursor``; the claim path must not call it (#66)."""
     import pathlib
 
     src = pathlib.Path(
         __file__
     ).parent.parent / "src" / "sqlery" / "django_sqlery" / "async_backend.py"
     text = src.read_text()
-    assert "sync_to_async" not in text
+    assert "acursor()" not in text
+
+
+# ----- anext_due_delay (#115) ----------------------------------------------
+
+
+async def test_anext_due_delay_none_then_future(backend, make_job):
+    from datetime import timedelta
+
+    assert await backend.anext_due_delay(["default"]) is None
+    await asyncio.to_thread(make_job)  # due now: does not count
+    assert await backend.anext_due_delay(["default"]) is None
+    await asyncio.to_thread(make_job, scheduled_at=timezone.now() + timedelta(seconds=3))
+    delay = await backend.anext_due_delay(["default"])
+    assert delay is not None and 0 < delay <= 3
+    assert await backend.anext_due_delay(["other"]) is None

@@ -122,8 +122,8 @@ async def test_deadline_wins_observes_transient_state_and_requeues_retry(
     backend, make_job, session_factory
 ):
     """Deadline wins: transient ``shutting_down`` IS observable; row ends
-    ``failed`` with the canonical error string; retry row enqueued when
-    ``max_retries > 0``.
+    ``failed`` with the canonical error string; when ``max_retries > 0`` a retry row
+    is enqueued and the failed attempt is archived (as the sync worker does).
     """
     job = await make_job(task_path=f"{__name__}._slow_job", max_retries=2)
 
@@ -171,10 +171,11 @@ async def test_deadline_wins_observes_transient_state_and_requeues_retry(
         f"expected to observe 'shutting_down' transient state; saw: {observed_statuses}"
     )
 
-    # Terminal state should be 'failed' with the canonical error string.
+    # Terminal state is 'failed' with the canonical error string; once the retry row exists
+    # the failed attempt is archived.
     async with session_factory() as s:
         row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
-        assert row.status == "failed", f"expected failed terminal, got {row.status}"
+        assert row.status == "archived", f"expected archived terminal, got {row.status}"
         assert row.error == SHUTDOWN_TIMEOUT_ERROR
 
         # Retry row should be enqueued (max_retries=2).

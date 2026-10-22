@@ -3,14 +3,15 @@
 Provides web UI and REST API for job queue management.
 """
 
-import uvicorn
-from datetime import datetime, UTC
+import inspect
+from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException, Body
+import uvicorn
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ..compat import get_backend, is_standalone_mode
@@ -50,6 +51,20 @@ STATIC_DIR.mkdir(exist_ok=True)
 
 # Set up Jinja2 templates
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+# Builtins the templates call directly; Jinja does not expose them by default.
+templates.env.globals.update(min=min, max=max, str=str)
+
+_REQUEST_FIRST = next(iter(inspect.signature(templates.TemplateResponse).parameters)) == "request"
+
+
+def _render(name: str, context: dict, status_code: int = 200):
+    """Render a template using the request-first (starlette 1.x) or legacy TemplateResponse form."""
+    if _REQUEST_FIRST:
+        return templates.TemplateResponse(
+            context["request"], name, context, status_code=status_code
+        )
+    return templates.TemplateResponse(name, context, status_code=status_code)
+
 
 # Mount static files (if directory exists and has content)
 if STATIC_DIR.exists():
@@ -112,7 +127,7 @@ async def dashboard(request: Request):
     # Get recent jobs (last 10)
     recent_jobs = backend.get_running_jobs()[:10]
 
-    return templates.TemplateResponse(
+    return _render(
         "dashboard.html",
         {
             "request": request,
@@ -160,7 +175,7 @@ async def jobs_list(
     has_prev = page > 1
     has_next = page < total_pages
 
-    return templates.TemplateResponse(
+    return _render(
         "jobs_list.html",
         {
             "request": request,
@@ -187,13 +202,13 @@ async def job_detail(request: Request, job_id: int):
     job = backend.get_job_by_id(job_id)
 
     if not job:
-        return templates.TemplateResponse(
+        return _render(
             "error.html",
             {"request": request, "error": f"Job {job_id} not found"},
             status_code=404,
         )
 
-    return templates.TemplateResponse(
+    return _render(
         "job_detail.html",
         {
             "request": request,
@@ -211,7 +226,7 @@ async def scheduled_tasks_list(request: Request):
     backend = get_backend()
     tasks = backend.get_scheduled_tasks()
 
-    return templates.TemplateResponse(
+    return _render(
         "scheduled_tasks.html",
         {
             "request": request,
@@ -229,7 +244,7 @@ async def workers_list(request: Request):
     backend = get_backend()
     workers = backend.get_worker_heartbeats(active_only=False)
 
-    return templates.TemplateResponse(
+    return _render(
         "workers.html",
         {
             "request": request,
@@ -253,7 +268,7 @@ async def registries_view(request: Request):
         'failed': backend.get_registry_jobs('failed', limit=50),
     }
 
-    return templates.TemplateResponse(
+    return _render(
         "registries.html",
         {
             "request": request,

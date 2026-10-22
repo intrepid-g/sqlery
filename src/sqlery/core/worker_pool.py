@@ -4,6 +4,7 @@ Manages spawning, monitoring, and cleanup of worker processes using the
 backend abstraction layer. Works in both Django and standalone modes.
 """
 
+import json
 import os
 import sys
 import socket
@@ -28,6 +29,8 @@ except ImportError:
     isoparse = None
 
 logger = logging.getLogger(__name__)
+
+WORKER_QUEUES_ENV = "SQLERY_WORKER_QUEUES"
 
 
 class WorkerPoolManager:
@@ -114,13 +117,18 @@ class WorkerPoolManager:
 
         # Spawn worker subprocess using core worker module
         # The worker will run jobs from the specified queues
+        # The fresh interpreter re-reads settings, so hand it this pool's queues explicitly
+        # (e.g. ``rqworker reports`` overrides WORKER_QUEUES only in the daemon process).
+        worker_env = os.environ.copy()
+        worker_env[WORKER_QUEUES_ENV] = json.dumps(list(self.queues))
+
         try:
             process = subprocess.Popen(
                 [sys.executable, "-m", "sqlery.core.worker_runner"],
                 stdout=worker_log_file,
                 stderr=sys.stderr,       # stderr goes to daemon's stderr (visible in docker logs)
                 stdin=subprocess.DEVNULL,
-                env=os.environ.copy(),
+                env=worker_env,
                 start_new_session=True,
                 close_fds=True,   # was False — prevents FD leaks into worker processes
             )
