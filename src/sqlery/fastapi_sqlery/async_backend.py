@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, or_, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend
@@ -125,6 +125,27 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     # ----- claim path ------------------------------------------------------
 
+    async def anext_due_delay(self, queues: list[str]) -> float | None:
+        """Seconds until the earliest queued-but-not-yet-due job on ``queues``."""
+        from sqlalchemy import func
+
+        now = _utcnow()
+        factory = get_async_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(func.min(QueuedJob.scheduled_at)).where(
+                    QueuedJob.queue_name.in_(list(queues)),
+                    QueuedJob.status == "queued",
+                    QueuedJob.scheduled_at > now,
+                )
+            )
+            nxt = result.scalar()
+        if nxt is None:
+            return None
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=UTC)
+        return (nxt - now).total_seconds()
+
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
 
@@ -142,6 +163,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 select(QueuedJob)
                 .where(QueuedJob.queue_name.in_(list(queues)))
                 .where(QueuedJob.status == "queued")
+                .where(or_(QueuedJob.scheduled_at.is_(None), QueuedJob.scheduled_at <= now))
                 .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
                 .limit(1)
             )

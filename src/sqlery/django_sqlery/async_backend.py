@@ -76,6 +76,18 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
 
     # ----- claim path ------------------------------------------------------
 
+    async def anext_due_delay(self, queues: list[str]) -> float | None:
+        """Seconds until the earliest queued-but-not-yet-due job on ``queues``."""
+        from django.db.models import Min
+
+        now = timezone.now()
+        nxt = (
+            await QueuedJob.objects.filter(
+                queue_name__in=list(queues), status="queued", scheduled_at__gt=now
+            ).aaggregate(m=Min("scheduled_at"))
+        )["m"]
+        return None if nxt is None else (nxt - now).total_seconds()
+
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
 
