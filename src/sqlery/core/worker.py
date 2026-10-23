@@ -909,6 +909,8 @@ class WorkerProcess:
     # Parent wait-loop tick bounds (seconds) in _fork_and_execute.
     WAIT_TICK_MIN = 0.005
     WAIT_TICK_MAX = 0.5
+    # A wait shorter than this cannot have staled the post-fork connection.
+    FRESH_CONN_WAIT_SECONDS = 1.0
 
     def _maybe_recover_lost_retries(self):
         """Throttled sweep for retries lost to a crash between failing a job and retrying it."""
@@ -943,7 +945,11 @@ class WorkerProcess:
                 except OSError:
                     pass
                 self.executor.execute_job_in_child(job)
-            except Exception:
+            # Old: except Exception:
+            # BaseException: a SystemExit raised by the task must not unwind into the
+            # parent's worker loop inside the child (it would run its cleanup on state
+            # inherited from the parent).
+            except BaseException:
                 os._exit(1)
             os._exit(0)
 
@@ -1091,9 +1097,19 @@ class WorkerProcess:
         # except Exception as e:
         #     logger.warning(f"Failed to read result from child for job {job.id}: {e}")
 
-        # Reconnect DB (may be stale after waiting)
-        self.executor._reset_db_connections()
-        refreshed = self.backend.get_job_by_id(job_id)
+        # Reconnect DB (may be stale after waiting). A child that finished almost
+        # at once leaves the connection opened right after the fork fresh, so the
+        # close+reopen is skipped for it (#127); a read error still resets and retries.
+        # Old: self.executor._reset_db_connections()
+        # Old: refreshed = self.backend.get_job_by_id(job_id)
+        if time.monotonic() - start_time >= self.FRESH_CONN_WAIT_SECONDS:
+            self.executor._reset_db_connections()
+        try:
+            refreshed = self.backend.get_job_by_id(job_id)
+        except Exception as e:
+            logger.warning(f"Reading job {job_id} result failed ({e}); reconnecting")
+            self.executor._reset_db_connections()
+            refreshed = self.backend.get_job_by_id(job_id)
         if refreshed and refreshed.status == 'success':
             return {'success': True, 'output': refreshed.output or ''}
         elif refreshed and refreshed.status in ('failed', 'archived'):
