@@ -109,6 +109,14 @@ def atomic_claim_job_queryset(queryset):
         return queryset.select_for_update()
 
 
+def _mirror_claim(job, worker, started_at, expected_version):
+    """Reflect a successful claim UPDATE on the in-memory job without another SELECT."""
+    job.status = 'running'
+    job.worker = worker
+    job.started_at = started_at
+    job.version = expected_version + 1
+
+
 def atomic_claim_job_sqlite(job, worker):
     """Atomically claim a job on SQLite using optimistic locking with version field.
 
@@ -142,6 +150,7 @@ def atomic_claim_job_sqlite(job, worker):
     # Old:     status='queued',  # Only claim if still queued
     # Old:     version=expected_version  # Optimistic lock: only succeed if version matches
     # Old: ).update(
+    started_at = timezone.now()
     rows_updated = QueuedJob.objects.filter(
         id=job.id,
         created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 1)
@@ -150,7 +159,7 @@ def atomic_claim_job_sqlite(job, worker):
     ).update(
         status='running',
         worker=worker,
-        started_at=timezone.now(),
+        started_at=started_at,
         version=F('version') + 1  # Atomically increment version
     )
 
@@ -158,8 +167,10 @@ def atomic_claim_job_sqlite(job, worker):
         # Either another worker claimed it (version changed) or status changed
         return False
 
-    # Successfully claimed - refresh from DB to get updated values
-    job.refresh_from_db()
+    # Successfully claimed. The version check proves the row we read is the row we
+    # updated, so mirror the written values instead of re-reading the row (#127).
+    # Old: job.refresh_from_db()
+    _mirror_claim(job, worker, started_at, expected_version)
     return True
 
 
@@ -186,6 +197,7 @@ def atomic_claim_job_postgres(job, worker):
     # Old:     id=job.id,
     # Old:     version=expected_version
     # Old: ).update(
+    started_at = timezone.now()
     rows_updated = QueuedJob.objects.filter(
         id=job.id,
         created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 2)
@@ -193,7 +205,7 @@ def atomic_claim_job_postgres(job, worker):
     ).update(
         status='running',
         worker=worker,
-        started_at=timezone.now(),
+        started_at=started_at,
         version=F('version') + 1
     )
 
@@ -201,7 +213,8 @@ def atomic_claim_job_postgres(job, worker):
         # Should not happen (row is locked), but handle gracefully
         return False
 
-    job.refresh_from_db()
+    # Old: job.refresh_from_db()
+    _mirror_claim(job, worker, started_at, expected_version)
     return True
 
 
