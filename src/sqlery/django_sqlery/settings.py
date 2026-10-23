@@ -15,6 +15,11 @@ DEFAULTS = {
     # directly, NOT DEFAULTS) — Plan 03 must pass get_config's default (0).
     "SCHEDULER_JITTER_SECONDS": 0,
 
+    # #127: keep an idle PostgreSQL connection open across the per-job fork (the child
+    # disowns it without closing it and opens its own). PostgreSQL only; SQLite/libSQL are
+    # always closed before the fork. Needs CONN_MAX_AGE != 0 to save a reconnect.
+    "KEEP_PG_CONNECTION_ACROSS_FORK": False,
+
     # Queue settings
     "DEFAULT_QUEUE": "default",
     "DEFAULT_PRIORITY": 0,

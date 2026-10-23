@@ -10,6 +10,18 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
+# Opt-in setting (default False): keep the parent's PostgreSQL connection open across
+# os.fork() instead of closing it before and reopening it after every job (#127).
+KEEP_PG_CONNECTION_SETTING = "KEEP_PG_CONNECTION_ACROSS_FORK"
+
+# libpq transaction status meaning "idle, nothing pending" (PQTRANS_IDLE).
+_PQTRANS_IDLE = 0
+
+# Inherited PostgreSQL connections disowned by a forked child. Held here so they are never
+# garbage-collected: finalising one runs PQfinish, which sends Terminate on the socket the
+# parent still uses. The child leaves through os._exit, so these are never finalised.
+_DISOWNED_PG_CONNECTIONS: list = []
+
 
 # ---------------------------------------------------------------------------
 # Pure functions — no IO, no side effects, deterministic
@@ -19,6 +31,7 @@ logger = logging.getLogger(__name__)
 def build_default_hooks(
     django_available: bool,
     sqlalchemy_engine: object | None = None,
+    keep_pg_connection: bool = False,
 ) -> dict[str, list[str]]:
     """Determine which fork hooks are needed based on available backends.
 
@@ -29,6 +42,10 @@ def build_default_hooks(
     Args:
         django_available: Whether Django's DB layer is importable.
         sqlalchemy_engine: A SQLAlchemy engine instance, or None.
+        keep_pg_connection: Opt in to keeping idle PostgreSQL Django connections open
+            across the fork (the child disowns them without closing). Everything else
+            (SQLite, libSQL, a PostgreSQL connection that is mid-transaction) is still
+            closed before the fork.
 
     Returns:
         Dict of hook phase -> list of hook identifiers.
@@ -39,7 +56,10 @@ def build_default_hooks(
         "post_fork_child": [],
     }
 
-    if django_available:
+    if django_available and keep_pg_connection:
+        hooks["pre_fork"].append("django_close_unkept")
+        hooks["post_fork_child"].append("django_disown_pg")
+    elif django_available:
         hooks["pre_fork"].append("django_close_all")
         hooks["post_fork_parent"].append("django_close_old")
         hooks["post_fork_child"].append("django_close_all")
@@ -49,6 +69,24 @@ def build_default_hooks(
         hooks["post_fork_child"].append("sqlalchemy_dispose")
 
     return hooks
+
+
+def can_keep_across_fork(
+    vendor: str, in_atomic_block: bool, needs_rollback: bool, uses_pool: bool, tx_status: object
+) -> bool:
+    """Whether an open Django connection may stay open through os.fork().
+
+    Only PostgreSQL, only a plain (unpooled) connection that is idle: not inside an
+    atomic block, not marked for rollback, and libpq reports no transaction or pending
+    result. Anything else is closed before the fork, exactly as without the opt-in.
+    """
+    return (
+        vendor == "postgresql"
+        and not in_atomic_block
+        and not needs_rollback
+        and not uses_pool
+        and tx_status == _PQTRANS_IDLE
+    )
 
 
 def verify_no_open_connections(
@@ -104,6 +142,7 @@ class ForkSafeExecutor:
         self._pre_fork: list[Callable[[], None]] = []
         self._post_fork_parent: list[Callable[[], None]] = []
         self._post_fork_child: list[Callable[[], None]] = []
+        self.keep_pg_connection = False
 
     def register_pre_fork(self, hook: Callable[[], None]) -> None:
         self._pre_fork.append(hook)
@@ -148,14 +187,66 @@ class ForkSafeExecutor:
 
     def _verify_pre_fork(self) -> None:
         """Log warnings for any connections that survived pre-fork cleanup."""
-        django_leaks = self._check_django_connections()
+        django_leaks = self._check_django_connections(skip_keepable=self.keep_pg_connection)
         sa_status = self._check_sqlalchemy_pool()
         leaks = verify_no_open_connections(django_leaks, sa_status)
         for leak in leaks:
             logger.warning(f"fork_safety: {leak}")
 
     @staticmethod
-    def _check_django_connections() -> list[str] | None:
+    def _django_conn_keepable(conn) -> bool:
+        """Adapter for can_keep_across_fork: read the live state of one Django connection."""
+        try:
+            raw = conn.connection
+            if raw is None:
+                return False
+            tx_status = raw.info.transaction_status
+            tx_status = getattr(tx_status, "value", tx_status)
+            return can_keep_across_fork(
+                vendor=conn.vendor,
+                in_atomic_block=conn.in_atomic_block,
+                needs_rollback=conn.needs_rollback,
+                uses_pool=bool(conn.settings_dict.get("OPTIONS", {}).get("pool")),
+                tx_status=tx_status,
+            )
+        except Exception:
+            return False
+
+    @classmethod
+    def django_close_unkept(cls) -> None:
+        """pre_fork (opt-in mode): close every Django connection except keepable PostgreSQL ones."""
+        from django.db import connections
+
+        for conn in connections.all(initialized_only=True):
+            if conn.connection is not None and not cls._django_conn_keepable(conn):
+                conn.close()
+
+    @staticmethod
+    def django_disown_pg() -> None:
+        """post_fork_child (opt-in mode): drop inherited PostgreSQL connections WITHOUT closing.
+
+        The child shares the parent's socket. close() (or letting the driver object be
+        garbage-collected) would send Terminate on it and end the parent's session. The
+        child only forgets the connection (Django opens its own on the next query) and
+        parks the driver object so it is never finalised. Any other open connection is
+        closed as in the default path.
+        """
+        from django.db import connections
+
+        for conn in connections.all(initialized_only=True):
+            raw = conn.connection
+            if raw is None:
+                continue
+            if conn.vendor != "postgresql":
+                conn.close()
+                continue
+            _DISOWNED_PG_CONNECTIONS.append(raw)
+            conn.connection = None
+            conn.close_at = None
+            conn.run_on_commit = []
+
+    @classmethod
+    def _check_django_connections(cls, skip_keepable: bool = False) -> list[str] | None:
         try:
             from django.conf import settings
             from django.db import connections as dj_connections
@@ -167,7 +258,9 @@ class ForkSafeExecutor:
         try:
             for name in dj_connections:
                 conn = dj_connections[name]
-                if conn.connection is not None:
+                if conn.connection is not None and not (
+                    skip_keepable and cls._django_conn_keepable(conn)
+                ):
                     open_names.append(name)
         except Exception:
             return None
@@ -204,12 +297,24 @@ class ForkSafeExecutor:
         except Exception:
             pass
 
-        hook_plan = build_default_hooks(django_available, sa_engine)
+        keep_pg = False
+        if django_available:
+            try:
+                from sqlery.compat import get_config
+
+                keep_pg = bool(get_config(KEEP_PG_CONNECTION_SETTING, False))
+            except Exception:
+                keep_pg = False
+
+        executor.keep_pg_connection = keep_pg
+        hook_plan = build_default_hooks(django_available, sa_engine, keep_pg_connection=keep_pg)
 
         hook_registry: dict[str, Callable[[], None]] = {}
         if django_available:
             hook_registry["django_close_all"] = dj_connections.close_all
             hook_registry["django_close_old"] = close_old_connections
+            hook_registry["django_close_unkept"] = cls.django_close_unkept
+            hook_registry["django_disown_pg"] = cls.django_disown_pg
         if sa_engine is not None:
             hook_registry["sqlalchemy_dispose"] = sa_engine.dispose
 
