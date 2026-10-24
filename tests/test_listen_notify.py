@@ -85,6 +85,12 @@ def _make_worker_process(queues=None):
     worker.poll_interval = 5
     worker.heartbeat_interval = 5
     worker._listen_conn = None
+    worker._last_tick = None  # #110 idle-poll state
+    worker._last_lease_renew = 0.0
+    worker._sched_next_check = 0.0
+    worker._idle_delay = None
+    worker._idle_delay_at = 0.0
+    worker._idle_dirty = False
     return worker
 
 
