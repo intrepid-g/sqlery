@@ -31,7 +31,8 @@ pytestmark = [
     ),
 ]
 
-POLLS = 10  # idle polls to observe (WORKER_POLL_INTERVAL = 1 s)
+POLLS_PER_WINDOW = 5  # idle polls per observation window (WORKER_POLL_INTERVAL = 1 s)
+WINDOWS = 3
 MAX_COMMITS_PER_POLL = 2
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -178,15 +179,25 @@ def test_idle_worker_commits_at_most_two_transactions_per_poll(database):
                 ).fetchone()
                 return row[0]
 
-            c0, t0 = count(), time.monotonic()
-            time.sleep(POLLS)
-            c1, t1 = count(), time.monotonic()
+            # pg_stat_database.xact_commit counts EVERY backend on the database, not just the
+            # worker. In particular an autovacuum worker visiting the freshly migrated scratch
+            # database (default autovacuum_naptime = 1 min, so it lands anywhere, e.g. in CI
+            # after the rest of the postgres suite) commits ~14 transactions of its own
+            # (VACUUM/ANALYZE per catalog and sqlery table). A steady worker commits in every
+            # window, a one-off visitor in at most one, so measure several short windows
+            # and judge the quietest: a worker over the bound fails all of them.
+            windows = []
+            for _ in range(WINDOWS):
+                c0, t0 = count(), time.monotonic()
+                time.sleep(POLLS_PER_WINDOW)
+                c1, t1 = count(), time.monotonic()
+                windows.append((c1 - c0, t1 - t0))
         finally:
             admin.close()
-    per_poll = (c1 - c0) / (t1 - t0)
-    assert per_poll <= MAX_COMMITS_PER_POLL, (
-        f"an idle worker committed {c1 - c0} transactions in {t1 - t0:.0f} polls "
-        f"= {per_poll:.1f} per poll"
+    rates = [commits / elapsed for commits, elapsed in windows]
+    assert min(rates) <= MAX_COMMITS_PER_POLL, (
+        f"an idle worker committed {[c for c, _ in windows]} transactions in "
+        f"{POLLS_PER_WINDOW} polls each = {[round(r, 1) for r in rates]} per poll"
     )
 
 
