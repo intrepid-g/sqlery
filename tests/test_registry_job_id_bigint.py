@@ -70,6 +70,7 @@ def test_add_job_to_registry_accepts_a_standalone_job_id(monkeypatch):
 @needs_pg
 def test_alembic_upgrade_widens_an_integer_registry_job_id(monkeypatch):
     """An INTEGER sqlery_registry.job_id database is widened by `alembic upgrade head`."""
+    pytest.importorskip("alembic.config")
     import sqlalchemy as sa
     from alembic.config import Config
 
