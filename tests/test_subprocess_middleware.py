@@ -142,7 +142,7 @@ class TestSubprocessTriggerMiddleware:
                 # Verify env was passed
                 args, kwargs = mock_popen.call_args
                 assert "env" in kwargs
-                assert kwargs["env"] == os.environ
+                assert all(kwargs["env"].get(k) == v for k, v in os.environ.items())
 
     def test_middleware_uses_start_new_session(self, settings):
         """Subprocess should use start_new_session to prevent zombies."""

@@ -38,6 +38,7 @@ python manage.py run_jobs --once -v 2
 - `--queue QUEUE` - Process jobs from specific queue only
 - `--max-jobs N` - Jobs this process runs before exiting (default: 1; a fresh process is spawned if more are queued)
 - `--idle-linger S` - Once the queue is empty and fewer than `--max-jobs` have run, wait up to S seconds for new jobs (default: 0). The subprocess trigger passes both through from the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings.
+- The subprocess trigger also bounds how many `run_jobs` processes are alive at once with `MAX_SUBPROCESS_WORKERS` (default 2, `0` = unbounded). The slots are `flock`ed files in `SUBPROCESS_SLOT_DIR` (default: a per-project directory under the system temp dir); a `run_jobs` chain hands its slot to the next worker it spawns, and when every slot is busy no new process is started (running chains keep processing the queue). Not enforced on Windows.
 - `-v {0,1,2,3}` - Verbosity level
 
 **Use cases:**
