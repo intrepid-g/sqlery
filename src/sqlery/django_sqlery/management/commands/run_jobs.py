@@ -9,6 +9,7 @@ SUBPROCESS_JOBS_PER_PROCESS / SUBPROCESS_IDLE_LINGER_S settings.
 
 from django.core.management.base import BaseCommand
 from sqlery.core.worker import TaskExecutor
+from sqlery.django_sqlery.subprocess_slots import protect_inherited_slot
 
 
 class Command(BaseCommand):
@@ -46,6 +47,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        protect_inherited_slot()
         executor = TaskExecutor()
 
         # Run scheduler (unless --worker-only)

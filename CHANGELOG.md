@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `SubprocessTriggerMiddleware` no longer spawns `run_jobs` without bound (#113). New `MAX_SUBPROCESS_WORKERS` setting (default 2, `0` = unbounded, the old behaviour) caps the `run_jobs` processes alive at once, counting both middleware spawns and the `run_jobs` successor chain (a chain hands its slot to its successor, so it occupies one). Slots are `flock`ed files in `SUBPROCESS_SLOT_DIR` (default: a per-project directory under the system temp dir), released by the kernel even if a child is SIGKILLed; not enforced where `fcntl` is unavailable (Windows). When all slots are busy the running chains keep draining the queue.
 - `AsyncWorker` now keeps up to `concurrency` jobs in flight (default 10, new constructor argument) as documented, instead of running one at a time, so I/O-bound coroutine jobs overlap on a single worker. Its jobs also go through `invoke_task` semantics (new `ainvoke_task`): chain/chord steps built with `.s()` receive the upstream result, `bind=True` tasks get a `TaskContext`, and `task_prerun`/`task_postrun`/`task_success`/`task_failure` fire. Signal receivers run on the event loop, so ORM work in them must be async-safe.
 
 ## [0.25.0] - 2026-10-15

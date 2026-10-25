@@ -1,16 +1,16 @@
 """Middleware for direct subprocess spawning (no HTTP layer)."""
 
+import logging
 import subprocess
 import sys
-import os
-import logging
 from pathlib import Path
 
 from django.conf import settings as django_settings
 from django.core.cache import cache
 
-from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .settings import get_setting
+from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
+from .subprocess_slots import claim_slot
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,12 @@ class SubprocessTriggerMiddleware:
         # Get absolute path to manage.py (prevents CWD issues)
         manage_py = get_manage_py_path()
 
+        # Bound on live run_jobs children (MAX_SUBPROCESS_WORKERS); None = all busy.
+        slot = claim_slot()
+        if slot is None:
+            logger.debug("MAX_SUBPROCESS_WORKERS reached; not spawning run_jobs")
+            return
+
         # Old: stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         # Discarding both streams made this mode undebuggable: a child that died
         # mid-job left the row at status='running' with empty error/traceback and
@@ -129,20 +135,23 @@ class SubprocessTriggerMiddleware:
 
         # Spawn subprocess (fire-and-forget)
         # NOTE: Each invocation processes EXACTLY ONE job
-        subprocess.Popen(
-            [
-                sys.executable,
-                manage_py,
-                "run_jobs",
-                # No --once flag - one job per process unless SUBPROCESS_JOBS_PER_PROCESS > 1
-                *run_jobs_extra_args(),
-            ],
-            stdout=child_output,
-            stderr=subprocess.STDOUT,
-            env=os.environ,  # Inherit environment (critical!)
-            start_new_session=True,  # Detach from parent, prevents zombies
-            close_fds=True,  # Close file descriptors
-        )
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    manage_py,
+                    "run_jobs",
+                    # No --once flag - one job per process unless SUBPROCESS_JOBS_PER_PROCESS > 1
+                    *run_jobs_extra_args(),
+                ],
+                stdout=child_output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # Detach from parent, prevents zombies
+                close_fds=True,  # Close file descriptors
+                **slot.popen_kwargs(),  # Inherit environment (critical!) + hold the slot
+            )
+        finally:
+            slot.release()
         if child_output not in (subprocess.DEVNULL, None):
             # Parent's copy is no longer needed; the child holds its own fd.
             try:

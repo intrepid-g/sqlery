@@ -22,20 +22,13 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from .db_compat import atomic_claim_job_queryset
-from .models import ScheduledTask, QueuedJob, Worker
-from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
-from .settings import get_setting
-from .utils import import_task, calculate_next_run
-from sqlery.core.utils import describe_task_args
-from sqlery.core.result import serialize_result
 from sqlery.core.execution import (
     RQCompatJob,
     invoke_task,
     run_failure_callback,
     run_success_callback,
 )
-from sqlery.core.signals import task_retry
+from sqlery.core.result import serialize_result
 from sqlery.core.retry import (
     pending_reason,
     policy_allows_retry,
@@ -43,10 +36,19 @@ from sqlery.core.retry import (
     retry_countdown,
     shape_retry_delay,
 )
+from sqlery.core.signals import task_retry
+from sqlery.core.utils import describe_task_args
 
 # Use the canonical ContextVar from sqlery.core.worker so context sharing
 # across the standalone + Django code paths uses ONE instance.
 from sqlery.core.worker import _current_job_var  # noqa: F401
+
+from .db_compat import atomic_claim_job_queryset
+from .models import QueuedJob, ScheduledTask, Worker
+from .settings import get_setting
+from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
+from .subprocess_slots import claim_slot
+from .utils import calculate_next_run, import_task
 
 logger = logging.getLogger(__name__)
 
@@ -922,15 +924,26 @@ class TaskExecutor:
             if queue_name:
                 cmd.extend(["--queue", queue_name])
 
+            # A chain keeps the slot it holds (MAX_SUBPROCESS_WORKERS); a run_jobs started
+            # by hand takes a free one, and spawns nothing when all are busy (running
+            # chains keep draining the queue).
+            slot = claim_slot(inherit=True)
+            if slot is None:
+                logger.debug("MAX_SUBPROCESS_WORKERS reached; not spawning next worker")
+                return
+
             # Spawn subprocess (fire-and-forget)
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=os.environ,
-                start_new_session=True,
-                close_fds=True,
-            )
+            try:
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    **slot.popen_kwargs(),
+                )
+            finally:
+                slot.release()
 
             logger.debug(f"Spawned next worker: {' '.join(cmd)}")
         except Exception as e:
