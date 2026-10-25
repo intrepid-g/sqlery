@@ -385,6 +385,18 @@ class SQLAlchemyBackend(DatabaseBackend):
             nxt = nxt.replace(tzinfo=UTC)
         return (nxt - now).total_seconds()
 
+    def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
+        with self._get_session() as session:
+            nxt = session.exec(
+                select(func.min(ScheduledTask.next_run_at)).where(
+                    ScheduledTask.enabled == True,  # noqa: E712
+                    ScheduledTask.queue_name.in_(queue_names),
+                )
+            ).first()
+        if nxt is not None and nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=UTC)
+        return nxt
+
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job.
 

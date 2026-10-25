@@ -14,6 +14,10 @@ DEFAULTS = {
     # enqueue. NOTE: read via get_config (DjangoConfig reads DJANGO_SQL_JOBS
     # directly, NOT DEFAULTS) — Plan 03 must pass get_config's default (0).
     "SCHEDULER_JITTER_SECONDS": 0,
+    # Max seconds an idle worker waits before re-reading the scheduled-task table (tasks
+    # created/changed by other processes are noticed within this bound; known due times are
+    # still honoured exactly).
+    "SCHEDULER_RECHECK_INTERVAL": 10,
 
     # #127: keep an idle PostgreSQL connection open across the per-job fork (the child
     # disowns it without closing it and opens its own). PostgreSQL only; SQLite/libSQL are
