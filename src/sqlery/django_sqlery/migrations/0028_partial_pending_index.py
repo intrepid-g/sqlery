@@ -35,6 +35,22 @@ class SafeAddIndexConcurrently(AddIndexConcurrently):
                 index=self.index,
             ).database_forwards(app_label, schema_editor, from_state, to_state)
             return
+        # Re-runnable after an interrupted build (#107): a cancelled CREATE INDEX
+        # CONCURRENTLY leaves an INVALID index behind and the migration unrecorded.
+        with schema_editor.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT i.indisvalid FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE c.relname = %s AND c.relnamespace = current_schema()::regnamespace",
+                [self.index.name],
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0]:
+                return  # already built and valid; the migration just was not recorded
+            if row is not None:
+                cursor.execute(
+                    f"DROP INDEX CONCURRENTLY IF EXISTS {schema_editor.quote_name(self.index.name)}"
+                )
         super().database_forwards(app_label, schema_editor, from_state, to_state)
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
