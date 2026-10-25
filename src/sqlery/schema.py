@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS sqlery_scheduled_task (
 REGISTRY_TABLE_SQLITE = """
 CREATE TABLE IF NOT EXISTS sqlery_registry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
+    job_id BIGINT NOT NULL,
     registry_type TEXT NOT NULL,
     entered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     exited_at TIMESTAMP,
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS sqlery_registry (
 REGISTRY_TABLE_POSTGRESQL = """
 CREATE TABLE IF NOT EXISTS sqlery_registry (
     id SERIAL PRIMARY KEY,
-    job_id INTEGER NOT NULL,
+    job_id BIGINT NOT NULL,
     registry_type TEXT NOT NULL,
     entered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     exited_at TIMESTAMP,

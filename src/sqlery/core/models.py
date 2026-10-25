@@ -342,7 +342,11 @@ class JobRegistry(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
     # Foreign key — references sqlery_queued_job.id (not composite FK; id is sufficient)
-    job_id: int = Field(foreign_key="sqlery_queued_job.id", description="Job being tracked")
+    # BigInteger: standalone job ids are 62-bit (UUIDv7-derived), too big for INTEGER on PG.
+    job_id: int = Field(
+        sa_column=Column(BigInteger, ForeignKey("sqlery_queued_job.id"), nullable=False),
+        description="Job being tracked",
+    )
 
     # Registry type
     registry_type: str = Field(max_length=20, index=True, description="Registry type (started/finished/failed/etc)")
