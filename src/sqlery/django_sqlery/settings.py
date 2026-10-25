@@ -46,6 +46,12 @@ DEFAULTS = {
     # job once the queue is empty while it is still below that cap (0 = exit at once).
     "SUBPROCESS_JOBS_PER_PROCESS": 1,
     "SUBPROCESS_IDLE_LINGER_S": 0,
+    # Most run_jobs processes alive at once from the subprocess trigger (middleware
+    # spawns plus the run_jobs successor chain); 0 = unbounded. Enforced with
+    # flock slot files in SUBPROCESS_SLOT_DIR (None = per-project dir under the
+    # system temp dir); not enforced where fcntl is unavailable (Windows).
+    "MAX_SUBPROCESS_WORKERS": 2,
+    "SUBPROCESS_SLOT_DIR": None,
     "INTERNAL_BASE_URL": None,  # e.g., 'http://127.0.0.1:8000' (required for http mode)
     "INTERNAL_SECRET": None,  # Shared secret for HMAC signatures (required for http mode)
     "SIGNATURE_MAX_AGE": 5,  # Signature validity in seconds
