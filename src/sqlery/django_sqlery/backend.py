@@ -283,13 +283,22 @@ class DjangoBackend(DatabaseBackend):
             _notify_queue_django(queue_name)
         return job
 
-    @retry_on_db_error()
+    # No @retry_on_db_error: called inside the worker's idle transaction, where a retry
+    # cannot recover an aborted statement; the caller is best-effort already.
     def next_due_delay(self, queues: list[str]) -> float | None:
         now = timezone.now()
         nxt = self.QueuedJob.objects.filter(
             queue_name__in=queues, status="queued", scheduled_at__gt=now
         ).aggregate(m=db_models.Min("scheduled_at"))["m"]
         return None if nxt is None else (nxt - now).total_seconds()
+
+    def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
+        return self.ScheduledTask.objects.filter(
+            enabled=True, next_run_at__isnull=False, queue_name__in=queue_names
+        ).aggregate(m=db_models.Min("next_run_at"))["m"]
+
+    def idle_transaction(self):
+        return transaction.atomic()
 
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job using the unified claiming path.
@@ -348,19 +357,21 @@ class DjangoBackend(DatabaseBackend):
         # REGRESSION 2026-05-18: select_for_update used outside transaction
         # Root cause: claim logic moved to framework-agnostic module without Django transaction wrapper
         # Fix: restore transaction.atomic() that existed in the old claim_job body
-        worker_row = self._resolve_worker(worker_id)
-        if not worker_row:
-            # I wish I had the time to: add a retry loop with exponential backoff
-            # before auto-registering, to handle transient visibility delays
-            worker_row = self._auto_register_worker(worker_id)
-            if not worker_row and not worker_id.startswith(_EPHEMERAL_CLAIMER_PREFIXES):
-                return None
-            # Ephemeral claimers (Lambda "lambda-<uuid>", HTTP trigger "trigger-<uuid>") never
-            # have a Worker row, and the claim itself does not need one (worker=None is handled
-            # by the shared claiming path). Before, they matched neither the UUID nor the
-            # "worker_<node>_<pid>" format and silently claimed nothing in Django mode. Any
-            # other unregistered worker id is still refused.
+        # #110: resolve the worker inside the claim transaction so an idle claim attempt
+        # is one commit, not two.
         with transaction.atomic():
+            worker_row = self._resolve_worker(worker_id)
+            if not worker_row:
+                # I wish I had the time to: add a retry loop with exponential backoff
+                # before auto-registering, to handle transient visibility delays
+                worker_row = self._auto_register_worker(worker_id)
+                if not worker_row and not worker_id.startswith(_EPHEMERAL_CLAIMER_PREFIXES):
+                    return None
+                # Ephemeral claimers (Lambda "lambda-<uuid>", HTTP trigger "trigger-<uuid>") never
+                # have a Worker row, and the claim itself does not need one (worker=None is handled
+                # by the shared claiming path). Before, they matched neither the UUID nor the
+                # "worker_<node>_<pid>" format and silently claimed nothing in Django mode. Any
+                # other unregistered worker id is still refused.
             return claim_next_job_with_queue_priority(worker_row, self, queues=queues)
 
     def request_job_revoke(self, job_id: int) -> bool:

@@ -80,8 +80,10 @@ class Scheduler:
         # Process each task atomically to prevent duplicate enqueueing
         for task in due_tasks:
             try:
-                # Atomically claim and enqueue the task
-                job = self._enqueue_for_scheduled_task(task)
+                # Atomically claim and enqueue the task. Own savepoint (#110): when the
+                # caller holds a shared transaction, a failed task must not abort it.
+                with self.backend.idle_transaction():
+                    job = self._enqueue_for_scheduled_task(task)
                 if job:
                     jobs.append(job)
             except Exception as e:
