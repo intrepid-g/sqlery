@@ -12,8 +12,8 @@
     }
 
     .stat-card {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 6px;
         padding: 15px;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
@@ -22,7 +22,7 @@
     .stat-card h3 {
         margin: 0 0 10px 0;
         font-size: 12px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         text-transform: uppercase;
         letter-spacing: 0.5px;
     }
@@ -42,13 +42,13 @@
 
     .stat-detail {
         font-size: 12px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         margin: 3px 0;
     }
 
     .refresh-indicator {
         font-size: 11px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
         text-align: right;
         margin-bottom: 10px;
     }
@@ -58,8 +58,8 @@
     }
 
     .scheduled-tasks-section {
-        background: white;
-        border: 1px solid #ddd;
+        background: var(--body-bg, white);
+        border: 1px solid var(--border-color, #ddd);
         border-radius: 6px;
         padding: 15px;
         margin-bottom: 25px;
@@ -79,20 +79,21 @@
     .scheduled-tasks-section th {
         text-align: left;
         padding: 10px;
-        background: #f8f9fa;
-        border-bottom: 2px solid #ddd;
+        background: var(--darkened-bg, #f8f9fa);
+        border-bottom: 2px solid var(--border-color, #ddd);
         font-weight: 600;
         font-size: 12px;
     }
 
     .scheduled-tasks-section td {
         padding: 10px;
-        border-bottom: 1px solid #eee;
+        border-bottom: 1px solid var(--border-color, #eee);
         font-size: 12px;
+        color: var(--body-fg, #333);
     }
 
     .scheduled-tasks-section tr:hover {
-        background: #f8f9fa;
+        background: var(--darkened-bg, #f8f9fa);
     }
 
     .status-badge {
@@ -119,7 +120,7 @@
 
     .task-path-small {
         font-size: 10px;
-        color: #999;
+        color: var(--body-quiet-color, #999);
         display: block;
         margin-top: 2px;
     }
@@ -127,13 +128,13 @@
     .empty-state {
         text-align: center;
         padding: 30px;
-        color: #999;
+        color: var(--body-quiet-color, #999);
     }
 
     .loading {
         text-align: center;
         padding: 30px;
-        color: #666;
+        color: var(--body-quiet-color, #666);
     }
 </style>
 {% endblock %}
@@ -144,7 +145,7 @@
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <div>
                     <h1 style="margin: 0 0 5px 0; font-size: 24px;">📊 Sqlery</h1>
-                    <p style="margin: 0; color: #666;">Real-time job queue monitoring and management</p>
+                    <p style="margin: 0; color: var(--body-quiet-color, #666);">Real-time job queue monitoring and management</p>
                 </div>
                 <div class="refresh-indicator" id="refreshIndicator">
                     Loading...
