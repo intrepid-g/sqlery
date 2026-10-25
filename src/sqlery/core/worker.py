@@ -665,6 +665,13 @@ class WorkerProcess:
         # Phase 18: dedicated psycopg3 AUTOCOMMIT connection for LISTEN/NOTIFY
         # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
         self._listen_conn = None
+        # #110: idle-poll housekeeping state (see _idle_tick / _idle_housekeeping)
+        self._last_tick: float | None = None
+        self._last_lease_renew = 0.0
+        self._sched_next_check = 0.0
+        self._idle_delay: float | None = None
+        self._idle_delay_at = 0.0
+        self._idle_dirty = False
 
     def run(self, max_jobs: int | None = None):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat.
@@ -734,6 +741,7 @@ class WorkerProcess:
         # held leases during a long blocking job (otherwise the lease expires
         # mid-job and another worker takes over scheduling — leadership flap).
         self._lease_secs = lease_secs
+        tick_interval = self._tick_interval(lease_secs)
         try:
             owned_queues = set(
                 self.backend.claim_queue_leases(
@@ -747,6 +755,7 @@ class WorkerProcess:
             owned_queues = set()
         # WR-01: keep the instance view of held queues in sync with the local.
         self._owned_queues = owned_queues
+        self._last_lease_renew = time.monotonic()
         logger.info(
             f"Worker {self.worker_id} scheduler responsibility: "
             f"{sorted(owned_queues) or 'none yet'}"
@@ -778,46 +787,50 @@ class WorkerProcess:
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
 
-                    # --- Scheduler-election step (every cycle, incl. idle) ---
-                    # Renew held leases, re-claim any expired/unowned queues,
-                    # then fire cron only for queues this worker leads. Wrapped
-                    # in its own try/except so an election error logs and the
-                    # loop continues — election never crashes the worker
-                    # (ELECT-07 safe-degradation).
-                    try:
-                        if owned_queues:
-                            self.backend.renew_queue_leases(
-                                sorted(owned_queues), self.worker_id, lease_secs
-                            )
-                        unowned = set(self.queues) - owned_queues
-                        if unowned:
-                            newly_claimed = set(
-                                self.backend.claim_queue_leases(
-                                    sorted(unowned),
-                                    self.worker_id,
-                                    self.node_id,
-                                    self.pid,
-                                    lease_secs,
-                                )
-                            )
-                            if newly_claimed:
-                                owned_queues |= newly_claimed
-                                logger.info(
-                                    f"Acquired scheduler leases for: {sorted(newly_claimed)}"
-                                )
-                        # Fire cron for held queues only (ELECT-01 + ELECT-02)
-                        jobs = scheduler.run_due_tasks(queue_names=owned_queues)
-                        if jobs:
-                            logger.info(f"Scheduler created {len(jobs)} jobs")
-                    except Exception as e:
-                        logger.error(f"Scheduler-election error: {e}", exc_info=True)
+                    # --- Idle tick (#110): scheduler election, due-task lookup, heartbeat
+                    # and next-delayed-job lookup. Runs at most every tick_interval, and
+                    # where the backend supports it (Django) the tick, the lost-retry sweep
+                    # and the claim attempt share ONE transaction, so an idle poll is a
+                    # single commit. The tick has its own try/except (and savepoint) so an
+                    # error logs and the loop continues (ELECT-07 safe-degradation).
+                    ticked = False
+                    pending: dict = {}
+                    with self.backend.idle_transaction():
+                        if self._tick_due(tick_interval):
+                            ticked = True
+                            pending["_last_tick"] = time.monotonic()
+                            self._idle_tick(scheduler, lease_secs, pending)
 
-                    self._maybe_recover_lost_retries()
+                        self._maybe_recover_lost_retries()
 
-                    job = self.backend.claim_job(self.queues, self.worker_id)
+                        # Own savepoint: a failed claim must not roll back the lease
+                        # renewal and heartbeat above; it is re-raised after the commit.
+                        claim_error = None
+                        job = None
+                        try:
+                            with self.backend.idle_transaction():
+                                job = self.backend.claim_job(self.queues, self.worker_id)
+                        except Exception as e:
+                            claim_error = e
+                    # Bookkeeping that says "the lease was renewed / the check ran" is applied
+                    # only once the shared transaction has committed: if it rolled back (an
+                    # exception above), the worker must not believe the work was done.
+                    for attr, value in pending.items():
+                        setattr(self, attr, value)
+                    if "_owned_queues" in pending:
+                        owned_queues = self._owned_queues
+                    if claim_error is not None:
+                        raise claim_error
 
                     if not job:
-                        self._heartbeat('idle')
+                        if self._idle_dirty and not ticked:
+                            # A job just ran: flip the heartbeat back to idle and refresh
+                            # the delayed-job lookup the job may have changed.
+                            try:
+                                with self.backend.idle_transaction():
+                                    self._idle_housekeeping()
+                            except Exception as e:
+                                logger.warning(f"Idle housekeeping failed: {e}")
                         logger.info(".")
                         # elapsed = 0
                         # while elapsed < self.poll_interval and not self.shutdown_requested:
@@ -864,6 +877,7 @@ class WorkerProcess:
                     finally:
                         self.current_job = None
                         self.child_pid = None
+                        self._idle_dirty = True
 
                     # Don't heartbeat idle between jobs — the next loop iteration
                     # will either claim a new job immediately or heartbeat idle
@@ -922,7 +936,10 @@ class WorkerProcess:
         if interval <= 0 or now - getattr(self, "_last_retry_recovery", -interval) < interval:
             return
         self._last_retry_recovery = now
-        self.executor.recover_lost_retries()
+        # Own savepoint: recover_lost_retries swallows its own errors, which would
+        # otherwise leave the shared idle transaction aborted for the claim after it.
+        with self.backend.idle_transaction():
+            self.executor.recover_lost_retries()
 
     def _fork_and_execute(self, job) -> dict:
         """Fork a child process to execute the job.
@@ -1341,15 +1358,119 @@ class WorkerProcess:
                 return
 
     def _idle_timeout(self) -> float:
-        """poll_interval, shortened to the earliest queued job that is not due yet."""
-        try:
-            delay = self.backend.next_due_delay(self.queues)
-        except Exception as e:  # best-effort: fall back to the plain poll interval
-            logger.debug(f"Worker {self.worker_id}: next_due_delay failed: {e}")
-            return self.poll_interval
+        """poll_interval, shortened to the earliest queued job that is not due yet.
+
+        Uses the delayed-job lookup cached by the last idle tick (#110) rather than
+        querying on every poll; a job enqueued since then is seen by the next claim.
+        """
+        if self._idle_delay_at == 0.0:  # no tick has looked yet
+            self._refresh_idle_delay()
+        delay = self._idle_delay
         if delay is None:
             return self.poll_interval
+        delay -= time.monotonic() - self._idle_delay_at
         return min(self.poll_interval, max(delay + 0.05, 0.1))
+
+    def _tick_interval(self, lease_secs: float) -> float:
+        """Minimum seconds between idle ticks.
+
+        A tick renews the scheduler lease and sends the heartbeat, so it must run at
+        least every half lease TTL and at least every WORKER_HEARTBEAT_INTERVAL (both
+        far below the WORKER_ALIVE_TIMEOUT / 60s staleness thresholds).
+        """
+        interval = lease_secs / 2
+        if self.heartbeat_interval and self.heartbeat_interval > 0:
+            interval = min(interval, self.heartbeat_interval)
+        return max(interval, 0.1)
+
+    def _tick_due(self, tick_interval: float) -> bool:
+        if self._last_tick is None:
+            return True
+        # 10% slack: polls are at least poll_interval apart, never meaningfully less.
+        return time.monotonic() - self._last_tick >= tick_interval * 0.9
+
+    def _idle_housekeeping(self) -> None:
+        """Idle heartbeat plus the delayed-job lookup that caps the idle wait."""
+        self._heartbeat('idle')
+        self._idle_dirty = False
+        self._refresh_idle_delay()
+
+    def _refresh_idle_delay(self) -> None:
+        try:
+            with self.backend.idle_transaction():  # own savepoint, see _heartbeat
+                self._idle_delay = self.backend.next_due_delay(self.queues)
+        except Exception as e:  # best-effort: fall back to the plain poll interval
+            logger.debug(f"Worker {self.worker_id}: next_due_delay failed: {e}")
+            self._idle_delay = None
+        self._idle_delay_at = time.monotonic()
+
+    def _idle_tick(self, scheduler, lease_secs: float, pending: dict) -> None:
+        """Scheduler election, due-task lookup, heartbeat and delayed-job lookup.
+
+        Each step runs in its own savepoint and logs its own failure, so an error in one
+        (which aborts only that savepoint) neither undoes the others nor poisons the shared
+        transaction (ELECT-07 safe-degradation). State describing completed work is
+        written to ``pending`` and applied by the caller after the transaction commits.
+        """
+        try:
+            self._scheduler_election_step(scheduler, lease_secs, pending)
+        except Exception as e:
+            logger.error(f"Scheduler-election error: {e}", exc_info=True)
+        self._idle_housekeeping()
+
+    def _scheduler_election_step(self, scheduler, lease_secs: float, pending: dict) -> None:
+        """Renew/claim scheduler leases and fire due cron tasks for held queues.
+
+        Lease renewal and claiming unowned queues run once at least half the TTL has
+        elapsed since the last one (the lease is never allowed below half its TTL).
+        The due-task lookup is skipped until the earliest known ``next_run_at`` is due,
+        but is repeated at least every SCHEDULER_RECHECK_INTERVAL seconds (default 10)
+        so a task created or changed by another process is picked up within that bound.
+        """
+        owned_queues = set(self._owned_queues)
+        now = time.monotonic()
+        if now - self._last_lease_renew >= lease_secs / 2 * 0.9:
+            with self.backend.idle_transaction():
+                if owned_queues:
+                    self.backend.renew_queue_leases(
+                        sorted(owned_queues), self.worker_id, lease_secs
+                    )
+                unowned = set(self.queues) - owned_queues
+                if unowned:
+                    newly_claimed = set(
+                        self.backend.claim_queue_leases(
+                            sorted(unowned), self.worker_id, self.node_id, self.pid, lease_secs
+                        )
+                    )
+                    if newly_claimed:
+                        owned_queues |= newly_claimed
+                        logger.info(f"Acquired scheduler leases for: {sorted(newly_claimed)}")
+            pending["_last_lease_renew"] = now
+            pending["_owned_queues"] = owned_queues
+            if owned_queues != self._owned_queues:
+                pending["_sched_next_check"] = 0.0
+        # Fire cron for held queues only (ELECT-01 + ELECT-02)
+        next_check = pending.get("_sched_next_check", self._sched_next_check)
+        if owned_queues and now >= next_check:
+            with self.backend.idle_transaction():
+                jobs = scheduler.run_due_tasks(queue_names=owned_queues)
+                if jobs:
+                    logger.info(f"Scheduler created {len(jobs)} jobs")
+                wait = self._scheduler_recheck_interval()
+                nxt = self.backend.next_scheduled_run_at(sorted(owned_queues))
+            if nxt is not None:
+                if nxt.tzinfo is None:
+                    nxt = nxt.replace(tzinfo=timezone.utc)
+                until_due = (nxt - datetime.now(timezone.utc)).total_seconds()
+                wait = min(wait, max(until_due, 0.0))
+            pending["_sched_next_check"] = now + wait
+
+    @staticmethod
+    def _scheduler_recheck_interval() -> float:
+        try:
+            return max(float(get_config("SCHEDULER_RECHECK_INTERVAL", 10)), 0.0)
+        except (TypeError, ValueError):
+            return 10.0
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""
@@ -1374,13 +1495,15 @@ class WorkerProcess:
     def _heartbeat(self, status: str, job_id=None):
         """Send a heartbeat to the database."""
         try:
-            self.backend.update_worker_heartbeat(
-                worker_id=self.worker_id,
-                status=status,
-                current_job_id=job_id,
-                jobs_processed=self.jobs_processed,
-                total_busy_seconds=self.total_busy_seconds,
-            )
+            # Own savepoint (#110): a swallowed error must not abort the shared transaction.
+            with self.backend.idle_transaction():
+                self.backend.update_worker_heartbeat(
+                    worker_id=self.worker_id,
+                    status=status,
+                    current_job_id=job_id,
+                    jobs_processed=self.jobs_processed,
+                    total_busy_seconds=self.total_busy_seconds,
+                )
         except Exception as e:
             logger.warning(f"Heartbeat failed: {e}")
 

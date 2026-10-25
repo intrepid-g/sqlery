@@ -98,6 +98,26 @@ class DatabaseBackend(ABC):
         """
         return None
 
+    def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
+        """Earliest ``next_run_at`` of an enabled scheduled task on ``queue_names``.
+
+        Lets an idle worker skip the due-task lookup until something is due. ``None``
+        means "no scheduled task" (or "unknown"); the caller still re-checks at a
+        bounded interval (``SCHEDULER_RECHECK_INTERVAL``).
+        """
+        return None
+
+    def idle_transaction(self):
+        """Context manager that runs an idle worker's housekeeping in one transaction.
+
+        An idle poll renews the scheduler lease, looks for due tasks, sends a heartbeat
+        and reads the next delayed job; inside this block a backend may commit them
+        together rather than once each. The default is a no-op (one commit per statement).
+        """
+        from contextlib import nullcontext
+
+        return nullcontext()
+
     @abstractmethod
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job from specified queues.
