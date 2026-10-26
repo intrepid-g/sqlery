@@ -68,8 +68,8 @@ def test_rqworker_cli_queue_is_served(tmp_path):
             out = run(
                 "shell",
                 "-c",
-                "from sqlery.django_sqlery.models import QueuedJob; "
-                "print(QueuedJob.objects.get().status)",
+                "from sqlery.django_sqlery.models import JobAll; "
+                "print(JobAll.objects.get().status)",
                 capture_output=True,
                 text=True,
             ).stdout.strip()
