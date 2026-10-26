@@ -458,8 +458,10 @@ class Queue:
             qj = QueuedJob.objects.filter(
                 queue_name=self.name,
                 job_name=job_name,
-                status__in=("queued", "running"),
+                status="queued",  # waiting or running (a running job is a queued row + attempt)
             ).first()
+            if qj is not None:
+                qj.show_running(qj.open_attempt())
             return JobModel(qj) if qj else None
         except Exception:
             return None
@@ -496,7 +498,7 @@ class Queue:
         # from django.db.models import Q  # moved to top-level
         # from django.utils import timezone  # moved to top-level
         return list(
-            QueuedJob.objects.filter(queue_name=self.name, status="queued")
+            QueuedJob.objects.waiting().filter(queue_name=self.name)
             .filter(
                 # RQ compat: only due jobs (not scheduled in the future)
                 Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=timezone.now())
@@ -514,7 +516,7 @@ class Queue:
         class _StartedRegistry:
             def get_job_ids(self) -> list[str]:
                 return list(
-                    QueuedJob.objects.filter(queue_name=queue_name, status="running")
+                    QueuedJob.objects.running().filter(queue_name=queue_name)
                     .exclude(job_name="")
                     .exclude(job_name__isnull=True)
                     .values_list("job_name", flat=True)

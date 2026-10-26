@@ -137,6 +137,25 @@ def _is_lost_race(exc: Exception) -> bool:
     return type(exc).__name__ in ("ConcurrentModificationError", "JobFencingError")
 
 
+def _fail_waiting_job(job, error: str, termination_reason: str) -> None:
+    """Fail a job that is waiting in the queue, only if it is still waiting.
+
+    The claim no longer changes the job row, so the job's version cannot tell that another
+    worker started it since it was read: a model that supports it (``idle_only``) loses that
+    race instead of failing a running job (a lost race, see :func:`_is_lost_race`).
+    """
+    import inspect
+
+    try:
+        takes_idle_only = "idle_only" in inspect.signature(job.mark_failed).parameters
+    except (TypeError, ValueError):
+        takes_idle_only = False
+    if takes_idle_only:
+        job.mark_failed(error=error, termination_reason=termination_reason, idle_only=True)
+    else:
+        job.mark_failed(error=error, termination_reason=termination_reason)
+
+
 def dependency_state(job) -> str:
     """Decide what a candidate's dependencies say: ``met``, ``pending``, ``failed`` or ``skip``.
 
@@ -154,9 +173,10 @@ def dependency_state(job) -> str:
 
     if failed_deps:
         try:
-            job.mark_failed(
+            _fail_waiting_job(
+                job,
                 error=f"Dependencies failed: {failed_deps}",
-                termination_reason="dependency_failed"
+                termination_reason="dependency_failed",
             )
         except Exception as e:
             if not _is_lost_race(e):
@@ -398,6 +418,9 @@ def _release_job(worker, job, status, **kwargs):
     from sqlery.django_sqlery.settings import get_setting
 
     with _django_transaction.atomic():
+        # When it started is on its attempt (the claim writes nothing to the job row).
+        open_attempt = JobAttempt.open_for(job.id)
+        started_at = open_attempt.claimed_at if open_attempt is not None else job.started_at
         # Unfenced by design: the executor already closed the attempt when it recorded the
         # outcome; this only sweeps anything still open (a crash between the two writes).
         JobAttempt.close_open(
@@ -406,8 +429,8 @@ def _release_job(worker, job, status, **kwargs):
         expected_version = job.version
         finished_at = _django_timezone.now()
         duration_seconds = None
-        if job.started_at:
-            duration_seconds = (finished_at - job.started_at).total_seconds()
+        if started_at:
+            duration_seconds = (finished_at - started_at).total_seconds()
 
         update_fields = {
             'status': status,

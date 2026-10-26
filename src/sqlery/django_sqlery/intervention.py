@@ -221,9 +221,7 @@ def diagnose_system_health(*, check_os: bool = False) -> list[dict]:
         w.current_job_id for w in db_workers
         if w.current_job_id is not None
     )
-    ghost_jobs = QueuedJob.objects.filter(
-        status='running'
-    ).exclude(id__in=active_job_ids)
+    ghost_jobs = QueuedJob.objects.running().exclude(id__in=active_job_ids)
     ghost_count = ghost_jobs.count()
     if ghost_count:
         problems.append({
@@ -242,7 +240,7 @@ def diagnose_system_health(*, check_os: bool = False) -> list[dict]:
     # Pure DB check — works from any container.
 
     _due_filter = Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
-    queued_count = QueuedJob.objects.filter(status='queued').filter(_due_filter).count()
+    queued_count = QueuedJob.objects.waiting().filter(_due_filter).count()
     if queued_count > 0 and not db_workers:
         problems.append({
             'kind': 'no_workers',
@@ -260,11 +258,9 @@ def diagnose_system_health(*, check_os: bool = False) -> list[dict]:
     # the worker's in-process SIGALRM failed AND the daemon's
     # deadline enforcement failed. Both supervision layers are broken.
 
-    overdue_jobs = QueuedJob.objects.filter(
-        status='running',
+    overdue_jobs = QueuedJob.objects.running().filter(
         timeout_seconds__isnull=False,
-        started_at__isnull=False,
-    )
+    ).list_shown()  # started_at is on the open attempt
     timed_out_jobs = []
     for job in overdue_jobs:
         if job.started_at + timedelta(seconds=job.timeout_seconds) < now:
@@ -341,19 +337,14 @@ def do_manual_intervention(payload: dict | None = None) -> dict:
         w.current_job_id for w in db_workers
         if w.current_job_id is not None
     )
-    ghost_jobs = QueuedJob.objects.filter(
-        status='running'
-    ).exclude(id__in=active_job_ids)
+    ghost_jobs = QueuedJob.objects.running().exclude(id__in=active_job_ids)
 
     # ── Reconcile DB with reality ──────────────────────────────
 
     # Mark dead-process workers as dead, fail their jobs
     for w in dead_db_workers:
         if w.current_job_id:
-            QueuedJob.objects.filter(
-                id=w.current_job_id, status='running'
-            ).update(
-                status='failed',
+            QueuedJob.objects.filter(id=w.current_job_id).fail_running(
                 error='Auto-recovery: worker process confirmed dead (PID check)',
                 termination_reason='daemon_intervention',
                 finished_at=now,
@@ -375,10 +366,7 @@ def do_manual_intervention(payload: dict | None = None) -> dict:
         except ProcessLookupError:
             pass
         if w.current_job_id:
-            QueuedJob.objects.filter(
-                id=w.current_job_id, status='running'
-            ).update(
-                status='failed',
+            QueuedJob.objects.filter(id=w.current_job_id).fail_running(
                 error='Auto-recovery: worker killed (stuck, stale heartbeat)',
                 termination_reason='daemon_intervention',
                 finished_at=now,
@@ -393,8 +381,7 @@ def do_manual_intervention(payload: dict | None = None) -> dict:
         result['workers_killed'] += 1
 
     # Fail ghost jobs
-    ghost_count = ghost_jobs.update(
-        status='failed',
+    ghost_count = ghost_jobs.fail_running(
         error='Auto-recovery: ghost job with no active worker',
         termination_reason='daemon_intervention',
         finished_at=now,
@@ -449,10 +436,7 @@ def do_manual_intervention_direct() -> dict:
     )
     for w in stale:
         if w.current_job_id:
-            QueuedJob.objects.filter(
-                id=w.current_job_id, status='running'
-            ).update(
-                status='failed',
+            QueuedJob.objects.filter(id=w.current_job_id).fail_running(
                 error='Direct intervention: worker process presumed dead',
                 termination_reason='direct_intervention',
                 finished_at=now,
@@ -472,12 +456,9 @@ def do_manual_intervention_direct() -> dict:
         current_job_id__isnull=True
     ).values_list('current_job_id', flat=True)
 
-    ghost_count = QueuedJob.objects.filter(
-        status='running'
-    ).exclude(
+    ghost_count = QueuedJob.objects.running().exclude(
         id__in=active_job_ids
-    ).update(
-        status='failed',
+    ).fail_running(
         error='Direct intervention: ghost job with no active worker',
         termination_reason='direct_intervention',
         finished_at=now,

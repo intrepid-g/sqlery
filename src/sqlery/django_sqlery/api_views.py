@@ -326,6 +326,7 @@ def api_stop_job(request, job_id):
     job = QueuedJob.objects.filter(id=job_id).first()
     if job is None:
         return _job_gone_response(job_id, 'running')
+    job.show_running(job.open_attempt())  # running = a queued row with an open attempt
 
     if job.status != 'running':
         return JsonResponse({'error': f'Job is not running (status: {job.status})'}, status=400)
@@ -511,6 +512,7 @@ def api_remove_queued_job(request, job_id):
     job = QueuedJob.objects.filter(id=job_id).first()
     if job is None:
         return _job_gone_response(job_id, 'queued')
+    job.show_running(job.open_attempt())  # running = a queued row with an open attempt
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -532,6 +534,7 @@ def api_enqueue_job_now(request, job_id):
     job = QueuedJob.objects.filter(id=job_id).first()
     if job is None:
         return _job_gone_response(job_id, 'queued')
+    job.show_running(job.open_attempt())  # running = a queued row with an open attempt
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -605,13 +608,13 @@ def api_worker_detail(request, worker_id):
     # from django.utils import timezone as _tz  # moved to top-level
     _now = timezone.now()
     if worker_queues:
-        upcoming_qs = QueuedJob.objects.filter(
-            status='queued', queue_name__in=worker_queues
+        upcoming_qs = QueuedJob.objects.waiting().filter(
+            queue_name__in=worker_queues
         ).filter(Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=_now))
     else:
-        upcoming_qs = QueuedJob.objects.filter(
-            status='queued'
-        ).filter(Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=_now))
+        upcoming_qs = QueuedJob.objects.waiting().filter(
+            Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=_now)
+        )
     upcoming_jobs = [{
         'id': j.id,
         'task_path': j.task_path,
@@ -670,6 +673,7 @@ def api_job_priority(request, job_id):
     job = QueuedJob.objects.filter(id=job_id).first()
     if job is None:
         return _job_gone_response(job_id, 'queued')
+    job.show_running(job.open_attempt())  # running = a queued row with an open attempt
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -683,13 +687,13 @@ def api_job_priority(request, job_id):
         elif action == 'bump_down':
             job.priority -= 10
         elif action == 'move_top':
-            max_pri = QueuedJob.objects.filter(
-                status='queued', queue_name=job.queue_name,
+            max_pri = QueuedJob.objects.waiting().filter(
+                queue_name=job.queue_name,
             ).aggregate(m=Max('priority'))['m'] or 0
             job.priority = max_pri + 10
         elif action == 'move_bottom':
-            min_pri = QueuedJob.objects.filter(
-                status='queued', queue_name=job.queue_name,
+            min_pri = QueuedJob.objects.waiting().filter(
+                queue_name=job.queue_name,
             ).aggregate(m=Min('priority'))['m'] or 0
             job.priority = min_pri - 10
         else:
@@ -922,7 +926,7 @@ def api_archive_scheduled_jobs(request):
         from . import ready
 
         with transaction.atomic():
-            queued = QueuedJob.objects.filter(id__in=job_ids, status='queued')
+            queued = QueuedJob.objects.waiting().filter(id__in=job_ids)
             archived_ids = list(queued.values_list('id', flat=True))
             ready.remove(archived_ids)  # archived jobs are no longer claimable (entries first)
             updated = queued.update(status='archived')

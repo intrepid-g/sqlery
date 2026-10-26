@@ -65,8 +65,13 @@ def move(
     *,
     expected_version: int | None = None,
     require_status=None,
+    require_idle: bool = False,
 ) -> bool:
     """Move one live job into history with the final ``status``; True iff it moved.
+
+    ``require_idle`` additionally demands that no attempt is open for the job (it is not
+    running): the claim no longer changes the job row, so a caller that failed a *waiting* job
+    (cancel, expiry, dependency failure) uses it to lose the race against a claim.
 
     ``values`` are the columns that differ from the live row at the moment of the
     transition (``output``, ``error``, ``runs``, ``termination_reason`` ...). The history row's
@@ -96,6 +101,11 @@ def move(
         if column in ("status", "version"):
             continue
         put(column, _expr(column), _prep(column, value))
+    # The claim writes nothing to the job row (#157): when and by whom it ran is on its newest
+    # attempt, which the finished row records (unless the caller gave the value).
+    for column, attempt_column in history_core.FROM_ATTEMPT:
+        if column not in overrides:
+            put(column, history_core.from_attempt_sql(column, attempt_column))
 
     columns = live_columns()
     # parameters in the order their placeholders appear in the SELECT list
@@ -110,6 +120,11 @@ def move(
         statuses = [require_status] if isinstance(require_status, str) else list(require_status)
         where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
         where_params.extend(statuses)
+    if require_idle:
+        where.append(
+            f"NOT EXISTS (SELECT 1 FROM {history_core.ATTEMPT_TABLE} a "
+            f"WHERE a.job_id = {history_core.LIVE_TABLE}.id AND a.finished_at IS NULL)"
+        )
     where_sql = " AND ".join(where)
 
     with connection.cursor() as cur:
@@ -133,6 +148,17 @@ def move(
             # Cannot happen after the row lock (SQLite has a single writer); never leave a
             # half move behind.
             raise RuntimeError(f"moving job {job_id} to history touched an unexpected row count")
+        # A finished job is not running: close any attempt a caller without a handle (an
+        # admin stop, a recovery sweep) left open. A fenced completion closed its own already.
+        cur.execute(
+            f"UPDATE {history_core.ATTEMPT_TABLE} SET finished_at = %s, outcome = %s "
+            f"WHERE job_id = %s AND finished_at IS NULL",
+            [
+                _prep("finished_at", timezone.now()),
+                "success" if status == "success" else "abandoned",
+                job_id,
+            ],
+        )
     return True
 
 

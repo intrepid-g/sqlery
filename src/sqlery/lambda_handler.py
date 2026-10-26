@@ -179,8 +179,7 @@ def process_queue_action(event, context):
 
             # Check if there are more jobs in the queue
             # If yes, spawn another Lambda to process them
-            more_jobs = QueuedJob.objects.filter(
-                status="queued",
+            more_jobs = QueuedJob.objects.waiting().filter(
                 queue_name=job.queue_name,
             ).exists()
 
@@ -226,8 +225,7 @@ def process_queue_action(event, context):
         logger.info(f"Processed {jobs_processed} jobs from queue '{queue_name or 'all'}'")
 
         # Check if there are more jobs and spawn another worker
-        more_jobs = QueuedJob.objects.filter(
-            status="queued",
+        more_jobs = QueuedJob.objects.waiting().filter(
             queue_name=queue_name if queue_name else None,
         ).exists()
 
@@ -362,7 +360,7 @@ def poll_and_process_action(event, context):
     # If there are more queued jobs, invoke another worker
     # from .models import QueuedJob  # moved to top-level
 
-    more_jobs = QueuedJob.objects.filter(status="queued").exists()
+    more_jobs = QueuedJob.objects.waiting().exists()
 
     if more_jobs:
         logger.info("More jobs in queue, invoking another worker")

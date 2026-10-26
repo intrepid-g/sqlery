@@ -159,7 +159,8 @@ class Queue:
             # from django.db.models import Max  # moved to top-level
             max_priority = (
                 QueuedJob.objects
-                .filter(queue_name=queue_options['queue'], status='queued')
+                .waiting()
+                .filter(queue_name=queue_options['queue'])
                 .aggregate(max_p=Max('priority'))['max_p']
             )
             priority = (max_priority or 0) + 1

@@ -131,6 +131,10 @@ def _dj_job(**kw):
     kw.setdefault("task_path", "tests.tasks.dummy_task")
     kw.setdefault("queue_name", "default")
     kw.setdefault("status", "queued")
+    if kw["status"] == "running":  # running = a queued row with an open attempt (#157)
+        from tests.running_jobs import django_running_job
+
+        return django_running_job(**kw)
     return QueuedJob.objects.create(**kw)
 
 

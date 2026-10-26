@@ -155,13 +155,66 @@ def delete_live_sql(where_sql: str) -> str:
     return f"DELETE FROM {LIVE_TABLE} WHERE {where_sql}"
 
 
-def view_sql(columns: Iterable[str], replace: bool = True) -> str:
-    """The union view over the live table and history (``columns`` are the shared ones)."""
-    cols = ", ".join(columns)
+# Columns of a live job that a running job takes from its open attempt (#157). The attempt is
+# the only place the claim writes: while a job runs its row is untouched, so the view derives
+# these from the open attempt (``a``) and leaves every other column as stored.
+_RUNNING_FROM_ATTEMPT = {
+    "status": "'running'",
+    "started_at": "a.claimed_at",
+    "worker_id": "a.worker_id",
+    "worker_pid": "a.worker_pid",
+    "child_pid": "a.child_pid",
+}
+
+
+def view_sql(columns: Iterable[str], replace: bool = True, with_attempts: bool = False) -> str:
+    """The union view over the live table and history (``columns`` are the shared ones).
+
+    With ``with_attempts`` (what #157 installs; the default stays the shape the released
+    migrations 0039 / 0021 create) a live job with ``status = 'queued'`` and an
+    open attempt reads as ``running``, with ``started_at`` / ``worker_id`` / ``worker_pid`` /
+    ``child_pid`` taken from that attempt. A job that is claimed has no UPDATE on its row, so
+    this view is where "running" exists for every reader of "any job". Without it the view is
+    the plain union (the pre-#157 shape, used by the older migrations and their reverse).
+    """
+    cols = list(columns)
     head = "CREATE OR REPLACE VIEW" if replace else "CREATE VIEW"
+    plain = ", ".join(cols)
+    if not with_attempts:
+        return (
+            f"{head} {JOB_ALL_VIEW} AS SELECT {plain} FROM {LIVE_TABLE} "
+            f"UNION ALL SELECT {plain} FROM {HISTORY_TABLE}"
+        )
+    live = ", ".join(
+        f"CASE WHEN a.id IS NULL THEN q.{c} ELSE {_RUNNING_FROM_ATTEMPT[c]} END AS {c}"
+        if c in _RUNNING_FROM_ATTEMPT
+        else f"q.{c} AS {c}"
+        for c in cols
+    )
     return (
-        f"{head} {JOB_ALL_VIEW} AS SELECT {cols} FROM {LIVE_TABLE} "
-        f"UNION ALL SELECT {cols} FROM {HISTORY_TABLE}"
+        f"{head} {JOB_ALL_VIEW} AS SELECT {live} FROM {LIVE_TABLE} q "
+        f"LEFT JOIN {ATTEMPT_TABLE} a ON a.job_id = q.id AND a.finished_at IS NULL "
+        f"AND q.status = 'queued' "
+        f"UNION ALL SELECT {plain} FROM {HISTORY_TABLE}"
+    )
+
+
+#: Live-row columns a finished job takes from its newest attempt (#157): the claim does not
+#: write them to the job row, so the terminal transition copies them from the attempt table.
+FROM_ATTEMPT = (
+    ("started_at", "claimed_at"),
+    ("worker_id", "worker_id"),
+    ("worker_pid", "worker_pid"),
+    ("child_pid", "child_pid"),
+)
+
+
+def from_attempt_sql(column: str, attempt_column: str, job_id_sql: str = f"{LIVE_TABLE}.id") -> str:
+    """SQL expression: ``attempt_column`` of the newest attempt of the job, else the row's own
+    ``column`` (a job claimed before attempts existed keeps what its row says)."""
+    return (
+        f"COALESCE((SELECT a.{attempt_column} FROM {ATTEMPT_TABLE} a "
+        f"WHERE a.job_id = {job_id_sql} ORDER BY a.id DESC LIMIT 1), {column})"
     )
 
 
@@ -260,11 +313,16 @@ def postgres_history_ddl(partitioned: bool = True, indexes: bool = True) -> list
     return statements
 
 
-def view_columns_ddl(columns: Iterable[str], dialect: str) -> list[str]:
-    """DDL of the union view for ``dialect`` (``postgresql`` replaces, others drop first)."""
-    if dialect == "postgresql":
-        return [view_sql(columns, replace=True)]
-    return [f"DROP VIEW IF EXISTS {JOB_ALL_VIEW}", view_sql(columns, replace=False)]
+def view_columns_ddl(
+    columns: Iterable[str], dialect: str, with_attempts: bool = False
+) -> list[str]:
+    """DDL of the union view for ``dialect``: always drop and create, in the caller's
+    transaction. ``CREATE OR REPLACE`` is not used because the status column's type modifier
+    differs between the two shapes of the view, which PostgreSQL refuses to replace."""
+    return [
+        f"DROP VIEW IF EXISTS {JOB_ALL_VIEW}",
+        view_sql(columns, replace=False, with_attempts=with_attempts),
+    ]
 
 
 def drop_view_ddl() -> str:
@@ -272,6 +330,9 @@ def drop_view_ddl() -> str:
 
 
 ATTEMPT_ID_SEQUENCE = "sqlery_attempt_id_seq"
+#: Tiny partial index of the open attempts by job: "is this job running" and "which jobs are
+#: running" (#157) read it instead of the whole attempt table.
+ATTEMPT_OPEN_JOB_INDEX = "sqlery_attempt_open_job_idx"
 ATTEMPT_OUTCOME_CHECK = (
     "CONSTRAINT sqlery_attempt_outcome_chk "
     "CHECK (outcome IS NULL OR outcome IN ('success', 'failed', 'abandoned'))"
@@ -308,6 +369,52 @@ def postgres_attempt_partitioned_ddl(table: str = ATTEMPT_TABLE) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS sqlery_attempt_open_worker_idx ON {table} (worker_id) "
         f"WHERE finished_at IS NULL",
     ]
+
+
+def normalize_running_sql(dialect: str) -> list[str]:
+    """Data migration to the attempt-derived running state (#157), idempotent.
+
+    Rows stored as ``status = 'running'`` by the older claim become ``queued`` rows with an open
+    attempt (every one of them already has one since #138; a row claimed before attempts
+    existed gets one built from the columns the old claim wrote). Run in the transaction that
+    replaces the ``sqlery_job_all`` view, with the workers stopped.
+    """
+    token = "lower(hex(randomblob(16)))" if dialect == "sqlite" else "md5(random()::text || clock_timestamp()::text)"
+    return [
+        f"INSERT INTO {ATTEMPT_TABLE} (token, job_id, worker_id, worker_pid, child_pid, claimed_at) "
+        f"SELECT {token}, q.id, q.worker_id, q.worker_pid, q.child_pid, "
+        f"COALESCE(q.started_at, q.created_at) FROM {LIVE_TABLE} q "
+        f"WHERE q.status = 'running' AND NOT EXISTS ("
+        f"SELECT 1 FROM {ATTEMPT_TABLE} a WHERE a.job_id = q.id AND a.finished_at IS NULL)",
+        f"UPDATE {LIVE_TABLE} SET status = 'queued' WHERE status = 'running'",
+    ]
+
+
+def denormalize_running_sql() -> list[str]:
+    """Reverse of :func:`normalize_running_sql`: a queued row with an open attempt is written
+    back as the ``running`` row the older claim produced (start, worker and PIDs copied from
+    the attempt). The attempts stay."""
+
+    def newest(column: str) -> str:
+        return (
+            f"(SELECT a.{column} FROM {ATTEMPT_TABLE} a WHERE a.job_id = {LIVE_TABLE}.id "
+            f"AND a.finished_at IS NULL ORDER BY a.id DESC LIMIT 1)"
+        )
+
+    return [
+        f"UPDATE {LIVE_TABLE} SET status = 'running', started_at = {newest('claimed_at')}, "
+        f"worker_id = {newest('worker_id')}, worker_pid = {newest('worker_pid')}, "
+        f"child_pid = {newest('child_pid')} WHERE status = 'queued' AND EXISTS ("
+        f"SELECT 1 FROM {ATTEMPT_TABLE} a WHERE a.job_id = {LIVE_TABLE}.id AND a.finished_at IS NULL)"
+    ]
+
+
+def open_job_index_ddl(table: str = ATTEMPT_TABLE) -> str:
+    """``CREATE INDEX`` of the open-attempts-by-job partial index (PostgreSQL and SQLite)."""
+    return (
+        f"CREATE INDEX IF NOT EXISTS {ATTEMPT_OPEN_JOB_INDEX} ON {table} (job_id) "
+        f"WHERE finished_at IS NULL"
+    )
 
 
 # --------------------------------------------------------------------------------------------

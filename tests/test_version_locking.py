@@ -9,6 +9,7 @@ from django.test import TestCase
 from django.utils import timezone
 from unittest.mock import Mock
 from sqlery.models import QueuedJob, Worker, ConcurrentModificationError
+from sqlery.django_sqlery.models import JobAttempt
 from sqlery.db_compat import atomic_claim_job, is_sqlite
 
 
@@ -34,13 +35,15 @@ class TestVersionBasedLocking(TestCase):
         assert self.job.version == 0
 
     def test_version_increments_on_claim(self):
-        """Version should increment when job is claimed."""
+        """A claim writes nothing to the job row (#157): the version is unchanged and the
+        job is shown running from its open attempt."""
         initial_version = self.job.version
 
         success = atomic_claim_job(self.job, self.worker)
 
         assert success is True
-        assert self.job.version == initial_version + 1
+        assert self.job.version == initial_version
+        assert QueuedJob.objects.get(id=self.job.id).version == initial_version
         assert self.job.status == "running"
 
     def test_concurrent_claim_only_one_succeeds(self):
@@ -69,9 +72,9 @@ class TestVersionBasedLocking(TestCase):
 
         # Verify job was claimed by first worker only
         job = QueuedJob.objects.get(id=self.job.id)
-        assert job.worker == self.worker
-        assert job.status == "running"
-        assert job.version == 1  # Incremented once
+        assert JobAttempt.open_for(job.id).worker_id == self.worker.id
+        assert job.get_status() == "running"
+        assert job.version == 0  # the claim does not write the row
 
     def test_mark_success_increments_version(self):
         """mark_success should increment version."""
@@ -150,9 +153,9 @@ class TestVersionBasedLocking(TestCase):
 
         # Verify final state
         job = QueuedJob.objects.get(id=self.job.id)
-        assert job.worker == workers[0]
-        assert job.status == "running"
-        assert job.version == 1
+        assert JobAttempt.open_for(job.id).worker_id == workers[0].id
+        assert job.get_status() == "running"
+        assert job.version == 0
 
     def test_version_persists_across_job_lifecycle(self):
         """Version should continuously increment through job lifecycle."""
@@ -162,12 +165,12 @@ class TestVersionBasedLocking(TestCase):
         # Claim
         atomic_claim_job(self.job, self.worker)
         self.job.refresh_from_db()
-        assert self.job.version == 1
+        assert self.job.version == 0  # a claim does not write the row
 
-        # Mark success
+        # Mark success (the history row is the live version plus one)
         self.job.mark_success(output="Done")
         self.job.refresh_from_db()
-        assert self.job.version == 2
+        assert self.job.version == 1
         assert self.job.status == "success"
 
     def test_stale_job_object_cannot_update(self):
@@ -213,7 +216,7 @@ class TestSQLiteSpecificBehavior(TestCase):
         success = atomic_claim_job_sqlite(job, worker)
 
         assert success is True
-        assert job.version == 1
+        assert job.version == 0
         assert job.worker == worker
 
 

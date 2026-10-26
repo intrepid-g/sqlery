@@ -273,7 +273,7 @@ class TestAtomicSchedulerClaiming:
 
         # No new jobs should be created
         assert len(jobs) == 0
-        assert QueuedJob.objects.filter(scheduled_task=task, status="queued").count() == 0
+        assert QueuedJob.objects.waiting().filter(scheduled_task=task).count() == 0
 
 
 @skip_on_sqlite

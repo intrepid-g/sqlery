@@ -13,7 +13,7 @@ from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models, transaction
-from django.db.models import F, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
@@ -375,6 +375,11 @@ class ScheduledTask(models.Model):
         return {}
 
 
+def _open_attempt_exists():
+    """``Exists`` of an open attempt for the outer job row (``OuterRef("id")``)."""
+    return Exists(JobAttempt.objects.filter(job_id=OuterRef("id"), finished_at__isnull=True))
+
+
 def _is_retry_marker(reason) -> bool:
     from sqlery.core.retry import is_retry_pending
 
@@ -396,6 +401,53 @@ class QueuedJobQuerySet(models.QuerySet):
     """
 
     _READY_FIELDS = ("queue_name", "priority", "scheduled_at")
+
+    def running(self):
+        """Jobs that are running: a ``queued`` row with an open attempt (#157).
+
+        The claim writes nothing to the job row, so ``filter(status="running")`` matches
+        nothing; this is the one place that states the rule for the ORM.
+        """
+        return self.filter(status="queued").filter(_open_attempt_exists())
+
+    def waiting(self):
+        """Jobs that are queued and not running (no open attempt)."""
+        return self.filter(status="queued").filter(~_open_attempt_exists())
+
+    def fail_running(self, **fields):
+        """Bulk-fail the running jobs of this queryset (a recovery sweep); returns how many.
+
+        A job is running iff it has an open attempt, so the attempts are abandoned first (in
+        the same transaction; a late completion from the old holder is then rejected) and the
+        terminal update, with ``fields`` (``error``, ``termination_reason``, ``finished_at``...),
+        is applied to the jobs that were running. They move to history like any final state.
+        """
+        with transaction.atomic(using=self.db):
+            ids = list(self.running().values_list("id", flat=True))
+            if not ids:
+                return 0
+            now = timezone.now()
+            JobAttempt.objects.filter(job_id__in=ids, finished_at__isnull=True).update(
+                finished_at=now, outcome=OUTCOME_ABANDONED
+            )
+            return self.model.objects.filter(id__in=ids, status="queued").update(
+                status="failed", **fields
+            )
+
+    def list_shown(self):
+        """Evaluate to a list, each job that has an open attempt shown as running (start time,
+        worker and PIDs from the attempt, in memory; see ``QueuedJob.show_running``). One extra
+        query for all of them."""
+        jobs = list(self)
+        attempts = {
+            a.job_id: a
+            for a in JobAttempt.objects.filter(
+                job_id__in=[j.id for j in jobs if j.status == "queued"], finished_at__isnull=True
+            ).order_by("id")
+        }
+        for job in jobs:
+            job.show_running(attempts.get(job.id))
+        return jobs
 
     def update(self, **kwargs):
         if kwargs.get("status") in TERMINAL_STATUSES:
@@ -695,11 +747,14 @@ class QueuedJob(models.Model):
     )
 
     # Worker assignment (for multi-worker mode)
+    # Not written by a claim since #157 (the open attempt names the worker); NULL for new jobs.
+    # db_index=False: the partial index below (migration 0042) serves ON DELETE SET NULL.
     worker = models.ForeignKey(
         "Worker",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
+        db_index=False,
         related_name="assigned_jobs",
         help_text="Worker currently processing this job",
     )
@@ -742,6 +797,14 @@ class QueuedJob(models.Model):
             # Dropped (migration 0039): ("-finished_at") and ("-started_at"). Finished jobs
             # are in sqlery_job_history, which has its own indexes (#140); a live job is found
             # by status.
+            # Replaced (migration 0042): the full ("worker") index by a partial one. The claim
+            # does not write the worker to the row any more (#157), so only legacy rows have
+            # one; the index still serves the SET NULL of a deleted Worker.
+            models.Index(
+                fields=["worker"],
+                name="sqlery_qj_worker_id_idx",
+                condition=Q(worker__isnull=False),
+            ),
         ]
 
     def __str__(self):
@@ -751,12 +814,73 @@ class QueuedJob(models.Model):
         return f"{task_name} [{self.queue_name}] - {self.status}"
 
     def get_status(self) -> str:
-        """Return the job status (RQ compat)."""
+        """Return the job status (RQ compat): ``running`` for a job with an open attempt."""
+        if self.status == "queued" and "_stored_row" not in self.__dict__:
+            if self.open_attempt() is not None:
+                return "running"
         return self.status
 
     _READY_RELEVANT = frozenset({"status", "queue_name", "priority", "scheduled_at"})
 
+    # What a running job shows (derived from its open attempt) but its row does not hold.
+    _DERIVED_FIELDS = ("status", "started_at", "worker_id", "worker_pid", "child_pid")
+
+    def show_running(self, attempt):
+        """Show this job as the running job its open ``attempt`` makes it, in memory only.
+
+        The claim writes nothing to the job row (#157): the row says ``queued`` with no start
+        time or worker, and the attempt says the rest. The values shown here never reach the
+        row: ``save()`` writes the stored ones back in their place unless the caller changed
+        them after this call. Returns ``self``.
+        """
+        if attempt is None:
+            return self
+        if "_stored_row" not in self.__dict__:
+            self.__dict__["_stored_row"] = {n: getattr(self, n) for n in self._DERIVED_FIELDS}
+        self.status = "running"
+        self.started_at = attempt.claimed_at
+        self.worker_id = attempt.worker_id
+        self.worker_pid = attempt.worker_pid
+        self.child_pid = attempt.child_pid
+        self.__dict__["_shown_row"] = {n: getattr(self, n) for n in self._DERIVED_FIELDS}
+        return self
+
+    def hide_running(self):
+        """Undo ``show_running``: the object shows the row as stored again (it is queued)."""
+        for name, value in self.__dict__.get("_stored_row", {}).items():
+            setattr(self, name, value)
+        self._forget_running()
+
+    def _forget_running(self):
+        """The object now holds a real (final) state: nothing shown is derived any more."""
+        self.__dict__.pop("_stored_row", None)
+        self.__dict__.pop("_shown_row", None)
+
+    def open_attempt(self):
+        """The open attempt of this job (it is running), or None."""
+        return JobAttempt.open_for(self.id)
+
     def save(self, *args, **kwargs):
+        """Save the job; values shown from the open attempt (``show_running``) are not written.
+
+        A field that still holds exactly what ``show_running`` put there is saved as the row
+        had it; one the caller changed since is saved as they changed it.
+        """
+        stored = self.__dict__.get("_stored_row")
+        if stored is None:
+            return self._save_row(*args, **kwargs)
+        shown = self.__dict__.get("_shown_row", {})
+        swapped = {n: getattr(self, n) for n in stored if getattr(self, n) == shown.get(n)}
+        for name in swapped:
+            setattr(self, name, stored[name])
+        try:
+            return self._save_row(*args, **kwargs)
+        finally:
+            if "_stored_row" in self.__dict__:  # not cleared by a terminal transition
+                for name, value in swapped.items():
+                    setattr(self, name, value)
+
+    def _save_row(self, *args, **kwargs):
         """Save the job and keep its ready-queue entry in step, in the same transaction.
 
         A job saved as ``queued`` gets (or keeps) its ready entry; one saved as anything
@@ -804,6 +928,7 @@ class QueuedJob(models.Model):
             ready.before_save(self)  # drops the entries of a job that is not queued
             super().save(*args, **kwargs)
             self._in_history = history.move(self.id, self.created_at, self.status, {})
+        self._forget_running()
         ready.release_dependents_quietly(self.id, self.parent_job_id)
 
     def refresh_from_db(self, using=None, fields=None, **kwargs):
@@ -812,8 +937,13 @@ class QueuedJob(models.Model):
         The object stays what it was (a ``QueuedJob``) but carries the final state, so code
         holding a job across its completion keeps working.
         """
+        if fields is not None and set(fields) & {"status", "started_at", "worker", "worker_id"}:
+            # Reloading any of what a running job shows reloads all of it (see show_running).
+            fields = list(dict.fromkeys([*fields, *self._DERIVED_FIELDS]))
+        if fields is None or "status" in fields:
+            self._forget_running()
         try:
-            return super().refresh_from_db(using=using, fields=fields, **kwargs)
+            result = super().refresh_from_db(using=using, fields=fields, **kwargs)
         except QueuedJob.DoesNotExist:
             row = JobHistory.objects.filter(id=self.id).first()
             if row is None:
@@ -824,6 +954,11 @@ class QueuedJob(models.Model):
                 attname = self._meta.get_field(name).attname if name != "pk" else name
                 if hasattr(row, attname):
                     setattr(self, attname, getattr(row, attname))
+            return None
+        if (fields is None or "status" in fields) and self.status == "queued":
+            # A queued row with an open attempt is a running job (the claim leaves the row alone).
+            self.show_running(self.open_attempt())
+        return result
 
     def delete(self, *args, **kwargs):
         """Delete the job together with its ready / blocked entries; jobs that waited on it
@@ -838,32 +973,29 @@ class QueuedJob(models.Model):
         return result
 
     def mark_running(self):
-        """Mark job as running and record worker PID.
+        """Mark job as running: open its attempt and drop its ready / blocked entries.
 
-        Uses optimistic locking to ensure atomic state transition.
+        The job row is not written (a job is running iff it has an open attempt, see
+        ``QueuedJob.objects.running()``). Fenced like a claim: the row is locked and must still
+        be the queued job this object read (same version) with no attempt open.
 
         Raises:
-            ConcurrentModificationError: If job was modified by another process
+            ConcurrentModificationError: If job was modified by another process, or is
+                running already
         """
         # import os  # moved to top-level
-
-        # from django.db.models import F  # moved to top-level
-
         expected_version = self.version
 
-        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
         with transaction.atomic():
-            rows_updated = QueuedJob.objects.filter(
-                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 3
-            ).update(
-                status="running",
-                started_at=timezone.now(),
-                # worker_pid is no longer written: it lives on the attempt (#138).
-                # #CLEANUP: drop QueuedJob.worker_pid/child_pid once no reader falls back to them.
-                version=F("version") + 1,
+            rows = QueuedJob.objects.filter(
+                id=self.id,
+                created_at=self.created_at,  # checklist item 3
+                version=expected_version,
+                status="queued",
             )
-
-            if rows_updated == 0:
+            if not is_sqlite():
+                rows = rows.select_for_update(skip_locked=True)
+            if not list(rows.values_list("id", flat=True)[:1]) or JobAttempt.open_for(self.id):
                 raise ConcurrentModificationError(
                     f"Job {self.id} was modified by another process (version conflict)"
                 )
@@ -896,11 +1028,32 @@ class QueuedJob(models.Model):
     def _record_final(self, status, in_history=True, **fields):
         """Carry the final state in memory after the terminal transition (the row itself is
         in history, or marked in place, by now)."""
+        self._forget_running()  # the final state is real, not derived from an attempt
         self.status = status
         self.version = (self.version or 0) + 1
         self._in_history = in_history
         for name, value in fields.items():
             setattr(self, name, value)
+
+    def _attempt_columns(self) -> dict:
+        """What the job row will record about the attempt that is finishing (``started_at``,
+        ``worker_id``, ``worker_pid``, ``child_pid``): the claim wrote none of it to the row.
+
+        Read from the object when it shows a running job (``show_running``), else from the open
+        attempt; empty when there is none (the history move then falls back to the newest
+        attempt, or the row's own values).
+        """
+        if "_stored_row" in self.__dict__:
+            return {n: getattr(self, n) for n in ("started_at", "worker_id", "worker_pid", "child_pid")}
+        attempt = self.open_attempt()
+        if attempt is None:
+            return {}
+        return {
+            "started_at": attempt.claimed_at,
+            "worker_id": attempt.worker_id,
+            "worker_pid": attempt.worker_pid,
+            "child_pid": attempt.child_pid,
+        }
 
     def mark_success(self, output="", attempt=None):
         """Mark job as successful: the job moves from the live table to history.
@@ -926,10 +1079,14 @@ class QueuedJob(models.Model):
 
         expected_version = self.version
         finished_at = timezone.now()
+        columns = self._attempt_columns()
+        started_at = columns.get("started_at") or self.started_at
         duration = None
-        if self.started_at:
-            duration = (finished_at - self.started_at).total_seconds()
+        if started_at:
+            duration = (finished_at - started_at).total_seconds()
         self.finished_at, self.duration_seconds = finished_at, duration
+        if started_at and not self.started_at:
+            self.started_at = started_at  # recorded in the run below
 
         # Record this run in history (update in-memory only)
         self._record_run(status="success", output=str(output))
@@ -938,6 +1095,7 @@ class QueuedJob(models.Model):
             "duration_seconds": duration,
             "output": str(output),
             "runs": self.runs,
+            **columns,
         }
 
         with transaction.atomic():
@@ -989,7 +1147,9 @@ class QueuedJob(models.Model):
             ready.release_dependents_quietly(self.id, self.parent_job_id)
         return moved
 
-    def mark_failed(self, error, traceback="", termination_reason="", attempt=None):
+    def mark_failed(
+        self, error, traceback="", termination_reason="", attempt=None, idle_only=False
+    ):
         """Mark job as failed with optional termination reason: the job moves to history.
 
         A failure that will be retried carries the ``retry_pending`` marker
@@ -1006,6 +1166,10 @@ class QueuedJob(models.Model):
                               (e.g., "timeout", "killed_by_user", "sigterm", "sigkill", "cancelled")
             attempt: Attempt handle to close (default: the one this object was claimed with).
                 Without any handle every open attempt of the job is abandoned.
+            idle_only: The caller fails a job that is *waiting* (cancelled, expired, dependency
+                failed) and must not touch one that has started since it looked: the failure
+                then applies only while no attempt is open, else it is a lost race. The claim
+                no longer changes the job row, so the version alone cannot tell.
 
         Raises:
             ConcurrentModificationError: If job was modified by another process
@@ -1016,12 +1180,18 @@ class QueuedJob(models.Model):
         from . import history
 
         expected_version = self.version
-        was_queued = self.status == "queued"
         finished_at = timezone.now()
+        columns = {} if idle_only else self._attempt_columns()
+        # Failed before it ran (cancelled, expired, dependency failed): a queued job that no
+        # attempt ever opened. A running job shows as running (and has an open attempt).
+        was_queued = idle_only or (self.status == "queued" and not columns)
+        started_at = columns.get("started_at") or self.started_at
         duration = None
-        if self.started_at:
-            duration = (finished_at - self.started_at).total_seconds()
+        if started_at:
+            duration = (finished_at - started_at).total_seconds()
         self.finished_at, self.duration_seconds = finished_at, duration
+        if started_at and not self.started_at:
+            self.started_at = started_at  # recorded in the run below
 
         # Record this run in history (update in-memory only)
         self._record_run(status="failed", error=str(error))
@@ -1032,6 +1202,7 @@ class QueuedJob(models.Model):
             "traceback": traceback,
             "termination_reason": termination_reason,
             "runs": self.runs,
+            **columns,
         }
         in_place = _is_retry_marker(termination_reason) or self._awaits_webhook("failure")
 
@@ -1043,15 +1214,26 @@ class QueuedJob(models.Model):
                 from . import ready
 
                 ready.remove([self.id])
-            self._close_attempt(attempt, OUTCOME_FAILED)
+            if not idle_only:
+                self._close_attempt(attempt, OUTCOME_FAILED)
             if in_place:
-                rows_updated = QueuedJob.objects.filter(
+                rows = QueuedJob.objects.filter(
                     id=self.id, created_at=self.created_at, version=expected_version
-                ).update_in_place(status="failed", version=F("version") + 1, **values)
+                )
+                if idle_only:
+                    rows = rows.filter(~_open_attempt_exists())
+                rows_updated = rows.update_in_place(
+                    status="failed", version=F("version") + 1, **values
+                )
                 moved = rows_updated == 1
             else:
                 moved = history.move(
-                    self.id, self.created_at, "failed", values, expected_version=expected_version
+                    self.id,
+                    self.created_at,
+                    "failed",
+                    values,
+                    expected_version=expected_version,
+                    require_idle=idle_only,
                 )
             if not moved:
                 raise ConcurrentModificationError(
@@ -1290,9 +1472,7 @@ class QueuedJob(models.Model):
         if is_sqlite():
             # SQLite doesn't support JSON __contains — filter in Python
             queued_jobs = (
-                QueuedJob.objects.filter(
-                    status="queued",
-                )
+                QueuedJob.objects.waiting()
                 .exclude(dependencies=[])
                 .exclude(dependencies__isnull=True)
             )
@@ -1302,16 +1482,18 @@ class QueuedJob(models.Model):
         else:
             # PostgreSQL: use JSON containment for efficient DB-level filtering
             dependent_jobs = list(
-                QueuedJob.objects.filter(
-                    status="queued",
-                    dependencies__contains=[self.id],
-                )
+                QueuedJob.objects.waiting().filter(dependencies__contains=[self.id])
             )
 
         for job in dependent_jobs:
-            job.mark_failed(
-                error=f"Dependency failed: job {self.id}", termination_reason="dependency_failed"
-            )
+            try:
+                job.mark_failed(
+                    error=f"Dependency failed: job {self.id}",
+                    termination_reason="dependency_failed",
+                    idle_only=True,
+                )
+            except ConcurrentModificationError:
+                continue  # started or changed since we looked: not ours to fail
             logger.info(f"Failed dependent job {job.id} because dependency {self.id} failed")
 
 
@@ -1676,6 +1858,12 @@ class JobAttempt(models.Model):
                 name="sqlery_attempt_open_worker_idx",
                 condition=Q(finished_at__isnull=True),
             ),
+            # The open attempts by job: "is this job running", "which jobs are running" (#157).
+            models.Index(
+                fields=["job_id"],
+                name="sqlery_attempt_open_job_idx",
+                condition=Q(finished_at__isnull=True),
+            ),
         ]
         constraints = [_attempt_outcome_check()]
 
@@ -1732,15 +1920,24 @@ class JobAttempt(models.Model):
     def open_new(cls, job, worker_id, worker_pid):
         """Insert the attempt for a claim of ``job`` and attach its handle to the object.
 
-        Must run inside the claim transaction. A job is claimed only while queued, so any
-        attempt still open for it is a leftover of a requeue that skipped closing: it is
-        abandoned here, which keeps "one open attempt per job" and fences the old holder.
+        Must run inside the claim transaction, after the claimer has verified (job row locked)
+        that no attempt is open for the job: an open attempt *is* the running state (#157), so
+        none is abandoned here. The object is shown as running (``show_running``); its row is
+        not written.
         """
-        cls.close_open(job.id, OUTCOME_ABANDONED)
         row = cls.objects.create(
-            job_id=job.id, token=new_token(), worker_id=worker_id, worker_pid=worker_pid
+            job_id=job.id,
+            token=new_token(),
+            worker_id=worker_id,
+            worker_pid=worker_pid,
         )
-        return attach_attempt(job, AttemptHandle(row.id, row.token, job.id))
+        attach_attempt(
+            job,
+            AttemptHandle(row.id, row.token, job.id, row.claimed_at, worker_id, worker_pid),
+        )
+        if hasattr(job, "show_running"):
+            job.show_running(row)
+        return attempt_of(job)
 
 
 # Backward compatibility alias

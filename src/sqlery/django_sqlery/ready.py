@@ -80,12 +80,37 @@ def entry_for(job, slot: int = SLOT_CURRENT):
     )
 
 
-def add(jobs) -> None:
-    """Give each job a ready entry; an existing entry is left alone (idempotent)."""
+def running_ids(job_ids) -> set:
+    """Ids among ``job_ids`` that are running, i.e. have an open attempt (#157)."""
+    m = _models()
+    ids = [i for i in job_ids if i is not None]
+    found: set = set()
+    for chunk in _chunks(ids):
+        found.update(
+            m.JobAttempt.objects.filter(job_id__in=chunk, finished_at__isnull=True).values_list(
+                "job_id", flat=True
+            )
+        )
+    return found
+
+
+def add(jobs, fresh: bool = False) -> None:
+    """Give each job a ready entry; an existing entry is left alone (idempotent).
+
+    A job that has an open attempt is running and gets no entry: every writer (save, bulk
+    update, sweep, unblock) passes through here, so none of them can make a running job
+    claimable a second time. ``fresh`` jobs (just inserted) cannot have an attempt and skip
+    the check.
+    """
     m = _models()
     jobs = list(jobs)
     if not jobs:
         return
+    if not fresh:
+        running = running_ids(j.id for j in jobs)
+        jobs = [j for j in jobs if j.id not in running]
+        if not jobs:
+            return
     with _fenced_write() as slot:
         entries = [entry_for(j, slot) for j in jobs]
         m.JobReady.objects.bulk_create(entries, ignore_conflicts=True)
@@ -137,7 +162,7 @@ def after_save(job, adding: bool, entry_updated: bool) -> None:
     if job.status != "queued" or entry_updated:
         return
     if adding or not m.JobBlocked.objects.filter(job_id=job.id).exists():
-        add([job])  # new job, became queued (again), or its entry was lost
+        add([job], fresh=adding)  # new job, became queued (again), or its entry was lost
 
 
 def before_update(rows, edits: dict) -> None:
@@ -155,9 +180,12 @@ def after_update(rows, requeue: bool, edits: dict) -> None:
     scheduled_at`` as they were before it)."""
     m = _models()
     if requeue:
+        running = running_ids(r[0] for r in rows)  # a running job stays unclaimable
         with _fenced_write() as slot:
             entries = []
             for job_id, created_at, queue_name, priority, scheduled_at in rows:
+                if job_id in running:
+                    continue
                 entries.append(
                     m.JobReady(
                         slot=slot,
@@ -207,7 +235,7 @@ def recheck_blocked(job_id: int, created_at) -> str:
     m = _models()
     with transaction.atomic():
         job = m.QueuedJob.objects.filter(id=job_id, created_at=created_at).first()
-        if job is None or job.status != "queued":
+        if job is None or job.status != "queued" or job.id in running_ids([job.id]):
             m.JobBlocked.objects.filter(job_id=job_id).delete()
             return "gone"
         all_met, failed = job.check_dependencies_met()
@@ -216,6 +244,7 @@ def recheck_blocked(job_id: int, created_at) -> str:
                 job.mark_failed(
                     error=f"Dependencies failed: {failed}",
                     termination_reason="dependency_failed",
+                    idle_only=True,
                 )
             except m.ConcurrentModificationError:
                 return "gone"  # someone else handled it
@@ -317,11 +346,13 @@ def _sweep_timeout() -> float:
 def maintain(queue_names=None, limit: int = 200, after_job_id: int = 0) -> dict:
     """Repair the ready queue (see ``DatabaseBackend.maintain_ready_queue``)."""
     m = _models()
-    jobs = m.QueuedJob.objects.filter(status="queued")
+    # A running job (open attempt) has no entry on purpose: it is never restored, and an entry
+    # that somehow exists for it is a ghost like one of a job that is no longer queued.
+    jobs = m.QueuedJob.objects.waiting()
     ghosts = m.JobReady.objects.filter(
         ~Exists(
-            m.QueuedJob.objects.filter(
-                id=OuterRef("job_id"), created_at=OuterRef("created_at"), status="queued"
+            m.QueuedJob.objects.waiting().filter(
+                id=OuterRef("job_id"), created_at=OuterRef("created_at")
             )
         )
     )
