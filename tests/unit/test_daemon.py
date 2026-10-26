@@ -375,6 +375,11 @@ class TestPromoteDueScheduledJobs:
     The advisory-lock try/finally pattern mirrors partitioning.py.
     """
 
+    _COLUMNS = [
+        ("id", "int8", True, False), ("queue_name", "varchar", True, False),
+        ("task_path", "varchar", True, False), ("kwargs", "jsonb", True, False),
+    ]
+
     def _make_cursor(self, lock_acquired=True, staged_rows=None):
         """Build a mock psycopg cursor that mimics advisory lock + DELETE RETURNING."""
         from unittest.mock import MagicMock, call
@@ -383,7 +388,8 @@ class TestPromoteDueScheduledJobs:
         # First fetchone: pg_try_advisory_lock result
         fetch_sequence.append((lock_acquired,))
         # fetchall: rows returned by DELETE ... FOR UPDATE SKIP LOCKED RETURNING
-        cursor.fetchall.return_value = staged_rows or []
+        # then the column catalog of sqlery_queued_job, read before the INSERTs
+        cursor.fetchall.side_effect = iter([staged_rows or [], self._COLUMNS])
         # fetchone is consumed once for the advisory lock result
         cursor.fetchone.side_effect = iter(fetch_sequence)
         return cursor
@@ -428,7 +434,7 @@ class TestPromoteDueScheduledJobs:
         ]
         cursor = MagicMock()
         cursor.fetchone.side_effect = iter([(True,)])
-        cursor.fetchall.return_value = fake_rows
+        cursor.fetchall.side_effect = iter([fake_rows, self._COLUMNS])
         # Make INSERT raise on second execute call
         call_count = {"n": 0}
         original_execute = cursor.execute

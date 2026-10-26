@@ -174,24 +174,21 @@ class StandaloneMode(Mode):
         with self.backend._get_session() as session:
             return _partition_layout(session.connection(), text)
 
-    def promote_staged(self):
+    def make_staged_due(self, job_id):
         from sqlalchemy import text
 
-        from sqlery.core.scheduler import promote_due_scheduled_jobs
-
+        if not self.pg:  # no staging table: the job simply waits in the live table
+            self.set_future_schedule(job_id, datetime.now(UTC))
+            return
         with self.backend._get_session() as session:
-            # The promotion INSERT names webhook_events, which the standalone DDL lacks (a
-            # defect independent of #139): give this test database the column.
-            session.execute(
-                text(
-                    "ALTER TABLE sqlery_queued_job "
-                    "ADD COLUMN IF NOT EXISTS webhook_events JSON NOT NULL DEFAULT '[]'::json"
-                )
-            )
             session.execute(text("UPDATE sqlery_scheduled_job SET scheduled_at = now()"))
             session.commit()
-        with self.backend.raw_cursor() as cur:
-            return promote_due_scheduled_jobs(cur)
+
+    def promote_staged(self):
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+
+        with self.backend.raw_cursor() as cur:  # None without staging (SQLite)
+            return 0 if cur is None else promote_due_scheduled_jobs(cur)
 
 
 class DjangoMode(Mode):
@@ -262,21 +259,20 @@ class DjangoMode(Mode):
 
         return _partition_layout(_Conn(), str)
 
-    def promote_staged(self):
+    def make_staged_due(self, job_id):
+        if not self.pg:  # no staging table: the job simply waits in the live table
+            self.set_future_schedule(job_id, datetime.now(UTC))
+            return
         from django.db import connection
 
+        with connection.cursor() as cur:
+            cur.execute("UPDATE sqlery_scheduled_job SET scheduled_at = now()")
+
+    def promote_staged(self):
         from sqlery.core.scheduler import promote_due_scheduled_jobs
 
-        with connection.cursor() as cur:
-            # The promotion INSERT omits two NOT NULL webhook columns of the Django schema (a
-            # defect independent of #139): give this test database their defaults.
-            cur.execute("ALTER TABLE sqlery_queued_job ALTER COLUMN webhook_retries SET DEFAULT 0")
-            cur.execute(
-                "ALTER TABLE sqlery_queued_job ALTER COLUMN webhook_max_retries SET DEFAULT 3"
-            )
-            cur.execute("UPDATE sqlery_scheduled_job SET scheduled_at = now()")
-        with self.backend.raw_cursor() as cur:
-            return promote_due_scheduled_jobs(cur)
+        with self.backend.raw_cursor() as cur:  # None without staging (SQLite)
+            return 0 if cur is None else promote_due_scheduled_jobs(cur)
 
 
 class _Result:
@@ -702,16 +698,21 @@ def test_ready_table_is_list_partitioned_by_slot_on_postgres(mode):
     assert pk == ["job_id", "slot"]
 
 
-@needs_pg
-def test_promoted_staged_job_is_claimable(mode):
-    if not mode.pg:
-        pytest.skip("this run's database is not PostgreSQL")
+def test_due_staged_job_is_promoted_and_claimable(mode):
     staged = mode.new_job(scheduled_at=datetime.now(UTC) + timedelta(days=3))
-    assert mode.ready() == set()  # staged jobs are not claimable
-    assert mode.claim() is None
-    assert mode.promote_staged() == 1
+    assert mode.claim() is None  # not claimable while it is far in the future
+    mode.make_staged_due(staged.id)
+    # Staging exists on PostgreSQL only; elsewhere the job already sits in the live table.
+    assert mode.promote_staged() == (1 if mode.pg else 0)
     assert mode.ready() == {staged.id}
     assert mode.claim().id == staged.id
+
+
+def test_not_yet_due_staged_job_is_not_promoted(mode):
+    staged = mode.new_job(scheduled_at=datetime.now(UTC) + timedelta(days=3))
+    assert mode.promote_staged() == 0
+    assert mode.claim() is None
+    assert mode.ready() == (set() if mode.pg else {staged.id})
 
 
 # ---- standalone only: retry chains (the Django model fails dependents of a failed job
