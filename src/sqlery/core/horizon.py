@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,169 @@ def _query_sqlalchemy() -> tuple | None:
         return tuple(conn.execute(text(HORIZON_SQL)).fetchone())
 
 
+# ---------------------------------------------------------------------------
+# Drained live partitions that cannot be dropped (#156)
+# ---------------------------------------------------------------------------
+
+LIVE_TABLE_NAME = "sqlery_queued_job"
+DEFAULT_LIVE_GRACE = "1 hour"
+DEFAULT_STUCK_PARTITION_SECONDS = 900.0
+# Candidates that get an exact emptiness probe per health call (oldest first).
+MAX_PARTITION_PROBES = 10
+
+LIVE_PARTITIONS_SQL = """
+SELECT c.relname, pg_get_expr(c.relpartbound, c.oid), COALESCE(s.n_live_tup, 0), now()
+  FROM pg_inherits i
+  JOIN pg_class c ON c.oid = i.inhrelid
+  LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+ WHERE i.inhparent = to_regclass('sqlery_queued_job')
+"""
+
+
+def assess_live_partitions(stuck_ages_seconds: list[float], max_age_seconds: float) -> str:
+    """Decide ``"ok"``/``"degraded"`` from the ages (seconds past their drop deadline) of the
+    drained live partitions that are still there. 0 disables the limit."""
+    if max_age_seconds > 0 and any(age > max_age_seconds for age in stuck_ages_seconds):
+        return DEGRADED
+    return OK
+
+
+def live_partition_candidates(
+    rows, grace: timedelta, now: datetime | None = None
+) -> tuple[list[tuple[str, float, int]], int]:
+    """Split catalog rows ``(name, bound, n_live_tup[, now])`` into the partitions past their
+    drop deadline (upper bound + grace).
+
+    Returns ``(candidates, overdue_total)``: ``candidates`` are ``(name, age_seconds,
+    estimated_live_rows)`` of the overdue partitions, oldest first; the DEFAULT partition and
+    unparsable bounds never count.
+    """
+    from .partitioning import _parse_upper_bound
+
+    overdue: list[tuple[str, float, int]] = []
+    for row in rows:
+        name, bound, live = row[0], row[1], row[2]
+        row_now = now or (row[3] if len(row) > 3 else None) or datetime.now(timezone.utc)
+        upper = _parse_upper_bound(bound)
+        if upper is None:
+            continue
+        age = (row_now - (upper + grace)).total_seconds()
+        if age > 0:
+            overdue.append((name, age, int(live or 0)))
+    overdue.sort(key=lambda item: -item[1])
+    return overdue, len(overdue)
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def check_live_partitions(
+    get_setting: Callable[[str, Any], Any], run_in_txn: Callable[[Callable], Any]
+) -> dict | None:
+    """Count and age the drained live partitions that were not dropped. Never raises.
+
+    A partition is *drained but undroppable* when it is past its upper bound plus
+    ``SQLERY_LIVE_PARTITION_GRACE`` and holds no row, yet still exists: something keeps it
+    locked (an old snapshot that read it, a transaction that wrote it) or the maintainer is
+    not running. Partitions that still hold rows are legitimately pinned and counted apart.
+    Emptiness is probed exactly (``EXISTS``, 3 s cap) for the oldest few overdue partitions
+    whose statistics claim no live row; the rest rely on ``n_live_tup``.
+    """
+    try:
+        from .partitioning import DEFAULT_LIVE_PARTITION_GRACE, parse_interval
+
+        grace = parse_interval(get_setting("SQLERY_LIVE_PARTITION_GRACE", DEFAULT_LIVE_GRACE))
+        grace = grace or parse_interval(DEFAULT_LIVE_PARTITION_GRACE)
+        try:
+            limit = float(
+                get_setting("PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS", DEFAULT_STUCK_PARTITION_SECONDS)
+            )
+            if limit < 0:
+                limit = DEFAULT_STUCK_PARTITION_SECONDS
+        except (TypeError, ValueError):
+            limit = DEFAULT_STUCK_PARTITION_SECONDS
+
+        rows = run_in_txn(lambda run: run(LIVE_PARTITIONS_SQL))
+        if not rows:
+            return None  # not partitioned: nothing to report
+        overdue, _ = live_partition_candidates(rows, grace)
+        stuck_ages: list[float] = []
+        with_rows = 0
+        probes = 0
+        for name, age, live in overdue:
+            if live > 0:
+                with_rows += 1
+                continue
+            drained = True
+            if probes < MAX_PARTITION_PROBES:
+                probes += 1
+                try:
+                    probe = run_in_txn(
+                        lambda run, n=name: run(
+                            f"SELECT EXISTS (SELECT 1 FROM {_quote_ident(n)})"
+                        )
+                    )
+                    drained = not probe[0][0]
+                except Exception:  # dropped meanwhile, or too bloated to scan: not counted
+                    continue
+            if drained:
+                stuck_ages.append(age)
+            else:
+                with_rows += 1
+        return {
+            "status": assess_live_partitions(stuck_ages, limit),
+            "drained_undroppable": len(stuck_ages),
+            "oldest_drained_age_seconds": int(max(stuck_ages)) if stuck_ages else 0,
+            "overdue_with_rows": with_rows,
+            "threshold_seconds": limit,
+        }
+    except Exception as exc:
+        logger.warning("live partition probe failed: %s", exc)
+        return {"status": UNKNOWN, "reason": f"probe_failed: {type(exc).__name__}"}
+
+
+def _txn_runner_django():
+    from django.db import connection, transaction
+
+    if connection.vendor != "postgresql":
+        return None
+
+    def run_in_txn(fn):
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '3000'")
+
+                def run(sql):
+                    cur.execute(sql)
+                    return cur.fetchall()
+
+                return fn(run)
+
+    return run_in_txn
+
+
+def _txn_runner_sqlalchemy():
+    from sqlalchemy import text
+
+    from sqlery.fastapi_sqlery.database import get_engine
+
+    engine = get_engine()
+    if engine.dialect.name != "postgresql":
+        return None
+
+    def run_in_txn(fn):
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = '3000'"))
+
+            def run(sql):
+                return [tuple(r) for r in conn.exec_driver_sql(sql).fetchall()]
+
+            return fn(run)
+
+    return run_in_txn
+
+
 def check_horizon(get_setting: Callable[[str, Any], Any] | None = None) -> dict:
     """Measure and assess the xmin horizon. Never raises.
 
@@ -182,6 +346,14 @@ def check_horizon(get_setting: Callable[[str, Any], Any] | None = None) -> dict:
             result["ready_rotation"] = ready_rotation
             if ready_rotation["status"] == DEGRADED:
                 result["status"] = DEGRADED
+        # Drained live partitions that could not be dropped (#156).
+        runner = _txn_runner_django() if is_django_mode() else _txn_runner_sqlalchemy()
+        live = check_live_partitions(get_setting, runner) if runner is not None else None
+        if live is not None:
+            result.setdefault("xmin_status", status)
+            result["live_partitions"] = live
+            if live["status"] == DEGRADED:
+                result["status"] = DEGRADED
         return result
     except Exception as exc:  # health must never crash on a probe failure
         logger.warning("xmin horizon probe failed: %s", exc)
@@ -198,6 +370,15 @@ def describe(result: dict) -> str:
             f"{result.get('slot_xid_age', 0)}, sqlery_queued_job dead tuples "
             f"{result.get('dead_tuples', 0)} ({result.get('dead_tuple_ratio', 0):.0%} of live). "
             "Find and end the long transaction (see docs/TROUBLESHOOTING.md)."
+        )
+    live = result.get("live_partitions") or {}
+    if live.get("status") == DEGRADED:
+        parts.append(
+            f"{live.get('drained_undroppable')} drained sqlery_queued_job partition(s) could not "
+            f"be dropped, the oldest {live.get('oldest_drained_age_seconds')}s past its deadline "
+            f"(limit {int(live.get('threshold_seconds', 0))}s): a transaction or snapshot keeps "
+            "them locked, or partition maintenance is not running "
+            "(see docs/TROUBLESHOOTING.md)."
         )
     rotation = result.get("ready_rotation") or {}
     if rotation.get("status") == DEGRADED:
