@@ -484,7 +484,10 @@ class DjangoBackend(DatabaseBackend):
                 return None
             ready.remove([job_id])
             updated = self.QueuedJob.objects.filter(
-                id=job_id, created_at=current.created_at, status="queued"
+                id=job_id,
+                created_at=current.created_at,
+                status="queued",
+                version=current.version or 0,
             ).update(
                 status="running",
                 started_at=timezone.now(),
@@ -1645,8 +1648,9 @@ class DjangoBackend(DatabaseBackend):
             if deleted < 1:
                 return False  # claimed by someone else, or no longer ready
             started_at = timezone.now()
+            expected_version = job.version or 0
             updated = self.QueuedJob.objects.filter(
-                id=job.id, created_at=job.created_at, status="queued"
+                id=job.id, created_at=job.created_at, status="queued", version=expected_version
             ).update(
                 status="running", worker=worker, started_at=started_at, version=db_models.F("version") + 1
             )
@@ -1659,7 +1663,6 @@ class DjangoBackend(DatabaseBackend):
                     ready.add([job])
                 return False
             # The version check of the old claim is the entry delete now; mirror the write.
-            expected_version = job.version
             job.status = "running"
             job.worker = worker
             job.started_at = started_at
