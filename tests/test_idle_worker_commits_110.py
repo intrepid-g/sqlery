@@ -214,7 +214,10 @@ def test_idle_worker_keeps_lease_and_fires_due_task(database):
     _migrate(database, env)
     admin = _connect(database)
     try:
+        # The database is shared by the module: a finished job lives in history (#140), so
+        # the live table alone no longer holds a previous test's leftovers or this test's job.
         admin.execute("DELETE FROM sqlery_queued_job")
+        admin.execute("DELETE FROM sqlery_job_history")
         admin.execute("DELETE FROM sqlery_scheduled_task")
         admin.execute("DELETE FROM sqlery_daemon_lease")
         with _Worker(env):
@@ -237,7 +240,7 @@ def test_idle_worker_keeps_lease_and_fires_due_task(database):
                     lapses.append(round(time.monotonic() - created, 1))
                 if (
                     fired_at is None
-                    and admin.execute("SELECT count(*) FROM sqlery_queued_job").fetchone()[0]
+                    and admin.execute("SELECT count(*) FROM sqlery_job_all").fetchone()[0]
                 ):
                     fired_at = time.monotonic() - created
                 time.sleep(0.1)
@@ -286,7 +289,12 @@ def test_idle_worker_survives_database_errors_in_idle_poll(database):
     _migrate(database, env)
     admin = _connect(database)
     try:
-        for table in ("sqlery_queued_job", "sqlery_scheduled_task", "sqlery_daemon_lease"):
+        for table in (
+            "sqlery_queued_job",
+            "sqlery_job_history",
+            "sqlery_scheduled_task",
+            "sqlery_daemon_lease",
+        ):
             admin.execute(f"DELETE FROM {table}")
         admin.execute("DROP TABLE IF EXISTS idle110_fail CASCADE")
         admin.execute("DROP FUNCTION IF EXISTS idle110_poison_job() CASCADE")
