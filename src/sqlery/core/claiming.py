@@ -226,7 +226,7 @@ def claim_next_job_with_queue_priority(
         queue_priorities: Optional {queue_name: weight} for ordering
         tag_concurrency_limits: Optional {tag: max_concurrent} limits
         tag_rate_limits: Optional {tag: rate_limit_str} limits
-        max_attempts: Max candidates to check before giving up
+        max_attempts: Page size when scanning candidates (the scan continues until exhausted)
         enable_registries: Whether to track job start in registry
 
     Returns:
@@ -242,14 +242,37 @@ def claim_next_job_with_queue_priority(
     # Expire TTL jobs before claiming
     expire_ttl_jobs(backend)
 
-    # Fetch a window of candidates once. Re-fetching limit=1 each attempt returned the
-    # same blocked job every time, so one tag-limited job starved everything behind it.
-    candidates = backend.get_claimable_jobs(
-        queues=queues,
-        priority_weights=queue_priorities,
-        limit=max_attempts,
-    )
+    # Scan in pages of ``max_attempts`` until the candidate set is exhausted. Every
+    # inspected-and-skipped id is excluded from the next page, so blocked jobs (unmet
+    # dependencies, tag limits) at the head of the queue can never hide runnable work.
+    seen: list = []
+    while True:
+        candidates = backend.get_claimable_jobs(
+            queues=queues,
+            priority_weights=queue_priorities,
+            limit=max_attempts,
+            exclude_ids=seen,
+        )
+        candidates = [job for job in candidates if job.id not in seen]
+        if not candidates:
+            return None
+        seen.extend(job.id for job in candidates)
+        job = _claim_from_candidates(
+            candidates,
+            worker,
+            backend,
+            tag_concurrency_limits,
+            tag_rate_limits,
+            enable_registries,
+        )
+        if job is not None:
+            return job
 
+
+def _claim_from_candidates(
+    candidates, worker, backend, tag_concurrency_limits, tag_rate_limits, enable_registries
+):
+    """Try each candidate in order; return the first one that passes every check and claims."""
     for job in candidates:
 
         # Acquire exclusive locks on tag coordination rows
@@ -261,7 +284,10 @@ def claim_next_job_with_queue_priority(
             ]
             if tags_with_limits:
                 sorted_tags = sorted(tags_with_limits)
-                backend.acquire_tag_locks(sorted_tags)
+                # Non-blocking: False means another worker holds a tag lock, so treat this
+                # candidate as tag-limited and move on instead of waiting.
+                if backend.acquire_tag_locks(sorted_tags) is False:
+                    continue
 
         # Check tag concurrency limits
         if not check_tag_concurrency_limits(job, tag_concurrency_limits, backend):
@@ -302,7 +328,6 @@ def claim_next_job_with_queue_priority(
 
         return job
 
-    # Exhausted max attempts
     return None
 
 

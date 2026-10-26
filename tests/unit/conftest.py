@@ -632,8 +632,9 @@ class FakeBackend(DatabaseBackend):
     def acquire_tag_locks(self, tags: list[str]) -> None:
         self._record("acquire_tag_locks", tuple(tags))
 
-    def get_claimable_jobs(self, queues, priority_weights=None, limit=1) -> list:
+    def get_claimable_jobs(self, queues, priority_weights=None, limit=1, exclude_ids=None) -> list:
         out = [j for j in self._jobs.values() if j.status == "queued" and j.queue_name in queues]
+        out = [j for j in out if j.id not in (exclude_ids or ())]
         # Order by priority desc, then created_at asc.
         out.sort(key=lambda j: (-j.priority, j.created_at))
         # Optional queue weighting
