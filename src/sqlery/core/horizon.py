@@ -172,7 +172,17 @@ def check_horizon(get_setting: Callable[[str, Any], Any] | None = None) -> dict:
             dead_tuples=metrics["dead_tuples"],
             slot_xid_age=metrics["slot_xid_age"],
         )
-        return {"status": status, **metrics}
+        result = {"status": status, **metrics}
+        # Opt-in ready-queue rotation (#141): a lagging rotation degrades health too.
+        from . import rotation
+
+        ready_rotation = rotation.check_rotation(get_setting)
+        if ready_rotation is not None:
+            result["xmin_status"] = status
+            result["ready_rotation"] = ready_rotation
+            if ready_rotation["status"] == DEGRADED:
+                result["status"] = DEGRADED
+        return result
     except Exception as exc:  # health must never crash on a probe failure
         logger.warning("xmin horizon probe failed: %s", exc)
         return {"status": UNKNOWN, "reason": f"probe_failed: {type(exc).__name__}"}
@@ -180,10 +190,21 @@ def check_horizon(get_setting: Callable[[str, Any], Any] | None = None) -> dict:
 
 def describe(result: dict) -> str:
     """One-line human description of a degraded result for dashboards."""
-    return (
-        f"PostgreSQL xmin horizon pinned or table bloated: oldest xmin holder "
-        f"{int(result.get('oldest_xmin_age_seconds', 0))}s, slot xid age "
-        f"{result.get('slot_xid_age', 0)}, sqlery_queued_job dead tuples "
-        f"{result.get('dead_tuples', 0)} ({result.get('dead_tuple_ratio', 0):.0%} of live). "
-        "Find and end the long transaction (see docs/TROUBLESHOOTING.md)."
-    )
+    parts = []
+    if result.get("xmin_status", result.get("status")) == DEGRADED:
+        parts.append(
+            f"PostgreSQL xmin horizon pinned or table bloated: oldest xmin holder "
+            f"{int(result.get('oldest_xmin_age_seconds', 0))}s, slot xid age "
+            f"{result.get('slot_xid_age', 0)}, sqlery_queued_job dead tuples "
+            f"{result.get('dead_tuples', 0)} ({result.get('dead_tuple_ratio', 0):.0%} of live). "
+            "Find and end the long transaction (see docs/TROUBLESHOOTING.md)."
+        )
+    rotation = result.get("ready_rotation") or {}
+    if rotation.get("status") == DEGRADED:
+        parts.append(
+            f"Ready-queue rotation is behind: no slot reclaimed for "
+            f"{rotation.get('lag_seconds')}s (limit {rotation.get('threshold_seconds')}s). "
+            "A transaction keeps the generation lock or a ready partition; the ready table "
+            "behaves like the non-rotating one until it ends (see docs/TROUBLESHOOTING.md)."
+        )
+    return " ".join(parts)

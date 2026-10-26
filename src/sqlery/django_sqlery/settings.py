@@ -150,6 +150,12 @@ DEFAULTS = {
     "PG_DEAD_TUPLE_MIN": 10000,            # ...but only with at least this many dead
     "PG_SLOT_XID_AGE_DEGRADED": 5000000,   # replication slot / standby xmin age (xids)
 
+    # Opt-in rotation of the PostgreSQL ready queue (#141, docs/design/queue-robustness.md).
+    "READY_ROTATION_ENABLED": False,
+    "READY_ROTATION_INTERVAL": 60,          # seconds between generation switches
+    "READY_ROTATION_DRAIN_BATCH": 1000,     # entries moved per drain transaction
+    "READY_ROTATION_LAG_DEGRADED_SECONDS": 0,  # 0 = 3 x interval + 60
+
     # Opt-in PG LISTEN/NOTIFY dispatch (Phase 18 — D1/D8).
     # Default False = byte-identical polling behaviour when off.
     # This is the ONLY feature flag in the listen-notify milestone.
