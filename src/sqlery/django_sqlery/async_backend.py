@@ -132,7 +132,7 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         ``sync_to_async``: Django has neither ``acursor`` nor ``transaction.aatomic``, so the
         multi-statement claim cannot be native async.
 
-        Returns the claimed ``QueuedJob`` with status='running', or ``None`` if nothing
+        Returns the claimed ``QueuedJob`` (shown running; its row is untouched), or ``None`` if nothing
         was available.
         """
         from asgiref.sync import sync_to_async
@@ -189,23 +189,36 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
     # ----- terminal-status writes -----------------------------------------
 
     async def amark_running(self, job_id, worker_id) -> None:
-        now = timezone.now()
-        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
-        # pk is now a composite (created_at, id); filter by id only.
-        # Add created_at to filter for partition pruning (write-path item, async mirror).
-        # Old (id-only — does not prune to partition on PG):
-        # await QueuedJob.objects.filter(id=job_id).aupdate(status="running", started_at=now)
-        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
-        if job:
-            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
-                status="running", started_at=now
-            )
+        """Make sure the job is running: it has an open attempt and no ready entry.
+
+        The claim already did both (``aclaim_job``); this is for starting a job by other
+        means. It writes no job row: the attempt is the running state. A job that is already
+        running, finished or gone is left as it is.
+        """
+        from asgiref.sync import sync_to_async
+
+        await sync_to_async(self._mark_running_sync)(job_id, worker_id)
+
+    @staticmethod
+    def _mark_running_sync(job_id, worker_id) -> None:
+        import os
+
+        from django.db import transaction
+
+        from . import ready
+        from .backend import DjangoBackend
+        from .db_compat import lock_unclaimed
+
+        with transaction.atomic():
+            job = QueuedJob.objects.waiting().filter(id=job_id).first()
+            if job is None:
+                return
             # A running job is not claimable: drop any ready / blocked entry.
-            from asgiref.sync import sync_to_async
-
-            from . import ready
-
-            await sync_to_async(ready.remove)([job_id])
+            ready.remove([job_id])
+            if not lock_unclaimed(job):
+                transaction.set_rollback(True)  # running already (or changed): nothing to start
+                return
+            JobAttempt.open_new(job, DjangoBackend()._attempt_worker_id(worker_id), os.getpid())
 
     @staticmethod
     def _finish_sync(job_id, outcome, attempt, values, in_place: bool = False) -> None:
@@ -227,6 +240,14 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         values = dict(values)
         status = values.pop("status")
         with transaction.atomic():
+            # The claim wrote nothing to the job row: when it started and who ran it come
+            # from the open attempt, read before it is closed.
+            running = JobAttempt.open_for(job_id)
+            if running is not None:
+                values.setdefault("started_at", running.claimed_at)
+                values.setdefault("worker_id", running.worker_id)
+                values.setdefault("worker_pid", running.worker_pid)
+                values.setdefault("child_pid", running.child_pid)
             if attempt is not None:
                 JobAttempt.close(attempt, outcome)
             else:
@@ -315,7 +336,14 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
     async def aget_job(self, job_id):
         try:
             # Old: return await QueuedJob.objects.aget(pk=job_id)
-            return await QueuedJob.objects.aget(id=job_id)
+            job = await QueuedJob.objects.aget(id=job_id)
+            if job.status == "queued":
+                # Running is derived from the open attempt (the claim leaves the row alone).
+                attempt = await JobAttempt.objects.filter(
+                    job_id=job_id, finished_at__isnull=True
+                ).order_by("-id").afirst()
+                job.show_running(attempt)
+            return job
         except QueuedJob.DoesNotExist:
             # A finished job is in history (read-only).
             return await JobHistory.objects.filter(id=job_id).afirst()

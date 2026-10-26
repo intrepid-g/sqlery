@@ -58,6 +58,34 @@ class Mode:
 
 
 class StandaloneMode(Mode):
+    def ready(self):
+        from sqlmodel import select
+
+        from sqlery.core.models import JobReady
+
+        with self.backend._get_session() as session:
+            return set(session.exec(select(JobReady.job_id)).all())
+
+    def raw_status(self, job_id, status):
+        from sqlalchemy import update
+
+        from sqlery.core.models import QueuedJob
+
+        with self.backend._get_session() as session:
+            session.execute(update(QueuedJob).where(QueuedJob.id == job_id).values(status=status))
+            session.commit()
+
+    def row_value(self, job_id, column):
+        """A column of the stored live row (not what the job shows)."""
+        from sqlalchemy import select
+
+        from sqlery.core.models import QueuedJob
+
+        with self.backend._get_session() as session:
+            return session.execute(
+                select(getattr(QueuedJob, column)).where(QueuedJob.id == job_id)
+            ).scalar()
+
     def attempts(self, job_id):
         from sqlmodel import select
 
@@ -71,6 +99,23 @@ class StandaloneMode(Mode):
 
 
 class DjangoMode(Mode):
+    def ready(self):
+        from sqlery.django_sqlery.models import JobReady
+
+        return set(JobReady.objects.values_list("job_id", flat=True))
+
+    def raw_status(self, job_id, status):
+        from django.db import connection
+
+        with connection.cursor() as cur:
+            cur.execute("UPDATE sqlery_queued_job SET status = %s WHERE id = %s", [status, job_id])
+
+    def row_value(self, job_id, column):
+        """A column of the stored live row (not what the job shows)."""
+        from sqlery.django_sqlery.models import QueuedJob
+
+        return QueuedJob.objects.filter(id=job_id).values_list(column, flat=True).first()
+
     def attempts(self, job_id):
         from sqlery.django_sqlery.models import JobAttempt
 
@@ -256,31 +301,20 @@ def test_requeue_closes_the_open_attempt_and_fences_the_old_holder(mode):
     assert [a["outcome"] for a in mode.attempts(job.id)] == ["abandoned", "success"]
 
 
-def test_claim_abandons_a_leftover_open_attempt_of_the_queued_job(mode):
-    from sqlery.core.attempts import attempt_of
-
+def test_a_queued_row_with_an_open_attempt_is_running_and_never_claimed_again(mode):
+    """#157: an open attempt *is* the running state. A raw reset of the row (or a duplicate
+    ready entry) cannot make the job claimable a second time; the old holder stays fenced
+    only by its own attempt closing."""
     job, old = _claimed(mode)
-    # A requeue that did not close the attempt (e.g. a raw status reset).
-    if isinstance(mode, DjangoMode):
-        from sqlery.django_sqlery.models import QueuedJob
-
-        QueuedJob.objects.filter(id=job.id).update(status="queued")
-    else:
-        from sqlalchemy import update
-
-        from sqlery.core.models import QueuedJob
-
-        with mode.backend._get_session() as session:
-            session.exec(update(QueuedJob).where(QueuedJob.id == job.id).values(status="queued"))
-            session.commit()
-    # A raw status reset bypasses the ready-queue bookkeeping (#139); the sweep restores the
-    # entry the job lost.
+    # A raw status write bypasses the ready-queue bookkeeping; the sweep must not restore an
+    # entry for a job that has an open attempt.
+    mode.raw_status(job.id, "queued")
     mode.backend.maintain_ready_queue()
-    new = attempt_of(mode.claim())
+    assert mode.ready() == set()
+    assert mode.claim() is None
     opens = [a for a in mode.attempts(job.id) if a["open"]]
-    assert [a["id"] for a in opens] == [new.id]
-    with pytest.raises(_fencing_error()):
-        mode.backend.mark_job_success(job.id, output="stale", attempt=old)
+    assert [a["id"] for a in opens] == [old.id]
+    assert mode.job(job.id).status == "running"
 
 
 # ---- readers -------------------------------------------------------------------------------
@@ -289,7 +323,8 @@ def test_child_pid_is_written_to_the_attempt_not_the_job_row(mode):
     mode.backend.update_job_child_pid(job.id, 4242, attempt=handle)
     (attempt,) = mode.attempts(job.id)
     assert attempt["child_pid"] == 4242
-    assert mode.job(job.id).child_pid in (None, 0)
+    assert mode.row_value(job.id, "child_pid") in (None, 0)  # the stored row says nothing
+    assert mode.job(job.id).child_pid == 4242  # the job shows what its open attempt says
 
 
 def test_superseded_worker_cannot_stamp_a_newer_attempt(mode):
@@ -302,7 +337,7 @@ def test_superseded_worker_cannot_stamp_a_newer_attempt(mode):
 
 def test_liveness_reads_the_claiming_pid_from_the_open_attempt(mode):
     job, _ = _claimed(mode)
-    assert mode.job(job.id).worker_pid in (None, 0)
+    assert mode.row_value(job.id, "worker_pid") in (None, 0)  # the stored row says nothing
     (record,) = [r for r in mode.backend.get_running_jobs_for_liveness() if r.job_id == job.id]
     assert record.worker_pid == os.getpid()
 

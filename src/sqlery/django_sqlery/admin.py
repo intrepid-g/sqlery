@@ -8,6 +8,7 @@ from datetime import datetime
 
 from django.contrib import admin
 from django.core.exceptions import ImproperlyConfigured
+from django.db.models import OuterRef, Subquery
 from django.shortcuts import redirect, render
 from django.urls import path, reverse
 from django.utils import timezone
@@ -224,6 +225,26 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
 # QueuedJob admin registered with read-only list view for job management
 # Old: @admin.register(QueuedJob)  — Django 5.2 disallows @admin.register for composite-PK models
 # Registration deferred to module end via admin.site.register (see bottom of file — Phase 15).
+class JobStatusFilter(admin.SimpleListFilter):
+    """Status filter that knows running jobs are queued rows with an open attempt (#157)."""
+
+    title = "status"
+    parameter_name = "status"
+
+    def lookups(self, request, model_admin):
+        return QueuedJob.STATUS_CHOICES
+
+    def queryset(self, request, queryset):
+        value = self.value()
+        if value == "running":
+            return queryset.running()
+        if value == "queued":
+            return queryset.waiting()
+        if value:
+            return queryset.filter(status=value)
+        return queryset
+
+
 class QueuedJobAdmin(admin.ModelAdmin):
     list_display = [
         "id",
@@ -237,7 +258,9 @@ class QueuedJobAdmin(admin.ModelAdmin):
         "duration_display",
     ]
     ordering = ["-created_at"]
-    list_filter = ["status", "queue_name", "created_at", "scheduled_task", "worker", "worker_pid"]
+    # (no "worker" / "worker_pid" filters: a claim writes neither to the job row any more, the
+    # open attempt names them)
+    list_filter = [JobStatusFilter, "queue_name", "created_at", "scheduled_task"]
     search_fields = ["task_path", "output", "error"]
     readonly_fields = [
         "task_path",
@@ -306,6 +329,21 @@ class QueuedJobAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return False  # Can't manually create jobs via admin
+
+    def get_queryset(self, request):
+        # The start time of a running job is on its open attempt, not on the job row.
+        open_attempts = JobAttempt.objects.filter(
+            job_id=OuterRef("id"), finished_at__isnull=True
+        ).order_by("-id")
+        return super().get_queryset(request).annotate(
+            _running_since=Subquery(open_attempts.values("claimed_at")[:1])
+        )
+
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field)
+        if obj is not None and obj.status == "queued":
+            obj.show_running(obj.open_attempt())  # shown running with its start and worker
+        return obj
 
     def change_view(self, request, object_id, form_url='', extra_context=None):
         extra_context = extra_context or {}
@@ -426,6 +464,12 @@ class QueuedJobAdmin(admin.ModelAdmin):
 
     task_display.short_description = "Task"
 
+    def _display_status(self, obj):
+        """Status as readers see it: ``running`` for a queued row with an open attempt."""
+        if obj.status == "queued" and getattr(obj, "_running_since", None) is not None:
+            return "running"
+        return obj.status
+
     def status_display(self, obj):
         colors = {
             "queued": "blue",
@@ -436,8 +480,8 @@ class QueuedJobAdmin(admin.ModelAdmin):
         }
         return format_html(
             '<span style="color: {}; font-weight: bold;">{}</span>',
-            colors.get(obj.status, "black"),
-            obj.get_status_display(),
+            colors.get(self._display_status(obj), "black"),
+            dict(QueuedJob.STATUS_CHOICES).get(self._display_status(obj), obj.status),
         )
 
     status_display.short_description = "Status"
@@ -456,8 +500,9 @@ class QueuedJobAdmin(admin.ModelAdmin):
     scheduled_display.short_description = "Scheduled For"
 
     def started_display(self, obj):
-        if obj.started_at:
-            return obj.started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        started_at = getattr(obj, "_running_since", None) or obj.started_at
+        if started_at:
+            return started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
         return "-"
 
     started_display.short_description = "Started"
@@ -596,7 +641,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
         from . import ready
 
         with transaction.atomic():
-            queued = queryset.filter(status="queued")
+            queued = queryset.waiting()  # a running job is not cancelled here
             ids = list(queued.values_list("id", flat=True))
             ready.remove(ids)  # cancelled jobs are no longer claimable (entries before rows)
             updated = queued.update(
@@ -618,7 +663,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
         killed_count = 0
         no_pid_count = 0
 
-        for job in queryset.filter(status="running"):
+        for job in queryset.running().list_shown():
             worker_pid, _child_pid = JobAttempt.process_ids(job)
             if not worker_pid:
                 # No PID stored, can't kill - mark as failed

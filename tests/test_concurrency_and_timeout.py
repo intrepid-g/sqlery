@@ -21,6 +21,7 @@ import time
 from django.utils import timezone
 from sqlery.executor import TaskExecutor
 from sqlery.models import JobAll, QueuedJob
+from tests.running_jobs import django_running_job
 
 
 # Dummy tasks for testing
@@ -365,11 +366,10 @@ class TestStaleJobCleanup:
         executor = TaskExecutor()
 
         # Create job that started 3 minutes ago with 60s timeout
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="test-queue",
             timeout_seconds=60,
-            status="running",
             started_at=timezone.now() - timedelta(minutes=3),  # 180s ago
         )
 
@@ -387,11 +387,10 @@ class TestStaleJobCleanup:
         executor = TaskExecutor()
 
         # Create job that started 2 hours ago with no timeout
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="test-queue",
             timeout_seconds=None,
-            status="running",
             started_at=timezone.now() - timedelta(hours=2),
         )
 
@@ -409,11 +408,10 @@ class TestStaleJobCleanup:
         executor = TaskExecutor()
 
         # Create job that started 30 seconds ago with 60s timeout
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="test-queue",
             timeout_seconds=60,
-            status="running",
             started_at=timezone.now() - timedelta(seconds=30),
         )
 
@@ -424,38 +422,17 @@ class TestStaleJobCleanup:
         job.refresh_from_db()
         assert job.status == "running"
 
-    def test_cleanup_job_without_started_at(self):
-        """Test cleanup of job stuck in running without started_at."""
-        executor = TaskExecutor()
-
-        # Create job marked as running but no started_at
-        job = QueuedJob.objects.create(
-            task_path="tests.test_concurrency_and_timeout.fast_task",
-            queue_name="test-queue",
-            status="running",
-            started_at=None,
-        )
-
-        # Should be cleaned up immediately
-        executor._cleanup_stale_jobs()
-
-        # Job should be marked as failed
-        job.refresh_from_db()
-        assert job.status == "failed"
-        assert "crashed" in job.error.lower()
-
     def test_cleanup_triggers_retry_if_configured(self):
         """Test that cleaned up stale jobs retry if max_retries is set."""
         from datetime import timedelta
         executor = TaskExecutor()
 
         # Create stale job with retries enabled
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="test-queue",
             timeout_seconds=60,
             max_retries=3,
-            status="running",
             started_at=timezone.now() - timedelta(minutes=5),
         )
 
@@ -480,19 +457,17 @@ class TestStaleJobCleanup:
         executor = TaskExecutor()
 
         # Create stale jobs in different queues
-        job_a = QueuedJob.objects.create(
+        job_a = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="queue-a",
             timeout_seconds=60,
-            status="running",
             started_at=timezone.now() - timedelta(minutes=5),
         )
 
-        job_b = QueuedJob.objects.create(
+        job_b = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="queue-b",
             timeout_seconds=60,
-            status="running",
             started_at=timezone.now() - timedelta(minutes=5),
         )
 
@@ -524,11 +499,10 @@ class TestStaleJobCleanup:
 
         # Create stale job with PID
         fake_pid = 99999
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="test-queue",
             timeout_seconds=60,
-            status="running",
             started_at=timezone.now() - timedelta(minutes=5),
             worker_pid=fake_pid,
         )
@@ -643,10 +617,9 @@ class TestOrphanedClaimerReaping:
         """Dead owner PID is proof nobody is executing — no need to wait an hour."""
         executor = TaskExecutor()
 
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="sync",
-            status="running",
             started_at=timezone.now(),  # just started — far inside any threshold
             worker_pid=999999,  # nonexistent process
         )
@@ -662,10 +635,9 @@ class TestOrphanedClaimerReaping:
         """A live claimer must never be reaped — this guards against false positives."""
         executor = TaskExecutor()
 
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="sync",
-            status="running",
             started_at=timezone.now(),
             worker_pid=os.getpid(),  # this very process is alive
         )
@@ -680,10 +652,9 @@ class TestOrphanedClaimerReaping:
         """Reaping orphans is global; only the time-threshold pass is queue-scoped."""
         executor = TaskExecutor()
 
-        job = QueuedJob.objects.create(
+        job = django_running_job(
             task_path="tests.test_concurrency_and_timeout.fast_task",
             queue_name="queue-b",
-            status="running",
             started_at=timezone.now(),
             worker_pid=999999,
         )

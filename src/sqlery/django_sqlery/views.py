@@ -25,7 +25,7 @@ from sqlery.core.worker_admin import (
     is_worker_deletable,
     worker_delete_staleness_threshold_seconds,
 )
-from .models import JobAll, JobHistory, QueuedJob, ScheduledTask, Worker
+from .models import JobAll, JobAttempt, JobHistory, QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .signature import verify_signature
 from .subprocess_executor import get_manage_py_path
@@ -94,12 +94,10 @@ def _serialize_worker(worker, now) -> dict:
             #     pass
             # Old: if worker.current_job and worker.current_job.started_at:
             # current_job FK demoted to current_job_id (D4, Phase 15); fetch explicitly
-            try:
-                _cj = QueuedJob.objects.only("started_at").get(id=worker.current_job_id)
-                if _cj.started_at:
-                    busy_seconds += (now - _cj.started_at).total_seconds()
-            except QueuedJob.DoesNotExist:
-                pass
+            # (a running job's start time is on its open attempt, the job row has none)
+            _attempt = JobAttempt.open_for(worker.current_job_id)
+            if _attempt is not None and _attempt.claimed_at:
+                busy_seconds += (now - _attempt.claimed_at).total_seconds()
         worker_data['uptime_seconds'] = uptime_seconds
         worker_data['busy_seconds'] = busy_seconds
         worker_data['idle_seconds'] = max(uptime_seconds - busy_seconds, 0.0)
@@ -162,6 +160,7 @@ def _serialize_worker(worker, now) -> dict:
         # Fetch current job explicitly using current_job_id
         try:
             job = QueuedJob.objects.select_related('scheduled_task').get(id=worker.current_job_id)
+            job.show_running(job.open_attempt())
         except QueuedJob.DoesNotExist:
             job = None
         if job:
@@ -273,11 +272,11 @@ def _compute_health_warnings(
     if precomputed_queued_count is not None:
         queued_count = precomputed_queued_count
     else:
-        queued_count = QueuedJob.objects.filter(status='queued').filter(_due_filter).count()
+        queued_count = QueuedJob.objects.waiting().filter(_due_filter).count()
     if precomputed_running_count is not None:
         running_count = precomputed_running_count
     else:
-        running_count = QueuedJob.objects.filter(status='running').count()
+        running_count = QueuedJob.objects.running().count()
 
     # 2. Jobs queued, no active workers at all
     if queued_count > 0 and not active_workers:
@@ -300,7 +299,7 @@ def _compute_health_warnings(
             finished_at__gte=now - timedelta(minutes=5),
         ).exists()
         if not recent_completed:
-            oldest = QueuedJob.objects.filter(status='queued').filter(_due_filter).order_by('created_at').first()
+            oldest = QueuedJob.objects.waiting().filter(_due_filter).order_by('created_at').first()
             wait = f'{int((now - oldest.created_at).total_seconds())}s' if oldest and oldest.created_at else '?'
             paused_workers = [w for w in idle_workers if w.paused_until and w.paused_until > now]
             if paused_workers:
@@ -323,7 +322,7 @@ def _compute_health_warnings(
     if precomputed_running_jobs is not None:
         running_jobs = [j for j in precomputed_running_jobs if j.timeout_seconds is not None]
     else:
-        running_jobs = QueuedJob.objects.filter(status='running').exclude(timeout_seconds=None)
+        running_jobs = QueuedJob.objects.running().exclude(timeout_seconds=None).list_shown()
     for job in running_jobs:
         if job.started_at and job.timeout_seconds:
             elapsed = (now - job.started_at).total_seconds()
@@ -515,7 +514,7 @@ async def health_check(request):
     # Check database connectivity
     try:
         queued_count = await asyncio.to_thread(
-            lambda: QueuedJob.objects.filter(status="queued").count()
+            lambda: QueuedJob.objects.waiting().count()
         )
 
         from sqlery.core.horizon import DEGRADED, check_horizon
@@ -615,8 +614,10 @@ def dashboard_stats(request):
         )
 
         # Queue statistics
+        # (the union view derives running from the open attempt; a live job is "queued" or
+        # "running" there, a finished one is in history)
         queue_stats = list(
-            QueuedJob.objects.filter(status__in=['queued', 'running'])
+            JobAll.objects.filter(status__in=['queued', 'running'])
             .values('queue_name')
             .annotate(
                 # queued=Count('id', filter=Q(status='queued')),
@@ -686,19 +687,17 @@ def dashboard_stats(request):
         # ALL RUNNING JOBS - explicitly show what's currently executing
         all_running_jobs = []
         try:
-            running_jobs_queryset = QueuedJob.objects.filter(
-                status='running'
-            ).select_related('scheduled_task')
+            running_jobs_queryset = QueuedJob.objects.running().select_related('scheduled_task')
 
             # Single query for all workers assigned to running jobs (avoid N+1)
-            _running_jobs_list = list(running_jobs_queryset)
+            _running_jobs_list = running_jobs_queryset.list_shown()
             running_job_ids = [j.id for j in _running_jobs_list]
             workers_by_job_id = {
                 w.current_job_id: w
                 for w in Worker.objects.filter(current_job_id__in=running_job_ids, status='busy')
             }
 
-            for job in running_jobs_queryset:
+            for job in _running_jobs_list:
                 assigned_worker = None
                 try:
                     worker = workers_by_job_id.get(job.id)
@@ -741,9 +740,7 @@ def dashboard_stats(request):
         all_queued_jobs = []
         _oldest_queued_created_at = None
         try:
-            queued_jobs_queryset = QueuedJob.objects.filter(
-                status='queued'
-            ).filter(
+            queued_jobs_queryset = QueuedJob.objects.waiting().filter(
                 # Match worker claiming: only show due jobs (not future-scheduled)
                 Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
             ).select_related('scheduled_task').order_by('-priority', 'created_at')[:50]
@@ -765,8 +762,7 @@ def dashboard_stats(request):
         # ALL SCHEDULED JOBS (future-scheduled, not yet due)
         all_scheduled_jobs = []
         try:
-            scheduled_jobs_queryset = QueuedJob.objects.filter(
-                status='queued',
+            scheduled_jobs_queryset = QueuedJob.objects.waiting().filter(
                 scheduled_at__gt=now,
             ).select_related('scheduled_task').order_by('scheduled_at')[:50]
             for job in scheduled_jobs_queryset:

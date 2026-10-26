@@ -6,10 +6,9 @@ Provides database-agnostic operations that work across both backends:
 """
 
 import logging
+import os
 
 from django.db import connection, transaction
-from django.db.models import F
-from django.utils import timezone
 
 from .settings import get_setting
 
@@ -109,47 +108,67 @@ def atomic_claim_job_queryset(queryset):
         return queryset.select_for_update()
 
 
-def _mirror_claim(job, worker, started_at, expected_version):
-    """Reflect a successful claim UPDATE on the in-memory job without another SELECT."""
-    job.status = 'running'
-    job.worker = worker
-    job.started_at = started_at
-    job.version = expected_version + 1
+def judge_claim(job) -> str:
+    """Lock the job row and judge a claim, after the claimer deleted the job's ready entry.
+
+    Returns what :func:`sqlery.core.attempts.claim_verdict` decides, as the claimer needs it:
+    ``"ok"`` (still the queued job this object read, same ``version``, no attempt open: go on
+    and open the attempt), ``"keep"`` (the job is gone, no longer queued, or already running:
+    its entry was stale and stays deleted) or ``"restore"`` (only the row moved or is locked
+    by a writer: undo the entry delete).
+
+    The row is only read and locked (``FOR UPDATE SKIP LOCKED`` on PostgreSQL, so a writer
+    holding it makes this a lost claim, never a wait; SQLite's single writer needs no lock); it
+    is never written. Must run inside ``transaction.atomic()``.
+    """
+    from sqlery.core.attempts import claim_verdict
+
+    from .models import JobAttempt, QueuedJob  # circular: models.py imports db_compat
+
+    base = QueuedJob.objects.filter(id=job.id, created_at=job.created_at)  # partition key
+    rows = base if is_sqlite() else base.select_for_update(skip_locked=True)
+    row = rows.values_list("status", "version").first()
+    if row is None:
+        # Gone (deleted, moved to history), or locked by a writer right now.
+        return "restore" if base.exists() else "keep"
+    running = JobAttempt.objects.filter(job_id=job.id, finished_at__isnull=True).exists()
+    verdict = claim_verdict(
+        stored_status=row[0],
+        version=row[1],
+        expected_version=job.version or 0,
+        has_open_attempt=running,
+    )
+    if verdict == "ok":
+        return "ok"
+    return "keep" if row[0] != "queued" or running else "restore"
+
+
+def lock_unclaimed(job) -> bool:
+    """``judge_claim(job) == "ok"``."""
+    return judge_claim(job) == "ok"
 
 
 def _claim_fenced(job, worker):
     """Claim ``job`` for ``worker``; the single implementation behind both dialect helpers.
 
     Deleting the job's ready entry (rowcount 1) is the mutex: of any number of claimers only
-    one deletes it. The job row is then set running by an update fenced on ``status =
-    'queued'`` and on the ``version`` the caller read, and its rowcount is checked. If the
-    update loses, the transaction part is rolled back (the ready entry stays) and the claim
-    returns False, so a job can never be handed to two claimers.
+    one deletes it. The job row is then locked and judged (:func:`judge_claim`) and the
+    attempt inserted, which makes the job running; the row itself is not written. If the
+    judgement loses, a stale entry stays deleted and an entry of a job that merely moved is
+    put back (savepoint), and the claim returns False: a job is never handed to two claimers.
     """
-    from .models import JobReady, QueuedJob  # circular: models.py imports db_compat
+    from .models import JobAttempt, JobReady  # circular: models.py imports db_compat
 
-    expected_version = job.version or 0
     with transaction.atomic():
         deleted, _ = JobReady.objects.filter(job_id=job.id).delete()
         if deleted < 1:
             return False  # claimed by someone else, cancelled, or not ready
-        started_at = timezone.now()
-        updated = QueuedJob.objects.filter(
-            id=job.id,
-            created_at=job.created_at,  # Composite PK: partition key for PG pruning
-            status="queued",
-            version=expected_version,
-        ).update(
-            status="running",
-            worker=worker,
-            started_at=started_at,
-            version=F("version") + 1,
-        )
-        if updated != 1:
-            transaction.set_rollback(True)  # keeps the entry: this claimer did not win
+        verdict = judge_claim(job)
+        if verdict != "ok":
+            if verdict == "restore":
+                transaction.set_rollback(True)  # keeps the entry: this claimer did not win
             return False
-    # The fence proves the row we read is the row we updated: mirror the written values.
-    _mirror_claim(job, worker, started_at, expected_version)
+        JobAttempt.open_new(job, getattr(worker, "id", None), os.getpid())
     return True
 
 

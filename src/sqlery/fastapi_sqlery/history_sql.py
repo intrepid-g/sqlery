@@ -20,18 +20,28 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, delete, func, insert, literal, or_
+from sqlalchemy import and_, delete, func, insert, literal, or_, update
 from sqlmodel import select
 
-from sqlery.core.history import TERMINAL_STATUSES
-from sqlery.core.models import JOB_COLUMNS, JobAll, JobHistory, QueuedJob
+from sqlery.core.history import FROM_ATTEMPT, TERMINAL_STATUSES
+from sqlery.core.models import JOB_COLUMNS, JobAll, JobAttempt, JobHistory, QueuedJob
 
 _LIVE = QueuedJob.__table__
 _HIST = JobHistory.__table__
 
 
-def _where(job_id, created_at=None, expected_version=None, require_status=None):
+def _where(
+    job_id, created_at=None, expected_version=None, require_status=None, require_idle=False
+):
     conds = [_LIVE.c.id == job_id]
+    if require_idle:
+        # Not running: no attempt is open (a queued row with an open attempt is a running job).
+        conds.append(
+            ~select(JobAttempt.id)
+            .where(JobAttempt.job_id == _LIVE.c.id)
+            .where(JobAttempt.finished_at.is_(None))
+            .exists()
+        )
     if created_at is not None:
         conds.append(_LIVE.c.created_at == created_at)
     if expected_version is not None:
@@ -52,6 +62,7 @@ def move_statements(
     created_at=None,
     expected_version: int | None = None,
     require_status=None,
+    require_idle: bool = False,
     now: datetime | None = None,
 ):
     """``(lock, insert, delete)`` statements that move one live job into history.
@@ -77,8 +88,20 @@ def move_statements(
         if name in ("status", "version"):
             continue
         exprs[name] = literal(value, type_=_LIVE.c[name].type)
+    # The claim writes nothing to the job row (#157): when and by whom it ran is on its newest
+    # attempt, which the finished row records (unless the caller gave the value).
+    for name, attempt_name in FROM_ATTEMPT:
+        if name not in exprs:
+            newest = (
+                select(getattr(JobAttempt, attempt_name))
+                .where(JobAttempt.job_id == _LIVE.c.id)
+                .order_by(JobAttempt.id.desc())
+                .limit(1)
+                .scalar_subquery()
+            )
+            exprs[name] = func.coalesce(newest, _LIVE.c[name])
     select_list = [exprs.get(name, _LIVE.c[name]).label(name) for name in JOB_COLUMNS]
-    where = _where(job_id, created_at, expected_version, require_status)
+    where = _where(job_id, created_at, expected_version, require_status, require_idle)
     ins = (
         insert(_HIST)
         .from_select(list(JOB_COLUMNS), select(*select_list).where(where))
@@ -90,6 +113,24 @@ def move_statements(
     # below then see the same row.
     lock = select(_LIVE.c.id).where(where).with_for_update()
     return lock, ins, dele
+
+
+def close_stragglers_stmt(job_id, status: str, now: datetime | None = None):
+    """Close the attempts still open for a job that just moved to history.
+
+    A finished job is not running: a caller without an attempt handle (admin stop, recovery)
+    may have left one open. A fenced completion has closed its own already.
+    """
+    return (
+        update(JobAttempt)
+        .where(JobAttempt.job_id == job_id)
+        .where(JobAttempt.finished_at.is_(None))
+        .values(
+            finished_at=now or datetime.now(UTC),
+            outcome="success" if status == "success" else "abandoned",
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 def moved(insert_result, delete_result) -> bool:

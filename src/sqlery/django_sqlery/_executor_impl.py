@@ -249,8 +249,8 @@ class TaskExecutor:
         )
         if queue_name:
             in_ready = in_ready.filter(queue_name=queue_name)
-        queryset = atomic_claim_job_queryset(QueuedJob.objects).filter(
-            status="queued", id__in=in_ready.values("job_id")
+        queryset = atomic_claim_job_queryset(QueuedJob.objects).waiting().filter(
+            id__in=in_ready.values("job_id")
         ).order_by(
             "-priority", "created_at"
         )
@@ -298,10 +298,8 @@ class TaskExecutor:
 
         # Check for other running jobs in the SAME QUEUE (not task_path!)
         has_running_in_queue = (
-            QueuedJob.objects.filter(
-                queue_name=job.queue_name,  # Queue-level check
-                status="running"
-            )
+            QueuedJob.objects.running()
+            .filter(queue_name=job.queue_name)  # Queue-level check
             .exclude(id=job.id)
             .exists()
         )
@@ -672,13 +670,19 @@ class TaskExecutor:
         behaviour is preserved.
         """
         now = timezone.now()
-        candidates = list(
-            QueuedJob.objects.filter(
-                status="running", worker_id__isnull=True, started_at__isnull=False
-            )
-        )
-        # The claiming PID lives on the open attempt (job-row column only for pre-attempt rows).
-        pids = JobAttempt.worker_pids_for(candidates)
+        # Running jobs whose attempt names no worker row: the claimer is a bare process. When it
+        # started and its PID are on the attempt (the job row says neither).
+        open_attempts = {
+            a.job_id: a
+            for a in JobAttempt.objects.filter(
+                finished_at__isnull=True, worker_id__isnull=True
+            ).order_by("id")
+        }
+        candidates = [
+            job.show_running(open_attempts[job.id])
+            for job in QueuedJob.objects.running().filter(id__in=list(open_attempts))
+        ]
+        pids = {job_id: a.worker_pid for job_id, a in open_attempts.items()}
 
         for job in candidates:
             pid = pids.get(job.id)
@@ -757,8 +761,8 @@ class TaskExecutor:
 
         now = timezone.now()
 
-        # Find jobs in running state
-        queryset = QueuedJob.objects.filter(status="running")
+        # Find jobs in running state (a queued row with an open attempt)
+        queryset = QueuedJob.objects.running()
         if queue_name:
             queryset = queryset.filter(queue_name=queue_name)
 
@@ -768,7 +772,15 @@ class TaskExecutor:
         self._reap_orphaned_running_jobs()
         self.recover_lost_retries()
 
-        for job in queryset:
+        running = list(queryset)
+        open_attempts = {
+            a.job_id: a
+            for a in JobAttempt.objects.filter(
+                job_id__in=[j.id for j in running], finished_at__isnull=True
+            ).order_by("id")
+        }
+        for job in running:
+            job.show_running(open_attempts.get(job.id))  # started_at lives on the attempt
             if not job.started_at:
                 # Job marked as running but never started - definitely stale
                 job.mark_failed(

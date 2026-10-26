@@ -13,6 +13,8 @@ from datetime import timedelta
 import pytest
 from django.utils import timezone
 
+from tests.running_jobs import django_make_running
+
 
 @pytest.fixture
 def django_backend(db):
@@ -24,6 +26,12 @@ def django_backend(db):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def django_backend_ready(backend):
+    from sqlery.django_sqlery.models import JobReady
+
+    return JobReady
+
 
 def _create_basic_job(backend, **overrides):
     defaults = dict(
@@ -186,14 +194,16 @@ class TestStatusTransitions:
 
     def test_release_job(self, django_backend):
         job = _create_basic_job(django_backend)
-        django_backend.QueuedJob.objects.filter(id=job.id).update(
-            status="running", started_at=timezone.now(), worker_pid=123
-        )
+        django_make_running(job, started_at=timezone.now(), worker_pid=123)
         django_backend.release_job(job.id)
         job.refresh_from_db()
+        # back in the queue: attempt abandoned, entry back, row untouched
         assert job.status == "queued"
         assert job.started_at is None
         assert job.worker_pid is None
+        assert django_backend_ready(django_backend).objects.filter(job_id=job.id).count() == 1
+        django_backend.release_job(job.id)  # not running any more: queued once only
+        assert django_backend_ready(django_backend).objects.filter(job_id=job.id).count() == 1
 
     def test_concurrent_modification_raises(self, django_backend):
         """Explicit ConcurrentModificationError assertion for T-03-07."""
@@ -700,20 +710,20 @@ class TestMiscMethods:
 
     def test_get_running_jobs(self, django_backend):
         j = _create_basic_job(django_backend)
-        django_backend.QueuedJob.objects.filter(id=j.id).update(status="running")
+        django_make_running(j)
         assert len(django_backend.get_running_jobs()) == 1
         assert len(django_backend.get_running_jobs(queue_name="default")) == 1
         assert django_backend.get_running_jobs(queue_name="other") == []
 
     def test_has_running_jobs_in_queue(self, django_backend):
         j = _create_basic_job(django_backend, queue_name="x")
-        django_backend.QueuedJob.objects.filter(id=j.id).update(status="running")
+        django_make_running(j)
         assert django_backend.has_running_jobs_in_queue("x") is True
         assert django_backend.has_running_jobs_in_queue("y") is False
 
     def test_has_running_jobs_exclude(self, django_backend):
         j = _create_basic_job(django_backend, queue_name="x")
-        django_backend.QueuedJob.objects.filter(id=j.id).update(status="running")
+        django_make_running(j)
         assert django_backend.has_running_jobs_in_queue("x", exclude_job_id=j.id) is False
 
     def test_get_jobs_pagination(self, django_backend):

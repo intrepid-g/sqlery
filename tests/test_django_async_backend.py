@@ -71,8 +71,8 @@ async def test_aclaim_job_claims_and_marks_running(backend, make_job):
 
     # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
     # pk is now a composite (created_at, id); look up by id only.
-    fresh = await QueuedJob.objects.aget(id=job.id)
-    assert fresh.status == "running"
+    fresh = await backend.aget_job(job.id)
+    assert fresh.status == "running"  # shown from the open attempt; the row stays queued
 
 
 async def test_aclaim_job_filters_by_queue(backend, make_job):
@@ -157,8 +157,8 @@ async def test_amark_running(backend, make_job):
     await backend.amark_running(job.id, "wkr-1")
     # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
     # pk is now a composite (created_at, id); look up by id only.
-    fresh = await QueuedJob.objects.aget(id=job.id)
-    assert fresh.status == "running"
+    fresh = await backend.aget_job(job.id)
+    assert fresh.status == "running"  # shown from the open attempt; the row stays queued
 
 
 async def test_amark_success(backend, make_job):

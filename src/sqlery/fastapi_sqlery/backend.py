@@ -24,6 +24,7 @@ from ..core.attempts import (
     AttemptHandle,
     AttemptInfo,
     attach_attempt,
+    claim_verdict,
     decide_close,
 )
 from ..core import history as history_core
@@ -437,19 +438,62 @@ class SQLAlchemyBackend(DatabaseBackend):
         return self._worker_pk(worker_id)
 
     @staticmethod
-    def _open_attempt(session, job_id, worker_id) -> AttemptHandle:
+    def _open_attempt(session, job_id, worker_id, now=None) -> AttemptHandle:
         """Insert the attempt of a claim inside the claim's transaction (caller commits).
 
-        A job is claimed only while queued, so an attempt still open for it is a leftover of
-        a requeue that skipped closing: it is abandoned here, which keeps "one open attempt
-        per job" and fences the old holder.
+        The claim has already verified (under the job row lock, see ``_start_attempt``) that no
+        attempt is open for the job: an open attempt *is* the running state, so it is never
+        abandoned here, and "one open attempt per job" is the claim's invariant.
         """
-        now = datetime.now(UTC)
-        session.exec(attempt_sql.abandon_open_stmt(job_id, now))
+        now = now or datetime.now(UTC)
         row = attempt_sql.new_attempt(job_id, worker_id, now)
         session.add(row)
         session.flush()
-        return AttemptHandle(row.id, row.token, job_id)
+        return AttemptHandle(row.id, row.token, job_id, now, worker_id, row.worker_pid)
+
+    def _start_attempt(self, session, dialect: str, job, worker_id, now):
+        """Second half of a claim, after the claimer deleted the job's ready entry (rowcount 1).
+
+        The job row is locked (PostgreSQL ``FOR UPDATE SKIP LOCKED``; SQLite's single writer
+        needs none) and judged by :func:`sqlery.core.attempts.claim_verdict`: it must still be
+        the queued job the claimer read (same version), with no attempt open. Only then is the
+        attempt inserted, which makes the job running: the job row is not written. Returns
+        ``(handle, outcome)``; ``outcome`` says what the caller does with the entry it deleted:
+        ``claimed``; ``keep`` (leave it deleted: the job is gone, not queued or running already,
+        so the entry was stale); ``restore`` (put it back: only the row moved or is busy).
+        """
+        stmt = (
+            select(QueuedJob.status, QueuedJob.version)
+            .where(QueuedJob.id == job.id)
+            .where(QueuedJob.created_at == job.created_at)
+        )
+        if dialect == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        row = session.exec(stmt).first()
+        if row is None:
+            # Gone (deleted, moved to history) or locked by a writer right now.
+            return None, "restore"
+        stored_status, version = row[0], row[1]
+        running = (
+            session.exec(
+                select(JobAttempt.id)
+                .where(JobAttempt.job_id == job.id)
+                .where(JobAttempt.finished_at.is_(None))
+                .limit(1)
+            ).first()
+            is not None
+        )
+        verdict = claim_verdict(
+            stored_status=stored_status,
+            version=version,
+            expected_version=job.version or 0,
+            has_open_attempt=running,
+        )
+        if verdict != "ok":
+            if stored_status != "queued" or running:
+                return None, "keep"
+            return None, "restore"
+        return self._open_attempt(session, job.id, worker_id, now), "claimed"
 
     @staticmethod
     def _close_attempt(session, job_id, attempt, outcome) -> None:
@@ -543,8 +587,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                 job = session.exec(ready_sql.job_of_entry_stmt(entry)).scalars().first()
                 if job is None:  # not found by (created_at, id): fall back to the id alone
                     job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-                if job is None or job.status != "queued":
-                    # Stale entry (the job was cancelled, deleted or claimed elsewhere).
+                if job is None or job.status != "queued" or self._is_running(session, job_id):
+                    # Stale entry (the job was cancelled, deleted, or is claimed elsewhere: a
+                    # queued job with an open attempt is running).
                     session.exec(ready_sql.delete_entry_stmt(slot, job_id))
                     session.commit()
                     continue
@@ -573,54 +618,49 @@ class SQLAlchemyBackend(DatabaseBackend):
                     session.commit()  # release the entry lock; the job stays ready
                     continue
 
-                # Claim: deleting the entry is the mutex (a lost race deletes nothing).
+                # Claim: deleting the entry is the mutex (a lost race deletes nothing). The job
+                # row is then only read (and locked), never written: the attempt is the claim.
                 if session.exec(ready_sql.delete_entry_stmt(slot, job_id)).rowcount != 1:
                     session.commit()
                     continue
-                res = session.exec(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.created_at == job.created_at)
-                    .where(QueuedJob.status == "queued")
-                    .where(QueuedJob.version == (job.version or 0))
-                    .values(
-                        status="running",
-                        started_at=now,
-                        # worker_pid is recorded on the attempt, not the job row (#138).
-                        # #CLEANUP: drop QueuedJob.worker_pid/child_pid once no reader falls
-                        # back to them.
-                        version=QueuedJob.version + 1,
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                if res.rowcount != 1:
-                    # The job changed under the entry we own: whoever changed it owns it
-                    # now; if it is somehow still queued, put the entry back.
-                    self._restore_entry_if_queued(session, dialect, job)
-                    session.commit()
+                handle, outcome = self._start_attempt(session, dialect, job, attempt_worker, now)
+                if handle is None:
+                    if outcome == "restore":
+                        # The job moved under the entry we own (or its row is busy): whoever
+                        # moved it owns it now; leave the entry where it was.
+                        session.rollback()
+                    else:
+                        session.commit()  # stale entry (job gone / not queued / running)
                     continue
-                # The attempt joins the claim's transaction: both commit or neither does.
-                handle = self._open_attempt(session, job_id, attempt_worker)
-                session.commit()
-                # The UPDATE above bypassed the identity map: load the row anew.
-                claimed = session.exec(
-                    select(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.created_at == job.created_at)
-                    .execution_options(populate_existing=True)
-                ).first()
-                return attach_attempt(claimed, handle)
+                session.commit()  # entry delete + attempt insert: both commit or neither does
+                return self._as_running(job, handle)
 
     @staticmethod
-    def _restore_entry_if_queued(session, dialect: str, job) -> None:
-        """Re-insert the ready entry of ``job`` if the job is (still) queued."""
-        status = session.exec(
-            select(QueuedJob.status)
-            .where(QueuedJob.id == job.id)
-            .where(QueuedJob.created_at == job.created_at)
-        ).first()
-        if status == "queued":
-            ready_sql.write_ready(session, dialect, [job])
+    def _is_running(session, job_id) -> bool:
+        """True iff an attempt is open for the job (a queued row with one is running)."""
+        return (
+            session.exec(
+                select(JobAttempt.id)
+                .where(JobAttempt.job_id == job_id)
+                .where(JobAttempt.finished_at.is_(None))
+                .limit(1)
+            ).first()
+            is not None
+        )
+
+    @staticmethod
+    def _as_running(job, handle: AttemptHandle):
+        """The claimed job as the caller sees it: running, started when the attempt was
+        claimed, owned by the claiming worker; carrying the handle every completion presents.
+        In memory only (the job row is not written by a claim)."""
+        attempt_sql.overlay_running(
+            job,
+            AttemptInfo(
+                handle.id, handle.job_id, handle.worker_id, handle.worker_pid, None,
+                handle.claimed_at,
+            ),
+        )
+        return attach_attempt(job, handle)
 
     def _claim_decision(self, session, job, now) -> str:
         """Decide a claim candidate: ``ok``, ``pending`` (wait for dependencies),
@@ -664,6 +704,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             {"error": error, "termination_reason": reason, "finished_at": now},
             created_at=job.created_at,
             require_status="queued",
+            require_idle=True,
         )
 
     @staticmethod
@@ -676,9 +717,11 @@ class SQLAlchemyBackend(DatabaseBackend):
         created_at=None,
         expected_version: int | None = None,
         require_status=None,
+        require_idle: bool = False,
     ) -> bool:
         """The terminal transition: move one live job into history inside the caller's
         transaction (``INSERT .. SELECT`` + ``DELETE``, both must touch exactly one row).
+        ``require_idle`` additionally demands that no attempt is open (the job is not running).
 
         Returns False, with nothing changed by this call, when the job is not (or no longer)
         in the state the fences demand; the caller decides whether that is stale (rollback)
@@ -691,6 +734,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             created_at=created_at,
             expected_version=expected_version,
             require_status=require_status,
+            require_idle=require_idle,
         )
         if session.exec(lock).first() is None:
             return False
@@ -699,6 +743,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         if not history_sql.moved(inserted, deleted):
             # Cannot happen after the row lock; never leave a half move behind.
             raise RuntimeError(f"moving job {job_id} to history touched an unexpected row count")
+        session.exec(history_sql.close_stragglers_stmt(job_id, status))
         return True
 
     @staticmethod
@@ -758,11 +803,14 @@ class SQLAlchemyBackend(DatabaseBackend):
     def request_job_revoke(self, job_id: int) -> bool:
         """Flag a running job for termination (see DatabaseBackend.request_job_revoke)."""
         with self._get_session() as session:
+            # The revoke flag is one of the few writes to a running job's row (the row is
+            # otherwise untouched while it runs): the worker polls it.
             res = session.exec(
                 update(QueuedJob)
                 .where(QueuedJob.id == job_id)
-                .where(QueuedJob.status == "running")
+                .where(attempt_sql.running_clause())
                 .values(termination_reason="revoke_requested")
+                .execution_options(synchronize_session=False)
             )
             session.commit()
             return res.rowcount > 0
@@ -773,7 +821,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.exec(
                     select(QueuedJob.id)
                     .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.status == "running")
+                    .where(attempt_sql.running_clause())
                     .where(QueuedJob.termination_reason == "revoke_requested")
                 ).first()
                 is not None
@@ -847,38 +895,19 @@ class SQLAlchemyBackend(DatabaseBackend):
                     session.commit()
                     return None  # the entry exists but is locked: someone else is claiming it
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            if job is None or job.status != "queued":
+            if job is None or job.status != "queued" or self._is_running(session, job_id):
                 session.commit()
                 return None
-            current_version = job.version or 0
-            created_at = job.created_at
             session.exec(ready_sql.delete_ready_stmt([job_id]))
             session.exec(ready_sql.delete_blocked_stmt([job_id]))
-            res = session.exec(
-                update(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .where(QueuedJob.created_at == created_at)
-                .where(QueuedJob.version == current_version)
-                .where(QueuedJob.status == "queued")
-                .values(
-                    status="running",
-                    started_at=datetime.now(UTC),
-                    version=current_version + 1,
-                )
-                .execution_options(synchronize_session=False)
+            handle, _outcome = self._start_attempt(
+                session, dialect, job, self._attempt_worker_id(worker_id), datetime.now(UTC)
             )
-            if res.rowcount != 1:
+            if handle is None:
                 session.rollback()  # keeps the entries: the job was not claimed by us
                 return None
-            handle = self._open_attempt(session, job_id, self._attempt_worker_id(worker_id))
             session.commit()
-            claimed = session.exec(
-                select(QueuedJob)
-                .where(QueuedJob.id == job_id)
-                .where(QueuedJob.created_at == created_at)
-                .execution_options(populate_existing=True)
-            ).first()
-            return attach_attempt(claimed, handle)
+            return self._as_running(job, handle)
 
     def claim_queue_leases(
         self,
@@ -1193,9 +1222,11 @@ class SQLAlchemyBackend(DatabaseBackend):
             # Old (id-only filter — does not prune to partition on PG):
             # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             # SQLModel exec() returns scalars for single-column selects
+            # Only a job that is queued and not running can be cancelled (a running one is
+            # revoked instead, see ``request_job_revoke``).
             created_at_val = session.exec(
                 select(QueuedJob.created_at).where(
-                    and_(QueuedJob.id == job_id, QueuedJob.status == "queued")
+                    and_(QueuedJob.id == job_id, attempt_sql.waiting_clause())
                 )
             ).first()
             if created_at_val is not None:
@@ -1212,6 +1243,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                     {"error": "Cancelled by user"},
                     created_at=created_at_val,
                     require_status="queued",
+                    require_idle=True,
                 )
                 if cancelled:
                     session.commit()
@@ -1829,6 +1861,11 @@ class SQLAlchemyBackend(DatabaseBackend):
             # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job is not None:
+                if job.status == "queued":
+                    # Running is derived from the open attempt (the claim leaves the row alone).
+                    attempt_sql.overlay_running(
+                        job, self._open_attempts_in(session, [job_id]).get(job_id)
+                    )
                 return job
             # A finished job is in history (read-only).
             finished = session.exec(history_sql.history_by_id_stmt(job_id)).first()
@@ -1880,6 +1917,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                     # bypassing the version-fenced UPDATE below (the CAS check has to
                     # be the only write path, not a side effect of ORM tracking).
                     session.expunge(db_job)
+                    running = self._open_attempts_in(session, [job_id]).get(job_id)
+                    attempt_sql.overlay_running(db_job, running)  # started_at lives on the attempt
                     db_job.mark_success(output=output)
                     values = {
                         "status": db_job.status,
@@ -1887,6 +1926,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                         "duration_seconds": db_job.duration_seconds,
                         "output": db_job.output,
                         "runs": db_job.runs,
+                        **attempt_sql.row_columns(running),
                     }
                     return self._fenced_update(
                         session, job_id, expected_version, values, attempt, OUTCOME_SUCCESS,
@@ -1919,6 +1959,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                 db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
                 if db_job:
                     session.expunge(db_job)
+                    running = self._open_attempts_in(session, [job_id]).get(job_id)
+                    attempt_sql.overlay_running(db_job, running)  # started_at lives on the attempt
                     db_job.mark_failed(
                         error=error, traceback=traceback, termination_reason=termination_reason
                     )
@@ -1930,6 +1972,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                         "traceback": db_job.traceback,
                         "termination_reason": db_job.termination_reason,
                         "runs": db_job.runs,
+                        **attempt_sql.row_columns(running),
                     }
                     return self._fenced_update(
                         session, job_id, expected_version, values, attempt, OUTCOME_FAILED,
@@ -2099,6 +2142,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             stmt = select(func.count(QueuedJob.id)).where(
                 and_(
                     QueuedJob.scheduled_task_id == task_id,
+                    # a running job is a queued row with an open attempt
                     QueuedJob.status.in_(["queued", "running"]),
                 )
             )
@@ -2296,21 +2340,22 @@ class SQLAlchemyBackend(DatabaseBackend):
             return session.get(ScheduledTask, task_id)
 
     def get_running_jobs(self, queue_name: str | None = None) -> list:
-        """Get currently running jobs."""
+        """Get currently running jobs: live jobs with an open attempt, shown running with the
+        attempt's start time, worker and PIDs (in memory; nothing is written back)."""
         with self._get_session() as session:
-            stmt = select(QueuedJob).where(QueuedJob.status == "running")
-
-            if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
-
-            return list(session.exec(stmt).all())
+            session.expire_on_commit = False
+            stmt = attempt_sql.running_with_attempts_stmt([queue_name] if queue_name else None)
+            jobs = {}
+            for job, attempt in session.exec(stmt).all():
+                jobs[job.id] = attempt_sql.overlay_running(job, attempt)  # newest attempt wins
+            return list(jobs.values())
 
     def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
         """Build RunningJobLiveness records for the zombie sweep.
 
-        Loads each ``status='running'`` job together with its assigned worker
-        and maps to the framework-agnostic dataclass. Datetimes are normalised
-        to timezone-aware UTC (SQLite/Postgres may return naive values).
+        Loads each running job (queued row with an open attempt) together with the worker
+        that attempt names and maps to the framework-agnostic dataclass. Datetimes are
+        normalised to timezone-aware UTC (SQLite/Postgres may return naive values).
         """
         from sqlery.core.liveness import RunningJobLiveness
         from sqlery.django_sqlery.friendly_name import uuid_to_friendly
@@ -2321,16 +2366,21 @@ class SQLAlchemyBackend(DatabaseBackend):
             return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
         with self._get_session() as session:
-            stmt = select(QueuedJob).where(QueuedJob.status == "running")
-            if queue_names:
-                stmt = stmt.where(QueuedJob.queue_name.in_(queue_names))
-
+            pairs = {}
+            for job, attempt in session.exec(
+                attempt_sql.running_with_attempts_stmt(queue_names)
+            ).all():
+                pairs[job.id] = (job, attempt)  # newest attempt wins
+            worker_ids = {a.worker_id for _, a in pairs.values() if a.worker_id is not None}
+            workers = {}
+            if worker_ids:
+                workers = {
+                    w.id: w
+                    for w in session.exec(select(Worker).where(Worker.id.in_(worker_ids))).all()
+                }
             records = []
-            jobs = list(session.exec(stmt).all())
-            attempts = self._open_attempts_in(session, [j.id for j in jobs])
-            for job in jobs:
-                worker = job.worker
-                attempt = attempts.get(job.id)
+            for job, attempt in pairs.values():
+                worker = workers.get(attempt.worker_id)
                 if worker is not None:
                     try:
                         friendly = uuid_to_friendly(worker.id)
@@ -2341,9 +2391,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                 records.append(
                     RunningJobLiveness(
                         job_id=job.id,
-                        started_at=_aware(job.started_at),
-                        # The open attempt; the row column only for jobs claimed before attempts.
-                        worker_pid=attempt.worker_pid if attempt else job.worker_pid,
+                        started_at=_aware(attempt.claimed_at),
+                        worker_pid=attempt.worker_pid,
                         worker_node_id=worker.node_id if worker else None,
                         worker_status=worker.status if worker else None,
                         worker_current_job_id=worker.current_job_id if worker else None,
@@ -2357,26 +2406,28 @@ class SQLAlchemyBackend(DatabaseBackend):
     def fail_zombie_job(self, job_id: int, reason: str) -> bool:
         """Mark a running job failed with termination_reason='zombie_job'.
 
-        Bumps `version` on reclaim, mirroring DjangoBackend's CAS
-        mark_failed (F("version") + 1). Without this, a superseded
-        worker's late completion write (mark_job_success/mark_job_failed
-        fenced with its originally-observed expected_version) would still
-        match the unchanged version and silently overwrite the zombie
-        outcome — the fencing check added in the lease-renewal fix would
-        be a silent no-op in standalone mode.
-
-        The open attempt is abandoned in the same transaction, so a late completion from
-        the dead worker is rejected by the attempt fence as well.
+        The open attempt is abandoned in the same transaction, so a late completion from the
+        dead worker is rejected by the attempt fence (and by the job being in history). A job
+        that is not running (it finished, or was requeued, since the sweep looked) is left
+        alone and False is returned: recovery acts on exactly one open attempt, once.
         """
         with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            if job is None:
+            if job is None or job.status != "queued":
                 return False
-            self._close_attempt(session, job_id, None, OUTCOME_ABANDONED)
+            attempts = self._open_attempts_in(session, [job_id])
+            if job_id not in attempts:
+                return False  # not running
+            closed = session.exec(
+                attempt_sql.close_unfenced_stmt(job_id, OUTCOME_ABANDONED, datetime.now(UTC))
+            ).rowcount
+            if closed < 1:
+                session.rollback()
+                return False
             # Detach before mutating: the in-memory mark_failed only computes the outcome
             # (runs, duration); the write is the move into history below.
             session.expunge(job)
+            attempt_sql.overlay_running(job, attempts[job_id])
             job.mark_failed(error=reason, termination_reason="zombie_job")
             parent = job.parent_job_id
             moved = self._finish_in(
@@ -2404,7 +2455,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         """Check if queue has running jobs."""
         with self._get_session() as session:
             stmt = select(func.count(QueuedJob.id)).where(
-                and_(QueuedJob.queue_name == queue_name, QueuedJob.status == "running")
+                and_(QueuedJob.queue_name == queue_name, attempt_sql.running_clause())
             )
 
             if exclude_job_id:
@@ -2459,6 +2510,9 @@ class SQLAlchemyBackend(DatabaseBackend):
             result = None
             if db_job:
                 parent_job_id = db_job.parent_job_id
+                # When it started is on its attempt (the claim writes nothing to the job row).
+                attempt = self._open_attempts_in(session, [db_job.id]).get(db_job.id)
+                started_at = attempt.claimed_at if attempt is not None else db_job.started_at
                 self._close_attempt(
                     session,
                     db_job.id,
@@ -2467,8 +2521,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                 )
                 finished_at = datetime.now(UTC)
                 duration = None
-                if db_job.started_at:
-                    started = db_job.started_at
+                if started_at:
+                    started = started_at
                     if started.tzinfo is None:
                         started = started.replace(tzinfo=UTC)
                     duration = (finished_at - started).total_seconds()
@@ -2481,6 +2535,11 @@ class SQLAlchemyBackend(DatabaseBackend):
                     self._finish_in(
                         session, db_job.id, status, values, created_at=db_job.created_at
                     )
+                elif status == "queued":
+                    # Back to the queue: the attempt is closed above, now the entry returns
+                    # (same transaction); the row itself is untouched.
+                    dialect = session.bind.dialect.name if session.bind is not None else ""
+                    ready_sql.write_ready(session, dialect, [db_job])
                 else:
                     db_job.status = status
                     for key, value in values.items():
@@ -2529,9 +2588,10 @@ class SQLAlchemyBackend(DatabaseBackend):
         """Get queued jobs whose TTL has expired (detached rows: expire them through
         :meth:`expire_queued_job`, mutating the returned rows persists nothing)."""
         with self._get_session() as session:
+            # A running job never expires (it is a queued row with an open attempt).
             stmt = select(QueuedJob).where(
                 and_(
-                    QueuedJob.status == "queued",
+                    attempt_sql.waiting_clause(),
                     QueuedJob.ttl != None,
                 )
             )
@@ -2587,7 +2647,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .join(t, and_(t.job_id == QueuedJob.id, t.created_at == QueuedJob.created_at))
                 .where(t.queue_name.in_(queues))
                 .where(or_(t.scheduled_at.is_(None), t.scheduled_at <= now))
-                .where(QueuedJob.status == "queued")
+                .where(attempt_sql.waiting_clause())
                 .order_by(t.priority.desc(), t.created_at, t.job_id)
                 .limit(limit)
             )
@@ -2601,8 +2661,9 @@ class SQLAlchemyBackend(DatabaseBackend):
     def atomic_claim_job(self, job, worker) -> bool:
         """Atomically claim a specific job for a worker.
 
-        Deleting the job's ready entry is the claim (rowcount 1); the job row is then set
-        running and the attempt inserted in the same transaction.
+        Deleting the job's ready entry is the claim (rowcount 1); the attempt is then
+        inserted in the same transaction, after the job row has been locked and judged. The job
+        row is not written.
         """
         with self._get_session() as session:
             session.expire_on_commit = False
@@ -2610,23 +2671,17 @@ class SQLAlchemyBackend(DatabaseBackend):
             if session.exec(ready_sql.delete_ready_stmt([job.id])).rowcount < 1:
                 session.commit()
                 return False  # not ready (claimed by someone else, cancelled, or blocked)
-            now = datetime.now(UTC)
-            res = session.exec(
-                update(QueuedJob)
-                .where(QueuedJob.id == job.id)
-                .where(QueuedJob.created_at == job.created_at)
-                .where(QueuedJob.status == "queued")
-                .where(QueuedJob.version == (job.version or 0))
-                .values(status="running", started_at=now, version=QueuedJob.version + 1)
-                .execution_options(synchronize_session=False)
+            handle, outcome = self._start_attempt(
+                session, dialect, job, getattr(worker, "id", None), datetime.now(UTC)
             )
-            if res.rowcount != 1:
-                self._restore_entry_if_queued(session, dialect, job)
-                session.commit()
+            if handle is None:
+                if outcome == "restore":
+                    session.rollback()  # the job moved under the entry: leave the entry
+                else:
+                    session.commit()  # stale entry (gone / not queued / running)
                 return False
-            handle = self._open_attempt(session, job.id, getattr(worker, "id", None))
             session.commit()
-            attach_attempt(job, handle)
+            self._as_running(job, handle)
             return True
 
     # ----- ready queue (#139) ----------------------------------------------
@@ -2713,7 +2768,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             job = session.exec(
                 select(QueuedJob).where(QueuedJob.id == job_id).where(QueuedJob.created_at == created_at)
             ).first()
-            if job is None or job.status != "queued":
+            if job is None or job.status != "queued" or self._is_running(session, job_id):
                 session.exec(ready_sql.delete_blocked_stmt([job_id]))
                 session.commit()
                 return "gone"
@@ -2753,8 +2808,9 @@ class SQLAlchemyBackend(DatabaseBackend):
         """Repair the ready queue (run periodically by the scheduler leader).
 
         * Queued jobs that have neither a ready nor a blocked entry get a ready entry (a job
-          whose entry was lost, e.g. by raw SQL, is delayed by one sweep, never lost).
-        * Entries of jobs that are no longer queued are dropped.
+          whose entry was lost, e.g. by raw SQL, is delayed by one sweep, never lost). A job
+          that is running (open attempt) has no entry on purpose and is never given one.
+        * Entries of jobs that are no longer queued, or are running, are dropped.
         * A page of blocked jobs is re-judged, which releases jobs whose dependency finished
           without anyone noticing and fails the ones whose dependency is gone.
 
@@ -2784,9 +2840,10 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .exists()
             )
             in_blocked = select(JobBlocked.job_id).where(JobBlocked.job_id == QueuedJob.id).exists()
+            # A running job (open attempt) has no entry on purpose: it is never restored.
             stmt = (
                 select(QueuedJob)
-                .where(QueuedJob.status == "queued")
+                .where(attempt_sql.waiting_clause())
                 .where(~in_ready)
                 .where(~in_blocked)
                 .limit(limit)
@@ -2801,7 +2858,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 select(QueuedJob.id)
                 .where(QueuedJob.id == JobReady.job_id)
                 .where(QueuedJob.created_at == JobReady.created_at)
-                .where(QueuedJob.status == "queued")
+                .where(attempt_sql.waiting_clause())
                 .exists()
             )
             stale_stmt = select(JobReady).where(~live).limit(limit)
@@ -2899,19 +2956,26 @@ class SQLAlchemyBackend(DatabaseBackend):
             return task
 
     def release_job(self, job_id: int):
-        """Release a claimed job back to queued status."""
-        with self._get_session() as session:
-            # session.get(QueuedJob, job_id)  # Replaced: composite PK requires (created_at, id)
-            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        """Release a claimed job back to the queue: abandon its open attempt and put its
+        ready entry back, in one transaction. The job row is not written (it never changed).
 
-            if job:
-                # The open attempt is abandoned in the same transaction as the requeue.
-                self._close_attempt(session, job_id, None, OUTCOME_ABANDONED)
-                job.status = "queued"
-                job.started_at = None
-                job.worker_pid = None
-                session.add(job)
-                session.commit()
+        A job that is not running is left alone (nothing to release), so a repeated release
+        queues the job once.
+        """
+        with self._get_session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            if job is None or job.status != "queued":
+                return
+            # Lock order of every writer: ready entry first (insert below), then the row.
+            closed = session.exec(
+                attempt_sql.close_unfenced_stmt(job_id, OUTCOME_ABANDONED, datetime.now(UTC))
+            ).rowcount
+            if closed < 1:
+                session.rollback()
+                return  # not running: nothing to release
+            ready_sql.write_ready(session, dialect, [job])
+            session.commit()
 
     def get_jobs(
         self,

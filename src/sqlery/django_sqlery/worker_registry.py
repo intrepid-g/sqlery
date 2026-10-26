@@ -100,11 +100,10 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
     # Old: if worker.current_job: job = worker.current_job  (FK demoted — D4, Phase 15)
     for worker in dead_workers:
         if worker.current_job_id:
-            try:
-                job = QueuedJob.objects.get(id=worker.current_job_id)
-            except QueuedJob.DoesNotExist:
-                job = None
+            # (only a job that is running: a queued row with an open attempt)
+            job = QueuedJob.objects.running().filter(id=worker.current_job_id).first()
             if job:
+                job.show_running(job.open_attempt())  # started_at is on the attempt
                 job.status = "failed"
                 job.error = "Worker died/timeout - no heartbeat"
                 job.finished_at = timezone.now()
@@ -131,17 +130,14 @@ def cleanup_dead_workers(node_id=None, timeout_seconds=None):
         .exclude(current_job_id__isnull=True)
         .values_list("current_job_id", flat=True)
     )
-    ghost_running = QueuedJob.objects.filter(status="running").exclude(
-        id__in=active_worker_job_ids
-    )
+    ghost_running = QueuedJob.objects.running().exclude(id__in=active_worker_job_ids)
     ghost_count = ghost_running.count()
     if ghost_count:
         # import logging as _logging  # moved to top-level
         logging.getLogger(__name__).warning(
             f"Marking {ghost_count} ghost running job(s) as failed (no active worker)"
         )
-        ghost_running.update(
-            status="failed",
+        ghost_running.fail_running(
             error="Ghost job: was stuck in running state with no active worker",
             finished_at=timezone.now(),
         )

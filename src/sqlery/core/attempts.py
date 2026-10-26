@@ -12,6 +12,13 @@ A rowcount other than 1 means the attempt was already closed (finished before, o
 abandoned by recovery), so the completion is stale: :class:`JobFencingError` is raised
 and the job row is not touched. The job's ``version`` CAS remains a second fence.
 
+A job is running iff it has an open attempt (#157). The claim writes nothing to the job
+row: it deletes the ready entry and inserts the attempt, so the row keeps ``status =
+'queued'`` while the job runs and every reader derives "running" (and ``started_at``,
+``worker_id``, ``worker_pid``, ``child_pid``) from the open attempt. :func:`derived_status` is
+the one statement of that rule; the ``sqlery_job_all`` view and the backends' queries
+implement it in SQL.
+
 This module holds the framework-agnostic parts (handle, outcomes, the decision on a close
 result, the start-up guard). The SQL lives in the two backends, behind the
 ``DatabaseBackend`` attempt methods.
@@ -50,13 +57,59 @@ class AttemptTableMissingError(RuntimeError):
     """The attempt table is missing: migrations have not been applied."""
 
 
+RUNNING = "running"
+
+#: Stored status of a live job that is waiting or running (the attempt tells which).
+STORED_QUEUED = "queued"
+
+
+def derived_status(stored_status: str | None, has_open_attempt: bool) -> str | None:
+    """The status readers see for a live job row: ``running`` iff the row is ``queued`` and an
+    attempt is open for it; any other stored status is shown as it is."""
+    if has_open_attempt and stored_status == STORED_QUEUED:
+        return RUNNING
+    return stored_status
+
+
+def claim_verdict(
+    *,
+    stored_status: str | None,
+    version: int | None,
+    expected_version: int | None,
+    has_open_attempt: bool,
+) -> str:
+    """Decision for a claimer that owns a ready entry and has read the job row under lock.
+
+    ``ok``: the job is still the queued job the claimer judged and nobody runs it.
+    ``stale``: it is gone / no longer queued, was edited after the claimer read it (version
+    moved), or is already running (the entry was a duplicate). A stale claim inserts no
+    attempt; the claimer drops the entry when the job is not queued-and-idle, and puts it
+    back when the job is only edited.
+    """
+    if stored_status != STORED_QUEUED:
+        return "stale"
+    if has_open_attempt:
+        return "stale"
+    if expected_version is not None and (version or 0) != (expected_version or 0):
+        return "stale"
+    return "ok"
+
+
 @dataclass(frozen=True)
 class AttemptHandle:
-    """Identity of one open execution attempt (what a completion must present)."""
+    """Identity of one open execution attempt (what a completion must present).
+
+    ``claimed_at`` / ``worker_id`` / ``worker_pid`` are what the claim wrote to the attempt;
+    the claimed job object shows them as its ``started_at`` / ``worker_id`` / ``worker_pid``
+    because the job row itself carries none of them while it runs.
+    """
 
     id: int
     token: str
     job_id: int
+    claimed_at: datetime | None = None
+    worker_id: Any = None
+    worker_pid: int | None = None
 
 
 @dataclass(frozen=True)

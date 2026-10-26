@@ -267,7 +267,9 @@ class TestDjangoPostgres:
         from sqlery.compat import get_backend
 
         backend = get_backend()
-        j = _dj_job(status="running")
+        from tests.running_jobs import django_make_running
+
+        j = django_make_running(_dj_job())  # running = a queued row with an open attempt (#157)
         assert backend.request_job_revoke(j.id) is True
         assert backend.is_job_revoke_requested(j.id) is True
         assert backend.request_job_revoke(_dj_job().id) is False
