@@ -3,6 +3,7 @@
 Provides web UI and REST API for job queue management.
 """
 
+import asyncio
 import inspect
 from datetime import UTC, datetime
 from pathlib import Path
@@ -606,10 +607,14 @@ async def health_check():
     """Health check endpoint."""
     # from ..compat import is_standalone_mode  # moved to top-level
 
+    from ..core.horizon import DEGRADED, check_horizon
+
+    horizon = await asyncio.to_thread(check_horizon)
     return {
-        "status": "healthy",
+        "status": "degraded" if horizon["status"] == DEGRADED else "healthy",
         "mode": "standalone" if is_standalone_mode() else "django",
         "timestamp": datetime.now(UTC).isoformat(),
+        "xmin_horizon": horizon,
     }
 
 

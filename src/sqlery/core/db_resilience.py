@@ -191,9 +191,74 @@ def _resolve_active_connection_and_vendor():
         from sqlery.compat import get_backend
         backend = get_backend()
         vendor = getattr(backend, "vendor", None)
+        if vendor is None:
+            # The SQLAlchemy backend has no ``vendor``; ask its engine.
+            from sqlery.fastapi_sqlery.database import get_engine
+
+            vendor = get_engine().dialect.name
         return None, vendor
     except Exception:
         return None, None
+
+
+# Session settings the standalone engine applies to every NEW pooled PostgreSQL
+# connection (a plain ``SET`` is lost when a pooled connection is recycled).
+_standalone_session_settings: dict[str, int] = {}
+
+
+def _pg_session_settings(get_setting, for_job_child: bool) -> dict[str, int]:
+    """PostgreSQL session GUCs (name -> ms) sqlery applies to its own sessions.
+
+    ``idle_in_transaction_session_timeout`` is the xmin-horizon guard: a session
+    left idle inside a transaction pins the horizon and stops VACUUM. Like
+    ``statement_timeout`` it is skipped for job children, which run user code. 0
+    (or unset/invalid) disables a setting.
+    """
+    wanted = {"lock_timeout": ("PG_LOCK_TIMEOUT_MS", 10000)}
+    if not for_job_child:
+        wanted["statement_timeout"] = ("PG_STATEMENT_TIMEOUT_MS", 30000)
+        wanted["idle_in_transaction_session_timeout"] = (
+            "PG_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+            60000,
+        )
+    out = {}
+    for guc, (key, default) in wanted.items():
+        try:
+            value = int(get_setting(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if value > 0:
+            out[guc] = value
+    return out
+
+
+def _install_standalone_pg_settings(settings: dict[str, int]) -> None:
+    """Make the standalone SQLAlchemy engine apply ``settings`` to new connections."""
+    from sqlalchemy import event
+
+    from sqlery.fastapi_sqlery.database import get_engine
+
+    engine = get_engine()
+    if engine.dialect.name != "postgresql":
+        return
+    _standalone_session_settings.clear()
+    _standalone_session_settings.update(settings)
+    if not getattr(engine, "_sqlery_pg_guard_installed", False):
+
+        @event.listens_for(engine, "connect")
+        def _apply(dbapi_conn, _record):
+            try:
+                with dbapi_conn.cursor() as cur:
+                    for guc, ms in _standalone_session_settings.items():
+                        cur.execute(f"SET {guc} = '{int(ms)}'")
+                dbapi_conn.commit()
+            except Exception as exc:
+                logger.warning("Failed to apply PostgreSQL session settings: %s", exc)
+
+        engine._sqlery_pg_guard_installed = True
+    # Drop idle pooled connections so they are re-created with the settings.
+    engine.dispose()
+    logger.info("PostgreSQL session settings for standalone engine: %s", settings)
 
 
 def configure_connection_resilience(for_job_child: bool = False):
@@ -201,7 +266,7 @@ def configure_connection_resilience(for_job_child: bool = False):
 
     Called once on worker/daemon startup. Applies:
     - SQLite: WAL journal mode + busy_timeout pragma
-    - PostgreSQL: statement_timeout + lock_timeout
+    - PostgreSQL: statement_timeout + lock_timeout + idle_in_transaction_session_timeout
 
     Args:
         for_job_child: When True (job child process), skips statement_timeout so
@@ -217,6 +282,13 @@ def configure_connection_resilience(for_job_child: bool = False):
         logger.debug("Could not determine DB vendor for resilience config; skipping.")
         return
 
+    if connection is None and vendor == "postgresql":
+        try:
+            _install_standalone_pg_settings(_pg_session_settings(_get_setting, for_job_child))
+        except Exception as exc:
+            logger.warning("Failed to configure standalone PostgreSQL resilience: %s", exc)
+        return
+
     if connection is None:
         # Standalone mode with vendor known but no cursor handle: nothing to do.
         logger.debug(
@@ -229,7 +301,7 @@ def configure_connection_resilience(for_job_child: bool = False):
     if vendor == "sqlite":
         _configure_sqlite(connection, _get_setting)
     elif vendor == "postgresql":
-        _configure_postgresql(connection, _get_setting, apply_statement_timeout=not for_job_child)
+        _configure_postgresql(connection, _get_setting, for_job_child=for_job_child)
 
 
 def _configure_sqlite(connection, get_setting):
@@ -251,19 +323,12 @@ def _configure_sqlite(connection, get_setting):
         logger.warning("Failed to configure SQLite resilience: %s", exc)
 
 
-def _configure_postgresql(connection, get_setting, apply_statement_timeout: bool = True):
-    """Apply PostgreSQL-specific resilience settings."""
-    statement_timeout_ms = get_setting("PG_STATEMENT_TIMEOUT_MS", 30000)
-    lock_timeout_ms = get_setting("PG_LOCK_TIMEOUT_MS", 10000)
-
+def _configure_postgresql(connection, get_setting, for_job_child: bool = False):
+    """Apply PostgreSQL-specific resilience settings to the current connection."""
     try:
         with connection.cursor() as cursor:
-            if apply_statement_timeout and statement_timeout_ms:
-                cursor.execute(f"SET statement_timeout = '{int(statement_timeout_ms)}'")
-                logger.info("PostgreSQL statement_timeout set to: %dms", statement_timeout_ms)
-
-            if lock_timeout_ms:
-                cursor.execute(f"SET lock_timeout = '{int(lock_timeout_ms)}'")
-                logger.info("PostgreSQL lock_timeout set to: %dms", lock_timeout_ms)
+            for guc, ms in _pg_session_settings(get_setting, for_job_child).items():
+                cursor.execute(f"SET {guc} = '{int(ms)}'")
+                logger.info("PostgreSQL %s set to: %dms", guc, ms)
     except Exception as exc:
         logger.warning("Failed to configure PostgreSQL resilience: %s", exc)
