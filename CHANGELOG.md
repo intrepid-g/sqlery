@@ -6,8 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-26
+
+### Upgrade notes
+
+- **Stop all workers, migrate, then start workers.** New migrations: Django `0042_claim_without_update`, Alembic `20261026_0023`. A worker started before the migration still claims with the old row UPDATE and would not be seen as running.
+- **BREAKING for direct table access: a running job's live row now reads `status = 'queued'`.** Running means "has an open `sqlery_job_attempt`". `QueuedJob.objects.filter(status='running')` and raw SQL for `running` on `sqlery_queued_job` no longer match; use `JobAll` / `sqlery_job_all`, which still report `running` with `started_at`, `worker_id`, `worker_pid` and `child_pid` taken from the attempt. The migration converts rows stored as `running`.
+- **Live-table partitions no longer follow `SQLERY_PARTITION_RETENTION`.** Drained live partitions are dropped within about two hours (#156). New settings: `SQLERY_LIVE_PARTITION_INTERVAL` (default `1 hour`, new partitions only) and `SQLERY_LIVE_PARTITION_GRACE` (default `1 hour`). Standalone partition maintenance now runs every 5 minutes.
+
 ### Changed
 
+- **A claim no longer updates the job row (#157, #159).** It deletes the ready entry and inserts an attempt; the job row is written only at enqueue and at completion. This removes the last per-job dead tuple from the claim path. A partial index of open attempts by job backs the running-state lookups.
 - **Drained live-job partitions are dropped within about two hours, not after 30 days (#156).** On partitioned PostgreSQL, a `sqlery_queued_job` partition is dropped when its upper bound is older than `SQLERY_LIVE_PARTITION_GRACE` (new, default `1 hour`), it is not the DEFAULT partition and it holds no row at all (rows of any status pin it). The emptiness check and the drop run under `LOCK TABLE ... ACCESS EXCLUSIVE NOWAIT`, with a 50 ms `lock_timeout` for the parent lock `DETACH` needs, so claims and enqueues never queue behind it; a failure retries on the next tick. `SQLERY_PARTITION_RETENTION` no longer applies to the live table (history and attempts keep it). New partitions of the live table are one hour wide (`SQLERY_LIVE_PARTITION_INTERVAL`, new, default `1 hour`; set `1 day` for the old shape) with at least a day premade; existing partitions are not repartitioned and mixed widths never overlap or leave gaps. The standalone default of `PARTITION_MAINTENANCE_INTERVAL_MINUTES` is now 5 (was 1440).
 - **Health reports drained live partitions that cannot be dropped (#156).** `xmin_horizon.live_partitions` gives their number and age and the number still holding rows, and health is `degraded` past `PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS` (default 900, 0 disables). See `docs/TROUBLESHOOTING.md` and `docs/design/queue-robustness.md`.
 
