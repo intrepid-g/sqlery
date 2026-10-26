@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg import sql as pgsql
@@ -24,6 +24,14 @@ __all__ = [
     "reclaim_drained_partitions",
     "check_default_partition",
     "is_partitioned",
+    "decide_partition_reclaim",
+    "ensure_live_partitions",
+    "reclaim_drained_live_partitions",
+    "parse_interval",
+    "DEFAULT_LIVE_PARTITION_INTERVAL",
+    "DEFAULT_LIVE_PARTITION_GRACE",
+    "MIN_LIVE_PARTITION_GRACE_SECONDS",
+    "LIVE_LOOKAHEAD",
 ]
 
 logger = logging.getLogger(__name__)
@@ -376,6 +384,332 @@ def reclaim_drained_partitions(
         cur.execute("SELECT pg_advisory_unlock(%s)", [ADVISORY_LOCK_RECLAIM])
 
     return dropped
+
+
+# ---------------------------------------------------------------------------
+# Live-table partitions (#156): short partitions, dropped as soon as drained
+# ---------------------------------------------------------------------------
+#
+# ``sqlery_queued_job`` only ever holds work in flight: finished jobs move to the insert-only
+# history. A ``created_at`` partition that has passed and holds no row at all therefore
+# contains nothing but dead tuples, and with the xmin horizon pinned VACUUM cannot clear
+# them. Dropping the whole partition is the only reclaim that does not depend on VACUUM, so
+# it must not wait for ``SQLERY_PARTITION_RETENTION`` (which is for history).
+
+DEFAULT_LIVE_PARTITION_INTERVAL = "1 hour"
+DEFAULT_LIVE_PARTITION_GRACE = "1 hour"
+# A grace shorter than this is raised to it: the margin covers in-flight inserts and clock skew.
+MIN_LIVE_PARTITION_GRACE_SECONDS = 60.0
+# Partitions are always premade at least this far ahead, whatever the interval, so a stopped
+# maintainer does not push inserts into the DEFAULT partition (which is never reclaimed).
+LIVE_LOOKAHEAD = "1 day"
+
+# Lock budget for the parent table: claims and enqueues queue behind a pending
+# ACCESS EXCLUSIVE request, so the request is abandoned after this long.
+RECLAIM_LOCK_TIMEOUT_MS = 50
+# Ceiling for the emptiness scans (a partition bloated with dead tuples is scanned in full).
+RECLAIM_STATEMENT_TIMEOUT_MS = 5000
+
+_INTERVAL_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(second|sec|minute|min|hour|day|week)s?\s*$", re.IGNORECASE
+)
+_INTERVAL_UNIT_SECONDS = {
+    "second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600, "day": 86400, "week": 604800,
+}
+
+# Outcomes of decide_partition_reclaim.
+DROP = "drop"
+CHECK_ROWS = "check_rows"  # undecided: look whether the partition holds any row
+TAKE_LOCK = "take_lock"  # undecided: take the partition lock
+SKIP_DEFAULT = "skip_default"
+SKIP_GRACE = "skip_grace"
+SKIP_HAS_ROWS = "skip_has_rows"
+SKIP_LOCKED = "skip_locked"
+
+
+def parse_interval(value) -> timedelta | None:
+    """Parse ``'1 hour'`` / ``'90 minutes'`` / ``'2 days'`` into a timedelta; None if invalid.
+
+    Months and years are rejected on purpose: their length depends on the calendar, and a
+    grace period or live partition width is a fixed duration.
+    """
+    match = _INTERVAL_RE.match(str(value)) if value is not None else None
+    if not match:
+        return None
+    seconds = float(match.group(1)) * _INTERVAL_UNIT_SECONDS[match.group(2).lower()]
+    return timedelta(seconds=seconds) if seconds > 0 else None
+
+
+def decide_partition_reclaim(
+    upper_bound: datetime | None,
+    now: datetime,
+    grace: timedelta,
+    has_rows: bool | None,
+    is_default: bool,
+    lock_ok: bool | None,
+) -> str:
+    """Pure decision for one live-table partition: what to do next.
+
+    A partition is dropped only when it is not the DEFAULT partition, its upper bound is older
+    than ``now - grace``, it holds **no row at all** (rows of every status pin it: queued,
+    running, retry-pending, webhook-pending, ...) and its lock was obtained. ``has_rows`` and
+    ``lock_ok`` are ``None`` while unknown; the answer then names the next step
+    (``check_rows`` / ``take_lock``), so the caller does the cheap checks first and takes the
+    strong lock last. Rows are checked again after the lock is held: call this once more with
+    the fresh ``has_rows`` and ``lock_ok=True``.
+
+    Returns one of ``drop``, ``check_rows``, ``take_lock``, ``skip_default``, ``skip_grace``,
+    ``skip_has_rows``, ``skip_locked``.
+    """
+    if is_default or upper_bound is None:
+        return SKIP_DEFAULT
+    if upper_bound >= now - grace:
+        return SKIP_GRACE
+    if has_rows is None:
+        return CHECK_ROWS
+    if has_rows:
+        return SKIP_HAS_ROWS
+    if lock_ok is None:
+        return TAKE_LOCK
+    if not lock_ok:
+        return SKIP_LOCKED
+    return DROP
+
+
+def _end_implicit_transaction(conn) -> bool:
+    """Commit a transaction psycopg opened implicitly, unless a framework owns it.
+
+    The standalone backend's raw connection is not in autocommit mode, so the partition DDL of
+    the same tick (which holds locks until commit) is still pending when reclaim starts.
+    Returns False when the connection is inside a Django ``atomic`` block: that transaction is
+    not ours to end.
+    """
+    from psycopg.pq import TransactionStatus
+
+    if conn.autocommit or conn.info.transaction_status != TransactionStatus.INTRANS:
+        return True
+    try:
+        from django.conf import settings as dj_settings
+
+        if dj_settings.configured:
+            from django.db import connection as dj_conn
+
+            if dj_conn.in_atomic_block:
+                return False
+    except Exception:  # Django absent or not set up: the transaction is psycopg's own
+        pass
+    conn.commit()
+    return True
+
+
+def _partition_has_rows(cur, name: str) -> bool:
+    cur.execute(pgsql.SQL("SELECT EXISTS (SELECT 1 FROM {name})").format(name=pgsql.Identifier(name)))
+    return bool(cur.fetchone()[0])
+
+
+def _try_reclaim_one(cur, conn, table: str, name: str, upper: datetime, now: datetime,
+                     grace: timedelta) -> str:
+    """Drop one live partition if it is safe; returns the decision that was reached.
+
+    1. Cheap unlocked look: a partition with any row is left alone without taking a lock.
+    2. In a transaction: ``lock_timeout`` small, ``LOCK TABLE part ACCESS EXCLUSIVE NOWAIT``
+       as the first statement (so even a REPEATABLE READ transaction sees committed rows
+       afterwards), re-check emptiness under the lock, ``DETACH`` then ``DROP``.
+    Any lock that cannot be had at once rolls the transaction back; the next tick retries.
+    """
+    first = decide_partition_reclaim(upper, now, grace, has_rows=None, is_default=False,
+                                     lock_ok=None)
+    if first != CHECK_ROWS:
+        return first
+
+    try:
+        with conn.transaction():
+            cur.execute(f"SET LOCAL statement_timeout = {int(RECLAIM_STATEMENT_TIMEOUT_MS)}")
+            has_rows = _partition_has_rows(cur, name)
+    except psycopg.errors.QueryCanceled:
+        return SKIP_HAS_ROWS  # too bloated to scan in time: assume rows, look again next tick
+    step = decide_partition_reclaim(upper, now, grace, has_rows, False, None)
+    if step != TAKE_LOCK:
+        return step
+
+    from psycopg.pq import TransactionStatus
+
+    nested = conn.info.transaction_status != TransactionStatus.IDLE
+    try:
+        with conn.transaction():
+            cur.execute(f"SET LOCAL lock_timeout = {int(RECLAIM_LOCK_TIMEOUT_MS)}")
+            cur.execute(f"SET LOCAL statement_timeout = {int(RECLAIM_STATEMENT_TIMEOUT_MS)}")
+            cur.execute("SHOW transaction_isolation")  # a utility command: takes no snapshot
+            if nested and cur.fetchone()[0] != "read committed":
+                # Inside someone else's snapshot transaction the re-check below could miss
+                # a row committed after that snapshot: never drop on that evidence.
+                return SKIP_LOCKED
+            part = pgsql.Identifier(name)
+            cur.execute(pgsql.SQL("LOCK TABLE {name} IN ACCESS EXCLUSIVE MODE NOWAIT").format(
+                name=part))
+            # Nothing can write the partition now: this check is final.
+            has_rows = _partition_has_rows(cur, name)
+            step = decide_partition_reclaim(upper, now, grace, has_rows, False, True)
+            if step != DROP:
+                return step  # leaving the block commits nothing but the lock release
+            cur.execute(pgsql.SQL("ALTER TABLE {table} DETACH PARTITION {name}").format(
+                table=pgsql.Identifier(table), name=part))
+            cur.execute(pgsql.SQL("DROP TABLE {name}").format(name=part))
+            return DROP
+    except (psycopg.errors.LockNotAvailable, psycopg.errors.DeadlockDetected,
+            psycopg.errors.QueryCanceled):
+        return SKIP_LOCKED
+
+
+def reclaim_drained_live_partitions(cur, table: str, grace_str: str | None = None) -> int:
+    """Drop the drained partitions of the live job table without waiting for retention.
+
+    A partition is dropped when it is not the DEFAULT partition, its upper bound is older than
+    ``now - grace`` and it holds no row at all (see ``decide_partition_reclaim``). The
+    emptiness check and the drop are made safe against a concurrent insert by taking the
+    partition's ACCESS EXCLUSIVE lock first (NOWAIT), checking again under it and detaching
+    and dropping in that same transaction.
+
+    Claims and enqueues never queue behind this: the partition lock is NOWAIT, the parent lock
+    that ``DETACH PARTITION`` needs is given ``lock_timeout`` 50 ms, and a failure to get
+    either rolls back and leaves the partition for the next tick. ``DETACH ... CONCURRENTLY``
+    is not used: it cannot run on a table with a DEFAULT partition (which this table has, to
+    catch stray ``created_at`` values) nor inside a transaction block, and it can leave a
+    half-detached partition behind if interrupted.
+
+    Only one maintainer runs this at a time (advisory lock). Returns the number dropped; any
+    per-partition failure is logged and skipped, never raised.
+    """
+    grace = parse_interval(grace_str if grace_str is not None else DEFAULT_LIVE_PARTITION_GRACE)
+    if grace is None:
+        logger.warning("invalid SQLERY_LIVE_PARTITION_GRACE %r: using %s", grace_str,
+                       DEFAULT_LIVE_PARTITION_GRACE)
+        grace = parse_interval(DEFAULT_LIVE_PARTITION_GRACE)
+    grace = max(grace, timedelta(seconds=MIN_LIVE_PARTITION_GRACE_SECONDS))
+
+    cur.execute("SELECT pg_try_advisory_lock(%s)", [ADVISORY_LOCK_RECLAIM])
+    (lock_acquired,) = cur.fetchone()
+    if not lock_acquired:
+        return 0
+
+    dropped = 0
+    try:
+        conn = cur.connection
+        if not _end_implicit_transaction(conn):
+            logger.debug("live partition reclaim skipped: caller owns an open transaction")
+            return 0
+        cur.execute("SELECT now()")
+        (now,) = cur.fetchone()
+        partitions = [(n, ub) for n, ub in _list_partitions(cur, table) if ub is not None]
+        for name, upper in sorted(partitions, key=lambda item: item[1]):
+            if upper >= now - grace:
+                continue  # the list is ordered: nothing newer qualifies either
+            try:
+                outcome = _try_reclaim_one(cur, conn, table, name, upper, now, grace)
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                if conn.closed or conn.broken:
+                    raise
+                logger.warning("live partition %s: reclaim failed, will retry", name,
+                               exc_info=True)
+                continue
+            except psycopg.Error:
+                logger.warning("live partition %s: reclaim failed, will retry", name,
+                               exc_info=True)
+                continue
+            if outcome == DROP:
+                dropped += 1
+                logger.info("dropped drained live partition %s", name)
+            elif outcome == SKIP_LOCKED:
+                logger.info("live partition %s is drained but locked; retrying next tick", name)
+    finally:
+        cur.execute("SELECT pg_advisory_unlock(%s)", [ADVISORY_LOCK_RECLAIM])
+    return dropped
+
+
+def ensure_live_partitions(
+    cur,
+    table: str,
+    interval_str: str | None = None,
+    premake: int = 7,
+    lookahead_str: str = LIVE_LOOKAHEAD,
+) -> int:
+    """Create live-table partitions so that coverage runs ahead of now for long enough.
+
+    Coverage reaches at least ``max(premake x interval, lookahead)`` ahead, so the default
+    ``'1 hour'`` interval keeps a day of partitions premade. Existing partitions of any width
+    are respected: the walk starts at the interval bucket holding now, jumps over every range
+    already covered, and clips a new partition to the next existing one, so a changed interval
+    (or the daily partitions of an older install) never overlaps and never leaves a gap that
+    would send inserts to the DEFAULT partition. Existing partitions are never touched.
+    """
+    width = parse_interval(interval_str or DEFAULT_LIVE_PARTITION_INTERVAL)
+    if width is None or width < timedelta(minutes=1):
+        logger.warning("invalid SQLERY_LIVE_PARTITION_INTERVAL %r: using %s", interval_str,
+                       DEFAULT_LIVE_PARTITION_INTERVAL)
+        interval_str = DEFAULT_LIVE_PARTITION_INTERVAL
+        width = parse_interval(interval_str)
+    interval_str = interval_str or DEFAULT_LIVE_PARTITION_INTERVAL
+    ahead = max(width * max(int(premake), 1), parse_interval(lookahead_str) or timedelta(days=1))
+
+    cur.execute("SELECT pg_try_advisory_lock(%s)", [ADVISORY_LOCK_ENSURE])
+    (lock_acquired,) = cur.fetchone()
+    if not lock_acquired:
+        return 0
+
+    created = 0
+    try:
+        conn = cur.connection
+        cur.execute("SELECT now()")
+        (now,) = cur.fetchone()
+        seconds = width.total_seconds()
+        if width >= timedelta(days=1) and width.total_seconds() % 86400 == 0:
+            cur.execute("SELECT date_trunc('day', now())")
+        else:
+            cur.execute("SELECT to_timestamp(floor(extract(epoch FROM now()) / %s) * %s)",
+                        [seconds, seconds])
+        (cursor_ts,) = cur.fetchone()
+        end = now + ahead
+        existing = sorted(_list_partition_ranges(cur, table))
+        suffix_fmt = "%Y%m%d_%H%M" if width < timedelta(days=1) else "%Y%m%d"
+        for _ in range(10_000):  # hard stop for a pathological interval
+            if cursor_ts >= end:
+                break
+            covering = next((hi for lo, hi in existing if lo <= cursor_ts < hi), None)
+            if covering is not None:
+                cursor_ts = covering
+                continue
+            hi = cursor_ts + width
+            following = [lo for lo, _ in existing if lo > cursor_ts]
+            if following and min(following) < hi:
+                hi = min(following)
+            name = table + "_" + cursor_ts.astimezone(timezone.utc).strftime(suffix_fmt)
+            try:
+                with conn.transaction():
+                    # DDL takes no bind parameters: the bounds are inlined as literals.
+                    cur.execute(
+                        pgsql.SQL(
+                            "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {table}"
+                            " FOR VALUES FROM ({lo}) TO ({hi})"
+                        ).format(
+                            name=pgsql.Identifier(name),
+                            table=pgsql.Identifier(table),
+                            lo=pgsql.Literal(cursor_ts),
+                            hi=pgsql.Literal(hi),
+                        )
+                    )
+                created += 1
+            except (psycopg.errors.InvalidTableDefinition, psycopg.errors.CheckViolation,
+                    psycopg.errors.ExclusionViolation) as exc:
+                # Rows already in the DEFAULT partition fall in this range.
+                logger.warning(
+                    "Partition attach conflict for %s: %s "
+                    "— rows in DEFAULT partition, manual cleanup required", name, exc)
+            existing.append((cursor_ts, hi))
+            existing.sort()
+            cursor_ts = hi
+    finally:
+        cur.execute("SELECT pg_advisory_unlock(%s)", [ADVISORY_LOCK_ENSURE])
+    return created
 
 
 def check_default_partition(cur, table: str) -> int:

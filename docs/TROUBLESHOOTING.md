@@ -559,6 +559,38 @@ SELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots;
 Note that `pg_stat_activity` hides other roles' transaction times unless the monitoring
 role is a member of `pg_read_all_stats`; the probe then under-reports.
 
+### Drained live partitions that are not dropped
+
+On partitioned PostgreSQL installs `sqlery_queued_job` is split by `created_at` (one hour
+per partition for new partitions, `SQLERY_LIVE_PARTITION_INTERVAL`). A partition with no
+row left is dropped by the daemon (or `cleanup_jobs`) once its upper bound is older than
+`SQLERY_LIVE_PARTITION_GRACE` (`1 hour`), whatever `SQLERY_PARTITION_RETENTION` says; a
+partition holding any row, of any status, is never dropped. The health block
+`xmin_horizon.live_partitions` shows `drained_undroppable` and `oldest_drained_age_seconds`
+and turns health `degraded` past `PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS` (900).
+
+If it does, a drained partition is being held. The drop is skipped, never waited for, when:
+
+- a transaction still has the partition locked: an old snapshot that read it (the same
+  culprit as above, so end it), or an uncommitted insert with an old `created_at`;
+- no daemon runs partition maintenance (`PARTITION_MAINTENANCE_ENABLED`, and a cadence
+  `PARTITION_MAINTENANCE_INTERVAL_MINUTES` that is not larger than the live width);
+- another maintainer holds the advisory lock.
+
+```sql
+SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bound, s.n_live_tup
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE i.inhparent = 'sqlery_queued_job'::regclass ORDER BY 2;
+SELECT pid, state, now() - xact_start AS age, left(query, 80)
+FROM pg_stat_activity WHERE backend_xmin IS NOT NULL OR backend_xid IS NOT NULL;
+```
+
+Rows in the `sqlery_queued_job_default` partition are never dropped (a `created_at` outside
+every partition, e.g. a backfill into a range that was already dropped); move or delete
+them by hand. To keep the old daily shape set `SQLERY_LIVE_PARTITION_INTERVAL` to `1 day`.
+Changing the interval only affects partitions created afterwards; existing ones are kept.
+
 ## Performance Issues
 
 ### Jobs Processing Too Slowly

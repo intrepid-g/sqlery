@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Drained live-job partitions are dropped within about two hours, not after 30 days (#156).** On partitioned PostgreSQL, a `sqlery_queued_job` partition is dropped when its upper bound is older than `SQLERY_LIVE_PARTITION_GRACE` (new, default `1 hour`), it is not the DEFAULT partition and it holds no row at all (rows of any status pin it). The emptiness check and the drop run under `LOCK TABLE ... ACCESS EXCLUSIVE NOWAIT`, with a 50 ms `lock_timeout` for the parent lock `DETACH` needs, so claims and enqueues never queue behind it; a failure retries on the next tick. `SQLERY_PARTITION_RETENTION` no longer applies to the live table (history and attempts keep it). New partitions of the live table are one hour wide (`SQLERY_LIVE_PARTITION_INTERVAL`, new, default `1 hour`; set `1 day` for the old shape) with at least a day premade; existing partitions are not repartitioned and mixed widths never overlap or leave gaps. The standalone default of `PARTITION_MAINTENANCE_INTERVAL_MINUTES` is now 5 (was 1440).
+- **Health reports drained live partitions that cannot be dropped (#156).** `xmin_horizon.live_partitions` gives their number and age and the number still holding rows, and health is `degraded` past `PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS` (default 900, 0 disables). See `docs/TROUBLESHOOTING.md` and `docs/design/queue-robustness.md`.
+
 ## [0.26.1] - 2026-10-26
 
 ### Fixed
