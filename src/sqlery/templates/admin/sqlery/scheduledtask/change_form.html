@@ -118,7 +118,7 @@
         <div class="job-runs-section">
             <h2>📋 Job Runs for this Scheduled Task</h2>
             <div class="scrollable-table">
-                {% if original.jobs.all %}
+                {% if original.recent_jobs %}
                     <table>
                         <thead>
                             <tr>
@@ -135,7 +135,7 @@
                             </tr>
                         </thead>
                         <tbody>
-                            {% for job in original.jobs.all|dictsortreversed:"created_at" %}
+                            {% for job in original.recent_jobs %}
                                 <tr>
                                     <td>
                                         <a href="{% url 'admin:sqlery_queuedjob_change' job.id %}" class="job-link">

@@ -6,6 +6,8 @@
 # Re-export from new location for backward compatibility
 try:
     from sqlery.django_sqlery.models import (
+        JobAll,
+        JobHistory,
         QueuedJob,
         ScheduledTask,
         Worker,
@@ -16,6 +18,8 @@ try:
     # Backward compatibility alias
     TaskExecution = QueuedJob
     __all__ = [
+        "JobAll",
+        "JobHistory",
         "QueuedJob",
         "ScheduledTask",
         "Worker",

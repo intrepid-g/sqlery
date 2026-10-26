@@ -59,6 +59,8 @@ class ConcurrentModificationError(Exception):
     pass
 
 
+TERMINAL_STATUSES = ("success", "failed", "archived")
+
 SCHEDULE_TYPE_CHOICES = [
     ("cron", "Cron"),
     ("interval", "Interval"),
@@ -356,6 +358,16 @@ class ScheduledTask(models.Model):
         if errors:
             raise ValidationError(errors)
 
+    @property
+    def all_jobs(self):
+        """Every job this task created, live and finished (``jobs`` is the live ones only)."""
+        return JobAll.objects.filter(scheduled_task_id=self.pk)
+
+    @property
+    def recent_jobs(self):
+        """The newest 200 jobs this task created, live and finished (admin change form)."""
+        return list(self.all_jobs.order_by("-created_at", "-id")[:200])
+
     def get_kwargs_dict(self):
         """Get task_kwargs as a dict for passing to QueuedJob."""
         if isinstance(self.task_kwargs, dict):
@@ -363,8 +375,18 @@ class ScheduledTask(models.Model):
         return {}
 
 
+def _is_retry_marker(reason) -> bool:
+    from sqlery.core.retry import is_retry_pending
+
+    return is_retry_pending(reason)
+
+
 class QueuedJobQuerySet(models.QuerySet):
-    """QuerySet whose ``update()`` keeps the ready queue in step (issue #139).
+    """QuerySet whose ``update()`` keeps the ready queue and the history in step (#139, #140).
+
+    A bulk ``update(status=<terminal>)`` is a terminal transition: the rows are written with
+    their final state and then move to ``sqlery_job_history`` in the same transaction (see
+    ``update_to_terminal``), so nothing finished is ever left in the live table by the ORM.
 
     A bulk ``update(status="queued")`` makes jobs claimable again, and an update of
     ``queue_name`` / ``priority`` / ``scheduled_at`` changes where (or when) their ready
@@ -376,6 +398,8 @@ class QueuedJobQuerySet(models.QuerySet):
     _READY_FIELDS = ("queue_name", "priority", "scheduled_at")
 
     def update(self, **kwargs):
+        if kwargs.get("status") in TERMINAL_STATUSES:
+            return self._update_to_terminal(kwargs)
         requeue = kwargs.get("status") == "queued"
         edits = {
             k: v
@@ -394,6 +418,37 @@ class QueuedJobQuerySet(models.QuerySet):
             ready.before_update(rows, edits)
             count = super().update(**kwargs)
             ready.after_update(rows, requeue=requeue, edits=edits)
+        return count
+
+    def update_in_place(self, **kwargs):
+        """``update()`` without the ready-queue / history bookkeeping.
+
+        For the few writes that mark a job finished but must keep it in the live table for
+        now: a failure that still owes its retry, or a finished job whose webhook delivery is
+        being attempted. Everything else goes through ``update()``.
+        """
+        return super().update(**kwargs)
+
+    def _update_to_terminal(self, kwargs):
+        """Bulk terminal transition: write the final state, then move the rows to history.
+
+        A failure that still owes a retry (``retry_pending`` marker) is not final and stays.
+        """
+        from . import history, ready
+
+        keep_live = _is_retry_marker(kwargs.get("termination_reason"))
+        with transaction.atomic(using=self.db):
+            rows = list(self.values_list("id", "created_at", "status"))
+            ids = [r[0] for r in rows]
+            # Entries first, then the job rows: the lock order of a claim.
+            if any(r[2] == "queued" for r in rows):
+                ready.remove(ids)
+            count = super().update(**kwargs)
+            if not keep_live:
+                history.move_current([(i, c, kwargs["status"]) for i, c, _ in rows])
+        if not keep_live:
+            for job_id in ids:
+                ready.release_dependents_quietly(job_id)
         return count
 
 
@@ -684,8 +739,9 @@ class QueuedJob(models.Model):
             # Dropped (migration 0036): ("task_path", "status") -- no query filters on
             # task_path and `status` churns on every transition; and ("-created_at") --
             # served by the (created_at, id) primary key.
-            models.Index(fields=["-finished_at"], name="sqlery_job_finished_desc"),
-            models.Index(fields=["-started_at"], name="sqlery_job_started_desc"),
+            # Dropped (migration 0039): ("-finished_at") and ("-started_at"). Finished jobs
+            # are in sqlery_job_history, which has its own indexes (#140); a live job is found
+            # by status.
         ]
 
     def __str__(self):
@@ -707,13 +763,26 @@ class QueuedJob(models.Model):
         else loses it. Saves that touch none of status / queue / priority / schedule skip
         the extra statements.
         """
+        if getattr(self, "_in_history", False):
+            raise TypeError(
+                f"job {self.id} is in history, which is insert-only; a finished job can not be "
+                "saved again"
+            )
         update_fields = kwargs.get("update_fields")
         adding = self._state.adding
+        from . import ready
+
+        terminal = self.status in TERMINAL_STATUSES and not _is_retry_marker(
+            self.termination_reason
+        )
+        if terminal and (adding or update_fields is None or "status" in update_fields):
+            # A job saved with a final status is a terminal transition: a new one is recorded
+            # in history directly, an existing one is written and then moved there.
+            return self._save_terminal(adding, args, kwargs)
         if not (
             adding or update_fields is None or self._READY_RELEVANT & set(update_fields)
         ):
             return super().save(*args, **kwargs)
-        from . import ready
 
         with transaction.atomic(using=kwargs.get("using")):
             # Lock order everywhere is ready entry first, then the job row (what a claim
@@ -721,6 +790,40 @@ class QueuedJob(models.Model):
             entry_updated = False if adding else ready.before_save(self)
             super().save(*args, **kwargs)
             ready.after_save(self, adding=adding, entry_updated=entry_updated)
+
+    def _save_terminal(self, adding, args, kwargs):
+        from . import history, ready
+
+        with transaction.atomic(using=kwargs.get("using")):
+            if adding:
+                if self.finished_at is None:
+                    self.finished_at = timezone.now()
+                history.insert_finished(self)
+                self._state.adding = False
+                return
+            ready.before_save(self)  # drops the entries of a job that is not queued
+            super().save(*args, **kwargs)
+            self._in_history = history.move(self.id, self.created_at, self.status, {})
+        ready.release_dependents_quietly(self.id, self.parent_job_id)
+
+    def refresh_from_db(self, using=None, fields=None, **kwargs):
+        """Reload from the database; a job that has since finished is read from history.
+
+        The object stays what it was (a ``QueuedJob``) but carries the final state, so code
+        holding a job across its completion keeps working.
+        """
+        try:
+            return super().refresh_from_db(using=using, fields=fields, **kwargs)
+        except QueuedJob.DoesNotExist:
+            row = JobHistory.objects.filter(id=self.id).first()
+            if row is None:
+                raise
+            self._in_history = True
+            names = fields or [f.attname for f in self._meta.concrete_fields if f.name != "pk"]
+            for name in names:
+                attname = self._meta.get_field(name).attname if name != "pk" else name
+                if hasattr(row, attname):
+                    setattr(self, attname, getattr(row, attname))
 
     def delete(self, *args, **kwargs):
         """Delete the job together with its ready / blocked entries; jobs that waited on it
@@ -790,11 +893,24 @@ class QueuedJob(models.Model):
                 self.id, OUTCOME_SUCCESS if outcome == OUTCOME_SUCCESS else OUTCOME_ABANDONED
             )
 
-    def mark_success(self, output="", attempt=None):
-        """Mark job as successful.
+    def _record_final(self, status, in_history=True, **fields):
+        """Carry the final state in memory after the terminal transition (the row itself is
+        in history, or marked in place, by now)."""
+        self.status = status
+        self.version = (self.version or 0) + 1
+        self._in_history = in_history
+        for name, value in fields.items():
+            setattr(self, name, value)
 
-        Uses optimistic locking to ensure atomic state transition. The attempt is closed in
-        the same transaction (``attempt`` or the one this object was claimed with).
+    def mark_success(self, output="", attempt=None):
+        """Mark job as successful: the job moves from the live table to history.
+
+        The transition is one transaction with the attempt close, fenced by the optimistic
+        locking version (``INSERT INTO sqlery_job_history .. SELECT`` + ``DELETE``, see
+        ``sqlery.django_sqlery.history``); a stale completion writes nothing to history. The
+        object keeps the final state in memory. A job whose webhook delivery is still to be
+        attempted stays in the live table, marked ``success``, until the delivery resolves
+        (``settle_finished``).
 
         Raises:
             ConcurrentModificationError: If job was modified by another process
@@ -806,36 +922,41 @@ class QueuedJob(models.Model):
         # not just individual executor call sites -- see REGRESSIONS.md
         reject_unawaited_coroutine(output)
 
+        from . import history
+
         expected_version = self.version
-        self.finished_at = timezone.now()
-        self.duration_seconds = None
+        finished_at = timezone.now()
+        duration = None
         if self.started_at:
-            self.duration_seconds = (self.finished_at - self.started_at).total_seconds()
+            duration = (finished_at - self.started_at).total_seconds()
+        self.finished_at, self.duration_seconds = finished_at, duration
 
         # Record this run in history (update in-memory only)
         self._record_run(status="success", output=str(output))
+        values = {
+            "finished_at": finished_at,
+            "duration_seconds": duration,
+            "output": str(output),
+            "runs": self.runs,
+        }
 
-        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
         with transaction.atomic():
             self._close_attempt(attempt, OUTCOME_SUCCESS)
-            rows_updated = QueuedJob.objects.filter(
-                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 4
-            ).update(
-                status="success",
-                finished_at=self.finished_at,
-                duration_seconds=self.duration_seconds,
-                output=str(output),
-                runs=self.runs,
-                # worker FK kept for historical tracking (Worker.current_job is cleared separately)
-                version=F("version") + 1,
-            )
-
-            if rows_updated == 0:
+            if self._awaits_webhook("success"):
+                rows_updated = QueuedJob.objects.filter(
+                    id=self.id, created_at=self.created_at, version=expected_version
+                ).update_in_place(status="success", version=F("version") + 1, **values)
+                moved = rows_updated == 1
+            else:
+                moved = history.move(
+                    self.id, self.created_at, "success", values, expected_version=expected_version
+                )
+            if not moved:
                 raise ConcurrentModificationError(
                     f"Job {self.id} was modified by another process (version conflict)"
                 )
 
-        self.refresh_from_db()
+        self._record_final("success", in_history=not self._awaits_webhook("success"), **values)
 
         # Clear worker.current_job so worker shows as idle
         self._release_worker()
@@ -846,13 +967,35 @@ class QueuedJob(models.Model):
         ready.release_dependents_quietly(self.id, self.parent_job_id)
 
         # Send webhook notification if configured
-        if self.webhook_url:
+        if self._awaits_webhook("success"):
             from .webhooks import send_webhook_with_retry
 
             send_webhook_with_retry(self, event="success")
 
+    def _awaits_webhook(self, event: str) -> bool:
+        """True if a webhook delivery for ``event`` still has to be attempted: the job then
+        stays in the live table until the delivery resolves (its bookkeeping is mutable)."""
+        return bool(self.webhook_url)
+
+    def settle_finished(self) -> bool:
+        """Move this finished job from the live table into history if it is still there
+        (called once its webhook delivery has resolved). True iff it moved."""
+        from . import history, ready
+
+        if self.status not in TERMINAL_STATUSES:
+            return False
+        moved = history.settle(self)
+        if moved:
+            ready.release_dependents_quietly(self.id, self.parent_job_id)
+        return moved
+
     def mark_failed(self, error, traceback="", termination_reason="", attempt=None):
-        """Mark job as failed with optional termination reason.
+        """Mark job as failed with optional termination reason: the job moves to history.
+
+        A failure that will be retried carries the ``retry_pending`` marker
+        (``sqlery.core.retry``) and is not final: it stays in the live table, marked failed,
+        until its retry exists (``mark_job_archived`` / ``settle_retry_pending`` then move
+        it). The same holds for a job whose webhook delivery is still to be attempted.
 
         Uses optimistic locking to ensure atomic state transition.
 
@@ -870,17 +1013,28 @@ class QueuedJob(models.Model):
         """
         # from django.db.models import F  # moved to top-level
 
+        from . import history
+
         expected_version = self.version
         was_queued = self.status == "queued"
-        self.finished_at = timezone.now()
-        self.duration_seconds = None
+        finished_at = timezone.now()
+        duration = None
         if self.started_at:
-            self.duration_seconds = (self.finished_at - self.started_at).total_seconds()
+            duration = (finished_at - self.started_at).total_seconds()
+        self.finished_at, self.duration_seconds = finished_at, duration
 
         # Record this run in history (update in-memory only)
         self._record_run(status="failed", error=str(error))
+        values = {
+            "finished_at": finished_at,
+            "duration_seconds": duration,
+            "error": str(error),
+            "traceback": traceback,
+            "termination_reason": termination_reason,
+            "runs": self.runs,
+        }
+        in_place = _is_retry_marker(termination_reason) or self._awaits_webhook("failure")
 
-        # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
         with transaction.atomic():
             if was_queued:
                 # Failed before it ran (cancelled, expired, dependency failed): it is no
@@ -890,26 +1044,21 @@ class QueuedJob(models.Model):
 
                 ready.remove([self.id])
             self._close_attempt(attempt, OUTCOME_FAILED)
-            rows_updated = QueuedJob.objects.filter(
-                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
-            ).update(
-                status="failed",
-                finished_at=self.finished_at,
-                duration_seconds=self.duration_seconds,
-                error=str(error),
-                traceback=traceback,
-                termination_reason=termination_reason,
-                runs=self.runs,
-                # worker FK kept for historical tracking (Worker.current_job is cleared separately)
-                version=F("version") + 1,
-            )
-
-            if rows_updated == 0:
+            if in_place:
+                rows_updated = QueuedJob.objects.filter(
+                    id=self.id, created_at=self.created_at, version=expected_version
+                ).update_in_place(status="failed", version=F("version") + 1, **values)
+                moved = rows_updated == 1
+            else:
+                moved = history.move(
+                    self.id, self.created_at, "failed", values, expected_version=expected_version
+                )
+            if not moved:
                 raise ConcurrentModificationError(
                     f"Job {self.id} was modified by another process (version conflict)"
                 )
 
-        self.refresh_from_db()
+        self._record_final("failed", in_history=not in_place, **values)
 
         # Clear worker.current_job so worker shows as idle
         self._release_worker()
@@ -918,7 +1067,7 @@ class QueuedJob(models.Model):
         self.fail_dependent_jobs()
 
         # Send webhook notification if configured
-        if self.webhook_url:
+        if self._awaits_webhook("failure"):
             from .webhooks import send_webhook_with_retry
 
             send_webhook_with_retry(self, event="failure")
@@ -1021,7 +1170,7 @@ class QueuedJob(models.Model):
         self.refresh_from_db(fields=["meta"])
 
     @classmethod
-    def get_by_name(cls, job_name: str) -> "QueuedJob | None":
+    def get_by_name(cls, job_name: str) -> "QueuedJob | JobHistory | None":
         """Look up a job by its unique string name.
 
         Returns:
@@ -1030,7 +1179,8 @@ class QueuedJob(models.Model):
         try:
             return cls.objects.get(job_name=job_name)
         except cls.DoesNotExist:
-            return None
+            # A finished job with that name is in history (the newest one wins).
+            return JobHistory.objects.filter(job_name=job_name).first()
 
     def calculate_retry_delay(self):
         """Calculate delay before next retry.
@@ -1057,8 +1207,8 @@ class QueuedJob(models.Model):
         if not self.dependencies:
             return True, []
 
-        # Get all dependency jobs
-        dependency_jobs = QueuedJob.objects.filter(id__in=self.dependencies)
+        # Get all dependency jobs (live or finished: the union view)
+        dependency_jobs = JobAll.objects.filter(id__in=self.dependencies)
 
         # Check if we found all dependencies
         found_ids = set(dependency_jobs.values_list("id", flat=True))
@@ -1074,7 +1224,7 @@ class QueuedJob(models.Model):
             hops = 0
             while dep.status in ("failed", "archived") and hops < 1000:
                 child = (
-                    QueuedJob.objects.filter(parent_job_id=dep.id)
+                    JobAll.objects.filter(parent_job_id=dep.id)
                     .order_by("-created_at", "-id")
                     .first()
                 )
@@ -1651,6 +1801,161 @@ class JobBlocked(models.Model):
 
     def __str__(self):
         return f"JobBlocked job {self.job_id} on {self.dependency_id}"
+
+
+class _JobRowMixin:
+    """Read helpers of a job row that is not (or no longer) live: shared by the history and
+    the union-view models. Nothing here executes a job."""
+
+    STATUS_CHOICES = QueuedJob.STATUS_CHOICES
+
+    def __str__(self):
+        return f"{self.task_path.split('.')[-1]} [{self.queue_name}] - {self.status}"
+
+    def get_status(self) -> str:
+        """Return the job status (RQ compat)."""
+        return self.status
+
+    def should_retry(self) -> bool:
+        return False
+
+    def calculate_retry_delay(self):
+        return QueuedJob.calculate_retry_delay(self)
+
+    @property
+    def scheduled_task(self):
+        """The scheduled task that created the job, if it still exists."""
+        if self.scheduled_task_id is None:
+            return None
+        return ScheduledTask.objects.filter(pk=self.scheduled_task_id).first()
+
+    @property
+    def worker(self):
+        if self.worker_id is None:
+            return None
+        return Worker.objects.filter(pk=self.worker_id).first()
+
+
+def _job_row_fields(*, history: bool) -> dict:
+    """Fields of a job row that is not live, cloned from ``QueuedJob`` so that history (and the
+    union view) have exactly the columns the terminal transition copies.
+
+    The two foreign keys become plain columns (the referenced row may be long gone), index
+    flags are dropped (history has its own small index set, see ``sqlery.core.history``), and
+    ``created_at`` is a plain timestamp. ``finished_at`` is the partition key of history, so
+    it can not be NULL there.
+    """
+    import copy
+
+    fields: dict = {}
+    for f in QueuedJob._meta.concrete_fields:
+        if f.name == "pk":
+            continue  # the composite key of the live table; history has its own
+        if f.name == "scheduled_task":
+            fields["scheduled_task_id"] = models.IntegerField(null=True, blank=True)
+            continue
+        if f.name == "worker":
+            fields["worker_id"] = models.UUIDField(null=True, blank=True)
+            continue
+        clone = copy.deepcopy(f)
+        clone.db_index = False
+        if f.name == "created_at":
+            clone.auto_now_add = False
+            clone.editable = True
+            clone.blank = False
+        if f.name == "finished_at" and history:
+            clone.null = False
+            clone.blank = False
+        if f.name == "id" and not history:
+            clone.primary_key = True
+        fields[f.name] = clone
+    return fields
+
+
+class _InsertOnly:
+    """A history row is written once, by the terminal transition, and never updated."""
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding and not kwargs.get("force_insert"):
+            raise TypeError("job history is insert-only; a finished job cannot be modified")
+        super().save(*args, **kwargs)
+
+
+class _ReadOnlyView:
+    def save(self, *args, **kwargs):
+        raise TypeError("sqlery_job_all is a read-only view")
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("sqlery_job_all is a read-only view")
+
+
+class _HistoryMeta:
+    db_table = "sqlery_job_history"
+    ordering = ["-finished_at", "-id"]
+    verbose_name = "Finished job"
+    verbose_name_plural = "Job history"
+    indexes = [
+        models.Index(fields=["id"], name="sqlery_hist_id_idx"),
+        models.Index(
+            fields=["parent_job_id"],
+            name="sqlery_hist_parent_idx",
+            condition=Q(parent_job_id__isnull=False),
+        ),
+        models.Index(fields=["status", "-finished_at"], name="sqlery_hist_status_idx"),
+        models.Index(
+            fields=["job_name"],
+            name="sqlery_hist_name_idx",
+            condition=Q(job_name__isnull=False),
+        ),
+        models.Index(fields=["-created_at"], name="sqlery_hist_created_idx"),
+    ]
+
+
+class _JobAllMeta:
+    db_table = "sqlery_job_all"
+    managed = False
+    ordering = ["-priority", "created_at"]
+    verbose_name = "Job"
+    verbose_name_plural = "Jobs"
+
+
+# Built in one go (a Django model's fields must exist when its class is created).
+JobHistory = type(
+    "JobHistory",
+    (_InsertOnly, _JobRowMixin, models.Model),
+    {
+        "__module__": __name__,
+        "__doc__": """A job that reached a terminal state (success / failed / archived): insert-only (#140).
+
+    Has every column of ``sqlery_queued_job`` (cloned from ``QueuedJob``); primary key
+    ``(finished_at, id)``. On PostgreSQL the table is ``PARTITION BY RANGE (finished_at)``
+    (created by migration 0039) and retention drops whole partitions; elsewhere it is a plain
+    table and retention deletes in batches. Rows are written once by the terminal
+    transition (``INSERT .. SELECT`` + ``DELETE`` from the live table, one transaction, see
+    ``sqlery.django_sqlery.history``) and never updated: ``save()`` of an existing row is
+    refused. Mirrors the SQLModel ``JobHistory``.
+    """,
+        "pk": models.CompositePrimaryKey("finished_at", "id"),
+        "Meta": _HistoryMeta,
+        **_job_row_fields(history=True),
+    },
+)
+
+JobAll = type(
+    "JobAll",
+    (_ReadOnlyView, _JobRowMixin, models.Model),
+    {
+        "__module__": __name__,
+        "__doc__": """Read-only row of the ``sqlery_job_all`` view: the live table and history together.
+
+    Reads that must see a job whatever its state (dashboards, lists, counts, statistics,
+    dependency checks, retry chains) use this model. Unmanaged: the view is created by
+    migration 0039. Writes are refused.
+    """,
+        "Meta": _JobAllMeta,
+        **_job_row_fields(history=False),
+    },
+)
 
 
 # Signal handlers

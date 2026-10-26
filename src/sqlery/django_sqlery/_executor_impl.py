@@ -45,7 +45,7 @@ from sqlery.core.utils import describe_task_args
 from sqlery.core.worker import _current_job_var  # noqa: F401
 
 from .db_compat import atomic_claim_job_queryset
-from .models import JobAttempt, JobReady, QueuedJob, ScheduledTask, Worker
+from .models import JobAll, JobAttempt, JobReady, QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .subprocess_slots import claim_slot
@@ -151,7 +151,7 @@ class TaskExecutor:
         """
         # Check repeat limit for interval tasks
         if task.schedule_type == "interval" and task.repeat is not None:
-            total_enqueued = task.jobs.count()
+            total_enqueued = task.all_jobs.count()  # live and finished
             if total_enqueued >= task.repeat:
                 logger.info(
                     f"Scheduled task '{task.name}' reached repeat limit ({task.repeat}), disabling"
@@ -435,7 +435,7 @@ class TaskExecutor:
 
         # Idempotent: reuse an existing retry (crash recovery, or a stale-job sweep racing the
         # worker that failed it) instead of creating a duplicate.
-        existing = QueuedJob.objects.filter(parent_job_id=failed_job.id).order_by("-created_at").first()
+        existing = JobAll.objects.filter(parent_job_id=failed_job.id).order_by("-created_at").first()
         if existing is not None:
             self._settle_retry_marker(failed_job)
             return existing
@@ -491,12 +491,15 @@ class TaskExecutor:
         return retry_job
 
     def _settle_retry_marker(self, failed_job):
-        """The retry exists: restore the job's original termination_reason."""
+        """The retry exists: the failed job is final. It moves to history with its original
+        termination_reason restored (a job already in history has nothing left to settle)."""
         from sqlery.core.retry import settled_reason
 
         reason = settled_reason(failed_job.termination_reason or "")
         if reason != (failed_job.termination_reason or ""):
-            QueuedJob.objects.filter(id=failed_job.id).update(termination_reason=reason)
+            from .backend import DjangoBackend
+
+            DjangoBackend().settle_retry_pending(failed_job.id)
             failed_job.termination_reason = reason
 
     def recover_lost_retries(self, grace_seconds=60, limit=100):

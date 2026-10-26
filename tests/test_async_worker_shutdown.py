@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlery.fastapi_sqlery import async_backend as _ab  # registers Lease  # noqa: F401
 from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
 from sqlery.fastapi_sqlery import database as _db_mod
-from sqlery.core.models import QueuedJob
+from sqlery.core.models import QueuedJob, JobAll
 from sqlery.core.async_worker import AsyncWorker, SHUTDOWN_TIMEOUT_ERROR
 
 
@@ -113,7 +113,7 @@ async def test_job_finishes_before_deadline_marks_success(backend, make_job, ses
     )
 
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
     assert row.status == "success", f"expected success, got {row.status}"
     assert row.output == "quick-done"
 
@@ -174,12 +174,12 @@ async def test_deadline_wins_observes_transient_state_and_requeues_retry(
     # Terminal state is 'failed' with the canonical error string; once the retry row exists
     # the failed attempt is archived.
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
         assert row.status == "archived", f"expected archived terminal, got {row.status}"
         assert row.error == SHUTDOWN_TIMEOUT_ERROR
 
         # Retry row should be enqueued (max_retries=2).
-        all_rows = (await s.execute(select(QueuedJob))).scalars().all()
+        all_rows = (await s.execute(select(JobAll))).scalars().all()
     retries = [r for r in all_rows if r.parent_job_id == job.id]
     assert len(retries) == 1, f"expected exactly one retry row; got {len(retries)}"
     retry = retries[0]
@@ -239,6 +239,6 @@ async def test_e2e_sigterm_triggers_shutdown(backend, make_job, session_factory)
     await asyncio.gather(worker.run(max_jobs=1), trigger())
 
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
     # Either way (job-wins or deadline-wins), the row should be terminal.
     assert row.status in ("success", "failed")

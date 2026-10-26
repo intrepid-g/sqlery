@@ -382,7 +382,7 @@ async def test_async_completion_is_fenced_by_the_claim_attempt(dialect):
     from sqlmodel import SQLModel
 
     from sqlery.core.attempts import attempt_of
-    from sqlery.core.models import QueuedJob
+    from sqlery.core.models import JobAll, QueuedJob
     from sqlery.fastapi_sqlery import database as db_mod
     from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
 
@@ -405,11 +405,11 @@ async def test_async_completion_is_fenced_by_the_claim_attempt(dialect):
         # completion is rejected and the job row keeps the recovery outcome.
         assert await backend.afail_zombie_job(job.id, "worker died")
         async with factory() as s:
-            recovered = (await s.execute(select(QueuedJob.status, QueuedJob.output))).one()
+            recovered = (await s.execute(select(JobAll.status, JobAll.output))).one()  # in history
         with pytest.raises(_fencing_error()):
             await backend.amark_success(job.id, "late", attempt=first)
         async with factory() as s:
-            after = (await s.execute(select(QueuedJob.status, QueuedJob.output))).one()
+            after = (await s.execute(select(JobAll.status, JobAll.output))).one()
         assert recovered[0] == "failed" and after == recovered
     finally:
         if dialect == "pg":

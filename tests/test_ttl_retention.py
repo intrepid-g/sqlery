@@ -13,6 +13,8 @@ from unittest.mock import patch
 from django.utils import timezone
 
 from sqlery.models import QueuedJob
+from sqlery.django_sqlery.history import find as find_job
+from sqlery.django_sqlery.models import JobAll, JobHistory
 from sqlery.core.claiming import expire_ttl_jobs
 from sqlery.core.cleanup import CleanupManager
 from sqlery.django_sqlery.backend import DjangoBackend
@@ -28,6 +30,13 @@ def _create_job(**kwargs):
     }
     defaults.update(kwargs)
     return QueuedJob.objects.create(**defaults)
+
+
+def _backdate(job_id, when):
+    """Age a job to ``when``: a finished job (it is in history) by when it finished, since
+    that is the age retention reads."""
+    QueuedJob.objects.filter(id=job_id).update(created_at=when)
+    JobHistory.objects.filter(id=job_id).update(created_at=when, finished_at=when)
 
 
 def dummy_task():
@@ -115,7 +124,7 @@ class TestExpireTTLJobs:
         expired_count = expire_ttl_jobs(backend)
 
         assert expired_count == 1
-        job = QueuedJob.objects.filter(id=job.id).first()
+        job = find_job(job.id)  # an expired job is final: it is in history
         assert job is not None
         assert job.status == "failed"
         assert "expired" in job.error.lower()
@@ -166,8 +175,7 @@ class TestExpireTTLJobs:
         success_job = _create_job(ttl=60, status="queued")
         success_job.mark_running()
         success_job.mark_success(output="done")
-        QueuedJob.objects.filter(id=success_job.id).update(created_at=past_time)
-        success_job = QueuedJob.objects.get(id=success_job.id)
+        _backdate(success_job.id, past_time)
 
         expired_count = expire_ttl_jobs(backend)
 
@@ -214,7 +222,7 @@ class TestExpireTTLJobs:
         expired_count = expire_ttl_jobs(backend)
 
         assert expired_count == 1
-        expired_job = QueuedJob.objects.filter(id=expired_job_id).first()
+        expired_job = find_job(expired_job_id)  # final: in history
         assert expired_job is not None
         assert expired_job.status == "failed"
         fresh_job.refresh_from_db()
@@ -306,9 +314,7 @@ class TestCleanupOldJobs:
         elif status == "failed":
             job.mark_running()
             job.mark_failed(error="boom")
-        QueuedJob.objects.filter(id=job.id).update(
-            created_at=timezone.now() - timedelta(days=days_old)
-        )
+        _backdate(job.id, timezone.now() - timedelta(days=days_old))
         return job
 
     def test_cleanup_deletes_old_failed_jobs(self):
@@ -320,7 +326,7 @@ class TestCleanupOldJobs:
         result = manager.cleanup_old_jobs(status="failed", max_age_days=30)
 
         assert result["deleted"] == 1
-        assert not QueuedJob.objects.filter(id=old_job.id).exists()
+        assert not JobAll.objects.filter(id=old_job.id).exists()
 
     def test_cleanup_deletes_old_success_jobs(self):
         """Old successful jobs should be deleted."""
@@ -331,7 +337,7 @@ class TestCleanupOldJobs:
         result = manager.cleanup_old_jobs(status="success", max_age_days=30)
 
         assert result["deleted"] == 1
-        assert not QueuedJob.objects.filter(id=old_job.id).exists()
+        assert not JobAll.objects.filter(id=old_job.id).exists()
 
     def test_cleanup_keeps_recent_jobs(self):
         """Jobs younger than max_age_days should not be deleted."""
@@ -342,7 +348,7 @@ class TestCleanupOldJobs:
         result = manager.cleanup_old_jobs(status="failed", max_age_days=30)
 
         assert result["deleted"] == 0
-        assert QueuedJob.objects.filter(id=recent_job.id).exists()
+        assert JobAll.objects.filter(id=recent_job.id).exists()
 
     def test_dry_run_does_not_delete(self):
         """dry_run=True should count but not delete."""
@@ -356,7 +362,7 @@ class TestCleanupOldJobs:
 
         assert result["deleted"] == 0
         assert result["would_delete"] == 1
-        assert QueuedJob.objects.filter(id=old_job.id).exists()
+        assert JobAll.objects.filter(id=old_job.id).exists()
 
     def test_cleanup_filters_by_queue_name(self):
         """cleanup_old_jobs should respect queue_name filter."""
@@ -366,24 +372,20 @@ class TestCleanupOldJobs:
         job_email = _create_job(queue_name="email", status="queued")
         job_email.mark_running()
         job_email.mark_failed(error="boom")
-        QueuedJob.objects.filter(id=job_email.id).update(
-            created_at=timezone.now() - timedelta(days=40)
-        )
+        _backdate(job_email.id, timezone.now() - timedelta(days=40))
 
         job_default = _create_job(queue_name="default", status="queued")
         job_default.mark_running()
         job_default.mark_failed(error="boom")
-        QueuedJob.objects.filter(id=job_default.id).update(
-            created_at=timezone.now() - timedelta(days=40)
-        )
+        _backdate(job_default.id, timezone.now() - timedelta(days=40))
 
         result = manager.cleanup_old_jobs(
             status="failed", max_age_days=30, queue_name="email"
         )
 
         assert result["deleted"] == 1
-        assert not QueuedJob.objects.filter(id=job_email.id).exists()
-        assert QueuedJob.objects.filter(id=job_default.id).exists()
+        assert not JobAll.objects.filter(id=job_email.id).exists()
+        assert JobAll.objects.filter(id=job_default.id).exists()
 
     def test_cleanup_all_statuses_when_status_is_none(self):
         """When status=None, cleanup should delete jobs regardless of status."""
@@ -395,7 +397,7 @@ class TestCleanupOldJobs:
         result = manager.cleanup_old_jobs(status=None, max_age_days=30)
 
         assert result["deleted"] == 2
-        assert not QueuedJob.objects.filter(
+        assert not JobAll.objects.filter(
             id__in=[old_failed.id, old_success.id]
         ).exists()
 
@@ -419,9 +421,7 @@ class TestCleanupByCount:
             job = _create_job(status="queued")
             job.mark_running()
             job.mark_failed(error="fail")
-            QueuedJob.objects.filter(id=job.id).update(
-                created_at=timezone.now() - timedelta(days=5 - i)
-            )
+            _backdate(job.id, timezone.now() - timedelta(days=5 - i))
             jobs.append(job)
 
         result = manager.cleanup_by_count(status="failed", keep_count=2)
@@ -429,7 +429,7 @@ class TestCleanupByCount:
         assert result["deleted"] == 3
         # The 2 most recent should remain
         remaining_ids = set(
-            QueuedJob.objects.filter(status="failed").values_list("id", flat=True)
+            JobAll.objects.filter(status="failed").values_list("id", flat=True)
         )
         assert jobs[3].id in remaining_ids
         assert jobs[4].id in remaining_ids
@@ -457,9 +457,7 @@ class TestCleanupByCount:
             job = _create_job(status="queued")
             job.mark_running()
             job.mark_failed(error="fail")
-            QueuedJob.objects.filter(id=job.id).update(
-                created_at=timezone.now() - timedelta(days=5 - i)
-            )
+            _backdate(job.id, timezone.now() - timedelta(days=5 - i))
 
         result = manager.cleanup_by_count(
             status="failed", keep_count=2, dry_run=True
@@ -467,7 +465,7 @@ class TestCleanupByCount:
 
         assert result["deleted"] == 0
         assert result["would_delete"] == 3
-        assert QueuedJob.objects.filter(status="failed").count() == 5
+        assert JobAll.objects.filter(status="failed").count() == 5
 
     def test_cleanup_by_count_filters_by_queue(self):
         """cleanup_by_count should respect queue_name filter."""
@@ -479,18 +477,14 @@ class TestCleanupByCount:
             job = _create_job(queue_name="email", status="queued")
             job.mark_running()
             job.mark_failed(error="fail")
-            QueuedJob.objects.filter(id=job.id).update(
-                created_at=timezone.now() - timedelta(days=3 - i)
-            )
+            _backdate(job.id, timezone.now() - timedelta(days=3 - i))
 
         # 3 jobs in 'default' queue
         for i in range(3):
             job = _create_job(queue_name="default", status="queued")
             job.mark_running()
             job.mark_failed(error="fail")
-            QueuedJob.objects.filter(id=job.id).update(
-                created_at=timezone.now() - timedelta(days=3 - i)
-            )
+            _backdate(job.id, timezone.now() - timedelta(days=3 - i))
 
         result = manager.cleanup_by_count(
             status="failed", keep_count=1, queue_name="email"
@@ -498,10 +492,10 @@ class TestCleanupByCount:
 
         assert result["deleted"] == 2
         # 'email' should have 1 remaining, 'default' should have 3
-        assert QueuedJob.objects.filter(
+        assert JobAll.objects.filter(
             status="failed", queue_name="email"
         ).count() == 1
-        assert QueuedJob.objects.filter(
+        assert JobAll.objects.filter(
             status="failed", queue_name="default"
         ).count() == 3
 
@@ -523,9 +517,7 @@ class TestAutoCleanup:
             job.mark_success(output="done")
         elif status == "failed":
             job.mark_failed(error="boom")
-        QueuedJob.objects.filter(id=job.id).update(
-            created_at=timezone.now() - timedelta(days=days_old)
-        )
+        _backdate(job.id, timezone.now() - timedelta(days=days_old))
         return job
 
     @patch("sqlery.compat.get_config")
@@ -559,11 +551,11 @@ class TestAutoCleanup:
         assert len(results["actions"]) >= 1
 
         # Old success should be deleted, recent kept
-        assert not QueuedJob.objects.filter(id=old_success.id).exists()
-        assert QueuedJob.objects.filter(id=recent_success.id).exists()
+        assert not JobAll.objects.filter(id=old_success.id).exists()
+        assert JobAll.objects.filter(id=recent_success.id).exists()
         # Old failed should be deleted, recent kept
-        assert not QueuedJob.objects.filter(id=old_failed.id).exists()
-        assert QueuedJob.objects.filter(id=recent_failed.id).exists()
+        assert not JobAll.objects.filter(id=old_failed.id).exists()
+        assert JobAll.objects.filter(id=recent_failed.id).exists()
 
     @patch("sqlery.compat.get_config")
     def test_auto_cleanup_dry_run(self, mock_get_config):
@@ -584,7 +576,7 @@ class TestAutoCleanup:
 
         assert results["dry_run"] is True
         # Job should still exist
-        assert QueuedJob.objects.filter(id=old_job.id).exists()
+        assert JobAll.objects.filter(id=old_job.id).exists()
 
     @patch("sqlery.compat.get_config")
     def test_auto_cleanup_with_count_limits(self, mock_get_config):
@@ -607,7 +599,7 @@ class TestAutoCleanup:
         results = manager.auto_cleanup(dry_run=False)
 
         # Should keep only the 2 most recent failed jobs
-        remaining = QueuedJob.objects.filter(status="failed").count()
+        remaining = JobAll.objects.filter(status="failed").count()
         assert remaining == 2
 
     @patch("sqlery.compat.get_config")
@@ -629,7 +621,7 @@ class TestAutoCleanup:
 
         assert len(results["actions"]) == 0
         # Job should still exist
-        assert QueuedJob.objects.filter(status="failed").count() == 1
+        assert JobAll.objects.filter(status="failed").count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -646,9 +638,7 @@ class TestBackendCleanupMethods:
         job = _create_job(status="queued")
         job.mark_running()
         job.mark_failed(error="err")
-        QueuedJob.objects.filter(id=job.id).update(
-            created_at=timezone.now() - timedelta(days=10)
-        )
+        _backdate(job.id, timezone.now() - timedelta(days=10))
 
         result = backend.cleanup_jobs(status="failed", max_age_days=5)
         assert result["deleted"] == 1
@@ -659,13 +649,11 @@ class TestBackendCleanupMethods:
         job = _create_job(status="queued")
         job.mark_running()
         job.mark_failed(error="err")
-        QueuedJob.objects.filter(id=job.id).update(
-            created_at=timezone.now() - timedelta(days=10)
-        )
+        _backdate(job.id, timezone.now() - timedelta(days=10))
 
         result = backend.cleanup_jobs(status="failed", max_age_days=5, dry_run=True)
         assert result["count"] == 1
-        assert QueuedJob.objects.filter(id=job.id).exists()
+        assert JobAll.objects.filter(id=job.id).exists()
 
     def test_cleanup_jobs_by_count_keeps_most_recent(self):
         """Backend cleanup_jobs_by_count should keep the N most recent."""
@@ -675,9 +663,7 @@ class TestBackendCleanupMethods:
             job = _create_job(status="queued")
             job.mark_running()
             job.mark_success(output="ok")
-            QueuedJob.objects.filter(id=job.id).update(
-                created_at=timezone.now() - timedelta(days=4 - i)
-            )
+            _backdate(job.id, timezone.now() - timedelta(days=4 - i))
             jobs.append(job)
 
         result = backend.cleanup_jobs_by_count(status="success", keep_count=2)
@@ -685,7 +671,7 @@ class TestBackendCleanupMethods:
         assert result["kept"] == 2
 
         remaining_ids = set(
-            QueuedJob.objects.filter(status="success").values_list("id", flat=True)
+            JobAll.objects.filter(status="success").values_list("id", flat=True)
         )
         # The two most recent should survive
         assert jobs[2].id in remaining_ids
@@ -703,7 +689,7 @@ class TestBackendCleanupMethods:
             status="success", keep_count=1, dry_run=True
         )
         assert result["count"] == 2
-        assert QueuedJob.objects.filter(status="success").count() == 3
+        assert JobAll.objects.filter(status="success").count() == 3
 
 
 # ---------------------------------------------------------------------------

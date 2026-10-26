@@ -10,7 +10,7 @@ from django.utils import timezone
 def test_queued_job_past_its_ttl_is_expired_not_run():
     from sqlery.compat import get_backend
     from sqlery.core.worker import TaskExecutor
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.models import JobAll, QueuedJob
 
     job = get_backend().create_job(
         task_path="builtins.print",
@@ -29,5 +29,5 @@ def test_queued_job_past_its_ttl_is_expired_not_run():
 
     TaskExecutor().run_queue_workers(once=True)
 
-    job = QueuedJob.objects.get(id=job.id)
+    job = JobAll.objects.get(id=job.id)  # an expired job is final: in history
     assert (job.status, job.termination_reason) == ("failed", "expired")

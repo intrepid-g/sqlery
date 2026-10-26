@@ -33,12 +33,14 @@ def _make(backend, **ttl):
 def _age(backend, job_id, seconds):
     from sqlalchemy import update
 
-    from sqlery.core.models import QueuedJob
+    from sqlery.core.models import JobHistory
 
+    # A finished job is in history (insert-only); retention reads when it finished, so the
+    # test moves that timestamp by hand.
     with backend._get_session() as session:
         session.exec(
-            update(QueuedJob)
-            .where(QueuedJob.id == job_id)
+            update(JobHistory)
+            .where(JobHistory.id == job_id)
             .values(finished_at=datetime.now(UTC) - timedelta(seconds=seconds))
         )
         session.commit()

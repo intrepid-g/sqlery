@@ -19,7 +19,12 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg import sql as pgsql
 
-__all__ = ["ensure_future_partitions", "reclaim_drained_partitions", "check_default_partition"]
+__all__ = [
+    "ensure_future_partitions",
+    "reclaim_drained_partitions",
+    "check_default_partition",
+    "is_partitioned",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,17 @@ def _is_sub_daily_interval(interval_str: str) -> bool:
     when multiple partitions fall on the same date.
     """
     return bool(_SUB_DAILY_RE.search(interval_str))
+
+
+def is_partitioned(cur, table: str) -> bool:
+    """True iff *table* exists and is a partitioned table (``relkind = 'p'``)."""
+    cur.execute(
+        "SELECT relkind = 'p' FROM pg_class "
+        "WHERE relname = %s AND relnamespace = current_schema()::regnamespace",
+        [table],
+    )
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 def _list_partitions(cur, table: str) -> list[tuple[str, datetime | None]]:
@@ -250,16 +266,28 @@ def ensure_future_partitions(cur, table: str, interval_str: str, premake: int) -
     return created
 
 
+# Default "live work" test of rule 3 below (the job table).
+LIVE_WORK_PREDICATE = "status IN ('queued', 'running')"
+
+
 def reclaim_drained_partitions(
-    cur, table: str, retention_str: str, archive_hook=None
+    cur,
+    table: str,
+    retention_str: str,
+    archive_hook=None,
+    live_predicate: str | None = LIVE_WORK_PREDICATE,
 ) -> int:
     """Detach and drop partitions that are outside retention and have no live work.
 
     Skip rules (applied in order):
         1. upper_bound is None → DEFAULT partition — never drop.
         2. upper_bound > now(UTC) − retention → inside retention window — skip.
-        3. Partition has queued or running rows → back-pressure invariant — skip.
+        3. Partition has rows matching ``live_predicate`` (queued or running jobs by default;
+           an open attempt for the attempt table; ``None`` for the insert-only job history,
+           which has no live work) → back-pressure invariant — skip.
         4. Advisory lock not acquired → skip the entire tick (returned 0 at top).
+
+    ``live_predicate`` is trusted SQL (module constants only, never user input).
 
     Reclaim order per constraints.md:
         DETACH PARTITION → archive_hook (if provided) → DROP TABLE
@@ -299,17 +327,15 @@ def reclaim_drained_partitions(
                 continue
 
             # Skip rule 3: back-pressure invariant — live work pins partition
-            cur.execute(
-                pgsql.SQL(
-                    "SELECT EXISTS("
-                    "SELECT 1 FROM {name}"
-                    " WHERE status IN ('queued', 'running')"
-                    ")"
-                ).format(name=pgsql.Identifier(name)),
-            )
-            (has_live_work,) = cur.fetchone()
-            if has_live_work:
-                continue
+            if live_predicate:
+                cur.execute(
+                    pgsql.SQL("SELECT EXISTS(SELECT 1 FROM {name} WHERE {pred})").format(
+                        name=pgsql.Identifier(name), pred=pgsql.SQL(live_predicate)
+                    ),
+                )
+                (has_live_work,) = cur.fetchone()
+                if has_live_work:
+                    continue
 
             # --- Reclaim: DETACH → archive hook → DROP ---
             cur.execute(

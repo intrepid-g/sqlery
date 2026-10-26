@@ -312,8 +312,9 @@ def get_job_registry_summary(queue_name: str) -> dict[str, list[int]]:
     }
 
     if is_django_mode():
-        from sqlery.django_sqlery.models import QueuedJob
-        qs = QueuedJob.objects.filter(queue_name=queue_name).values("id", "status", "scheduled_at")
+        from sqlery.django_sqlery.models import JobAll
+        # live and finished jobs together (the union view)
+        qs = JobAll.objects.filter(queue_name=queue_name).values("id", "status", "scheduled_at")
         for row in qs:
             status = row["status"]
             pk = row["id"]
@@ -358,9 +359,11 @@ def clear_failed_jobs(queue_name: str) -> int:
         Number of jobs deleted.
     """
     if is_django_mode():
-        from sqlery.django_sqlery.models import QueuedJob
-        count, _ = QueuedJob.objects.filter(queue_name=queue_name, status="failed").delete()
-        return count
+        # Failed jobs are finished jobs: they are in history, which retention (and this
+        # call) alone removes.
+        from sqlery.django_sqlery.cleanup import _delete_history
+        from sqlery.django_sqlery.models import JobHistory
+        return _delete_history(JobHistory.objects.filter(queue_name=queue_name, status="failed"))
     else:
         result = get_backend().cleanup_jobs(status="failed", queue_name=queue_name)
         return result.get("deleted", 0)
@@ -382,13 +385,14 @@ def delete_other_jobs_by_same_meta_tag(current_job_id: int, meta_tag: str) -> in
         from sqlery.django_sqlery.models import QueuedJob
         candidates = QueuedJob.objects.filter(
             status="queued",
-        ).exclude(pk=current_job_id)
+        ).exclude(id=current_job_id)
 
         for job_obj in candidates:
             if (job_obj.meta or {}).get("tag") == meta_tag:
-                job_obj.status = "cancelled"
-                job_obj.save(update_fields=["status"])
-                cancelled += 1
+                # A cancelled job is final: it moves to history (as failed, "Cancelled by
+                # user"), like a cancel in standalone mode.
+                if get_backend().cancel_job(job_obj.id):
+                    cancelled += 1
     else:
         backend = get_backend()
         # Fetch all queued jobs (global, since meta-tag match is cross-queue)
@@ -564,10 +568,14 @@ class Job:
     def fetch(cls, job_id, connection=None):
         """Fetch a job by ID. Raises NoSuchJobError if not found."""
         if is_django_mode():
-            from sqlery.django_sqlery.models import QueuedJob
+            from sqlery.django_sqlery.models import JobHistory, QueuedJob
             try:
-                qj = QueuedJob.objects.get(pk=job_id)
-            except (QueuedJob.DoesNotExist, ValueError):
+                pk = int(job_id)
+            except (ValueError, TypeError):
+                raise NoSuchJobError(f"No such job: {job_id}")
+            # live, else finished (history)
+            qj = QueuedJob.objects.filter(id=pk).first() or JobHistory.objects.filter(id=pk).first()
+            if qj is None:
                 raise NoSuchJobError(f"No such job: {job_id}")
             return cls(qj)
         else:

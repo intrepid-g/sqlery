@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from sqlery.core.db_resilience import retry_on_db_error
 
+from sqlery.core import history as history_core
 from sqlery.core.attempts import (
     OUTCOME_ABANDONED,
     OUTCOME_SUCCESS,
@@ -31,12 +32,14 @@ from .db_compat import (
     is_sqlite,
 )
 # Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
-from . import ready
+from . import history, ready
 from .models import (
     ConcurrentModificationError,
     DaemonLease,
+    JobAll,
     JobAttempt,
     JobBlocked,
+    JobHistory,
     JobReady,
     QueuedJob,
     ScheduledTask,
@@ -420,19 +423,31 @@ class DjangoBackend(DatabaseBackend):
         )
 
     def settle_retry_pending(self, job_id: int) -> None:
-        from sqlery.core.retry import settled_reason
-
-        reason = (
-            self.QueuedJob.objects.filter(id=job_id).values_list("termination_reason", flat=True).first()
+        """No retry is owed any more: the failed job becomes final (moves to history as
+        ``failed`` with the marker cleared). A job already in history is left alone."""
+        row = (
+            self.QueuedJob.objects.filter(id=job_id, status="failed")
+            .values("created_at", "termination_reason")
+            .first()
         )
-        if reason is not None:
-            self.QueuedJob.objects.filter(id=job_id).update(termination_reason=settled_reason(reason))
+        if row is not None:
+            with transaction.atomic():
+                history.move(
+                    job_id,
+                    row["created_at"],
+                    "failed",
+                    {
+                        "termination_reason": history_core.settled_termination_reason(
+                            row["termination_reason"]
+                        )
+                    },
+                    require_status="failed",
+                )
 
     def get_latest_retry(self, job_id: int):
-        """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
-        return (
-            self.QueuedJob.objects.filter(parent_job_id=job_id).order_by("-created_at", "-id").first()
-        )
+        """Newest retry attempt (child via parent_job_id) of ``job_id`` (live or finished),
+        or None."""
+        return history.latest_retry(job_id)
 
     @retry_on_db_error()
     def claim_job_by_id(self, job_id: int, worker_id: str):
@@ -588,13 +603,13 @@ class DjangoBackend(DatabaseBackend):
         return False
 
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
-        """Get queue statistics (counts by status)."""
-        query = self.QueuedJob.objects.all()
+        """Get queue statistics (counts by status), live and finished jobs together."""
+        query = JobAll.objects.all()
 
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
-        stats = query.values("status").annotate(count=Count("id"))
+        stats = query.order_by().values("status").annotate(count=Count("id"))
 
         result = {
             "queued": 0,
@@ -630,9 +645,16 @@ class DjangoBackend(DatabaseBackend):
                 # Entries first, then the job row: the lock order of a claim. A claimer that
                 # holds the entry finishes first; the cancel then finds the job running.
                 ready.remove([job_id])
-                updated = self.QueuedJob.objects.filter(
-                    id=job_id, created_at=row["created_at"], status="queued"
-                ).update(status="failed", error="Cancelled by user")
+                # The cancelled job is final: it moves to history as failed.
+                updated = int(
+                    history.move(
+                        job_id,
+                        row["created_at"],
+                        "failed",
+                        {"error": "Cancelled by user"},
+                        require_status="queued",
+                    )
+                )
                 if updated == 0:
                     transaction.set_rollback(True)  # not cancelled: keep the entries
         else:
@@ -645,24 +667,54 @@ class DjangoBackend(DatabaseBackend):
         return deleted > 0
 
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
-        """Retry failed jobs by resetting them to queued status."""
-        query = self.QueuedJob.objects.filter(status="failed")
-
+        """Retry failed jobs: each failed job that has not been retried gets a fresh queued
+        copy (``retry_count`` 0, ``parent_job_id`` = the failed job). The failed job itself
+        is in history and stays as it was (history is insert-only); having a retry child, it
+        is not retried a second time."""
+        retried = JobAll.objects.filter(parent_job_id=db_models.OuterRef("id"))
+        query = (
+            JobHistory.objects.filter(status="failed")
+            .filter(~db_models.Exists(retried))
+            .order_by("finished_at", "id")
+        )
         if queue_name:
             query = query.filter(queue_name=queue_name)
-
         if max_jobs:
-            job_ids = list(query.values_list("id", flat=True)[:max_jobs])
-            query = self.QueuedJob.objects.filter(id__in=job_ids)
-
-        count = query.update(
-            status="queued",
-            error="",
-            traceback="",
-            retry_count=0,
-        )
-
-        return count
+            query = query[:max_jobs]
+        failed = list(query)
+        with transaction.atomic():
+            for old in failed:
+                task_id = old.scheduled_task_id
+                if task_id is not None and not self.ScheduledTask.objects.filter(pk=task_id).exists():
+                    task_id = None  # the task is gone
+                self.QueuedJob.objects.create(
+                    task_path=old.task_path,
+                    kwargs=old.kwargs,
+                    queue_name=old.queue_name,
+                    priority=old.priority,
+                    max_retries=old.max_retries,
+                    retry_backoff=old.retry_backoff,
+                    allow_parallel=old.allow_parallel,
+                    timeout_seconds=old.timeout_seconds,
+                    retry_count=0,
+                    scheduled_task_id=task_id,
+                    job_name=old.job_name,
+                    retry_intervals=old.retry_intervals,
+                    meta=old.meta,
+                    dependencies=old.dependencies,
+                    tags=old.tags,
+                    webhook_url=old.webhook_url,
+                    webhook_events=old.webhook_events,
+                    webhook_max_retries=old.webhook_max_retries,
+                    on_success_path=old.on_success_path,
+                    on_failure_path=old.on_failure_path,
+                    ttl=old.ttl,
+                    result_ttl=old.result_ttl,
+                    failure_ttl=old.failure_ttl,
+                    parent_job_id=old.id,
+                    status="queued",
+                )
+        return len(failed)
 
     def get_due_scheduled_tasks(self):
         """Get scheduled tasks that are due to run."""
@@ -813,63 +865,60 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up old jobs based on retention policy.
+        """Clean up finished jobs (history) based on retention policy.
 
-        On a partitioned PostgreSQL install (self._partitioned_pg() is True),
-        routes to reclaim_drained_partitions which drops entire drained partitions
-        instead of batched DELETEs (D5 — see loud comment below). Advisory lock
-        (pg_try_advisory_lock) is acquired inside reclaim_drained_partitions; if
-        not acquired the call returns 0 without error (T-16-09).
+        Only history is ever pruned; queued and running jobs are never touched. The age of a
+        finished job is the time since it finished.
 
-        On SQLite or non-partitioned PG, keeps the Phase-12 keyset-batched DELETE
-        loop byte-for-byte unchanged (D6).
+        On a partitioned PostgreSQL install (history ``PARTITION BY RANGE (finished_at)``)
+        whole partitions past ``SQLERY_PARTITION_RETENTION`` are dropped through
+        ``sqlery.core.partitioning`` (the attempt table is partitioned too and drops with
+        them; see ``sqlery.core.history``). Advisory lock (pg_try_advisory_lock) is acquired
+        inside reclaim_drained_partitions; if not acquired the call returns 0 without error.
+        Elsewhere history is deleted in keyset batches of ``CLEANUP_BATCH_SIZE`` rows, and the
+        finished attempts of the deleted jobs go with each batch.
         """
-        # --- D5: Partition reclaim path (PostgreSQL + partitioned table) ---
+        # --- Partition reclaim path (PostgreSQL + partitioned table) ---
         if self._partitioned_pg() and _partitioning is not None:
             if dry_run:
                 # dry_run is not meaningful for partition-drop path; return estimate
-                query = self.QueuedJob.objects.all()
+                query = JobHistory.objects.all()
                 if status:
                     query = query.filter(status=status)
                 if queue_name:
                     query = query.filter(queue_name=queue_name)
-                if max_age_days:
-                    cutoff = timezone.now() - timedelta(days=max_age_days)
-                    query = query.filter(created_at__lt=cutoff)
-                count = query.count()
-                return {"deleted": 0, "count": count}
+                return {"deleted": 0, "count": query.count()}
 
             retention_str = get_setting("SQLERY_PARTITION_RETENTION", "30 days")
             archive_hook = get_setting("SQLERY_PARTITION_ARCHIVE_HOOK", None)
-            # Old: cur = self.get_raw_cursor()
-            # CR-02: cursor was never closed, leaking a CursorWrapper on every cleanup_jobs call.
-            # Use try/finally to ensure close() is called even if reclaim raises.
             cur = self.get_raw_cursor()
             try:
-                # D5: Partition reclaim destroys all jobs in drained partitions (beyond
-                # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
-                # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
-                # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
-                # to archive instead. The archive hook receives (cur, partition_name)
-                # and must not execute arbitrary SQL via string interpolation (T-16-07).
-                dropped = _partitioning.reclaim_drained_partitions(
-                    cur, self.QueuedJob._meta.db_table, retention_str, archive_hook
+                # Partition reclaim destroys all finished jobs in drained partitions (beyond
+                # SQLERY_PARTITION_RETENTION) by default. Set SQLERY_PARTITION_ARCHIVE_HOOK
+                # to archive instead. The archive hook receives (cur, partition_name) and
+                # must not execute arbitrary SQL via string interpolation.
+                dropped_by_table = history_core.reclaim_partitions(
+                    cur, retention_str, archive_hook, _partitioning
                 )
+                attempts_partitioned = _partitioning.is_partitioned(cur, JobAttempt._meta.db_table)
             finally:
                 if cur is not None:
                     cur.close()
+            if not attempts_partitioned:
+                self._prune_attempts_without_history()
             return {
                 "deleted": 0,
                 "reclaimed_via_partition_drop": True,
-                "dropped_partitions": dropped,
+                "dropped_partitions": sum(dropped_by_table.values()),
+                "dropped_by_table": dropped_by_table,
                 "note": (
-                    "Partition reclaim: jobs beyond retention destroyed by default (D5). "
+                    "Partition reclaim: jobs beyond retention destroyed by default. "
                     "Set SQLERY_PARTITION_ARCHIVE_HOOK to archive instead."
                 ),
             }
 
-        # --- SQLite or non-partitioned PG: Phase-12 batched DELETE loop (D6 — unchanged) ---
-        query = self.QueuedJob.objects.all()
+        # --- SQLite or non-partitioned PG: batched DELETE of history ---
+        query = JobHistory.objects.all()
 
         if status:
             query = query.filter(status=status)
@@ -879,43 +928,58 @@ class DjangoBackend(DatabaseBackend):
 
         if max_age_days:
             cutoff = timezone.now() - timedelta(days=max_age_days)
-            query = query.filter(created_at__lt=cutoff)
+            query = query.filter(finished_at__lt=cutoff)
 
         if dry_run:
             count = query.count()
             return {"deleted": 0, "count": count}
 
-        # Old: unbounded delete that holds table lock for the full result set
-        # count = query.count()
-        # if not dry_run:
-        #     query.delete()
-        # return {"deleted": count, "count": count}
-
-        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE.
-        # The DELETE re-applies the SAME retention filter (`query`) restricted to
-        # the selected ids, so the deleted set is always a subset of the selected
-        # set — guaranteeing forward progress (no infinite re-selection) while
-        # still skipping any row that was claimed/changed mid-loop so it no longer
-        # matches the filter. (A divergent status__in=FINISHED_STATUSES DELETE
-        # filter would re-select non-finished rows forever and hang #12-02.)
+        # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE. The DELETE
+        # re-applies the SAME retention filter (`query`) restricted to the selected ids, so
+        # the deleted set is always a subset of the selected set — guaranteeing forward progress
+        # (no infinite re-selection).
         total_deleted = 0
         while True:
-            ids = list(query.order_by("id").values_list("id", flat=True)[:CLEANUP_BATCH_SIZE])
+            ids = list(
+                query.order_by("finished_at", "id").values_list("id", flat=True)[:CLEANUP_BATCH_SIZE]
+            )
             if not ids:
                 break
-            # Old: status__in re-check diverged from the SELECT filter and looped forever
-            # deleted_count, _ = self.QueuedJob.objects.filter(
-            #     id__in=ids, status__in=FINISHED_STATUSES
-            # ).delete()
-            deleted_count, _ = query.filter(id__in=ids).delete()
+            deleted_count = self._delete_history_batch(query.filter(id__in=ids), ids)
             if not deleted_count:
-                # No selected row was deletable (all changed mid-loop) — stop to
-                # avoid re-selecting the same un-deletable ids indefinitely.
+                # No selected row was deletable (all gone mid-loop) — stop to avoid
+                # re-selecting the same ids indefinitely.
                 break
             total_deleted += deleted_count
             time.sleep(0.1)
 
         return {"deleted": total_deleted, "count": total_deleted}
+
+    @staticmethod
+    def _delete_history_batch(queryset, ids: list) -> int:
+        """Delete the history rows of ``queryset`` (``ids``) and their finished attempts;
+        returns the rows deleted. Retention is the only thing that removes history, and an
+        attempt outlives neither its job nor the history row of it."""
+        with transaction.atomic():
+            # _raw_delete: history rows have no relations to cascade over.
+            deleted = queryset._raw_delete(using=queryset.db)
+            JobAttempt.objects.filter(job_id__in=ids, finished_at__isnull=False)._raw_delete(
+                using=JobAttempt.objects.db
+            )
+        return deleted
+
+    def _prune_attempts_without_history(self, limit: int = 5000) -> int:
+        """Delete finished attempts whose job is in neither the live table nor history (one
+        bounded batch per call). Used where attempts cannot be dropped with a partition."""
+        has_job = JobAll.objects.filter(id=db_models.OuterRef("job_id"))
+        ids = list(
+            JobAttempt.objects.filter(finished_at__isnull=False)
+            .filter(~db_models.Exists(has_job))
+            .values_list("id", flat=True)[:limit]
+        )
+        if not ids:
+            return 0
+        return JobAttempt.objects.filter(id__in=ids)._raw_delete(using=JobAttempt.objects.db)
 
     def cleanup_jobs_by_count(
         self,
@@ -924,8 +988,8 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up jobs by keeping only the most recent N jobs."""
-        query = self.QueuedJob.objects.all()
+        """Keep only the most recent N finished jobs (by finish time); delete older history."""
+        query = JobHistory.objects.all()
 
         if status:
             query = query.filter(status=status)
@@ -933,26 +997,36 @@ class DjangoBackend(DatabaseBackend):
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
-        # Get IDs of jobs to keep (most recent N)
-        keep_ids = list(query.order_by("-created_at").values_list("id", flat=True)[:keep_count])
+        total = query.count()
+        kept = min(total, keep_count)
+        if dry_run:
+            return {"deleted": 0, "count": max(0, total - keep_count), "kept": kept}
 
-        # Delete jobs not in keep list
-        delete_query = query.exclude(id__in=keep_ids)
-        count = delete_query.count()
-        if not dry_run:
-            delete_query.delete()
-
-        return {"deleted": count, "count": count, "kept": len(keep_ids)}
+        # Rows past the newest ``keep_count``: each pass takes the next batch of them (what
+        # was deleted is gone from the offset window, so the offset stays put).
+        ordered = query.order_by("-finished_at", "-id")
+        deleted = 0
+        while True:
+            ids = list(
+                ordered.values_list("id", flat=True)[keep_count : keep_count + CLEANUP_BATCH_SIZE]
+            )
+            if not ids:
+                break
+            batch = self._delete_history_batch(JobHistory.objects.filter(id__in=ids), ids)
+            if not batch:
+                break
+            deleted += batch
+        return {"deleted": deleted, "count": deleted, "kept": kept}
 
     def get_database_stats(self) -> dict:
         """Get database statistics."""
-        job_counts = self.QueuedJob.objects.values("status").annotate(count=Count("id"))
+        job_counts = JobAll.objects.order_by().values("status").annotate(count=Count("id"))
         registry_counts = self.JobRegistry.objects.values("registry_type").annotate(
             count=Count("id")
         )
 
         stats = {
-            "total_jobs": self.QueuedJob.objects.count(),
+            "total_jobs": JobAll.objects.count(),
             "job_counts": {item["status"]: item["count"] for item in job_counts},
             "total_registries": self.JobRegistry.objects.count(),
             "registry_counts": {item["registry_type"]: item["count"] for item in registry_counts},
@@ -986,7 +1060,9 @@ class DjangoBackend(DatabaseBackend):
                     # Partition DROP leaves nothing to vacuum on parent table; skip when partitioned.
                     if not self._partitioned_pg():
                         cursor.execute("VACUUM ANALYZE sqlery_queued_job")
+                        cursor.execute("VACUUM ANALYZE sqlery_job_history")
                     # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
+                    #       (the history and the attempt table are partitioned the same way)
                     cursor.execute("VACUUM ANALYZE sqlery_scheduled_task")
                     cursor.execute("VACUUM ANALYZE sqlery_registry")
                     cursor.execute("VACUUM ANALYZE sqlery_worker")
@@ -1034,7 +1110,7 @@ class DjangoBackend(DatabaseBackend):
             # queue_name traversal via FK not possible after demotion — fetch job_ids then filter
             job_ids = list(query.values_list("job_id", flat=True))
             job_ids = list(
-                self.QueuedJob.objects.filter(id__in=job_ids, queue_name=queue_name).values_list("id", flat=True)
+                JobAll.objects.filter(id__in=job_ids, queue_name=queue_name).values_list("id", flat=True)
             )
             query = query.filter(job_id__in=job_ids)
 
@@ -1043,7 +1119,8 @@ class DjangoBackend(DatabaseBackend):
 
         # Old: return [entry.job for entry in query]
         job_ids = list(query.values_list("job_id", flat=True))
-        return list(self.QueuedJob.objects.filter(id__in=job_ids))
+        # live or finished: the registries mostly list finished jobs
+        return list(JobAll.objects.filter(id__in=job_ids))
 
     def cleanup_registry(
         self,
@@ -1080,10 +1157,27 @@ class DjangoBackend(DatabaseBackend):
             return self.QueuedJob.objects.get(id=job_id)
         except self.QueuedJob.DoesNotExist:
             pass
+        # A finished job is in history (read-only).
+        finished = JobHistory.objects.filter(id=job_id).first()
+        if finished is not None:
+            return finished
         try:
             return self.ScheduledJob.objects.get(id=job_id)
         except self.ScheduledJob.DoesNotExist:
             return None
+
+    @staticmethod
+    def _already_finished(job, expected_version, attempt):
+        """A completion for a job that is already in history.
+
+        A fenced completion (it holds a version or an attempt handle) is stale: another
+        completion, or recovery, got there first. An unfenced caller just gets the job back.
+        """
+        if expected_version is not None or attempt is not None:
+            raise JobFencingError(
+                f"Job {job.id} already finished ({job.status}); completion rejected"
+            )
+        return job
 
     def mark_job_success(
         self,
@@ -1092,7 +1186,7 @@ class DjangoBackend(DatabaseBackend):
         expected_version: int | None = None,
         attempt=None,
     ):
-        """Mark job as successful.
+        """Mark job as successful (the job moves to history, see ``QueuedJob.mark_success``).
 
         Staged ScheduledJob rows (not yet promoted) do not have mark_success;
         the guard prevents AttributeError if an operator calls this for a staged id.
@@ -1105,6 +1199,8 @@ class DjangoBackend(DatabaseBackend):
         it never actually held.
         """
         job = self.get_job_by_id(job_id)
+        if isinstance(job, JobHistory):
+            return self._already_finished(job, expected_version, attempt)
         # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_success"):
             if expected_version is not None:
@@ -1132,6 +1228,8 @@ class DjangoBackend(DatabaseBackend):
         See mark_job_success for expected_version fencing semantics.
         """
         job = self.get_job_by_id(job_id)
+        if isinstance(job, JobHistory):
+            return self._already_finished(job, expected_version, attempt)
         # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_failed"):
             if expected_version is not None:
@@ -1148,48 +1246,61 @@ class DjangoBackend(DatabaseBackend):
         return job
 
     def mark_job_archived(self, job_id: int):
-        """Mark a failed job as archived (a retry has been created for it)."""
-        # Item 8: Add created_at to filter so PG prunes to one partition (write-path pruning).
-        # Old (id-only filter — does not prune to partition on PG):
-        # self.QueuedJob.objects.filter(id=job_id, status="failed").update(status="archived")
-        row = self.QueuedJob.objects.filter(id=job_id, status="failed").values("created_at").first()
+        """Mark a failed job as archived (a retry has been created for it): the job moves to
+        history as ``archived`` and its retry marker is cleared. A job that is already in
+        history is final and stays as it is."""
+        # Item 8: created_at in the filter lets PG prune to one partition (write-path pruning).
+        row = (
+            self.QueuedJob.objects.filter(id=job_id, status="failed")
+            .values("created_at", "termination_reason")
+            .first()
+        )
         if row:
-            self.QueuedJob.objects.filter(
-                id=job_id, created_at=row["created_at"], status="failed"
-            ).update(status="archived")
+            with transaction.atomic():
+                history.move(
+                    job_id,
+                    row["created_at"],
+                    "archived",
+                    {
+                        "termination_reason": history_core.settled_termination_reason(
+                            row["termination_reason"]
+                        )
+                    },
+                    require_status="failed",
+                )
 
     def cascade_ancestor_status(self, job_id: int, status: str):
-        """Walk parent_job_id chain, set all ancestors to given status."""
+        """Walk the parent_job_id chain, set the live ancestors to the given status.
+
+        Ancestors that are already in history are final (history is insert-only) and are only
+        walked through. A live ancestor that is not already ``success`` / ``archived`` becomes
+        ``status`` (a terminal status moves it into history).
+        """
         current_id = (
-            self.QueuedJob.objects.filter(id=job_id).values_list("parent_job_id", flat=True).first()
+            JobAll.objects.filter(id=job_id).values_list("parent_job_id", flat=True).first()
         )
-        # Item 9: Add created_at to the UPDATE filter so PG prunes to one partition.
-        # Fetch created_at + parent_job_id together in one query per iteration.
-        while current_id:
-            # Old (id-only filter — does not prune to partition on PG):
-            # self.QueuedJob.objects.filter(id=current_id).update(status=status)
-            # current_id = (
-            #     self.QueuedJob.objects.filter(id=current_id)
-            #     .values_list("parent_job_id", flat=True)
-            #     .first()
-            # )
+        seen: set = set()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
             job_row = (
-                self.QueuedJob.objects.filter(id=current_id)
-                .values("created_at", "parent_job_id")
-                .first()
+                JobAll.objects.filter(id=current_id).values("created_at", "parent_job_id").first()
             )
             if not job_row:
                 break
-            # Old: self.QueuedJob.objects.filter(
-            # Old:     id=current_id, created_at=job_row["created_at"]
-            # Old: ).update(status=status)
-            # WR-03: exclude terminal-status ancestors so a completed or archived
-            # parent is never overwritten by a child's cascaded status change.
-            self.QueuedJob.objects.filter(
+            live = self.QueuedJob.objects.filter(
                 id=current_id, created_at=job_row["created_at"]
-            ).exclude(
-                status__in=("success", "archived")
-            ).update(status=status)
+            ).exclude(status__in=("success", "archived"))
+            if history_core.is_terminal(status):
+                with transaction.atomic():
+                    history.move(
+                        current_id,
+                        job_row["created_at"],
+                        status,
+                        {},
+                        require_status=("queued", "running", "failed", "shutting_down"),
+                    )
+            else:
+                live.update(status=status)
             current_id = job_row["parent_job_id"]
 
     def has_pending_job_for_scheduled_task(self, task_id: int) -> bool:
@@ -1392,7 +1503,8 @@ class DjangoBackend(DatabaseBackend):
     def count_started_with_tag_since(self, tag: str, threshold) -> int:
         """Count jobs with the given tag that started since threshold."""
         return self._count_with_tag(
-            self.QueuedJob.objects.filter(
+            # finished jobs live in history: read the union view
+            JobAll.objects.filter(
                 status__in=["running", "success", "failed"],
                 started_at__gte=threshold,
                 started_at__isnull=False,
@@ -1555,7 +1667,13 @@ class DjangoBackend(DatabaseBackend):
     def maintain_ready_queue(
         self, queue_names: list[str] | None = None, limit: int = 200, after_job_id: int = 0
     ) -> dict:
-        return ready.maintain(queue_names, limit, after_job_id)
+        settled = history.settle_finished(limit)
+        result = ready.maintain(queue_names, limit, after_job_id)
+        result["settled"] = settled
+        return result
+
+    def history_table_exists(self) -> bool:
+        return JobHistory._meta.db_table in set(connection.introspection.table_names())
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
@@ -1595,11 +1713,11 @@ class DjangoBackend(DatabaseBackend):
     ) -> list:
         """Get jobs with optional filtering and pagination.
 
-        Returns only rows from sqlery_queued_job (the executable queue).
+        Returns live (sqlery_queued_job) and finished (sqlery_job_history) jobs together.
         Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
         """
         # Staged jobs (sqlery_scheduled_job) are in a separate table; use get_staged_jobs() for them.
-        query = self.QueuedJob.objects.all()
+        query = JobAll.objects.all()
 
         if status:
             query = query.filter(status=status)
@@ -1608,7 +1726,7 @@ class DjangoBackend(DatabaseBackend):
             query = query.filter(queue_name=queue_name)
 
         # Order by priority (desc) and created_at (asc)
-        query = query.order_by("-priority", "created_at")
+        query = query.order_by("-priority", "created_at", "id")
 
         # Apply pagination
         return list(query[offset : offset + limit])
@@ -1641,7 +1759,7 @@ class DjangoBackend(DatabaseBackend):
         queue_name: str | None = None,
     ) -> int:
         """Count jobs with optional filtering."""
-        query = self.QueuedJob.objects.all()
+        query = JobAll.objects.all()
 
         if status:
             query = query.filter(status=status)

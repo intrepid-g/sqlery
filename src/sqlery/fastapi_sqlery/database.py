@@ -11,6 +11,7 @@ from sqlalchemy import event, text
 from sqlalchemy.pool import QueuePool, StaticPool
 from sqlmodel import Session, create_engine, SQLModel
 
+from ..core import history as _history
 from ..core import models as _models  # noqa: F401  # ensures SQLModel.metadata is populated
 from ..core import ready as _ready
 # IN-01: unused — the table name "sqlery_queued_job" is interpolated inline in the
@@ -126,6 +127,9 @@ def _init_partitioned_pg(engine) -> None:
       6. Create the ready-queue tables (``sqlery_job_ready`` partitioned by LIST (slot),
          ``sqlery_job_blocked``). The partial pending index ``sqlery_job_pending_idx`` is
          no longer created: claiming reads the ready table (#139).
+      7. Create the job history ``sqlery_job_history`` (``PARTITION BY RANGE (finished_at)``,
+         #140) and, when it is missing, the attempt table partitioned by ``claimed_at`` so
+         retention reclaims both with DROP.
     """
     # Step 1 — create the jobs table first (partitioned) so that other tables
     # referencing sqlery_queued_job.id via FK can resolve the FK target.
@@ -247,6 +251,35 @@ def _init_partitioned_pg(engine) -> None:
         for statement in _ready.postgres_ready_ddl():
             conn.execute(text(statement))
 
+        # Step 5 — job history (#140): same columns as sqlery_queued_job, partitioned by
+        # finished_at. Terminal rows that already sit in the live table need partitions for
+        # their finish dates before they are moved (the DEFAULT partition is no home).
+        for statement in _history.postgres_history_ddl(partitioned=True):
+            conn.execute(text(statement))
+        first_day = today
+        oldest = conn.execute(
+            text(
+                "SELECT min(COALESCE(finished_at, started_at, created_at)) "
+                "FROM sqlery_queued_job WHERE status IN ('success', 'failed', 'archived')"
+            )
+        ).scalar()
+        if oldest is not None:
+            first_day = min(first_day, oldest.date())
+        for statement in _history.daily_partition_ddl(
+            _history.HISTORY_TABLE, first_day, today + timedelta(days=PREMAKE + 1)
+        ):
+            conn.execute(text(statement))
+
+        # Step 6 — attempt table (#138/#140): partitioned by claimed_at when created here.
+        # An existing plain table is converted by the Alembic revision, not at start-up.
+        if conn.execute(text("SELECT to_regclass('sqlery_job_attempt')")).scalar() is None:
+            for statement in _history.postgres_attempt_partitioned_ddl():
+                conn.execute(text(statement))
+            for statement in _history.daily_partition_ddl(
+                _history.ATTEMPT_TABLE, today, today + timedelta(days=PREMAKE + 1)
+            ):
+                conn.execute(text(statement))
+
         conn.commit()
 
     # Step 5 — create all other tables.
@@ -265,6 +298,9 @@ def _init_partitioned_pg(engine) -> None:
         "sqlery_registry",
         "sqlery_job_ready",
         "sqlery_job_blocked",
+        # created above by explicit (partitioned) DDL
+        "sqlery_job_history",
+        "sqlery_job_attempt",
     }
     safe_tables = [
         t for t in SQLModel.metadata.sorted_tables
@@ -383,6 +419,7 @@ def init_database(database_url: str, **kwargs):
     # from ..core import models as _models  # noqa: F401  # moved to top-level
 
     had_ready = _has_table(_engine, _ready.READY_TABLE)
+    had_history = _has_table(_engine, _history.HISTORY_TABLE)
 
     if database_url.startswith('sqlite'):
         # D6 — SQLite: keep plain create_all (no partitioning)
@@ -398,6 +435,13 @@ def init_database(database_url: str, **kwargs):
     if not had_ready:
         _backfill_ready(_engine)
 
+    # The union view over the live table and history, then (first start after the history
+    # table appeared) the terminal rows that still sit in the live table move over. Whichever
+    # of this, the Alembic revision or the Django migration runs first wins; all are idempotent.
+    _ensure_job_view(_engine)
+    if not had_history:
+        _backfill_history(_engine)
+
 
 def _has_table(engine, name: str) -> bool:
     from sqlalchemy import inspect as sa_inspect
@@ -410,6 +454,28 @@ def _backfill_ready(engine) -> None:
     entry (the Alembic revision does the same; whichever runs first wins, both idempotent)."""
     with engine.begin() as conn:
         conn.execute(text(_ready.backfill_ready_sql()))
+
+
+def _ensure_job_view(engine) -> None:
+    """Create ``sqlery_job_all``, the read-only union of the live table and history, unless it
+    exists (an existing view is left alone: replacing it takes a lock for nothing)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    if _history.JOB_ALL_VIEW in sa_inspect(engine).get_view_names():
+        return
+    with engine.begin() as conn:
+        for statement in _history.view_columns_ddl(_models.JOB_COLUMNS, engine.dialect.name):
+            conn.execute(text(statement))
+
+
+def _backfill_history(engine) -> int:
+    """Move terminal rows from the live table into history, one short transaction per batch."""
+
+    def run(sql: str) -> int:
+        with engine.begin() as conn:
+            return conn.execute(text(sql)).rowcount
+
+    return _history.move_terminal_rows(run, _models.JOB_COLUMNS)
 
 
 def get_engine():

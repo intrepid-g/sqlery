@@ -25,7 +25,7 @@ from sqlery.core.worker_admin import (
     is_worker_deletable,
     worker_delete_staleness_threshold_seconds,
 )
-from .models import QueuedJob, ScheduledTask, Worker
+from .models import JobAll, JobHistory, QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .signature import verify_signature
 from .subprocess_executor import get_manage_py_path
@@ -185,6 +185,9 @@ def _serialize_worker(worker, now) -> dict:
                 worker_data['current_job']['is_timeout'] = False
         else:
             worker_data['current_job'] = None
+            if JobHistory.objects.filter(id=worker.current_job_id).exists():
+                # The job finished (it is in history): the worker is not busy with it any more.
+                worker_data['status'] = 'idle'
     else:
         worker_data['current_job'] = None
 
@@ -292,7 +295,7 @@ def _compute_health_warnings(
     #    A backed-up queue with a busy worker is normal — only warn when
     #    workers are idle AND no jobs have finished recently (5 min).
     elif queued_count > 0 and running_count == 0 and idle_workers:
-        recent_completed = QueuedJob.objects.filter(
+        recent_completed = JobHistory.objects.filter(
             status__in=['success', 'failed'],
             finished_at__gte=now - timedelta(minutes=5),
         ).exists()
@@ -591,7 +594,8 @@ def dashboard_stats(request):
 
         # Job counts by status
         # Queued count excludes future-scheduled jobs (matching worker claiming behavior)
-        job_counts = QueuedJob.objects.aggregate(
+        # live and finished jobs together (the union view)
+        job_counts = JobAll.objects.aggregate(
             total=Count('id'),
             # queued=Count('id', filter=Q(status='queued')),
             queued=Count('id', filter=Q(status='queued') & (Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now))),
@@ -602,7 +606,7 @@ def dashboard_stats(request):
         )
 
         # Recent activity (last hour)
-        recent_activity = QueuedJob.objects.filter(
+        recent_activity = JobAll.objects.filter(
             created_at__gte=hour_ago
         ).aggregate(
             recent_total=Count('id'),
@@ -668,7 +672,7 @@ def dashboard_stats(request):
 
         # Recent jobs (last 50)
         recent_jobs = list(
-            QueuedJob.objects.order_by('-created_at')[:50].values(
+            JobAll.objects.order_by('-created_at')[:50].values(
                 'id', 'task_path', 'status', 'queue_name',
                 'priority', 'created_at', 'duration_seconds'
             )
@@ -780,7 +784,7 @@ def dashboard_stats(request):
 
         # ALL JOBS SUMMARY - complete picture of job states
         all_jobs_summary = list(
-            QueuedJob.objects.values('status', 'queue_name')
+            JobAll.objects.order_by().values('status', 'queue_name')
             .annotate(count=Count('id'))
             .order_by('queue_name', 'status')
         )

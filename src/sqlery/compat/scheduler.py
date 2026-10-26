@@ -31,7 +31,13 @@ from sqlery.core.worker import _current_job_var as _core_job_var
 from sqlery.core.worker import _current_job_var as _django_job_var
 
 from sqlery.django_sqlery.decorators import job
-from sqlery.django_sqlery.models import QueuedJob, ScheduledTask as _ScheduledTaskModel, Worker
+from sqlery.django_sqlery.models import (
+    JobAll,
+    JobHistory,
+    QueuedJob,
+    ScheduledTask as _ScheduledTaskModel,
+    Worker,
+)
 from sqlery.django_sqlery.queue import Queue as _SQLeryQueue
 from sqlery.django_sqlery.backend import DjangoBackend as _DjangoBackend
 # from sqlery.django_sqlery.utils import (  # Promoted to core
@@ -475,7 +481,8 @@ class Queue:
     # --- Inspection ---
 
     def get_all_jobs(self) -> list[JobModel]:
-        jobs = QueuedJob.objects.filter(queue_name=self.name).exclude(status="success")
+        # live and finished jobs (the union view), minus the successful ones
+        jobs = JobAll.objects.filter(queue_name=self.name).exclude(status="success")
         return [JobModel(j) for j in jobs]
 
     @property
@@ -570,15 +577,21 @@ class Queue:
         class _FinishedRegistry:
             def get_job_ids(self) -> list[str]:
                 return list(
-                    QueuedJob.objects.filter(queue_name=queue_name, status="success")
+                    JobHistory.objects.filter(queue_name=queue_name, status="success")
                     .exclude(job_name="")
+                    .exclude(job_name__isnull=True)
                     .values_list("job_name", flat=True)
                 )
 
             def remove(self, job_id: str) -> None:
-                QueuedJob.objects.filter(
-                    queue_name=queue_name, job_name=job_id, status="success"
-                ).delete()
+                # Finished jobs are in history, which only retention (and this) removes.
+                from sqlery.django_sqlery.cleanup import _delete_history
+
+                _delete_history(
+                    JobHistory.objects.filter(
+                        queue_name=queue_name, job_name=job_id, status="success"
+                    )
+                )
         return _FinishedRegistry()
 
     @property
@@ -589,15 +602,20 @@ class Queue:
         class _FailedRegistry:
             def get_job_ids(self) -> list[str]:
                 return list(
-                    QueuedJob.objects.filter(queue_name=queue_name, status="failed")
+                    JobHistory.objects.filter(queue_name=queue_name, status="failed")
                     .exclude(job_name="")
+                    .exclude(job_name__isnull=True)
                     .values_list("job_name", flat=True)
                 )
 
             def remove(self, job_id: str) -> None:
-                QueuedJob.objects.filter(
-                    queue_name=queue_name, job_name=job_id, status="failed"
-                ).delete()
+                from sqlery.django_sqlery.cleanup import _delete_history
+
+                _delete_history(
+                    JobHistory.objects.filter(
+                        queue_name=queue_name, job_name=job_id, status="failed"
+                    )
+                )
         return _FailedRegistry()
 
     def cancel_job(self, job_name: str) -> None:
@@ -887,20 +905,20 @@ class Task:
 
     @property
     def successful_runs(self):
-        return self._task.jobs.filter(status="success").count()
+        return self._task.all_jobs.filter(status="success").count()
 
     @property
     def failed_runs(self):
-        return self._task.jobs.filter(status="failed").count()
+        return self._task.all_jobs.filter(status="failed").count()
 
     @property
     def last_successful_run(self):
-        job = self._task.jobs.filter(status="success").order_by("-finished_at").first()
+        job = self._task.all_jobs.filter(status="success").order_by("-finished_at").first()
         return job.finished_at if job else None
 
     @property
     def last_failed_run(self):
-        job = self._task.jobs.filter(status="failed").order_by("-finished_at").first()
+        job = self._task.all_jobs.filter(status="failed").order_by("-finished_at").first()
         return job.finished_at if job else None
 
     # --- Methods ---

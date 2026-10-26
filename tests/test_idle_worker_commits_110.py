@@ -323,7 +323,7 @@ def test_idle_worker_survives_database_errors_in_idle_poll(database):
             time.sleep(3)
             after = admin.execute("SELECT max(last_heartbeat) FROM sqlery_worker").fetchone()[0]
             queued = [
-                r[0] for r in admin.execute("SELECT task_path FROM sqlery_queued_job").fetchall()
+                r[0] for r in admin.execute("SELECT task_path FROM sqlery_job_all").fetchall()
             ]
     finally:
         admin.execute("DROP TABLE IF EXISTS idle110_fail CASCADE")

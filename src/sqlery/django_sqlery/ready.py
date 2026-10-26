@@ -220,7 +220,8 @@ def release_dependents(job_id: int, parent_job_id: int | None = None) -> int:
         while parent and parent not in ids and hops < ready_core.MAX_CHAIN_HOPS:
             ids.append(parent)
             parent = (
-                m.QueuedJob.objects.filter(id=parent)
+                m.JobAll.objects.filter(id=parent)  # live or finished
+                .order_by()
                 .values_list("parent_job_id", flat=True)
                 .first()
             )

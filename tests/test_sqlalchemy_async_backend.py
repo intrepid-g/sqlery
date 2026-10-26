@@ -22,7 +22,7 @@ from sqlery.fastapi_sqlery.async_backend import (
     SQLAlchemyAsyncBackend,
 )
 from sqlery.fastapi_sqlery import database as _db_mod
-from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker, JobAll
 
 
 pytestmark = pytest.mark.asyncio
@@ -86,7 +86,7 @@ async def test_aclaim_job_claims_and_marks_running(backend, make_job, session_fa
     async with session_factory() as s:
         from sqlalchemy import select
 
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         fresh = res.scalars().first()
         assert fresh.status == "running"
 
@@ -116,7 +116,7 @@ async def test_amark_running(backend, make_job, session_factory):
     async with session_factory() as s:
         from sqlalchemy import select
 
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         assert res.scalars().first().status == "running"
 
 
@@ -126,7 +126,7 @@ async def test_amark_success(backend, make_job, session_factory):
     async with session_factory() as s:
         from sqlalchemy import select
 
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         fresh = res.scalars().first()
         assert fresh.status == "success"
         assert fresh.output == "ok"
@@ -156,7 +156,7 @@ async def test_amark_success_rejects_unawaited_coroutine(backend, make_job, sess
     from sqlalchemy import select
 
     async with session_factory() as s:
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         fresh = res.scalars().first()
         # The job must NOT be marked success from the unawaited coroutine.
         assert fresh.status == "running"
@@ -169,7 +169,7 @@ async def test_amark_failed(backend, make_job, session_factory):
     async with session_factory() as s:
         from sqlalchemy import select
 
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         fresh = res.scalars().first()
         assert fresh.status == "failed"
         assert fresh.error == "boom"
@@ -182,7 +182,7 @@ async def test_amark_shutting_down(backend, make_job, session_factory):
     async with session_factory() as s:
         from sqlalchemy import select
 
-        res = await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))
+        res = await s.execute(select(JobAll).where(JobAll.id == job.id))
         assert res.scalars().first().status == "shutting_down"
 
 
