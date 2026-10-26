@@ -637,8 +637,9 @@ class QueuedJob(models.Model):
                 name="sqlery_job_pending_idx",
                 condition=Q(status="queued"),
             ),
-            models.Index(fields=["task_path", "status"]),
-            models.Index(fields=["-created_at"], name="sqlery_job_created_desc"),
+            # Dropped (migration 0036): ("task_path", "status") -- no query filters on
+            # task_path and `status` churns on every transition; and ("-created_at") --
+            # served by the (created_at, id) primary key.
             models.Index(fields=["-finished_at"], name="sqlery_job_finished_desc"),
             models.Index(fields=["-started_at"], name="sqlery_job_started_desc"),
         ]
