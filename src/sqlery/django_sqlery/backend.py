@@ -18,6 +18,12 @@ from django.utils import timezone
 
 from sqlery.core.db_resilience import retry_on_db_error
 
+from sqlery.core.attempts import (
+    OUTCOME_ABANDONED,
+    OUTCOME_SUCCESS,
+    AttemptInfo,
+)
+
 from ..compat import DatabaseBackend, JobFencingError
 from .db_compat import (
     assert_in_atomic_block,
@@ -29,6 +35,7 @@ from .db_compat import (
 from .models import (
     ConcurrentModificationError,
     DaemonLease,
+    JobAttempt,
     QueuedJob,
     ScheduledTask,
     JobRegistry,
@@ -426,12 +433,27 @@ class DjangoBackend(DatabaseBackend):
             updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
                 status="running",
                 started_at=timezone.now(),
-                worker_pid=os.getpid(),
+                # worker_pid lives on the attempt now (#138).
+                # #CLEANUP: stop reading QueuedJob.worker_pid/child_pid, then drop the columns.
                 version=F("version") + 1,
             )
             if updated != 1:
                 return None
-        return self.QueuedJob.objects.filter(id=job_id).first()
+            # Ephemeral claimers (lambda-/trigger-) have no Worker row: worker id stays NULL.
+            job = self.QueuedJob.objects.filter(id=job_id).first()
+            JobAttempt.open_new(job, self._attempt_worker_id(worker_id), os.getpid())
+        return job
+
+    def _attempt_worker_id(self, worker_id):
+        """Id of the registered Worker row ``worker_id`` names, else None (ephemeral claimers)."""
+        worker_id = str(worker_id)
+        if worker_id.startswith(_EPHEMERAL_CLAIMER_PREFIXES):
+            return None
+        try:
+            row = self._resolve_worker(worker_id)
+        except (ValueError, TypeError):
+            return None
+        return row.id if row is not None else None
 
     @retry_on_db_error()
     def release_claimed_job(
@@ -439,6 +461,9 @@ class DjangoBackend(DatabaseBackend):
     ):
         """Release a job after processing and update worker state."""
         with transaction.atomic():
+            JobAttempt.close_open(
+                job.id, OUTCOME_SUCCESS if status == "success" else OUTCOME_ABANDONED
+            )
             job.status = status
             job.finished_at = timezone.now()
             if job.started_at:
@@ -1024,7 +1049,13 @@ class DjangoBackend(DatabaseBackend):
         except self.ScheduledJob.DoesNotExist:
             return None
 
-    def mark_job_success(self, job_id: int, output: str = "", expected_version: int | None = None):
+    def mark_job_success(
+        self,
+        job_id: int,
+        output: str = "",
+        expected_version: int | None = None,
+        attempt=None,
+    ):
         """Mark job as successful.
 
         Staged ScheduledJob rows (not yet promoted) do not have mark_success;
@@ -1043,7 +1074,7 @@ class DjangoBackend(DatabaseBackend):
             if expected_version is not None:
                 job.version = expected_version
             try:
-                job.mark_success(output=output)
+                job.mark_success(output=output, attempt=attempt)
             except ConcurrentModificationError as e:
                 raise JobFencingError(str(e)) from e
         return job
@@ -1055,6 +1086,7 @@ class DjangoBackend(DatabaseBackend):
         traceback: str = "",
         expected_version: int | None = None,
         termination_reason: str = "",
+        attempt=None,
     ):
         """Mark job as failed.
 
@@ -1070,7 +1102,10 @@ class DjangoBackend(DatabaseBackend):
                 job.version = expected_version
             try:
                 job.mark_failed(
-                    error=error, traceback=traceback, termination_reason=termination_reason
+                    error=error,
+                    traceback=traceback,
+                    termination_reason=termination_reason,
+                    attempt=attempt,
                 )
             except ConcurrentModificationError as e:
                 raise JobFencingError(str(e)) from e
@@ -1226,14 +1261,18 @@ class DjangoBackend(DatabaseBackend):
             query = query.filter(queue_name__in=queue_names)
         query = query.select_related("worker")
 
+        jobs = list(query)
+        attempts = self.get_open_attempts([j.id for j in jobs])
         records = []
-        for job in query:
+        for job in jobs:
             worker = job.worker
+            attempt = attempts.get(job.id)
             records.append(
                 RunningJobLiveness(
                     job_id=job.id,
                     started_at=job.started_at,
-                    worker_pid=job.worker_pid,
+                    # The open attempt; the row column only for jobs claimed before attempts.
+                    worker_pid=attempt.worker_pid if attempt else job.worker_pid,
                     worker_node_id=worker.node_id if worker else None,
                     worker_status=worker.status if worker else None,
                     worker_current_job_id=worker.current_job_id if worker else None,
@@ -1264,24 +1303,42 @@ class DjangoBackend(DatabaseBackend):
 
         return query.exists()
 
-    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None):
-        """Store the forked child PID on the job row.
+    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
+        """Store the forked child PID on the job's open attempt.
 
         Args:
             job_id: QueuedJob primary key.
             child_pid: PID of the forked child process.
-            created_at: Optional job creation timestamp. When provided, added to the
-                filter so PG prunes to one partition (write-path pruning, item 11).
-                Existing callers that omit it degrade gracefully to id-only filter.
+            created_at: Unused (the attempt table has no partition key); kept for callers.
+            attempt: Handle of the attempt the caller holds; when given only that exact
+                attempt is updated, so a superseded worker cannot stamp a newer attempt.
         """
-        # Item 11: When created_at is available from the caller (e.g. worker.py
-        # which holds the full job object), add it to the filter for partition pruning.
-        # Old (id-only — does not prune to partition on PG):
-        # self.QueuedJob.objects.filter(id=job_id).update(child_pid=child_pid)
-        filter_kwargs: dict = {"id": job_id}
-        if created_at is not None:
-            filter_kwargs["created_at"] = created_at
-        self.QueuedJob.objects.filter(**filter_kwargs).update(child_pid=child_pid)
+        # Old: wrote QueuedJob.child_pid (a job-row update per job). The PID now lives on the
+        # attempt; #CLEANUP: drop QueuedJob.child_pid once no reader falls back to it.
+        query = JobAttempt.objects.filter(finished_at__isnull=True)
+        if attempt is not None:
+            query = query.filter(id=attempt.id, token=attempt.token)
+        else:
+            query = query.filter(job_id=job_id)
+        query.update(child_pid=child_pid)
+
+    def attempt_table_exists(self) -> bool:
+        return JobAttempt._meta.db_table in connection.introspection.table_names()
+
+    def get_open_attempts(self, job_ids: list) -> dict:
+        if not job_ids:
+            return {}
+        rows = JobAttempt.objects.filter(job_id__in=list(job_ids), finished_at__isnull=True)
+        # Newest wins if several are open (cannot happen through claim; defensive).
+        return {
+            r.job_id: AttemptInfo(
+                r.id, r.job_id, r.worker_id, r.worker_pid, r.child_pid, r.claimed_at
+            )
+            for r in rows.order_by("id")
+        }
+
+    def abandon_attempts(self, job_id: int) -> int:
+        return JobAttempt.close_open(job_id, OUTCOME_ABANDONED)
 
     def _count_with_tag(self, queryset, tag: str) -> int:
         """Count rows carrying ``tag``; SQL ``contains`` where supported, Python otherwise
@@ -1387,7 +1444,14 @@ class DjangoBackend(DatabaseBackend):
     def atomic_claim_job(self, job, worker) -> bool:
         """Atomically claim a specific job for a worker."""
         # from .db_compat import atomic_claim_job  # moved to top-level
-        return atomic_claim_job(job, worker)
+        # The claim and its attempt row are one unit: if the attempt cannot be recorded the
+        # claim is rolled back (savepoint inside the caller's transaction) and the job stays
+        # queued.
+        with transaction.atomic():
+            if not atomic_claim_job(job, worker):
+                return False
+            JobAttempt.open_new(job, getattr(worker, "id", None), os.getpid())
+            return True
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
@@ -1409,12 +1473,14 @@ class DjangoBackend(DatabaseBackend):
             return None
 
     def release_job(self, job_id: int):
-        """Release a claimed job back to queued status."""
-        self.QueuedJob.objects.filter(id=job_id).update(
-            status="queued",
-            started_at=None,
-            worker_pid=None,
-        )
+        """Release a claimed job back to queued status (its open attempt is abandoned)."""
+        with transaction.atomic():
+            JobAttempt.close_open(job_id, OUTCOME_ABANDONED)
+            self.QueuedJob.objects.filter(id=job_id).update(
+                status="queued",
+                started_at=None,
+                worker_pid=None,
+            )
 
     def get_jobs(
         self,

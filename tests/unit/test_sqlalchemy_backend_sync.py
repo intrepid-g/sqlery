@@ -704,8 +704,10 @@ class TestMiscMethods:
 
     def test_update_job_child_pid(self, sync_backend):
         j = _create_basic_job(sync_backend)
+        sync_backend.claim_job_by_id(j.id, "trigger-test")
         sync_backend.update_job_child_pid(j.id, 4242)
-        assert sync_backend.get_job_by_id(j.id).child_pid == 4242
+        # The child PID lives on the open execution attempt (#138), not the job row.
+        assert sync_backend.get_open_attempts([j.id])[j.id].child_pid == 4242
 
     def test_cascade_ancestor_status(self, sync_backend):
         grandparent = _create_basic_job(sync_backend)

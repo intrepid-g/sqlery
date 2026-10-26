@@ -44,7 +44,7 @@ from sqlery.core.utils import describe_task_args
 from sqlery.core.worker import _current_job_var  # noqa: F401
 
 from .db_compat import atomic_claim_job_queryset
-from .models import QueuedJob, ScheduledTask, Worker
+from .models import JobAttempt, QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .subprocess_slots import claim_slot
@@ -663,25 +663,33 @@ class TaskExecutor:
         behaviour is preserved.
         """
         now = timezone.now()
-        candidates = QueuedJob.objects.filter(
-            status="running", worker_id__isnull=True, started_at__isnull=False
-        ).exclude(worker_pid__isnull=True).exclude(worker_pid=0)
+        candidates = list(
+            QueuedJob.objects.filter(
+                status="running", worker_id__isnull=True, started_at__isnull=False
+            )
+        )
+        # The claiming PID lives on the open attempt (job-row column only for pre-attempt rows).
+        pids = JobAttempt.worker_pids_for(candidates)
 
         for job in candidates:
+            pid = pids.get(job.id)
+            if not pid:
+                continue
             threshold_seconds = job.timeout_seconds * 2 if job.timeout_seconds else 3600
             if (now - job.started_at).total_seconds() > threshold_seconds:
                 continue  # already stale — the existing path handles (and kills) it
-            if job.worker_pid == os.getpid():
+            if pid == os.getpid():
                 continue  # our own row
-            if _claimer_process_is_gone(job.worker_pid):
-                self._fail_orphaned_job(job)
+            if _claimer_process_is_gone(pid):
+                self._fail_orphaned_job(job, pid)
 
-    def _fail_orphaned_job(self, job):
+    def _fail_orphaned_job(self, job, pid=None):
         """Fail a running job whose claiming process no longer exists."""
+        pid = pid if pid is not None else job.worker_pid
         try:
             job.mark_failed(
                 error=(
-                    f"Claiming process (pid {job.worker_pid}) no longer exists — "
+                    f"Claiming process (pid {pid}) no longer exists — "
                     "container restart, OOM, or crash"
                 ),
                 traceback="Job stuck in 'running' with a dead owner PID and no worker row",
@@ -695,7 +703,7 @@ class TaskExecutor:
             # One unreapable row must never block claiming for everything else.
             logger.warning(f"Could not reap orphaned job {job.id}: {e}")
             return
-        logger.warning(f"Reaped orphaned job {job.id} (dead pid {job.worker_pid})")
+        logger.warning(f"Reaped orphaned job {job.id} (dead pid {pid})")
         if retry_budget_left(job):
             self._retry_job(job)
 
@@ -773,11 +781,12 @@ class TaskExecutor:
             if running_duration > threshold_seconds:
                 # Try to kill the worker process if PID is stored and process exists
                 kill_method = None
-                if job.worker_pid:
-                    kill_method = self._kill_worker_process(job.worker_pid)
+                worker_pid, _child_pid = JobAttempt.process_ids(job)
+                if worker_pid:
+                    kill_method = self._kill_worker_process(worker_pid)
                     if kill_method:
                         logger.warning(
-                            f"Killed hung worker process {job.worker_pid} for job {job.id} using {kill_method}"
+                            f"Killed hung worker process {worker_pid} for job {job.id} using {kill_method}"
                         )
 
                 # Determine termination reason based on what happened

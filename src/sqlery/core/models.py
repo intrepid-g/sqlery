@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import BigInteger, ForeignKey, Index, DateTime
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, Integer, DateTime, text
 
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.sqltypes import UTCDateTime
@@ -191,11 +191,12 @@ class QueuedJob(SQLModel, table=True):
         ]
 
     def mark_running(self):
-        """Mark job as running and record worker PID."""
+        """Mark job as running (the worker PID is recorded on the execution attempt)."""
         # import os  # moved to top-level
         self.status = "running"
         self.started_at = datetime.now(UTC)
-        self.worker_pid = os.getpid()
+        # worker_pid is no longer written: it lives on the attempt (#138).
+        # #CLEANUP: drop QueuedJob.worker_pid/child_pid once no reader falls back to them.
 
     def mark_success(self, output: str = ""):
         """Mark job as successful."""
@@ -422,6 +423,52 @@ class Worker(SQLModel, table=True):
         return is_worker_beating(
             self.status, self.last_heartbeat, datetime.now(UTC), timeout_seconds
         )
+
+
+class JobAttempt(SQLModel, table=True):
+    """One execution attempt of a job: inserted on claim, closed exactly once on completion.
+
+    ``job_id`` is a plain indexed column, not a foreign key: on partitioned PostgreSQL the
+    ``sqlery_queued_job`` primary key is ``(created_at, id)``, so ``id`` alone cannot be
+    referenced. A completion closes the attempt with a compare-and-set on ``(id, token)``
+    where ``finished_at IS NULL``; zero rows means the completion is stale (see
+    ``sqlery.core.attempts``). Mirrors the Django ``JobAttempt`` model.
+    """
+
+    __tablename__ = "sqlery_job_attempt"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('success', 'failed', 'abandoned')",
+            name="sqlery_attempt_outcome_chk",
+        ),
+        Index("sqlery_attempt_job_idx", "job_id"),
+        Index(
+            "sqlery_attempt_open_worker_idx",
+            "worker_id",
+            postgresql_where=text("finished_at IS NULL"),
+            sqlite_where=text("finished_at IS NULL"),
+        ),
+    )
+
+    # Integer on SQLite so the primary key auto-increments (rowid alias).
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            BigInteger().with_variant(Integer, "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+        ),
+    )
+    job_id: int = Field(sa_column=Column(BigInteger, nullable=False))
+    token: str = Field(max_length=36)
+    worker_id: UUID | None = Field(default=None, description="Claiming worker, if registered")
+    worker_pid: int | None = Field(default=None, description="PID of the claiming process")
+    child_pid: int | None = Field(default=None, description="PID of the forked child")
+    claimed_at: datetime = Field(
+        sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC)
+    )
+    finished_at: datetime | None = Field(sa_type=UTCDateTime, default=None)
+    outcome: str | None = Field(default=None, max_length=10)
 
 
 class DaemonLease(SQLModel, table=True):

@@ -210,6 +210,27 @@ print('Database connection: OK')
 "
 ```
 
+### Worker Refuses to Start: Attempt Table Missing
+
+**Symptoms:**
+- A worker exits at start-up with `The execution attempt table 'sqlery_job_attempt' does not exist`
+- A daemon keeps respawning workers that exit immediately after an upgrade
+
+Every claim of a job records an execution attempt (`sqlery_job_attempt`); a completion is
+accepted only for the attempt that is still open, so a worker that was declared dead by
+recovery can no longer overwrite the outcome. Workers refuse to run without the table.
+
+**Solution:** stop all workers (and the daemon), apply the migrations, then start them again.
+Workers started before the migration do not record attempts and cannot be fenced.
+
+```bash
+# Django
+python manage.py migrate sqlery
+
+# Standalone
+sqlery-migrate upgrade
+```
+
 ### Daemon Keeps Restarting
 
 **Symptoms:**
