@@ -526,6 +526,27 @@ class DaemonManager:
                 logger.error(f"Partition maintenance config error: {e} — maintenance disabled")
                 partition_maintenance_enabled = False
 
+        # #156: drained live partitions are dropped by this tick, so a cadence slower than the
+        # live partition width delays the drop. Advisory only: never disables maintenance.
+        if partition_maintenance_enabled and _partition_maint_available:
+            try:
+                live_width = _partitioning.parse_interval(
+                    get_config(
+                        "SQLERY_LIVE_PARTITION_INTERVAL",
+                        _partitioning.DEFAULT_LIVE_PARTITION_INTERVAL,
+                    )
+                )
+                if live_width is not None and partition_maintenance_interval * 60 > (
+                    live_width.total_seconds()
+                ):
+                    logger.warning(
+                        f"PARTITION_MAINTENANCE_INTERVAL_MINUTES={partition_maintenance_interval}"
+                        f" is longer than SQLERY_LIVE_PARTITION_INTERVAL: drained live "
+                        f"partitions are dropped later than necessary"
+                    )
+            except Exception:
+                logger.debug("live partition cadence check failed", exc_info=True)
+
         # Validate staging threshold vs partition retention unconditionally (WR-04).
         # Old: nested inside the partition_maintenance_enabled and _partition_maint_available
         #      block — never ran on SQLite; a string SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS

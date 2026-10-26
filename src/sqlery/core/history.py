@@ -446,26 +446,67 @@ def partitioned_tables(cur, partitioning=None) -> list[tuple[str, str | None]]:
     return tables
 
 
-def ensure_partitions(cur, interval_str: str, premake: int, partitioning=None) -> int:
-    """Create the upcoming partitions of every partitioned job table; returns how many."""
+def _setting(name: str, default):
+    """A maintenance setting from the active configuration (default on any failure)."""
+    try:
+        from sqlery.compat import get_config
+
+        return get_config(name, default)
+    except Exception:
+        return default
+
+
+def ensure_partitions(
+    cur, interval_str: str, premake: int, partitioning=None, live_interval_str: str | None = None
+) -> int:
+    """Create the upcoming partitions of every partitioned job table; returns how many.
+
+    The history and attempt tables use ``interval_str`` (``SQLERY_PARTITION_INTERVAL``). The
+    live table has its own, shorter width (``SQLERY_LIVE_PARTITION_INTERVAL``, ``live_interval_str``
+    or the setting) so that a drained partition appears and can be dropped within hours.
+    """
     if partitioning is None:
         from . import partitioning
 
-    return sum(
-        partitioning.ensure_future_partitions(cur, table, interval_str, premake)
-        for table, _ in partitioned_tables(cur, partitioning)
-    )
+    if live_interval_str is None:
+        live_interval_str = _setting(
+            "SQLERY_LIVE_PARTITION_INTERVAL", partitioning.DEFAULT_LIVE_PARTITION_INTERVAL
+        )
+    made = 0
+    for table, _ in partitioned_tables(cur, partitioning):
+        if table == LIVE_TABLE:
+            made += partitioning.ensure_live_partitions(cur, table, live_interval_str, premake)
+        else:
+            made += partitioning.ensure_future_partitions(cur, table, interval_str, premake)
+    return made
 
 
-def reclaim_partitions(cur, retention_str: str, archive_hook=None, partitioning=None) -> dict:
-    """Drop every partition past retention from the history, the live table and the attempt
-    table (``{table: dropped}``). The archive hook sees history partitions only: that is
-    where finished jobs are."""
+def reclaim_partitions(
+    cur, retention_str: str, archive_hook=None, partitioning=None, live_grace_str: str | None = None
+) -> dict:
+    """Drop the partitions that are no longer needed (``{table: dropped}``).
+
+    * history and attempt tables: partitions past ``retention_str`` (the attempt table only
+      without an open attempt). The archive hook sees history partitions only: that is where
+      finished jobs are.
+    * live table: every partition that is past its upper bound plus ``live_grace_str``
+      (``SQLERY_LIVE_PARTITION_GRACE``) and holds no row at all; retention does not apply,
+      because the live table holds no finished jobs worth keeping.
+    """
     if partitioning is None:
         from . import partitioning
 
+    if live_grace_str is None:
+        live_grace_str = _setting(
+            "SQLERY_LIVE_PARTITION_GRACE", partitioning.DEFAULT_LIVE_PARTITION_GRACE
+        )
     dropped: dict = {}
     for table, predicate in partitioned_tables(cur, partitioning):
+        if table == LIVE_TABLE:
+            dropped[table] = partitioning.reclaim_drained_live_partitions(
+                cur, table, live_grace_str
+            )
+            continue
         dropped[table] = partitioning.reclaim_drained_partitions(
             cur,
             table,

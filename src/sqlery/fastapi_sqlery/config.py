@@ -117,6 +117,17 @@ class StandaloneConfig(Config):
             # (mirrors daemon.py + Django backend defaults). Loaded from SQLERY_PARTITION_RETENTION.
             'SQLERY_PARTITION_RETENTION': '30 days',
 
+            # Live job table (#156): partition width and the grace after a partition's
+            # upper bound before an empty one is dropped. Fixed durations ('1 hour',
+            # '30 minutes', '1 day'); an invalid value falls back to the default at
+            # runtime with a warning. Unlike SQLERY_PARTITION_RETENTION these do not apply
+            # to the job history. Loaded from SQLERY_LIVE_PARTITION_INTERVAL / _GRACE.
+            'SQLERY_LIVE_PARTITION_INTERVAL': '1 hour',
+            'SQLERY_LIVE_PARTITION_GRACE': '1 hour',
+            # Health is degraded when a drained live partition has stayed undroppable for
+            # longer than this many seconds past its grace (0 disables).
+            'PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS': 900,
+
             # Optional Python import path to a callable invoked before a
             # partition is dropped. Signature: hook(table_name, partition_name).
             # None disables the hook. Loaded from SQLERY_PARTITION_ARCHIVE_HOOK.
@@ -124,10 +135,11 @@ class StandaloneConfig(Config):
 
             # How often the partition maintenance task runs (minutes). Int minutes.
             # Must be <= the partition interval expressed in minutes (see
-            # _validate_partition_config). Default: 1440 (once per day). NOTE: this key
+            # _validate_partition_config). Default: 5, so drained live partitions are
+            # dropped within minutes (#156; it was 1440). NOTE: this key
             # is UNPREFIXED to match daemon.py get_config("PARTITION_MAINTENANCE_INTERVAL_MINUTES").
             # Loaded from SQLERY_PARTITION_MAINTENANCE_INTERVAL_MINUTES.
-            'PARTITION_MAINTENANCE_INTERVAL_MINUTES': 1440,
+            'PARTITION_MAINTENANCE_INTERVAL_MINUTES': 5,
 
             # Scheduled jobs older than this many days in the staging table
             # are considered overdue for promotion or expiry. Int days. Must be less
@@ -182,6 +194,7 @@ class StandaloneConfig(Config):
             ("PG_DEAD_TUPLE_RATIO_DEGRADED", float),
             ("PG_DEAD_TUPLE_MIN", int),
             ("PG_SLOT_XID_AGE_DEGRADED", int),
+            ("PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS", float),
             ("READY_ROTATION_INTERVAL", float),
             ("READY_ROTATION_DRAIN_BATCH", int),
             ("READY_ROTATION_LAG_DEGRADED_SECONDS", float),
@@ -227,6 +240,11 @@ class StandaloneConfig(Config):
         if raw_interval is not None:
             # Old: self._config["PARTITION_INTERVAL"] = raw_interval.strip()
             self._config["SQLERY_PARTITION_INTERVAL"] = raw_interval.strip()
+
+        for live_key in ("SQLERY_LIVE_PARTITION_INTERVAL", "SQLERY_LIVE_PARTITION_GRACE"):
+            raw_live = os.getenv(live_key)
+            if raw_live is not None and raw_live.strip():
+                self._config[live_key] = raw_live.strip()
 
         raw_premake = os.getenv("SQLERY_PARTITION_PREMAKE")
         if raw_premake is not None:
@@ -316,7 +334,7 @@ class StandaloneConfig(Config):
         interval = self._config.get("SQLERY_PARTITION_INTERVAL", "1 day")
         premake = self._config.get("SQLERY_PARTITION_PREMAKE", 7)
         retention = self._config.get("SQLERY_PARTITION_RETENTION", "30 days")
-        maint_mins = self._config.get("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 1440)
+        maint_mins = self._config.get("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 5)
         threshold_days = self._config.get("SQLERY_SCHEDULED_JOB_THRESHOLD_DAYS", 7)
 
         # PARTITION_INTERVAL must be a parseable PG interval string.
