@@ -190,10 +190,26 @@ def send_webhook(job, event='success'):
         return False
 
 
+def _settle(job):
+    """The delivery is resolved (sent, or out of retries): the finished job leaves the live
+    table for history, where it is never updated again. Jobs of other types (tests) and
+    failures here are ignored: the settle sweep moves what is left."""
+    settle = getattr(job, "settle_finished", None)
+    if callable(settle):
+        try:
+            settle()
+        except Exception:
+            logger.warning(f"Could not move job {job.id} to history", exc_info=True)
+
+
 def send_webhook_with_retry(job, event='success'):
     """Send webhook with automatic retry on failure.
 
     Attempts to send webhook, retrying with exponential backoff on failure.
+
+    A finished job whose delivery is not resolved yet stays in the live table (its webhook
+    bookkeeping is mutable, history is insert-only): once the delivery succeeded or ran out of
+    retries the job moves to history. ``retry_failed_webhooks`` retries the pending ones.
 
     Args:
         job: QueuedJob instance
@@ -214,6 +230,7 @@ def send_webhook_with_retry(job, event='success'):
     success = send_webhook(job, event)
 
     if success:
+        _settle(job)
         return True
 
     # Webhook failed, increment retry counter
@@ -239,6 +256,7 @@ def send_webhook_with_retry(job, event='success'):
         )
         job.webhook_status = 'failed'
         job.save(update_fields=['webhook_status'])
+        _settle(job)
         return False
 
 

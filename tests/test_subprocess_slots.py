@@ -160,8 +160,8 @@ def test_run_jobs_chain_hands_slot_to_successor(tmp_path, settings, monkeypatch)
                 "-c",
                 (
                     "import django; django.setup()\n"
-                    "from sqlery.django_sqlery.models import QueuedJob\n"
-                    "print(QueuedJob.objects.filter(status='success').count())"
+                    "from sqlery.django_sqlery.models import JobAll\n"
+                    "print(JobAll.objects.filter(status='success').count())"
                 ),
             ],
             cwd=project,

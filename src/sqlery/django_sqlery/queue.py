@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from django.db.models import Max
 
-from .models import QueuedJob
+from .models import JobHistory, QueuedJob
 from .settings import get_setting
 
 # REMOVED in v0.13: backends abstraction layer was removed
@@ -349,16 +349,21 @@ class Queue:
         # from .models import QueuedJob  # moved to top-level
 
         # Try job_name first (RQ string ID)
+        # A finished job is in history (JobHistory has the same attributes, read-only).
         if isinstance(job_id, str):
-            job = QueuedJob.objects.filter(job_name=job_id).first()
+            job = (
+                QueuedJob.objects.filter(job_name=job_id).first()
+                or JobHistory.objects.filter(job_name=job_id).first()
+            )
             if job:
                 return job
 
         # Fall back to integer PK
         try:
-            return QueuedJob.objects.get(id=int(job_id))
-        except (QueuedJob.DoesNotExist, ValueError, TypeError):
+            pk = int(job_id)
+        except (ValueError, TypeError):
             return None
+        return QueuedJob.objects.filter(id=pk).first() or JobHistory.objects.filter(id=pk).first()
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         """Get job by ID.

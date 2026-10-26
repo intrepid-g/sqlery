@@ -19,7 +19,7 @@ import pytest
 from django.test import TestCase, RequestFactory, override_settings
 from django.utils import timezone
 
-from sqlery.django_sqlery.models import QueuedJob, Worker, DaemonCommand
+from sqlery.django_sqlery.models import JobAll, QueuedJob, Worker, DaemonCommand
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -679,11 +679,11 @@ class TestFailureTtlKeepForever:
         manager = CleanupManager()
         result = manager.cleanup_per_job_ttl()
 
-        # job_expire should be deleted
-        assert not QueuedJob.objects.filter(id=job_expire.id).exists()
+        # job_expire should be deleted (a failed job is in history: read the union view)
+        assert not JobAll.objects.filter(id=job_expire.id).exists()
 
         # job_keep should still exist (failure_ttl=-1)
-        assert QueuedJob.objects.filter(id=job_keep.id).exists()
+        assert JobAll.objects.filter(id=job_keep.id).exists()
 
     def test_failure_ttl_none_uses_global(self):
         """failure_ttl=None should not be touched by per-job TTL cleanup."""
@@ -701,4 +701,4 @@ class TestFailureTtlKeepForever:
         result = manager.cleanup_per_job_ttl()
 
         # Should still exist — per-job TTL only applies when failure_ttl is set
-        assert QueuedJob.objects.filter(id=job.id).exists()
+        assert JobAll.objects.filter(id=job.id).exists()

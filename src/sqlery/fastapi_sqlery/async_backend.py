@@ -38,13 +38,23 @@ from sqlery.core.attempts import (
     attach_attempt,
     decide_close,
 )
+from sqlery.core import history as history_core
 from sqlery.core import ready as ready_core
 from sqlery.core import ready_sql
-from sqlery.core.models import JobBlocked, JobReady, JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core.models import (
+    JobAll,
+    JobBlocked,
+    JobHistory,
+    JobReady,
+    JobRegistry,
+    QueuedJob,
+    ScheduledTask,
+    Worker,
+)
 from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.utils import reject_unawaited_coroutine
 
-from . import attempt_sql
+from . import attempt_sql, history_sql
 from .database import get_async_session_factory
 
 # Partition maintenance helpers — guarded against psycopg absence (SQLite installs).
@@ -164,6 +174,16 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 )
 
             return await conn.run_sync(_check)
+
+    async def ahistory_table_exists(self) -> bool:
+        from sqlalchemy import inspect as sa_inspect
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            conn = await session.connection()
+            return await conn.run_sync(
+                lambda sync_conn: sa_inspect(sync_conn).has_table(JobHistory.__tablename__)
+            )
 
     async def aattempt_table_exists(self) -> bool:
         from sqlalchemy import inspect as sa_inspect
@@ -366,10 +386,29 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 return False
             # Abandon the open attempt in the same transaction as the failure.
             await self._aclose_attempt(session, job_id, None, OUTCOME_ABANDONED)
+            # Detach before mutating: mark_failed only computes the outcome in memory; the
+            # write is the move into history.
+            session.expunge(job)
             job.mark_failed(error=reason, termination_reason="zombie_job")
-            job.version = (job.version or 0) + 1
-            session.add(job)
             parent = job.parent_job_id
+            moved = await self._afinish_in(
+                session,
+                job_id,
+                "failed",
+                {
+                    "finished_at": job.finished_at,
+                    "duration_seconds": job.duration_seconds,
+                    "error": job.error,
+                    "traceback": job.traceback,
+                    "termination_reason": job.termination_reason,
+                    "runs": job.runs,
+                },
+                created_at=job.created_at,
+                require_status="running",
+            )
+            if not moved:
+                await session.rollback()
+                return False
             await session.commit()
         await self._arelease_dependents_quietly(job_id, parent)
         return True
@@ -404,28 +443,16 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     async def amark_success(self, job_id, result, attempt=None) -> None:
         # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
-        # (raw update() statement), so it needs its own guard against unawaited
-        # coroutines.
+        # (raw statements), so it needs its own guard against unawaited coroutines.
         reject_unawaited_coroutine(result)
         now = _utcnow()
         output = "" if result is None else str(result)
         factory = get_async_session_factory()
         async with factory() as session:
-            # Write-path pruning: fetch created_at first so PG prunes to one partition.
-            created_at = None
-            if self._partitioned_pg():
-                res = await session.execute(
-                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
-                )
-                row = res.first()
-                created_at = row[0] if row else None
-            # Old (id-only filter):
-            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="success", ...)
-            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
-            if created_at is not None:
-                stmt = stmt.where(QueuedJob.created_at == created_at)
-            stmt = stmt.values(status="success", finished_at=now, output=output)
-            await self._afinish(session, job_id, attempt, OUTCOME_SUCCESS, stmt)
+            await self._afinish(
+                session, job_id, attempt, OUTCOME_SUCCESS, "success",
+                {"finished_at": now, "output": output},
+            )
 
     async def amark_failed(
         self, job_id, error: str, traceback: str | None = None, attempt=None
@@ -433,29 +460,46 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         now = _utcnow()
         factory = get_async_session_factory()
         async with factory() as session:
-            # Write-path pruning: fetch created_at first so PG prunes to one partition.
-            created_at = None
-            if self._partitioned_pg():
-                res = await session.execute(
-                    select(QueuedJob.created_at).where(QueuedJob.id == job_id)
+            # A failure the worker is about to retry is not final: the job stays in the live
+            # table until ``arequeue_retry`` has queued the retry and archived it (a crash in
+            # between leaves it to the settle sweep). A final failure moves to history now.
+            row = (
+                await session.execute(
+                    select(QueuedJob.max_retries, QueuedJob.retry_count).where(
+                        QueuedJob.id == job_id
+                    )
                 )
-                row = res.first()
-                created_at = row[0] if row else None
-            # Old (id-only filter):
-            # update(QueuedJob).where(QueuedJob.id == job_id).values(status="failed", ...)
-            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
-            if created_at is not None:
-                stmt = stmt.where(QueuedJob.created_at == created_at)
-            stmt = stmt.values(
-                status="failed",
-                finished_at=now,
-                error=error or "",
-                traceback=traceback or "",
+            ).first()
+            will_retry = bool(row and (row[0] or 0) > 0 and (row[1] or 0) < (row[0] or 0))
+            await self._afinish(
+                session, job_id, attempt, OUTCOME_FAILED, "failed",
+                {"finished_at": now, "error": error or "", "traceback": traceback or ""},
+                in_place=will_retry,
             )
-            await self._afinish(session, job_id, attempt, OUTCOME_FAILED, stmt)
 
-    async def _afinish(self, session, job_id, attempt, outcome, job_stmt) -> None:
-        """Close the attempt and write the terminal job row in one transaction.
+    async def _afinish_in(
+        self, session, job_id, status, values=None, *, created_at=None,
+        expected_version=None, require_status=None,
+    ) -> bool:
+        """The terminal transition inside the caller's transaction (async twin of
+        ``SQLAlchemyBackend._finish_in``)."""
+        lock, ins, dele = history_sql.move_statements(
+            job_id, status, values, created_at=created_at,
+            expected_version=expected_version, require_status=require_status,
+        )
+        if (await session.execute(lock)).first() is None:
+            return False
+        inserted = await session.execute(ins)
+        deleted = await session.execute(dele)
+        if not history_sql.moved(inserted, deleted):
+            raise RuntimeError(f"moving job {job_id} to history touched an unexpected row count")
+        return True
+
+    async def _afinish(
+        self, session, job_id, attempt, outcome, status, values, in_place: bool = False
+    ) -> None:
+        """Close the attempt and record the terminal state in one transaction: the job moves
+        from the live table to history (or, ``in_place``, is only marked, awaiting its retry).
 
         A stale attempt raises ``JobFencingError`` and rolls back: the job row is untouched.
         """
@@ -464,10 +508,28 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         except JobFencingError:
             await session.rollback()
             raise
-        await session.execute(job_stmt)
+        parent = None
+        if in_place:
+            await session.execute(
+                update(QueuedJob)
+                .where(QueuedJob.id == job_id)
+                .values(status=status, version=QueuedJob.version + 1, **values)
+                .execution_options(synchronize_session=False)
+            )
+        else:
+            parent = (
+                await session.execute(
+                    select(QueuedJob.parent_job_id).where(QueuedJob.id == job_id)
+                )
+            ).scalar()
+            if not await self._afinish_in(session, job_id, status, values):
+                # Already finished (in history) or gone: there is nothing to write. A stale
+                # completion of an attempt that is no longer open was rejected above.
+                await session.rollback()
+                return
         await session.commit()
         if outcome == OUTCOME_SUCCESS:
-            await self._arelease_dependents_quietly(job_id)
+            await self._arelease_dependents_quietly(job_id, parent)
         # A failure is released by the worker once it has decided on the retry (releasing
         # here would fail dependents of a job whose retry is not queued yet).
 
@@ -496,18 +558,19 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
     async def aget_status(self, job_id) -> str | None:
         factory = get_async_session_factory()
         async with factory() as session:
-            res = await session.execute(
-                select(QueuedJob.status).where(QueuedJob.id == job_id)
-            )
+            res = await session.execute(select(JobAll.status).where(JobAll.id == job_id))
             row = res.first()
             return row[0] if row is not None else None
 
     async def aget_job(self, job_id):
         factory = get_async_session_factory()
         async with factory() as session:
-            res = await session.execute(
-                select(QueuedJob).where(QueuedJob.id == job_id)
-            )
+            res = await session.execute(select(QueuedJob).where(QueuedJob.id == job_id))
+            job = res.scalars().first()
+            if job is not None:
+                return job
+            # A finished job is in history (read-only).
+            res = await session.execute(select(JobHistory).where(JobHistory.id == job_id))
             return res.scalars().first()
 
     # ----- worker registry -------------------------------------------------
@@ -663,7 +726,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 if parent is None:
                     row = (
                         await session.execute(
-                            select(QueuedJob.parent_job_id).where(QueuedJob.id == current)
+                            select(JobAll.parent_job_id).where(JobAll.id == current)
                         )
                     ).first()
                     parent = row[0] if row else None
@@ -671,7 +734,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                     ids.append(parent)
                     row = (
                         await session.execute(
-                            select(QueuedJob.parent_job_id).where(QueuedJob.id == parent)
+                            select(JobAll.parent_job_id).where(JobAll.id == parent)
                         )
                     ).first()
                     parent = row[0] if row else None
@@ -714,7 +777,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             rows = {
                 d.id: d
                 for d in (
-                    await session.execute(select(QueuedJob).where(QueuedJob.id.in_(deps)))
+                    await session.execute(select(JobAll).where(JobAll.id.in_(deps)))
                 ).scalars()
             }
             # Pre-fetch the retry chains the judgement may follow (it takes plain callables).
@@ -725,12 +788,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 nxt = []
                 for dep in frontier:
                     child = (
-                        await session.execute(
-                            select(QueuedJob)
-                            .where(QueuedJob.parent_job_id == dep.id)
-                            .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
-                            .limit(1)
-                        )
+                        await session.execute(history_sql.latest_retry_stmt(dep.id))
                     ).scalars().first()
                     retries[dep.id] = child
                     if child is not None and child.status in ("failed", "archived"):
@@ -747,19 +805,17 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 # Entries first, then the job row: the lock order of a claim.
                 await session.execute(ready_sql.delete_ready_stmt([job_id]))
                 await session.execute(ready_sql.delete_blocked_stmt([job_id]))
-                await session.execute(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.created_at == created_at)
-                    .where(QueuedJob.status == "queued")
-                    .values(
-                        status="failed",
-                        error=f"Dependencies failed: {verdict.failed}",
-                        termination_reason="dependency_failed",
-                        finished_at=_utcnow(),
-                        version=QueuedJob.version + 1,
-                    )
-                    .execution_options(synchronize_session=False)
+                await self._afinish_in(
+                    session,
+                    job_id,
+                    "failed",
+                    {
+                        "error": f"Dependencies failed: {verdict.failed}",
+                        "termination_reason": "dependency_failed",
+                        "finished_at": _utcnow(),
+                    },
+                    created_at=created_at,
+                    require_status="queued",
                 )
                 await session.commit()
                 return "failed"
@@ -784,18 +840,20 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             session.add(QueuedJob(status="queued", scheduled_at=scheduled_at, **fields))
             # The failed attempt is superseded by the retry (as in the sync worker).
             res = await session.execute(
-                select(QueuedJob.created_at).where(
+                select(QueuedJob.created_at, QueuedJob.termination_reason).where(
                     QueuedJob.id == failed_job.id, QueuedJob.status == "failed"
                 )
             )
             row = res.first()
             if row is not None:
-                await session.execute(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == failed_job.id)
-                    .where(QueuedJob.created_at == row[0])
-                    .where(QueuedJob.status == "failed")
-                    .values(status="archived")
+                # The superseded failure is final: it moves to history as ``archived``.
+                await self._afinish_in(
+                    session,
+                    failed_job.id,
+                    "archived",
+                    {"termination_reason": history_core.settled_termination_reason(row[1])},
+                    created_at=row[0],
+                    require_status="failed",
                 )
             await session.commit()
 

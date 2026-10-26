@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
 from .attempts import attempt_kwargs, attempt_of, require_attempt_table
+from .history import require_history_table
 from .ready import require_ready_tables
 from .utils import describe_task_args, import_task
 from .result import serialize_result
@@ -717,6 +718,8 @@ class WorkerProcess:
         require_attempt_table(self.backend)
         # ... and without the ready-queue tables there would be nothing to claim from.
         require_ready_tables(self.backend)
+        # ... and without the history table a finished job could not be recorded.
+        require_history_table(self.backend)
 
         logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
 

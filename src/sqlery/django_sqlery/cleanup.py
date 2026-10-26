@@ -6,8 +6,26 @@ from django.db import connection, transaction
 from django.db.models import Count, Sum
 from django.utils import timezone
 
-from .models import DaemonCommand, QueuedJob, JobRegistry
+from .models import DaemonCommand, JobAll, JobHistory, JobRegistry
 from .settings import get_setting
+
+BATCH_SIZE = 500
+
+
+def _delete_history(queryset) -> int:
+    """Delete the history rows of ``queryset`` in batches (with their finished attempts);
+    returns how many. History is only ever removed here, by retention."""
+    from .backend import DjangoBackend
+
+    total = 0
+    while True:
+        ids = list(queryset.order_by('finished_at', 'id').values_list('id', flat=True)[:BATCH_SIZE])
+        if not ids:
+            return total
+        deleted = DjangoBackend._delete_history_batch(queryset.filter(id__in=ids), ids)
+        if not deleted:
+            return total
+        total += deleted
 
 
 class CleanupManager:
@@ -36,17 +54,18 @@ class CleanupManager:
 
         cutoff = timezone.now() - timedelta(days=max_age_days)
 
-        query = QueuedJob.objects.filter(created_at__lt=cutoff)
+        # Only finished jobs (history) are ever pruned; their age is the time since they finished.
+        query = JobHistory.objects.filter(finished_at__lt=cutoff)
         if status:
             query = query.filter(status=status)
 
         count = query.count()
 
         if not dry_run:
-            deleted_count, details = query.delete()
+            deleted_count = _delete_history(query)
             return {
                 'deleted': deleted_count,
-                'details': details,
+                'details': {JobHistory._meta.label: deleted_count},
                 'cutoff_date': cutoff.isoformat(),
             }
         else:
@@ -72,11 +91,11 @@ class CleanupManager:
             else:
                 keep_count = self.retention_config.get('default_max_count', 10000)
 
-        query = QueuedJob.objects.all()
+        query = JobHistory.objects.all()
         if status:
             query = query.filter(status=status)
 
-        query = query.order_by('-created_at')
+        query = query.order_by('-finished_at', '-id')
         total_count = query.count()
 
         if total_count <= keep_count:
@@ -87,7 +106,7 @@ class CleanupManager:
 
         # Get IDs of jobs to delete (all except the most recent keep_count)
         jobs_to_keep_ids = list(query.values_list('id', flat=True)[:keep_count])
-        jobs_to_delete = QueuedJob.objects.exclude(id__in=jobs_to_keep_ids)
+        jobs_to_delete = JobHistory.objects.exclude(id__in=jobs_to_keep_ids)
 
         if status:
             jobs_to_delete = jobs_to_delete.filter(status=status)
@@ -95,10 +114,10 @@ class CleanupManager:
         count = jobs_to_delete.count()
 
         if not dry_run:
-            deleted_count, details = jobs_to_delete.delete()
+            deleted_count = _delete_history(jobs_to_delete)
             return {
                 'deleted': deleted_count,
-                'details': details,
+                'details': {JobHistory._meta.label: deleted_count},
                 'kept': keep_count,
             }
         else:
@@ -158,12 +177,13 @@ class CleanupManager:
 
         # Job counts by status
         job_counts = (
-            QueuedJob.objects
+            JobAll.objects
+            .order_by()
             .values('status')
             .annotate(count=Count('id'))
         )
         stats['job_counts'] = {item['status']: item['count'] for item in job_counts}
-        stats['total_jobs'] = QueuedJob.objects.count()
+        stats['total_jobs'] = JobAll.objects.count()
 
         # Registry counts by type
         registry_counts = (
@@ -180,7 +200,10 @@ class CleanupManager:
                 # Get table sizes
                 cursor.execute("""
                     SELECT
-                        pg_size_pretty(pg_total_relation_size('sqlery_queued_job')) as jobs_size,
+                        pg_size_pretty(
+                            pg_total_relation_size('sqlery_queued_job')
+                            + pg_total_relation_size('sqlery_job_history')
+                        ) as jobs_size,
                         pg_size_pretty(pg_total_relation_size('sqlery_registry')) as registry_size
                 """)
                 row = cursor.fetchone()
@@ -207,30 +230,34 @@ class CleanupManager:
         total_deleted = 0
 
         # Successful jobs with per-job result_ttl
-        success_jobs = QueuedJob.objects.filter(
+        success_jobs = JobHistory.objects.filter(
             status='success',
             result_ttl__isnull=False,
-            finished_at__isnull=False,
         ).exclude(result_ttl=-1)  # -1 means keep forever
 
-        for job in success_jobs:
-            if job.finished_at + timedelta(seconds=job.result_ttl) < now:
-                if not dry_run:
-                    job.delete()
-                total_deleted += 1
+        expired = [
+            job.id
+            for job in success_jobs.only('id', 'finished_at', 'result_ttl')
+            if job.finished_at + timedelta(seconds=job.result_ttl) < now
+        ]
+        total_deleted += len(expired)
+        if expired and not dry_run:
+            _delete_history(JobHistory.objects.filter(id__in=expired))
 
         # Failed/archived jobs with per-job failure_ttl
-        failed_jobs = QueuedJob.objects.filter(
+        failed_jobs = JobHistory.objects.filter(
             status__in=['failed', 'archived'],
             failure_ttl__isnull=False,
-            finished_at__isnull=False,
         ).exclude(failure_ttl=-1)  # -1 means keep forever
 
-        for job in failed_jobs:
-            if job.finished_at + timedelta(seconds=job.failure_ttl) < now:
-                if not dry_run:
-                    job.delete()
-                total_deleted += 1
+        expired = [
+            job.id
+            for job in failed_jobs.only('id', 'finished_at', 'failure_ttl')
+            if job.finished_at + timedelta(seconds=job.failure_ttl) < now
+        ]
+        total_deleted += len(expired)
+        if expired and not dry_run:
+            _delete_history(JobHistory.objects.filter(id__in=expired))
 
         return {
             'deleted' if not dry_run else 'would_delete': total_deleted,
@@ -341,6 +368,7 @@ class CleanupManager:
         try:
             with connection.cursor() as cursor:
                 cursor.execute('VACUUM ANALYZE sqlery_queued_job')
+                cursor.execute('VACUUM ANALYZE sqlery_job_history')
                 cursor.execute('VACUUM ANALYZE sqlery_registry')
 
             return {

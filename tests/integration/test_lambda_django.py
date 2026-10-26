@@ -22,7 +22,7 @@ import pytest
 @pytest.mark.django_db
 def test_lambda_django_smoke():
     """Lambda handler claims+executes one job; DB row lifecycle transitions."""
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.models import JobAll, QueuedJob
     from sqlery.lambda_handler import handler
 
     # Enqueue via the Django ORM directly to keep the test self-contained.
@@ -39,7 +39,7 @@ def test_lambda_django_smoke():
     result = handler({"action": "process_queue", "queue_name": "default", "job_id": job.id}, None)
 
     # PLAN-CHECKER-FIXES B1: assert DB-row status, NOT result["processed"].
-    refreshed = QueuedJob.objects.get(id=job.id)
+    refreshed = JobAll.objects.get(id=job.id)  # a finished job is in history
     assert refreshed.status in {"running", "success", "failed"}, (
         f"Lambda smoke: expected lifecycle transition (running|success|failed) "
         f"but row remained at status={refreshed.status!r}; "

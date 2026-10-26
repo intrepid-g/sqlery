@@ -167,8 +167,8 @@ class TestDivergenceMatrixSQLite:
         )
 
     def test_get_jobs_returns_list(self):
-        """get_jobs returns a list of QueuedJob instances on SQLite."""
-        from sqlery.django_sqlery.models import QueuedJob
+        """get_jobs returns a list of job rows (live and finished: the union view) on SQLite."""
+        from sqlery.django_sqlery.models import JobAll
 
         backend = _make_backend()
         _create_basic_job(backend)
@@ -176,7 +176,7 @@ class TestDivergenceMatrixSQLite:
         assert isinstance(result, list)
         assert len(result) >= 1
         for row in result:
-            assert isinstance(row, QueuedJob)
+            assert isinstance(row, JobAll)
 
     def test_mark_job_archived_works(self):
         """mark_job_archived transitions a failed job to archived status."""
@@ -184,7 +184,14 @@ class TestDivergenceMatrixSQLite:
 
         backend = _make_backend()
         job = _create_basic_job(backend)
-        QueuedJob.objects.filter(id=job.id).update(status="failed")
+        # A failure awaiting its retry carries the marker and stays live; archiving it (the
+        # retry exists) makes it final. (History is insert-only: a plain final failure is not
+        # rewritten as archived any more.)
+        from sqlery.core.retry import pending_reason
+
+        QueuedJob.objects.filter(id=job.id).update(
+            status="failed", termination_reason=pending_reason()
+        )
         backend.mark_job_archived(job.id)
         job.refresh_from_db()
         assert job.status == "archived"

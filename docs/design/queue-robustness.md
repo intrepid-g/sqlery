@@ -142,6 +142,76 @@ chains) consult history too. Retention: history is partitioned by
 `finished_at` on partitioned PostgreSQL installs and reclaimed by DROP via
 `core/partitioning.py`; otherwise batched deletes as today.
 
+Attempt retention: `sqlery_job_attempt` is pruned under the same retention as
+history. On PostgreSQL it is `PARTITION BY RANGE (claimed_at)` and dropped
+with the same tick (a partition with an open attempt is kept); elsewhere the
+finished attempts of every history row that retention deletes are deleted in
+the same batch.
+
+### #140 implementation notes
+
+- **Tables.** `sqlery_job_history` has every column of `sqlery_queued_job`
+  (PostgreSQL: created with `LIKE`, so the types always match), primary key
+  `(finished_at, id)`, indexes on `id`, `parent_job_id`, `(status, finished_at
+  DESC)`, `job_name`, `created_at DESC`. `sqlery_job_all` is a view
+  (`UNION ALL` of the live table and history) that every reader of "any
+  job" uses (Django `JobAll`, SQLModel `JobAll`); `get_job_by_id` returns the
+  live row, else the history row (`JobHistory`, read-only).
+- **The transition** is `INSERT .. SELECT` (the final values replace the
+  columns that change) + `DELETE`, both fenced by the row's `version` (and
+  status where the caller needs one), after the attempt close and, on
+  PostgreSQL, a `FOR UPDATE` row lock. Zero rows in either statement is a stale
+  completion: `JobFencingError`, nothing is written. A completion for a job that
+  is already in history is stale too (an unfenced caller is ignored).
+  Entry points: `mark_job_success/failed`, cancel, TTL expiry, dependency
+  failure, zombie/recovery failure, admin/intervention `update(status=<terminal>)`
+  (the Django `QuerySet.update` and `QueuedJob.save` do it for any terminal
+  status), `release_claimed_job`, the async backends.
+- **Retries.** A failure that will be retried carries the existing
+  `retry_pending` marker and stays in the live table, marked `failed`, until
+  the retry exists; `mark_job_archived` then moves it as `archived` and
+  `settle_retry_pending` moves it as `failed` (no retry owed). The chain
+  (`parent_job_id`) is resolved across both tables (`get_latest_retry`,
+  dependency judgement, `AsyncResult`, blocked-set release). The async workers
+  mark a failure in place only when a retry budget is left, with the same effect.
+  `retry_failed_jobs` can no longer re-queue a history row: it creates a fresh
+  job with `parent_job_id` = the failed job (once per failure).
+- **Settle sweep.** `maintain_ready_queue` (scheduler leader) also moves
+  terminal rows that were left in the live table (raw SQL, a crash between the
+  steps of a retry) into history once they are older than
+  `HISTORY_SETTLE_GRACE_SECONDS` (60); rows owing a retry are left alone.
+- **Webhooks (Django).** Delivery bookkeeping is mutable, so a job with a
+  `webhook_url` stays in the live table, finished, until the delivery resolves
+  (sent, or out of retries); `send_webhook_with_retry` then moves it.
+- **Retention.** `cleanup_jobs` only ever touches history (never live jobs);
+  its age is the time since `finished_at`. Partitioned PostgreSQL: the daemon
+  creates and drops daily partitions of the live table, history and the attempt
+  table (`core.history.ensure_partitions / reclaim_partitions`); the archive
+  hook sees history partitions. Elsewhere: batched deletes of history and the
+  finished attempts of the deleted rows.
+- **Migrations.** Django 0039 (schema) + 0040 (data, batched, resumable, not
+  atomic); Alembic `20261026_0021`; standalone start-up creates the same objects
+  and moves the rows. The reverse moves the rows back.
+- **Indexes.** The `started_at DESC` / `finished_at DESC` indexes of the live
+  table are dropped (Django): finished jobs are found in history. `status`,
+  `queue_name`, `priority`, `parent_job_id`, `job_name`, `scheduled_at`,
+  `worker_id`, `scheduled_task_id` stay: live `queued` / `running` lookups, retry
+  chains, named jobs, scheduled-task checks and orphan detection use them. Because
+  `status` stays indexed, a status update is still not HOT (see deviations).
+
+### #140 deviations from the section above
+
+- `sqlery_job_attempt` is partitioned on PostgreSQL (migration converts it) so it
+  can be reclaimed by DROP; its primary key becomes `(claimed_at, id)`.
+- A failed job owing a retry, and a finished job whose webhook is being
+  delivered, are in the live table for a short while (the live table is
+  "queued / running" plus these transient rows).
+- Status updates on the live table are not HOT: the `status` index is still
+  needed to find `running` / `queued` jobs. Making them HOT needs running-job
+  lookups to move to the open-attempt table (follow-up).
+- A final failure is `failed` in history even if someone later creates a retry
+  for it by hand (history is not rewritten to `archived`).
+
 ## #141 Rotation (opt-in, PostgreSQL only)
 
 Reclaims `sqlery_job_ready` by `TRUNCATE` instead of VACUUM.

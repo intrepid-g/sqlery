@@ -26,12 +26,15 @@ from ..core.attempts import (
     attach_attempt,
     decide_close,
 )
+from ..core import history as history_core
 from ..core import ready as ready_core
 from ..core import ready_sql
 from ..core.models import (
     DaemonLease,
+    JobAll,
     JobAttempt,
     JobBlocked,
+    JobHistory,
     JobReady,
     JobRegistry,
     QueuedJob,
@@ -40,7 +43,7 @@ from ..core.models import (
     Worker,
 )
 from ..crontab import next_cron_occurrence
-from . import attempt_sql
+from . import attempt_sql, history_sql
 from .database import get_engine, get_session
 
 # Partition maintenance helpers — guarded against psycopg absence (SQLite installs)
@@ -195,6 +198,9 @@ class SQLAlchemyBackend(DatabaseBackend):
         cur = raw_conn.cursor()
         try:
             yield cur
+            # The partition DDL (create / detach / drop) must survive the connection going
+            # back to the pool, which rolls back whatever is uncommitted.
+            raw_conn.commit()
         finally:
             try:
                 cur.close()
@@ -641,45 +647,69 @@ class SQLAlchemyBackend(DatabaseBackend):
 
     @staticmethod
     def _fail_queued(session, job, error: str, reason: str, now) -> bool:
-        """Fail a job that is still queued (compare-and-set on its status).
+        """Fail a job that is still queued: it moves to history as ``failed`` (compare-and-set
+        on its status).
 
         Its ready / blocked entries go with it, in the same transaction (entries first, then
-        the job row: the lock order of a claim).
+        the job row: the lock order of a claim). If the job is no longer queued the move
+        touches nothing and the transaction is left to the caller to commit or roll back.
         """
         session.exec(ready_sql.delete_ready_stmt([job.id]))
         session.exec(ready_sql.delete_blocked_stmt([job.id]))
-        res = session.exec(
-            update(QueuedJob)
-            .where(QueuedJob.id == job.id)
-            .where(QueuedJob.created_at == job.created_at)
-            .where(QueuedJob.status == "queued")
-            .values(
-                status="failed",
-                error=error,
-                termination_reason=reason,
-                finished_at=now,
-                version=QueuedJob.version + 1,
-            )
-            .execution_options(synchronize_session=False)
+        return SQLAlchemyBackend._finish_in(
+            session,
+            job.id,
+            "failed",
+            {"error": error, "termination_reason": reason, "finished_at": now},
+            created_at=job.created_at,
+            require_status="queued",
         )
-        return res.rowcount == 1
+
+    @staticmethod
+    def _finish_in(
+        session,
+        job_id: int,
+        status: str,
+        values: dict | None = None,
+        *,
+        created_at=None,
+        expected_version: int | None = None,
+        require_status=None,
+    ) -> bool:
+        """The terminal transition: move one live job into history inside the caller's
+        transaction (``INSERT .. SELECT`` + ``DELETE``, both must touch exactly one row).
+
+        Returns False, with nothing changed by this call, when the job is not (or no longer)
+        in the state the fences demand; the caller decides whether that is stale (rollback)
+        or fine.
+        """
+        lock, ins, dele = history_sql.move_statements(
+            job_id,
+            status,
+            values,
+            created_at=created_at,
+            expected_version=expected_version,
+            require_status=require_status,
+        )
+        if session.exec(lock).first() is None:
+            return False
+        inserted = session.exec(ins)
+        deleted = session.exec(dele)
+        if not history_sql.moved(inserted, deleted):
+            # Cannot happen after the row lock; never leave a half move behind.
+            raise RuntimeError(f"moving job {job_id} to history touched an unexpected row count")
+        return True
 
     @staticmethod
     def _judge_dependencies(session, deps: list):
         """Verdict on ``deps`` (see ``sqlery.core.ready.judge_dependencies``)."""
         from sqlery.core.retry import is_retry_pending
 
-        rows = {
-            d.id: d for d in session.exec(select(QueuedJob).where(QueuedJob.id.in_(deps))).all()
-        }
+        # A dependency may be live or finished (history): read both through the union view.
+        rows = {d.id: d for d in session.exec(history_sql.anywhere_in_stmt(deps)).all()}
 
         def latest_retry(job_id):
-            return session.exec(
-                select(QueuedJob)
-                .where(QueuedJob.parent_job_id == job_id)
-                .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
-                .limit(1)
-            ).first()
+            return session.exec(history_sql.latest_retry_stmt(job_id)).first()
 
         return ready_core.judge_dependencies(deps, rows.get, latest_retry, is_retry_pending)
 
@@ -766,29 +796,31 @@ class SQLAlchemyBackend(DatabaseBackend):
             )
 
     def settle_retry_pending(self, job_id: int) -> None:
-        from sqlery.core.retry import settled_reason
-
+        """No retry is owed any more: the failed job becomes final (moves to history as
+        ``failed`` with the marker cleared). A job already in history is left alone."""
         with self._get_session() as session:
-            reason = session.exec(
-                select(QueuedJob.termination_reason).where(QueuedJob.id == job_id)
+            row = session.exec(
+                select(QueuedJob.created_at, QueuedJob.termination_reason).where(
+                    QueuedJob.id == job_id, QueuedJob.status == "failed"
+                )
             ).first()
-            if reason is not None:
-                session.exec(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .values(termination_reason=settled_reason(reason))
+            if row is not None:
+                created_at, reason = row
+                self._finish_in(
+                    session,
+                    job_id,
+                    "failed",
+                    {"termination_reason": history_core.settled_termination_reason(reason)},
+                    created_at=created_at,
+                    require_status="failed",
                 )
                 session.commit()
 
     def get_latest_retry(self, job_id: int):
-        """Newest retry attempt (child via parent_job_id) of ``job_id``, or None."""
+        """Newest retry attempt (child via parent_job_id) of ``job_id``, live or finished,
+        or None."""
         with self._get_session() as session:
-            return session.exec(
-                select(QueuedJob)
-                .where(QueuedJob.parent_job_id == job_id)
-                .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
-                .limit(1)
-            ).first()
+            return session.exec(history_sql.latest_retry_stmt(job_id)).first()
 
     def claim_job_by_id(self, job_id, worker_id: str):
         """Atomically claim one specific queued job (Lambda / HTTP-trigger paths).
@@ -1126,12 +1158,12 @@ class SQLAlchemyBackend(DatabaseBackend):
     def get_queue_stats(self, queue_name: str | None = None) -> dict:
         """Get queue statistics (counts by status)."""
         with self._get_session() as session:
-            stmt = select(QueuedJob.status, func.count(QueuedJob.id).label("count"))
+            stmt = select(JobAll.status, func.count(JobAll.id).label("count"))
 
             if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
+                stmt = stmt.where(JobAll.queue_name == queue_name)
 
-            stmt = stmt.group_by(QueuedJob.status)
+            stmt = stmt.group_by(JobAll.status)
             results = session.exec(stmt).all()
 
             stats = {
@@ -1171,19 +1203,20 @@ class SQLAlchemyBackend(DatabaseBackend):
                 # entry finishes first; the cancel then finds the job running).
                 session.exec(ready_sql.delete_ready_stmt([job_id]))
                 session.exec(ready_sql.delete_blocked_stmt([job_id]))
-                updated = session.exec(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.created_at == created_at_val)
-                    .where(QueuedJob.status == "queued")
-                    .values(status="failed", error="Cancelled by user")
-                    .execution_options(synchronize_session=False)
+                # The cancelled job is final: it moves to history as failed.
+                cancelled = self._finish_in(
+                    session,
+                    job_id,
+                    "failed",
+                    {"error": "Cancelled by user"},
+                    created_at=created_at_val,
+                    require_status="queued",
                 )
-                if updated.rowcount > 0:
+                if cancelled:
                     session.commit()
                 else:
                     session.rollback()  # not cancelled: keep the entries
-                if updated.rowcount > 0:
+                if cancelled:
                     # Jobs that waited on it fail now (they would at their next claim).
                     self._release_dependents_quietly(job_id)
                     return True
@@ -1202,27 +1235,54 @@ class SQLAlchemyBackend(DatabaseBackend):
             return False
 
     def retry_failed_jobs(self, queue_name: str | None = None, max_jobs: int | None = None) -> int:
-        """Retry failed jobs by resetting them to queued status."""
+        """Retry failed jobs: each failed job that has not been retried gets a fresh queued
+        copy (``retry_count`` 0, ``parent_job_id`` = the failed job). The failed job itself
+        is in history and stays as it was (history is insert-only); having a retry child, it
+        is not retried a second time."""
         with self._get_session() as session:
-            stmt = select(QueuedJob).where(QueuedJob.status == "failed")
-
+            has_child = (
+                select(JobAll.id).where(JobAll.parent_job_id == JobHistory.id).exists()
+            )
+            stmt = (
+                select(JobHistory)
+                .where(JobHistory.status == "failed")
+                .where(~has_child)
+                .order_by(JobHistory.finished_at, JobHistory.id)
+            )
             if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
-
+                stmt = stmt.where(JobHistory.queue_name == queue_name)
             if max_jobs:
                 stmt = stmt.limit(max_jobs)
-
-            jobs = session.exec(stmt).all()
-
-            for job in jobs:
-                job.status = "queued"
-                job.error = ""
-                job.traceback = ""
-                job.retry_count = 0
-                session.add(job)
-
+            failed = session.exec(stmt).all()
+            for old in failed:
+                session.add(
+                    QueuedJob(
+                        task_path=old.task_path,
+                        kwargs=dict(old.kwargs or {}),
+                        queue_name=old.queue_name,
+                        priority=old.priority,
+                        max_retries=old.max_retries,
+                        retry_backoff=old.retry_backoff,
+                        allow_parallel=old.allow_parallel,
+                        timeout_seconds=old.timeout_seconds,
+                        retry_count=0,
+                        scheduled_task_id=old.scheduled_task_id,
+                        job_name=old.job_name,
+                        retry_intervals=old.retry_intervals,
+                        meta=old.meta,
+                        dependencies=list(old.dependencies or []),
+                        tags=list(old.tags or []),
+                        on_success_path=old.on_success_path,
+                        on_failure_path=old.on_failure_path,
+                        ttl=old.ttl,
+                        result_ttl=old.result_ttl,
+                        failure_ttl=old.failure_ttl,
+                        parent_job_id=old.id,
+                        status="queued",
+                    )
+                )
             session.commit()
-            return len(jobs)
+            return len(failed)
 
     def get_due_scheduled_tasks(self):
         """Get scheduled tasks that are due to run."""
@@ -1355,157 +1415,146 @@ class SQLAlchemyBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up old jobs based on retention policy.
+        """Clean up finished jobs (history) based on retention policy.
 
-        On a partitioned PostgreSQL install (self._partitioned_pg() is True),
-        routes to reclaim_drained_partitions which drops entire drained partitions
-        instead of batched DELETEs (D5 — see loud comment below). Advisory lock
-        (pg_try_advisory_lock) is acquired inside reclaim_drained_partitions; if
-        not acquired the call returns 0 without error.
+        Only history is ever pruned; queued and running jobs are never touched. The age of a
+        finished job is the time since it finished.
 
-        On SQLite or non-partitioned PG, keeps the Phase-12 keyset-batched DELETE
-        loop byte-for-byte unchanged (D6).
+        On a partitioned PostgreSQL install (history ``PARTITION BY RANGE (finished_at)``)
+        whole partitions past ``SQLERY_PARTITION_RETENTION`` are dropped (the attempt table
+        is partitioned too and drops with them; see ``sqlery.core.history``). Elsewhere
+        history is deleted in keyset batches of ``CLEANUP_BATCH_SIZE`` rows, and the finished
+        attempts of the deleted jobs go with each batch.
         """
-        # --- D5: Partition reclaim path (PostgreSQL + partitioned table) ---
+        # --- Partition reclaim path (PostgreSQL + partitioned history) ---
         if self._partitioned_pg() and _partitioning is not None:
             if dry_run:
                 # dry_run is not meaningful for partition-drop path; return estimate
                 with self._get_session() as session:
-                    count_stmt = select(func.count(QueuedJob.id))
+                    count_stmt = select(func.count(JobHistory.id))
                     if status:
-                        count_stmt = count_stmt.where(QueuedJob.status == status)
+                        count_stmt = count_stmt.where(JobHistory.status == status)
                     if queue_name:
-                        count_stmt = count_stmt.where(QueuedJob.queue_name == queue_name)
+                        count_stmt = count_stmt.where(JobHistory.queue_name == queue_name)
                     count = session.exec(count_stmt).one()
                 return {"deleted": 0, "count": count}
 
             retention_str = get_config("SQLERY_PARTITION_RETENTION", "30 days")
             archive_hook = get_config("SQLERY_PARTITION_ARCHIVE_HOOK", None)
-            # WR-03: use the raw_cursor() context manager so the pooled connection is
-            # always released — the previous manual try/finally lived only here, but the
-            # daemon call sites only closed the cursor and leaked the connection.
-            # Old (manual, easy to get wrong / not shared with daemon):
-            # cur = self.get_raw_cursor()
-            # try:
-            #     dropped = _partitioning.reclaim_drained_partitions(
-            #         cur, QueuedJob.__tablename__, retention_str, archive_hook)
-            # finally:
-            #     if cur is not None:
-            #         cur.close()
-            #         try:
-            #             cur.connection.close()
-            #         except Exception:
-            #             pass
             with self.raw_cursor() as cur:
-                # D5: Partition reclaim destroys all jobs in drained partitions (beyond
-                # SQLERY_PARTITION_RETENTION) by default. Failed-job history is gone
-                # unless SQLERY_PARTITION_ARCHIVE_HOOK is configured. This is
-                # intentional (see GSD-CONTEXT.md D5). Set SQLERY_PARTITION_ARCHIVE_HOOK
-                # to archive instead. The archive hook receives (cur, partition_name)
-                # and must not execute arbitrary SQL via string interpolation (T-17-09).
-                dropped = _partitioning.reclaim_drained_partitions(
-                    cur, QueuedJob.__tablename__, retention_str, archive_hook
+                # Partition reclaim destroys all finished jobs in drained partitions (beyond
+                # SQLERY_PARTITION_RETENTION) by default. Set SQLERY_PARTITION_ARCHIVE_HOOK
+                # to archive instead. The archive hook receives (cur, partition_name) and
+                # must not execute arbitrary SQL via string interpolation.
+                dropped_by_table = history_core.reclaim_partitions(
+                    cur, retention_str, archive_hook, _partitioning
                 )
+            dropped = sum(dropped_by_table.values())
+            if not self._attempts_partitioned():
+                self._prune_attempts_without_history()
             return {
                 "deleted": 0,
                 "reclaimed_via_partition_drop": True,
                 "dropped_partitions": dropped,
+                "dropped_by_table": dropped_by_table,
                 "note": (
-                    "Partition reclaim: jobs beyond retention destroyed by default (D5). "
+                    "Partition reclaim: jobs beyond retention destroyed by default. "
                     "Set SQLERY_PARTITION_ARCHIVE_HOOK to archive instead."
                 ),
             }
 
-        # --- SQLite or non-partitioned PG: Phase-12 batched DELETE loop (D6 — unchanged) ---
+        # --- SQLite or non-partitioned PG: batched DELETE of history ---
+        cutoff = None
+        if max_age_days:
+            cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+
+        def _filters(stmt):
+            if status:
+                stmt = stmt.where(JobHistory.status == status)
+            if queue_name:
+                stmt = stmt.where(JobHistory.queue_name == queue_name)
+            if cutoff is not None:
+                stmt = stmt.where(JobHistory.finished_at < cutoff)
+            return stmt
+
         with self._get_session() as session:
-            # Old: stmt built here fed the now-removed unbounded-delete path (see commented-out
-            # block below). The live path uses batch_stmt inside the loop; dry_run uses count_stmt.
-            # Preserved as a comment so the filter intent is documented alongside the replacements.
-            # stmt = delete(QueuedJob)
-            # if status:
-            #     stmt = stmt.where(QueuedJob.status == status)
-            # if queue_name:
-            #     stmt = stmt.where(QueuedJob.queue_name == queue_name)
-            # if max_age_days:
-            #     cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
-            #     stmt = stmt.where(QueuedJob.created_at < cutoff)
-
-            # CR-01: hoist `cutoff` ABOVE the dry_run fork. Previously `cutoff` was
-            # only assigned in the non-dry-run path (~line 946), so the dry_run path
-            # at line 924 referenced an undefined name and raised
-            # NameError: name 'cutoff' is not defined whenever
-            # cleanup_jobs(max_age_days=N, dry_run=True) was called.
-            cutoff = None
-            if max_age_days:
-                cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
-
             if dry_run:
-                # Count without deleting
-                # from sqlmodel import select, func  # moved to top-level
-                count_stmt = select(func.count(QueuedJob.id))
-                if status:
-                    count_stmt = count_stmt.where(QueuedJob.status == status)
-                if queue_name:
-                    count_stmt = count_stmt.where(QueuedJob.queue_name == queue_name)
-                if max_age_days and cutoff is not None:
-                    count_stmt = count_stmt.where(QueuedJob.created_at < cutoff)
-                count = session.exec(count_stmt).one()
+                count = session.exec(_filters(select(func.count(JobHistory.id)))).one()
                 return {"deleted": 0, "count": count}
 
-            # Old: unbounded delete that holds table lock for the full result set
-            # result = session.exec(stmt)
-            # session.commit()
-            # return {"deleted": result.rowcount, "count": result.rowcount}
-
-            # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE.
-            # The batch DELETE re-applies the SAME retention filters as the id
-            # SELECT (status/queue/age) restricted to the selected ids, so the
-            # deleted set is always a subset of the selected set — guaranteeing
-            # forward progress (no infinite re-selection) while still skipping any
-            # row claimed/changed mid-loop. (A divergent status.in_(FINISHED_STATUSES)
-            # DELETE filter would re-select non-finished rows forever and hang #12-02.)
-            id_stmt = select(QueuedJob.id)
-            if status:
-                id_stmt = id_stmt.where(QueuedJob.status == status)
-            if queue_name:
-                id_stmt = id_stmt.where(QueuedJob.queue_name == queue_name)
-            if max_age_days:
-                # Old: cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
-                # CR-01: cutoff is now computed above the dry_run fork; reuse it here.
-                id_stmt = id_stmt.where(QueuedJob.created_at < cutoff)
-            id_stmt = id_stmt.order_by(QueuedJob.id).limit(CLEANUP_BATCH_SIZE)
-
+            # Keyset-batched loop: at most CLEANUP_BATCH_SIZE rows per DELETE. The DELETE
+            # re-applies the SAME filters restricted to the selected ids, so the deleted set is
+            # always a subset of the selected set (forward progress, no infinite re-selection).
+            id_stmt = _filters(select(JobHistory.id)).order_by(
+                JobHistory.finished_at, JobHistory.id
+            ).limit(CLEANUP_BATCH_SIZE)
             total_deleted = 0
             while True:
                 ids = list(session.exec(id_stmt).all())
                 if not ids:
                     break
-                # Old: status.in_(FINISHED_STATUSES) diverged from the SELECT filter and looped forever
-                # batch_stmt = (
-                #     delete(QueuedJob)
-                #     .where(QueuedJob.id.in_(ids))
-                #     .where(QueuedJob.status.in_(FINISHED_STATUSES))
-                # )
-                batch_stmt = delete(QueuedJob).where(QueuedJob.id.in_(ids))
-                if status:
-                    batch_stmt = batch_stmt.where(QueuedJob.status == status)
-                if queue_name:
-                    batch_stmt = batch_stmt.where(QueuedJob.queue_name == queue_name)
-                if max_age_days:
-                    batch_stmt = batch_stmt.where(QueuedJob.created_at < cutoff)
-                result = session.exec(batch_stmt)
+                deleted = self._delete_history_batch(session, ids, _filters)
                 session.commit()
-                if not result.rowcount:
-                    # No selected row was deletable (all changed mid-loop) — stop to
-                    # avoid re-selecting the same un-deletable ids indefinitely.
+                if not deleted:
+                    # No selected row was deletable (all gone mid-loop) — stop to avoid
+                    # re-selecting the same ids indefinitely.
                     break
-                total_deleted += result.rowcount
+                total_deleted += deleted
                 time.sleep(0.1)
 
             return {"deleted": total_deleted, "count": total_deleted}
 
+    @staticmethod
+    def _delete_history_batch(session, ids: list, apply_filters=None) -> int:
+        """Delete history rows ``ids`` (and their finished attempts); returns rows deleted.
+
+        Retention is the only thing that removes history, and an attempt outlives neither
+        its job nor the history row of it.
+        """
+        stmt = delete(JobHistory).where(JobHistory.id.in_(ids))
+        if apply_filters is not None:
+            stmt = apply_filters(stmt)  # the same predicates as the selection
+        result = session.exec(stmt)
+        session.exec(
+            delete(JobAttempt)
+            .where(JobAttempt.job_id.in_(ids))
+            .where(JobAttempt.finished_at.is_not(None))
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount
+
+    def _attempts_partitioned(self) -> bool:
+        """True iff the attempt table is partitioned (PostgreSQL), so partition drops reclaim it."""
+        if not self._partitioned_pg() or _partitioning is None:
+            return False
+        with self.raw_cursor() as cur:
+            return cur is not None and _partitioning.is_partitioned(cur, JobAttempt.__tablename__)
+
+    def _prune_attempts_without_history(self, limit: int = 5000) -> int:
+        """Delete finished attempts whose job is in neither the live table nor history (one
+        bounded batch per call). Used where attempts cannot be dropped with a partition."""
+        with self._get_session() as session:
+            has_job = select(JobAll.id).where(JobAll.id == JobAttempt.job_id).exists()
+            ids = list(
+                session.exec(
+                    select(JobAttempt.id)
+                    .where(JobAttempt.finished_at.is_not(None))
+                    .where(~has_job)
+                    .limit(limit)
+                ).all()
+            )
+            if not ids:
+                return 0
+            res = session.exec(
+                delete(JobAttempt)
+                .where(JobAttempt.id.in_(ids))
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+            return res.rowcount
+
     def cleanup_per_job_ttl(self, dry_run: bool = False) -> dict:
-        """Delete finished jobs whose per-job result_ttl / failure_ttl has elapsed.
+        """Delete finished jobs (history) whose per-job result_ttl / failure_ttl has elapsed.
 
         A TTL of None or -1 keeps the job forever (RQ semantics).
         """
@@ -1513,15 +1562,14 @@ class SQLAlchemyBackend(DatabaseBackend):
         total = 0
         with self._get_session() as session:
             for statuses, ttl_col in (
-                (["success"], QueuedJob.result_ttl),
-                (["failed", "archived"], QueuedJob.failure_ttl),
+                (["success"], JobHistory.result_ttl),
+                (["failed", "archived"], JobHistory.failure_ttl),
             ):
                 rows = session.exec(
-                    select(QueuedJob.id, QueuedJob.finished_at, ttl_col).where(
-                        QueuedJob.status.in_(statuses),
+                    select(JobHistory.id, JobHistory.finished_at, ttl_col).where(
+                        JobHistory.status.in_(statuses),
                         ttl_col.is_not(None),
                         ttl_col != -1,
-                        QueuedJob.finished_at.is_not(None),
                     )
                 ).all()
                 expired = [
@@ -1534,7 +1582,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                 ]
                 total += len(expired)
                 if expired and not dry_run:
-                    session.exec(delete(QueuedJob).where(QueuedJob.id.in_(expired)))
+                    for i in range(0, len(expired), CLEANUP_BATCH_SIZE):
+                        self._delete_history_batch(session, expired[i : i + CLEANUP_BATCH_SIZE])
             if not dry_run:
                 session.commit()
         return {"deleted" if not dry_run else "would_delete": total}
@@ -1546,57 +1595,47 @@ class SQLAlchemyBackend(DatabaseBackend):
         queue_name: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Clean up jobs by keeping only the most recent N jobs."""
+        """Keep only the most recent N finished jobs (by finish time); delete older history."""
         with self._get_session() as session:
-            # Get IDs of jobs to keep
-            stmt = select(QueuedJob.id)
-
-            if status:
-                stmt = stmt.where(QueuedJob.status == status)
-
-            if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
-
-            stmt = stmt.order_by(QueuedJob.created_at.desc()).limit(keep_count)
-            keep_ids = list(session.exec(stmt).all())
-
-            # Delete jobs not in keep list
-            delete_stmt = delete(QueuedJob)
-
-            if status:
-                delete_stmt = delete_stmt.where(QueuedJob.status == status)
-
-            if queue_name:
-                delete_stmt = delete_stmt.where(QueuedJob.queue_name == queue_name)
-
-            if keep_ids:
-                delete_stmt = delete_stmt.where(~QueuedJob.id.in_(keep_ids))
-
-            if dry_run:
-                # Count without deleting — convert delete to count query
-                # from sqlmodel import func  # moved to top-level
-                count_stmt = select(func.count(QueuedJob.id))
+            def _filters(stmt):
                 if status:
-                    count_stmt = count_stmt.where(QueuedJob.status == status)
+                    stmt = stmt.where(JobHistory.status == status)
                 if queue_name:
-                    count_stmt = count_stmt.where(QueuedJob.queue_name == queue_name)
-                if keep_ids:
-                    count_stmt = count_stmt.where(~QueuedJob.id.in_(keep_ids))
-                count = session.exec(count_stmt).one()
-                return {"deleted": 0, "count": count, "kept": len(keep_ids)}
+                    stmt = stmt.where(JobHistory.queue_name == queue_name)
+                return stmt
 
-            result = session.exec(delete_stmt)
-            session.commit()
+            total = session.exec(_filters(select(func.count(JobHistory.id)))).one()
+            kept = min(total, keep_count)
+            if dry_run:
+                return {"deleted": 0, "count": max(0, total - keep_count), "kept": kept}
 
-            return {"deleted": result.rowcount, "count": result.rowcount, "kept": len(keep_ids)}
+            # Rows past the newest ``keep_count``: each pass takes the next batch of them
+            # (what was deleted is gone from the offset window, so the offset stays put).
+            older = (
+                _filters(select(JobHistory.id))
+                .order_by(JobHistory.finished_at.desc(), JobHistory.id.desc())
+                .offset(keep_count)
+                .limit(CLEANUP_BATCH_SIZE)
+            )
+            deleted = 0
+            while True:
+                ids = list(session.exec(older).all())
+                if not ids:
+                    break
+                batch = self._delete_history_batch(session, ids)
+                session.commit()
+                if not batch:
+                    break
+                deleted += batch
+            return {"deleted": deleted, "count": deleted, "kept": kept}
 
     def get_database_stats(self) -> dict:
         """Get database statistics."""
         with self._get_session() as session:
             # Job counts
-            job_count_stmt = select(
-                QueuedJob.status, func.count(QueuedJob.id).label("count")
-            ).group_by(QueuedJob.status)
+            job_count_stmt = select(JobAll.status, func.count(JobAll.id).label("count")).group_by(
+                JobAll.status
+            )
             job_counts = {status: count for status, count in session.exec(job_count_stmt).all()}
 
             # Registry counts
@@ -1609,7 +1648,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             }
 
             # Total counts
-            total_jobs = session.exec(select(func.count(QueuedJob.id))).one()
+            total_jobs = session.exec(select(func.count(JobAll.id))).one()
             total_registries = session.exec(select(func.count(JobRegistry.id))).one()
             total_scheduled_tasks = session.exec(select(func.count(ScheduledTask.id))).one()
             enabled_scheduled_tasks = session.exec(
@@ -1676,7 +1715,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                     # skip the parent when partitioned (D5/R3).
                     if not self._partitioned_pg():
                         conn.execute(text("VACUUM ANALYZE sqlery_queued_job"))
+                        conn.execute(text("VACUUM ANALYZE sqlery_job_history"))
                     # else: partition DROP leaves nothing to vacuum on parent; skip (D5/R3)
+                    #       (the history and the attempt table are partitioned the same way)
                     conn.execute(text("VACUUM ANALYZE sqlery_scheduled_task"))
                     conn.execute(text("VACUUM ANALYZE sqlery_registry"))
                     conn.execute(text("VACUUM ANALYZE sqlery_worker"))
@@ -1734,11 +1775,11 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .where(
                     and_(JobRegistry.registry_type == registry_type, JobRegistry.exited_at == None)
                 )
-                .join(QueuedJob, QueuedJob.id == JobRegistry.job_id)
+                .join(JobAll, JobAll.id == JobRegistry.job_id)
             )
 
             if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
+                stmt = stmt.where(JobAll.queue_name == queue_name)
 
             if limit:
                 stmt = stmt.limit(limit)
@@ -1749,7 +1790,8 @@ class SQLAlchemyBackend(DatabaseBackend):
             # session.get(QueuedJob, entry.job_id)  # Replaced: composite PK requires (created_at, id)
             jobs = []
             for entry in entries:
-                job = session.exec(select(QueuedJob).where(QueuedJob.id == entry.job_id)).first()
+                # live or finished: the registries mostly list finished jobs
+                job = session.exec(history_sql.anywhere_by_id_stmt(entry.job_id)).first()
                 if job:
                     jobs.append(job)
 
@@ -1787,6 +1829,10 @@ class SQLAlchemyBackend(DatabaseBackend):
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             if job is not None:
                 return job
+            # A finished job is in history (read-only).
+            finished = session.exec(history_sql.history_by_id_stmt(job_id)).first()
+            if finished is not None:
+                return finished
             # Fall back to staging table on partitioned PG (D6 gate)
             if self._partitioned_pg():
                 staged = session.exec(
@@ -1821,6 +1867,8 @@ class SQLAlchemyBackend(DatabaseBackend):
         touching the job row.
         """
         job = self.get_job_by_id(job_id)
+        if isinstance(job, JobHistory):
+            return self._already_finished(job, expected_version, attempt)
         # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_success"):
             with self._get_session() as session:
@@ -1862,6 +1910,8 @@ class SQLAlchemyBackend(DatabaseBackend):
         See mark_job_success for expected_version fencing semantics.
         """
         job = self.get_job_by_id(job_id)
+        if isinstance(job, JobHistory):
+            return self._already_finished(job, expected_version, attempt)
         # Old: if job: job.mark_failed(...)  <-- AttributeError for ScheduledJob (IN-01)
         if job and hasattr(job, "mark_failed"):
             with self._get_session() as session:
@@ -1886,6 +1936,19 @@ class SQLAlchemyBackend(DatabaseBackend):
                     )
         return job
 
+    @staticmethod
+    def _already_finished(job, expected_version, attempt):
+        """A completion for a job that is already in history.
+
+        A fenced completion (it holds a version or an attempt handle) is stale: another
+        completion, or recovery, got there first. An unfenced caller just gets the job back.
+        """
+        if expected_version is not None or attempt is not None:
+            raise JobFencingError(
+                f"Job {job.id} already finished ({job.status}); completion rejected"
+            )
+        return job
+
     def _fenced_update(
         self,
         session: Session,
@@ -1896,33 +1959,46 @@ class SQLAlchemyBackend(DatabaseBackend):
         outcome: str = OUTCOME_FAILED,
         parent_job_id: int | None = None,
     ):
-        """Apply `values` to a QueuedJob via a single atomic conditional UPDATE.
+        """Record a completion: the job leaves the live table for history, fenced.
 
-        When expected_version is given, the UPDATE only matches a row whose
-        current version still equals it (WHERE-clause CAS, mirroring
-        DjangoBackend.mark_success/mark_failed and claim_job's SQLite branch).
-        Zero rows affected means another worker already reclaimed the job
-        (its lease/heartbeat went stale and the zombie detector requeued
-        it) -- raise JobFencingError instead of silently clobbering the
-        reclaiming worker's result. Always bumps version by 1 on success.
+        The transition (``INSERT INTO sqlery_job_history .. SELECT`` + ``DELETE``) is one
+        transaction with the attempt close. When ``expected_version`` is given it only
+        applies to a row whose version still matches (compare-and-set in the WHERE clause,
+        mirroring DjangoBackend); zero rows means another worker already reclaimed the job
+        (its lease/heartbeat went stale and the zombie detector requeued it) -- raise
+        JobFencingError instead of silently clobbering the reclaiming worker's result, and
+        write nothing to history.
 
         The execution attempt is closed first, in the same transaction (see
         ``_close_attempt``): a stale attempt raises JobFencingError before the job row is
-        written, and any later failure rolls the attempt close back with it.
+        touched, and any later failure rolls the attempt close back with it.
+
+        A failure that will be retried (``retry_pending`` marker) is not final: the job stays
+        in the live table, marked failed, until its retry exists (``mark_job_archived`` /
+        ``settle_retry_pending`` then move it).
         """
         try:
             self._close_attempt(session, job_id, attempt, outcome)
         except JobFencingError:
             session.rollback()
             raise
-        stmt = update(QueuedJob).where(QueuedJob.id == job_id)
-        if expected_version is not None:
-            stmt = stmt.where(QueuedJob.version == expected_version)
-        stmt = stmt.values(version=QueuedJob.version + 1, **values).execution_options(
-            synchronize_session=False
-        )
-        result = session.exec(stmt)
-        if result.rowcount == 0:
+        status = values["status"]
+        row_values = {k: v for k, v in values.items() if k != "status"}
+        from sqlery.core.retry import is_retry_pending
+
+        if status == "failed" and is_retry_pending(row_values.get("termination_reason")):
+            stmt = update(QueuedJob).where(QueuedJob.id == job_id)
+            if expected_version is not None:
+                stmt = stmt.where(QueuedJob.version == expected_version)
+            stmt = stmt.values(version=QueuedJob.version + 1, **values).execution_options(
+                synchronize_session=False
+            )
+            applied = session.exec(stmt).rowcount > 0
+        else:
+            applied = self._finish_in(
+                session, job_id, status, row_values, expected_version=expected_version
+            )
+        if not applied:
             session.rollback()
             if expected_version is not None:
                 raise JobFencingError(
@@ -1932,81 +2008,87 @@ class SQLAlchemyBackend(DatabaseBackend):
             # No row matched at all (job deleted concurrently) -- nothing to return.
             return None
         session.commit()
-        if values.get("status") in ("success", "failed"):
+        if status in ("success", "failed") and not is_retry_pending(
+            row_values.get("termination_reason")
+        ):
             # Terminal: jobs waiting on this one are re-checked (moved to ready, or failed).
             self._release_dependents_quietly(job_id, parent_job_id)
-        return session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        return self._find_job(session, job_id)
+
+    @staticmethod
+    def _find_job(session, job_id):
+        """The job as a model object: the live row, else its history row, else None."""
+        job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+        if job is not None:
+            return job
+        return session.exec(history_sql.history_by_id_stmt(job_id)).first()
 
     def mark_job_archived(self, job_id: int):
-        """Mark a failed job as archived (a retry has been created for it).
+        """Mark a failed job as archived (a retry has been created for it): the job moves to
+        history as ``archived`` and its retry marker is cleared. A job that is already in
+        history is final and stays as it is.
 
         Write-path pruning: fetches created_at first so PG can prune to one partition.
         Mirrors DjangoBackend.mark_job_archived (Phase 16 item 8).
         """
         with self._get_session() as session:
-            # Item 8: Add created_at to filter so PG prunes to one partition.
-            # Old (id-only filter — does not prune to partition on PG):
-            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            # if job and job.status == "failed":
-            #     job.status = "archived"
-            # SQLModel exec() returns scalars for single-column selects
-            created_at_val = session.exec(
-                select(QueuedJob.created_at).where(
+            row = session.exec(
+                select(QueuedJob.created_at, QueuedJob.termination_reason).where(
                     and_(QueuedJob.id == job_id, QueuedJob.status == "failed")
                 )
             ).first()
-            if created_at_val is not None:
-                session.exec(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == job_id)
-                    .where(QueuedJob.created_at == created_at_val)
-                    .where(QueuedJob.status == "failed")
-                    .values(status="archived")
-                    .execution_options(synchronize_session=False)
+            if row is not None:
+                created_at_val, reason = row
+                self._finish_in(
+                    session,
+                    job_id,
+                    "archived",
+                    {"termination_reason": history_core.settled_termination_reason(reason)},
+                    created_at=created_at_val,
+                    require_status="failed",
                 )
                 session.commit()
 
     def cascade_ancestor_status(self, job_id: int, status: str):
-        """Walk parent_job_id chain, set all ancestors to given status.
+        """Walk the parent_job_id chain, set the live ancestors to the given status.
 
-        Write-path pruning: fetches (created_at, parent_job_id) per iteration and
-        uses (id, created_at) filter on UPDATE so PG prunes to one partition (item 9).
-        WR-03: excludes terminal-status ancestors so a completed or archived parent is
-        never overwritten by a child's cascaded status change.
+        Ancestors that are already in history are final (history is insert-only) and are
+        only walked through. A live ancestor that is not already ``success`` / ``archived``
+        becomes ``status`` (a terminal status moves it into history).
         """
         with self._get_session() as session:
-            # Item 9: fetch created_at + parent_job_id together in one query per iteration.
-            # Old (id-only — does not prune to partition on PG):
-            # job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            # current_id = job.parent_job_id if job else None
-            # while current_id:
-            #     ancestor = session.exec(select(QueuedJob).where(QueuedJob.id == current_id)).first()
-            #     if not ancestor: break
-            #     ancestor.status = status
-            #     current_id = ancestor.parent_job_id
-            start_row = session.exec(
-                select(QueuedJob.parent_job_id).where(QueuedJob.id == job_id)
+            current_id = session.exec(
+                select(JobAll.parent_job_id).where(JobAll.id == job_id)
             ).first()
-            # SQLModel exec() returns scalars for single-column selects
-            current_id = start_row if start_row is not None else None
-            while current_id:
+            seen: set[int] = set()
+            while current_id and current_id not in seen:
+                seen.add(current_id)
                 job_row = session.exec(
-                    select(QueuedJob.created_at, QueuedJob.parent_job_id).where(
-                        QueuedJob.id == current_id
+                    select(JobAll.created_at, JobAll.parent_job_id).where(
+                        JobAll.id == current_id
                     )
                 ).first()
                 if not job_row:
                     break
-                # WR-03: exclude terminal-status ancestors
                 row_created_at, next_parent_id = job_row
-                session.exec(
-                    update(QueuedJob)
-                    .where(QueuedJob.id == current_id)
-                    .where(QueuedJob.created_at == row_created_at)
-                    .where(QueuedJob.status.not_in(("success", "archived")))
-                    .values(status=status)
-                    .execution_options(synchronize_session=False)
-                )
+                if history_core.is_terminal(status):
+                    self._finish_in(
+                        session,
+                        current_id,
+                        status,
+                        {},
+                        created_at=row_created_at,
+                        require_status=("queued", "running", "failed", "shutting_down"),
+                    )
+                else:
+                    session.exec(
+                        update(QueuedJob)
+                        .where(QueuedJob.id == current_id)
+                        .where(QueuedJob.created_at == row_created_at)
+                        .where(QueuedJob.status.not_in(("success", "archived")))
+                        .values(status=status)
+                        .execution_options(synchronize_session=False)
+                    )
                 current_id = next_parent_id
             session.commit()
 
@@ -2291,10 +2373,28 @@ class SQLAlchemyBackend(DatabaseBackend):
             if job is None:
                 return False
             self._close_attempt(session, job_id, None, OUTCOME_ABANDONED)
+            # Detach before mutating: the in-memory mark_failed only computes the outcome
+            # (runs, duration); the write is the move into history below.
+            session.expunge(job)
             job.mark_failed(error=reason, termination_reason="zombie_job")
-            job.version = (job.version or 0) + 1
-            session.add(job)
             parent = job.parent_job_id
+            moved = self._finish_in(
+                session,
+                job_id,
+                "failed",
+                {
+                    "finished_at": job.finished_at,
+                    "duration_seconds": job.duration_seconds,
+                    "error": job.error,
+                    "traceback": job.traceback,
+                    "termination_reason": job.termination_reason,
+                    "runs": job.runs,
+                },
+                created_at=job.created_at,
+            )
+            if not moved:
+                session.rollback()
+                return False
             session.commit()
         self._release_dependents_quietly(job_id, parent)
         return True
@@ -2344,38 +2444,47 @@ class SQLAlchemyBackend(DatabaseBackend):
     ):
         """Release a job after processing and update worker state.
 
-        Write-path pruning: uses job.created_at if the caller passes the full job object
+        A terminal ``status`` moves the job into history; the returned object is its history
+        row. Write-path pruning: uses job.created_at if the caller passes the full job object
         so PG can prune to one partition (item 10). Falls back to id-only for SQLite.
         """
+        parent_job_id = None
         with self._get_session() as session:
-            # Item 10: if the job object has created_at (caller passes full job), use it for pruning.
-            # Old (id-only — does not prune to partition on PG):
-            # db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
-            if hasattr(job, "created_at") and job.created_at is not None:
-                db_job = session.exec(
-                    select(QueuedJob)
-                    .where(QueuedJob.id == job.id)
-                    .where(QueuedJob.created_at == job.created_at)
-                ).first()
-            else:
-                db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job.id)).first()
+            created_at = getattr(job, "created_at", None)
+            stmt = select(QueuedJob).where(QueuedJob.id == job.id)
+            if created_at is not None:
+                stmt = stmt.where(QueuedJob.created_at == created_at)
+            db_job = session.exec(stmt).first()
+            result = None
             if db_job:
+                parent_job_id = db_job.parent_job_id
                 self._close_attempt(
                     session,
                     db_job.id,
                     None,
                     OUTCOME_SUCCESS if status == "success" else OUTCOME_FAILED,
                 )
-                db_job.status = status
-                db_job.finished_at = datetime.now(UTC)
+                finished_at = datetime.now(UTC)
+                duration = None
                 if db_job.started_at:
-                    db_job.duration_seconds = (
-                        db_job.finished_at - db_job.started_at
-                    ).total_seconds()
-                for key, value in kwargs.items():
-                    if hasattr(db_job, key):
+                    started = db_job.started_at
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=UTC)
+                    duration = (finished_at - started).total_seconds()
+                columns = set(JobHistory.__table__.c.keys()) - {"id", "status", "version"}
+                values = {k: v for k, v in kwargs.items() if k in columns}
+                values.setdefault("finished_at", finished_at)
+                values.setdefault("duration_seconds", duration)
+                if history_core.is_terminal(status):
+                    session.expunge(db_job)
+                    self._finish_in(
+                        session, db_job.id, status, values, created_at=db_job.created_at
+                    )
+                else:
+                    db_job.status = status
+                    for key, value in values.items():
                         setattr(db_job, key, value)
-                session.add(db_job)
+                    session.add(db_job)
 
             # Update worker back to idle
             worker = session.get(Worker, self._worker_pk(worker_id))
@@ -2387,19 +2496,20 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.add(worker)
 
             session.commit()
-            if db_job:
-                session.refresh(db_job)
-        if db_job is not None and db_job.status in ("success", "failed"):
-            self._release_dependents_quietly(db_job.id, db_job.parent_job_id)
-        return db_job
+            if db_job is not None:
+                result = self._find_job(session, db_job.id)
+        if result is not None and result.status in ("success", "failed"):
+            self._release_dependents_quietly(result.id, parent_job_id)
+        return result
 
     @staticmethod
     def _count_tag_in_session(session, tag: str, statuses: list[str], since=None) -> int:
         """Count jobs carrying ``tag``. Filters in Python: JSON ``contains`` is not portable
         (unsupported on SQLite, wrong operator on PostgreSQL ``json``)."""
-        stmt = select(QueuedJob.tags).where(QueuedJob.status.in_(statuses))
+        # Finished jobs live in history: read the union view.
+        stmt = select(JobAll.tags).where(JobAll.status.in_(statuses))
         if since is not None:
-            stmt = stmt.where(QueuedJob.started_at != None, QueuedJob.started_at >= since)  # noqa: E711
+            stmt = stmt.where(JobAll.started_at != None, JobAll.started_at >= since)  # noqa: E711
         return sum(1 for tags in session.exec(stmt).all() if tags and tag in tags)
 
     def count_running_with_tag(self, tag: str) -> int:
@@ -2498,6 +2608,11 @@ class SQLAlchemyBackend(DatabaseBackend):
 
     # ----- ready queue (#139) ----------------------------------------------
 
+    def history_table_exists(self) -> bool:
+        from sqlalchemy import inspect as sa_inspect
+
+        return sa_inspect(get_engine()).has_table(JobHistory.__tablename__)
+
     def ready_tables_exist(self) -> bool:
         from sqlalchemy import inspect as sa_inspect
 
@@ -2557,7 +2672,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             while parent and parent not in ids and hops < ready_core.MAX_CHAIN_HOPS:
                 ids.append(parent)
                 parent = session.exec(
-                    select(QueuedJob.parent_job_id).where(QueuedJob.id == parent)
+                    select(JobAll.parent_job_id).where(JobAll.id == parent)
                 ).first()
                 hops += 1
             rows = session.exec(
@@ -2625,6 +2740,7 @@ class SQLAlchemyBackend(DatabaseBackend):
         ``after_job_id`` to continue (0 restarts).
         """
         restored = dropped = 0
+        settled = self.settle_finished_jobs(limit)
         with self._get_session() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "postgresql":
@@ -2694,8 +2810,54 @@ class SQLAlchemyBackend(DatabaseBackend):
             "restored": restored,
             "dropped": dropped,
             "rechecked": len(page),
+            "settled": settled,
             "cursor": cursor if len(page) >= limit else 0,
         }
+
+    def settle_finished_jobs(self, limit: int = 200) -> int:
+        """Move terminal rows stranded in the live table into history; returns how many.
+
+        The terminal transition normally leaves nothing behind. This is the safety net for
+        raw SQL / third-party code that sets a final status on ``sqlery_queued_job`` and for a
+        crash between the steps of a retry. A failed job that still owes a retry (marker) is
+        left alone. One short transaction per row; never raises.
+        """
+        moved = 0
+        try:
+            grace = history_core.settle_grace_seconds(get_config)
+            cutoff = datetime.now(UTC) - timedelta(seconds=grace)
+            with self._get_session() as session:
+                strays = session.exec(history_sql.stray_terminal_stmt(limit, cutoff)).all()
+                for job in strays:
+                    has_retry = (
+                        session.exec(history_sql.has_retry_child_stmt(job.id)).first()
+                        is not None
+                    )
+                    status = history_core.settle_status(
+                        job.status, job.termination_reason, has_retry
+                    )
+                    if status is None:
+                        continue
+                    session.expunge(job)
+                    ok = self._finish_in(
+                        session,
+                        job.id,
+                        status,
+                        {
+                            "termination_reason": history_core.settled_termination_reason(
+                                job.termination_reason
+                            )
+                        },
+                        created_at=job.created_at,
+                        require_status=job.status,
+                    )
+                    session.commit()
+                    if ok:
+                        moved += 1
+                        self._release_dependents_quietly(job.id, job.parent_job_id)
+        except Exception:
+            logger.warning("settle_finished_jobs failed", exc_info=True)
+        return moved
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""
@@ -2739,16 +2901,18 @@ class SQLAlchemyBackend(DatabaseBackend):
     ) -> list:
         """Get jobs with optional filtering and pagination."""
         with self._get_session() as session:
-            stmt = select(QueuedJob)
+            # Live and finished jobs together (the union view); a terminal status filter
+            # is served by history alone.
+            stmt = select(JobAll)
 
             if status:
-                stmt = stmt.where(QueuedJob.status == status)
+                stmt = stmt.where(JobAll.status == status)
 
             if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
+                stmt = stmt.where(JobAll.queue_name == queue_name)
 
             # Order by priority (desc) and created_at (asc)
-            stmt = stmt.order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
+            stmt = stmt.order_by(JobAll.priority.desc(), JobAll.created_at, JobAll.id)
 
             # Apply pagination
             stmt = stmt.limit(limit).offset(offset)
@@ -2789,12 +2953,12 @@ class SQLAlchemyBackend(DatabaseBackend):
     ) -> int:
         """Count jobs with optional filtering."""
         with self._get_session() as session:
-            stmt = select(func.count(QueuedJob.id))
+            stmt = select(func.count(JobAll.id))
 
             if status:
-                stmt = stmt.where(QueuedJob.status == status)
+                stmt = stmt.where(JobAll.status == status)
 
             if queue_name:
-                stmt = stmt.where(QueuedJob.queue_name == queue_name)
+                stmt = stmt.where(JobAll.queue_name == queue_name)
 
             return session.exec(stmt).one()

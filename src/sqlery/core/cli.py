@@ -452,11 +452,15 @@ def jobs_list(
     backend = get_backend()
 
     try:
-        jobs = backend.get_jobs(
-            status=status,
-            queue_name=queue,
-            limit=limit,
-        )
+        # live and finished (history) jobs together
+        jobs = [
+            _job_as_dict(j)
+            for j in backend.get_jobs(
+                status=status,
+                queue_name=queue,
+                limit=limit,
+            )
+        ]
     except Exception as e:
         console.print(f"[red]Failed to fetch jobs: {e}[/red]")
         raise typer.Exit(1)
@@ -497,6 +501,16 @@ def jobs_list(
     console.print(f"\n[dim]Showing {len(jobs)} job(s)[/dim]")
 
 
+def _job_as_dict(job) -> dict:
+    """A job row (live ``QueuedJob``, ``JobHistory`` or view row) as the dict the job
+    commands print."""
+    if isinstance(job, dict):
+        return job
+    columns = getattr(getattr(job, "__table__", None), "columns", None)
+    names = [c.name for c in columns] if columns is not None else list(vars(job))
+    return {name: getattr(job, name, None) for name in names}
+
+
 @jobs_app.command("inspect")
 def jobs_inspect(
     job_id: int = typer.Argument(..., help="Job ID to inspect"),
@@ -511,7 +525,7 @@ def jobs_inspect(
     backend = get_backend()
 
     try:
-        job = backend.get_job_by_id(job_id)
+        job = backend.get_job_by_id(job_id)  # live, else finished (history)
     except Exception as e:
         console.print(f"[red]Failed to fetch job: {e}[/red]")
         raise typer.Exit(1)
@@ -519,6 +533,7 @@ def jobs_inspect(
     if not job:
         console.print(f"[red]Job {job_id} not found[/red]")
         raise typer.Exit(1)
+    job = _job_as_dict(job)
 
     job_status = str(job.get("status", ""))
     status_color = {"queued": "yellow", "running": "blue", "success": "green", "failed": "red", "cancelled": "dim"}.get(job_status, "white")
@@ -853,7 +868,7 @@ def queues_list():
     backend = get_backend()
 
     try:
-        jobs = backend.get_jobs(limit=10000)
+        jobs = [_job_as_dict(j) for j in backend.get_jobs(limit=10000)]
     except Exception as e:
         console.print(f"[red]Failed to fetch queues: {e}[/red]")
         raise typer.Exit(1)

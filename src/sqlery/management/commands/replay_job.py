@@ -10,7 +10,7 @@ import traceback as tb
 from django.core.management.base import BaseCommand, CommandError
 
 from sqlery.core.utils import import_task
-from sqlery.django_sqlery.models import JobAttempt, QueuedJob
+from sqlery.django_sqlery.models import JobAttempt, JobHistory, QueuedJob
 
 
 class Command(BaseCommand):
@@ -29,9 +29,12 @@ class Command(BaseCommand):
 
         job_id = options["job_id"]
 
-        try:
-            job = QueuedJob.objects.select_related("worker", "scheduled_task").get(pk=job_id)
-        except QueuedJob.DoesNotExist:
+        # A live job, else a finished one (history).
+        job = (
+            QueuedJob.objects.select_related("worker", "scheduled_task").filter(id=job_id).first()
+            or JobHistory.objects.filter(id=job_id).first()
+        )
+        if job is None:
             raise CommandError(f"Job #{job_id} not found")
 
         self._print_job(job)

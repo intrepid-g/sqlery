@@ -2,7 +2,7 @@
 
 import pytest
 
-from sqlery.models import QueuedJob
+from sqlery.models import JobAll, QueuedJob
 
 
 @pytest.mark.django_db
@@ -89,4 +89,4 @@ def test_http_trigger_process_queue_claims_a_queued_job(trigger_settings):
     assert result.status_code == 200
     assert result.body["claimed"] is True, result.body
     assert result.body["job_ids"] == [job.id]
-    assert QueuedJob.objects.get(id=job.id).status == "success"
+    assert JobAll.objects.get(id=job.id).status == "success"  # finished: in history

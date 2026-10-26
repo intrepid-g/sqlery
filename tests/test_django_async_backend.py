@@ -134,7 +134,7 @@ async def test_aclaim_job_waits_for_dependencies(backend, make_job):
 async def test_aclaim_job_expires_jobs_past_ttl(backend, make_job):
     """#67: a queued job older than its ttl fails as expired instead of running."""
     from asgiref.sync import sync_to_async
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.models import JobAll, QueuedJob
 
     job = await sync_to_async(make_job)(ttl=1)
     await QueuedJob.objects.filter(id=job.id).aupdate(
@@ -142,7 +142,7 @@ async def test_aclaim_job_expires_jobs_past_ttl(backend, make_job):
     )
 
     assert await backend.aclaim_job(["default"], "wkr-1") is None
-    fresh = await QueuedJob.objects.aget(id=job.id)
+    fresh = await JobAll.objects.aget(id=job.id)  # an expired job is final: in history
     assert (fresh.status, fresh.termination_reason) == ("failed", "expired")
 
 
@@ -163,24 +163,24 @@ async def test_amark_running(backend, make_job):
 
 async def test_amark_success(backend, make_job):
     from asgiref.sync import sync_to_async
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.models import JobAll, QueuedJob
 
     job = await sync_to_async(make_job)(status="running")
     await backend.amark_success(job.id, "ok")
     # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
-    fresh = await QueuedJob.objects.aget(id=job.id)
+    fresh = await JobAll.objects.aget(id=job.id)  # finished: in history
     assert fresh.status == "success"
     assert fresh.output == "ok"
 
 
 async def test_amark_failed(backend, make_job):
     from asgiref.sync import sync_to_async
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.django_sqlery.models import JobAll, QueuedJob
 
     job = await sync_to_async(make_job)(status="running")
     await backend.amark_failed(job.id, "boom", traceback="tb")
     # Old: fresh = await QueuedJob.objects.aget(pk=job.id)
-    fresh = await QueuedJob.objects.aget(id=job.id)
+    fresh = await JobAll.objects.aget(id=job.id)  # finished: in history
     assert fresh.status == "failed"
     assert fresh.error == "boom"
     assert fresh.traceback == "tb"

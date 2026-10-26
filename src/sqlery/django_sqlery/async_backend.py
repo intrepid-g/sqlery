@@ -24,7 +24,9 @@ from sqlery.core.utils import reject_unawaited_coroutine
 
 from .models import (
     DaemonLease,
+    JobAll,
     JobAttempt,
+    JobHistory,
     JobReady,
     JobRegistry,
     QueuedJob,
@@ -106,6 +108,13 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         from . import ready
 
         return await sync_to_async(ready.release_dependents)(job_id, parent_job_id)
+
+    async def ahistory_table_exists(self) -> bool:
+        from asgiref.sync import sync_to_async
+
+        from .backend import DjangoBackend
+
+        return await sync_to_async(DjangoBackend().history_table_exists)()
 
     async def aattempt_table_exists(self) -> bool:
         from asgiref.sync import sync_to_async
@@ -199,18 +208,24 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             await sync_to_async(ready.remove)([job_id])
 
     @staticmethod
-    def _finish_sync(job_id, outcome, attempt, values) -> None:
-        """Close the attempt and write the terminal job row in one transaction.
+    def _finish_sync(job_id, outcome, attempt, values, in_place: bool = False) -> None:
+        """Close the attempt and record the terminal state in one transaction: the job moves
+        from the live table to history (or, ``in_place``, is only marked, awaiting its retry).
 
-        Django has no ``transaction.aatomic``, so the two statements run through
+        Django has no ``transaction.aatomic``, so the statements run through
         ``sync_to_async`` (like ``aclaim_job``). A stale attempt raises ``JobFencingError``
         and the transaction rolls back: the job row is untouched. Without a handle every
         open attempt of the job is closed.
         """
         from django.db import transaction
+        from django.db.models import F
+
+        from . import history
 
         # Write-path pruning: fetch created_at first so PG prunes to one partition.
         row = QueuedJob.objects.filter(id=job_id).values("created_at").first()
+        values = dict(values)
+        status = values.pop("status")
         with transaction.atomic():
             if attempt is not None:
                 JobAttempt.close(attempt, outcome)
@@ -218,8 +233,14 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                 JobAttempt.close_open(
                     job_id, OUTCOME_SUCCESS if outcome == OUTCOME_SUCCESS else OUTCOME_ABANDONED
                 )
-            if row:
-                QueuedJob.objects.filter(id=job_id, created_at=row["created_at"]).update(**values)
+            if not row:
+                return  # already finished (in history) or gone: nothing to write
+            if in_place:
+                QueuedJob.objects.filter(id=job_id, created_at=row["created_at"]).update_in_place(
+                    status=status, version=F("version") + 1, **values
+                )
+            else:
+                history.move(job_id, row["created_at"], status, values)
 
     async def amark_success(self, job_id, result, attempt=None) -> None:
         # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
@@ -252,6 +273,15 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
     ) -> None:
         from asgiref.sync import sync_to_async
 
+        # A failure the worker is about to retry is not final: the job stays in the live
+        # table until ``arequeue_retry`` has queued the retry and archived it (a crash in
+        # between leaves it to the settle sweep). A final failure moves to history now.
+        budget = await QueuedJob.objects.filter(id=job_id).values("max_retries", "retry_count").afirst()
+        will_retry = bool(
+            budget
+            and (budget["max_retries"] or 0) > 0
+            and (budget["retry_count"] or 0) < (budget["max_retries"] or 0)
+        )
         await sync_to_async(self._finish_sync)(
             job_id,
             OUTCOME_FAILED,
@@ -262,6 +292,7 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                 "error": error or "",
                 "traceback": traceback or "",
             },
+            will_retry,
         )
 
     async def amark_shutting_down(self, job_id) -> None:
@@ -278,20 +309,16 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
     # ----- read paths ------------------------------------------------------
 
     async def aget_status(self, job_id) -> str | None:
-        try:
-            # Old: job = await QueuedJob.objects.only("status").aget(pk=job_id)
-            # pk is now a composite (created_at, id); look up by id only.
-            job = await QueuedJob.objects.only("status").aget(id=job_id)
-        except QueuedJob.DoesNotExist:
-            return None
-        return job.status
+        # Live or finished: the union view.
+        return await JobAll.objects.filter(id=job_id).values_list("status", flat=True).afirst()
 
     async def aget_job(self, job_id):
         try:
             # Old: return await QueuedJob.objects.aget(pk=job_id)
             return await QueuedJob.objects.aget(id=job_id)
         except QueuedJob.DoesNotExist:
-            return None
+            # A finished job is in history (read-only).
+            return await JobHistory.objects.filter(id=job_id).afirst()
 
     # ----- worker registry -------------------------------------------------
 
@@ -395,14 +422,13 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
 
         await QueuedJob.objects.acreate(status="queued", scheduled_at=scheduled_at, **fields)
 
-        # The failed attempt is superseded by the retry (as in the sync worker).
-        row = await QueuedJob.objects.filter(id=failed_job.id, status="failed").values(
-            "created_at"
-        ).afirst()
-        if row:
-            await QueuedJob.objects.filter(
-                id=failed_job.id, created_at=row["created_at"], status="failed"
-            ).aupdate(status="archived")
+        # The failed attempt is superseded by the retry (as in the sync worker): it is final
+        # now and moves to history as ``archived``.
+        from asgiref.sync import sync_to_async
+
+        from .backend import DjangoBackend
+
+        await sync_to_async(DjangoBackend().mark_job_archived)(failed_job.id)
 
     # ----- registry --------------------------------------------------------
 

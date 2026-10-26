@@ -4,7 +4,7 @@ import pytest
 
 from sqlery.compat import get_backend
 from sqlery.django_sqlery._executor_impl import TaskExecutor
-from sqlery.django_sqlery.models import QueuedJob
+from sqlery.django_sqlery.models import JobAll, QueuedJob
 
 
 @pytest.mark.django_db(transaction=True)
@@ -22,8 +22,9 @@ def test_retry_keeps_a_findable_name():
         job_name="repro:flaky:0",
     )
     TaskExecutor().run_queue_workers(queue_name="q", once=True)
-    first = QueuedJob.objects.get(job_name="repro:flaky:0")
-    retry = QueuedJob.objects.get(parent_job_id=first.id)
+    # the failed first attempt is final: it is in history (read the union view)
+    first = JobAll.objects.get(job_name="repro:flaky:0")
+    retry = JobAll.objects.get(parent_job_id=first.id)
     assert retry.job_name == "repro:flaky:0:retry:1"
 
 

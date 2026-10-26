@@ -188,7 +188,12 @@ class TestStatusTransitions:
     def test_mark_job_archived(self, sync_backend):
         job = _create_basic_job(sync_backend)
         sync_backend.claim_job(queues=["default"], worker_id="w1")
-        sync_backend.mark_job_failed(job.id, error="x")
+        # A failure awaiting its retry carries the marker and stays live; archiving it (the
+        # retry exists) makes it final. (History is insert-only: a plain final failure is not
+        # rewritten as archived any more.)
+        from sqlery.core.retry import pending_reason
+
+        sync_backend.mark_job_failed(job.id, error="x", termination_reason=pending_reason())
         sync_backend.mark_job_archived(job.id)
         assert sync_backend.get_job_by_id(job.id).status == "archived"
 
@@ -229,10 +234,15 @@ class TestRetryAndTTL:
         sync_backend.mark_job_failed(job.id, error="x", traceback="tb")
         count = sync_backend.retry_failed_jobs()
         assert count == 1
-        refreshed = sync_backend.get_job_by_id(job.id)
-        assert refreshed.status == "queued"
-        assert refreshed.error == ""
-        assert refreshed.retry_count == 0
+        # The failed job is in history and stays as it was; its retry is a fresh queued job.
+        failed = sync_backend.get_job_by_id(job.id)
+        assert failed.status == "failed"
+        retry = sync_backend.get_latest_retry(job.id)
+        assert retry.status == "queued"
+        assert retry.error == ""
+        assert retry.retry_count == 0
+        # It is retried once: the failed job now has a retry child.
+        assert sync_backend.retry_failed_jobs() == 0
 
     def test_retry_failed_filtered_by_queue(self, sync_backend):
         _create_basic_job(sync_backend, queue_name="a")
@@ -583,21 +593,29 @@ class TestCleanup:
         assert result["deleted"] >= 1
 
     def test_cleanup_jobs_dry_run(self, sync_backend):
+        # Retention only ever touches finished jobs (history); a queued job is never counted.
         _create_basic_job(sync_backend)
-        result = sync_backend.cleanup_jobs(status="queued", dry_run=True)
+        done = _create_basic_job(sync_backend)
+        sync_backend.claim_job(queues=["default"], worker_id="w1")
+        sync_backend.claim_job(queues=["default"], worker_id="w1")
+        sync_backend.mark_job_success(done.id)
+        result = sync_backend.cleanup_jobs(status="success", dry_run=True)
         assert result["deleted"] == 0
         assert result["count"] >= 1
 
     def test_cleanup_jobs_max_age(self, sync_backend):
         j = _create_basic_job(sync_backend)
+        sync_backend.claim_job(queues=["default"], worker_id="w1")
+        sync_backend.mark_job_success(j.id)
         with sync_backend._get_session() as session:
-            from sqlery.core.models import QueuedJob
+            from sqlalchemy import text
 
-            # Old: row = session.get(QueuedJob, j.id)  # composite PK (id, created_at) — single id invalid
-            from sqlmodel import select as _select
-            row = session.exec(_select(QueuedJob).where(QueuedJob.id == j.id)).first()
-            row.created_at = datetime.now(UTC) - timedelta(days=30)
-            session.add(row)
+            # History is insert-only; age the row by hand (as retention would see it).
+            session.exec(
+                text("UPDATE sqlery_job_history SET finished_at = :t").bindparams(
+                    t=datetime.now(UTC) - timedelta(days=30)
+                )
+            )
             session.commit()
         result = sync_backend.cleanup_jobs(max_age_days=1)
         assert result["deleted"] >= 1
@@ -613,14 +631,18 @@ class TestCleanup:
 
     def test_cleanup_jobs_by_count(self, sync_backend):
         for _ in range(5):
-            _create_basic_job(sync_backend)
+            j = _create_basic_job(sync_backend)
+            sync_backend.claim_job(queues=["default"], worker_id="w1")
+            sync_backend.mark_job_success(j.id)
         result = sync_backend.cleanup_jobs_by_count(keep_count=2)
         assert result["kept"] == 2
         assert result["deleted"] == 3
 
     def test_cleanup_jobs_by_count_dry_run(self, sync_backend):
         for _ in range(5):
-            _create_basic_job(sync_backend)
+            j = _create_basic_job(sync_backend)
+            sync_backend.claim_job(queues=["default"], worker_id="w1")
+            sync_backend.mark_job_success(j.id)
         result = sync_backend.cleanup_jobs_by_count(keep_count=2, dry_run=True)
         assert result["deleted"] == 0
 

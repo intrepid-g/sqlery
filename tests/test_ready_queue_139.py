@@ -667,8 +667,10 @@ def test_retried_failed_job_is_claimable_again(mode):
     mode.finish(mode.claim(), ok=False)
     assert mode.claim() is None
     assert mode.backend.retry_failed_jobs() == 1
-    assert mode.ready() == {job.id}
-    assert mode.claim().id == job.id
+    # The failed job is final (history is insert-only); its retry is a fresh queued job.
+    retry = mode.backend.get_latest_retry(job.id)
+    assert mode.ready() == {retry.id}
+    assert mode.claim().id == retry.id
 
 
 # ---- schema and start-up -------------------------------------------------------------------

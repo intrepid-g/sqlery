@@ -49,11 +49,12 @@ def run_next(backend, worker):
 def _all_jobs():
     from sqlmodel import Session, select
 
-    from sqlery.core.models import QueuedJob
+    from sqlery.core.models import JobAll
     from sqlery.fastapi_sqlery import database
 
+    # live and finished (history) jobs together
     with Session(database.get_engine()) as s:
-        return list(s.exec(select(QueuedJob)))
+        return list(s.exec(select(JobAll)))
 
 
 def test_chord_body_receives_header_results_in_forked_child(backend):

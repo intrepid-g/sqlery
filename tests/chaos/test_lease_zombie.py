@@ -546,11 +546,11 @@ class TestFencedCompletionAfterReclaim:
         assert job.output != "late result"
 
     def test_unfenced_call_would_have_clobbered(self):
-        """Sanity control: omitting expected_version reproduces the historical
-        bug (the whole reason this fix exists) — the stale write succeeds and
-        overwrites the reclaiming worker's result. Pins the pre-fix behaviour
-        so a future refactor can't silently drop the `expected_version=None`
-        default and reintroduce fencing everywhere without anyone noticing.
+        """Sanity control: omitting expected_version used to reproduce the historical
+        bug (the whole reason this fix exists) — the stale write succeeded and
+        overwrote the reclaiming worker's result. Since terminal jobs live in the
+        insert-only history, even an unfenced late write can no longer touch the
+        reclaimed job: it is ignored (the outcome of the sweep stays).
         """
         from django.utils import timezone
         from sqlery.compat import get_backend
@@ -573,8 +573,8 @@ class TestFencedCompletionAfterReclaim:
         backend.mark_job_success(job.id, output="late result")
 
         job.refresh_from_db()
-        assert job.status == "success"
-        assert job.output == "late result"
+        assert job.status == "failed"
+        assert job.output != "late result"
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +630,7 @@ class TestStandaloneFencedCompletionAfterReclaim:
         from sqlmodel import select
         from sqlery.compat import JobFencingError
         from sqlery.core.daemon import DaemonManager
-        from sqlery.core.models import QueuedJob, Worker
+        from sqlery.core.models import JobAll, QueuedJob, Worker
 
         backend = standalone_zombie_backend
 
@@ -684,7 +684,8 @@ class TestStandaloneFencedCompletionAfterReclaim:
         DaemonManager._fail_zombie_running_jobs(backend)
 
         with backend._get_session() as session:
-            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            # the reclaimed job is final: it is in history (read the union view)
+            db_job = session.exec(select(JobAll).where(JobAll.id == job_id)).first()
             assert db_job.status == "failed", "zombie sweep must have reclaimed the job"
             reclaimed_version = db_job.version
             assert reclaimed_version != expected_version, (
@@ -701,7 +702,7 @@ class TestStandaloneFencedCompletionAfterReclaim:
 
         # The zombie sweep's outcome must be untouched — no silent clobber.
         with backend._get_session() as session:
-            db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
+            db_job = session.exec(select(JobAll).where(JobAll.id == job_id)).first()
             assert db_job.status == "failed"
             assert db_job.output != "late result"
 
@@ -770,4 +771,7 @@ class TestStandaloneFencedCompletionAfterReclaim:
         with backend._get_session() as session:
             db_job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
             assert db_job.output != "stale result"
-            assert db_job.version == 1
+            assert db_job.version == 1  # still live: the stale completion wrote no history
+            from sqlery.core.models import JobHistory
+
+            assert session.exec(select(JobHistory).where(JobHistory.id == job_id)).first() is None

@@ -161,9 +161,16 @@ class TestStatusTransitions:
 
     def test_mark_job_archived(self, django_backend):
         job = _create_basic_job(django_backend)
-        django_backend.QueuedJob.objects.filter(id=job.id).update(status="failed")
+        # A failure awaiting its retry carries the marker and stays live; archiving it (the
+        # retry exists) makes it final. (History is insert-only: a plain final failure is not
+        # rewritten as archived any more.)
+        from sqlery.core.retry import pending_reason
+
+        django_backend.QueuedJob.objects.filter(id=job.id).update(
+            status="failed", termination_reason=pending_reason()
+        )
         django_backend.mark_job_archived(job.id)
-        job.refresh_from_db()
+        job.refresh_from_db()  # the job is in history now: the object follows it
         assert job.status == "archived"
 
     def test_mark_job_success_missing(self, django_backend):
@@ -216,8 +223,13 @@ class TestRetryAndTTL:
         django_backend.QueuedJob.objects.filter(id=j.id).update(status="failed")
         count = django_backend.retry_failed_jobs()
         assert count == 1
+        # The failed job is in history and stays as it was; its retry is a fresh queued job.
         j.refresh_from_db()
-        assert j.status == "queued"
+        assert j.status == "failed"
+        retry = django_backend.get_latest_retry(j.id)
+        assert retry.status == "queued"
+        assert retry.retry_count == 0
+        assert django_backend.retry_failed_jobs() == 0  # retried once
 
     def test_retry_failed_by_queue(self, django_backend):
         a = _create_basic_job(django_backend, queue_name="a")
@@ -625,15 +637,18 @@ class TestCleanup:
 
     def test_cleanup_jobs_max_age(self, django_backend):
         j = _create_basic_job(django_backend)
-        django_backend.QueuedJob.objects.filter(id=j.id).update(
-            created_at=timezone.now() - timedelta(days=30)
-        )
+        django_backend.QueuedJob.objects.filter(id=j.id).update(status="success")
+        # History is insert-only; age the row by hand (as retention would see it).
+        from sqlery.django_sqlery.models import JobHistory
+
+        JobHistory.objects.filter(id=j.id).update(finished_at=timezone.now() - timedelta(days=30))
         result = django_backend.cleanup_jobs(max_age_days=1)
         assert result["deleted"] >= 1
 
     def test_cleanup_jobs_by_count(self, django_backend):
         for _ in range(5):
-            _create_basic_job(django_backend)
+            j = _create_basic_job(django_backend)
+            django_backend.QueuedJob.objects.filter(id=j.id).update(status="success")
         result = django_backend.cleanup_jobs_by_count(keep_count=2)
         assert result["kept"] == 2
         assert result["deleted"] == 3
@@ -1010,10 +1025,11 @@ class TestDualTableApiSurface:
         self._create_staged_job(django_backend)
         results = django_backend.get_jobs(queue_name="mixed")
         assert len(results) >= 1
-        # All returned objects must be QueuedJob instances, never ScheduledJob
+        # Rows come from the live table and history (read through the union view), never
+        # from the staging table: never ScheduledJob
         for r in results:
-            assert isinstance(r, QueuedJob), (
-                f"get_jobs() returned a {type(r).__name__}, expected QueuedJob only"
+            assert not isinstance(r, ScheduledJob), (
+                f"get_jobs() returned a {type(r).__name__}, expected queue rows only"
             )
 
     def test_get_staged_jobs_callable(self, django_backend):

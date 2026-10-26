@@ -19,6 +19,7 @@ from sqlery.core.models import (
     DaemonLease,
     JobAttempt,
     JobBlocked,
+    JobHistory,
     JobReady,
     JobRegistry,
     QueuedJob,
