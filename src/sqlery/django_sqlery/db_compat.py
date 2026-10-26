@@ -117,105 +117,74 @@ def _mirror_claim(job, worker, started_at, expected_version):
     job.version = expected_version + 1
 
 
+def _claim_fenced(job, worker):
+    """Claim ``job`` for ``worker``; the single implementation behind both dialect helpers.
+
+    Deleting the job's ready entry (rowcount 1) is the mutex: of any number of claimers only
+    one deletes it. The job row is then set running by an update fenced on ``status =
+    'queued'`` and on the ``version`` the caller read, and its rowcount is checked. If the
+    update loses, the transaction part is rolled back (the ready entry stays) and the claim
+    returns False, so a job can never be handed to two claimers.
+    """
+    from .models import JobReady, QueuedJob  # circular: models.py imports db_compat
+
+    expected_version = job.version or 0
+    with transaction.atomic():
+        deleted, _ = JobReady.objects.filter(job_id=job.id).delete()
+        if deleted < 1:
+            return False  # claimed by someone else, cancelled, or not ready
+        started_at = timezone.now()
+        updated = QueuedJob.objects.filter(
+            id=job.id,
+            created_at=job.created_at,  # Composite PK: partition key for PG pruning
+            status="queued",
+            version=expected_version,
+        ).update(
+            status="running",
+            worker=worker,
+            started_at=started_at,
+            version=F("version") + 1,
+        )
+        if updated != 1:
+            transaction.set_rollback(True)  # keeps the entry: this claimer did not win
+            return False
+    # The fence proves the row we read is the row we updated: mirror the written values.
+    _mirror_claim(job, worker, started_at, expected_version)
+    return True
+
+
 def atomic_claim_job_sqlite(job, worker):
-    """Atomically claim a job on SQLite using optimistic locking with version field.
+    """Atomically claim a job on SQLite (ready-entry delete + status/version fenced update).
 
-    SQLite doesn't support SELECT FOR UPDATE SKIP LOCKED, so we use
-    optimistic locking with a version counter:
-
-    UPDATE queued_job SET status='running', version=version+1
-    WHERE id=Y AND status='queued' AND version=Z
-
-    This ensures 100% reliable atomic claiming:
-    - Only the worker with the matching version succeeds
-    - Version counter increments on every update
-    - Race conditions are impossible (version mismatch = claim fails)
+    SQLite has no row locks; the delete of the ready entry is serialised by the database's
+    single writer, and the fenced update (``status='queued' AND version=<read>``) is the
+    second compare-and-set.
 
     Args:
         job: QueuedJob instance to claim (must have current version)
         worker: Worker instance claiming the job
 
     Returns:
-        bool: True if claimed successfully, False if version conflict or already claimed
+        bool: True if claimed successfully, False if another claimer won or the job changed
     """
-    from .models import QueuedJob  # circular: models.py imports db_compat
-    # from django.db.models import F  # moved to top-level
-
-    # Remember the version we read from the SELECT
-    expected_version = job.version
-
-    # Atomically claim the job using UPDATE with version check
-    # Old: rows_updated = QueuedJob.objects.filter(
-    # Old:     id=job.id,
-    # Old:     status='queued',  # Only claim if still queued
-    # Old:     version=expected_version  # Optimistic lock: only succeed if version matches
-    # Old: ).update(
-    started_at = timezone.now()
-    rows_updated = QueuedJob.objects.filter(
-        id=job.id,
-        created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 1)
-        status='queued',  # Only claim if still queued
-        version=expected_version  # Optimistic lock: only succeed if version matches
-    ).update(
-        status='running',
-        worker=worker,
-        started_at=started_at,
-        version=F('version') + 1  # Atomically increment version
-    )
-
-    if rows_updated == 0:
-        # Either another worker claimed it (version changed) or status changed
-        return False
-
-    # Successfully claimed. The version check proves the row we read is the row we
-    # updated, so mirror the written values instead of re-reading the row (#127).
-    # Old: job.refresh_from_db()
-    _mirror_claim(job, worker, started_at, expected_version)
-    return True
+    return _claim_fenced(job, worker)
 
 
 def atomic_claim_job_postgres(job, worker):
-    """Claim a job on PostgreSQL (already locked by SELECT FOR UPDATE).
+    """Claim a job on PostgreSQL (ready-entry delete + status/version fenced update).
 
-    Since we used SELECT FOR UPDATE SKIP LOCKED in the query,
-    the row is already locked. However, we still use version field
-    for consistency and additional safety.
+    The caller's ``SELECT FOR UPDATE SKIP LOCKED`` is not relied on (its lock does not
+    survive across transactions): the entry delete decides the race, and the update is
+    fenced on ``status='queued'`` and the version the caller read.
 
     Args:
-        job: QueuedJob instance (already locked)
+        job: QueuedJob instance to claim
         worker: Worker instance claiming the job
 
     Returns:
-        bool: True if claimed successfully, False if version conflict (should not happen)
+        bool: True if claimed successfully, False if another claimer won or the job changed
     """
-    # from django.db.models import F  # moved to top-level
-    from .models import QueuedJob  # circular: models.py imports db_compat
-
-    expected_version = job.version
-
-    # Old: rows_updated = QueuedJob.objects.filter(
-    # Old:     id=job.id,
-    # Old:     version=expected_version
-    # Old: ).update(
-    started_at = timezone.now()
-    rows_updated = QueuedJob.objects.filter(
-        id=job.id,
-        created_at=job.created_at,  # Composite PK: partition key for PG pruning (checklist item 2)
-        version=expected_version
-    ).update(
-        status='running',
-        worker=worker,
-        started_at=started_at,
-        version=F('version') + 1
-    )
-
-    if rows_updated == 0:
-        # Should not happen (row is locked), but handle gracefully
-        return False
-
-    # Old: job.refresh_from_db()
-    _mirror_claim(job, worker, started_at, expected_version)
-    return True
+    return _claim_fenced(job, worker)
 
 
 def atomic_claim_job(job, worker):
