@@ -162,8 +162,9 @@ def test_django_backend_revoke_flag_and_states():
     queued = apply_async_job("tests.tasks.dummy_task", {})
     assert revoke(queued.id) is True and queued.state == "REVOKED"
 
-    running = QueuedJob.objects.create(task_path="tests.tasks.dummy_task", queue_name="default",
-                                       status="running")
+    from tests.running_jobs import django_running_job
+
+    running = django_running_job(task_path="tests.tasks.dummy_task", queue_name="default")
     res = AsyncResult(running.id)
     assert res.revoke() is False and backend.is_job_revoke_requested(running.id) is False
     assert res.revoke(terminate=True) is True

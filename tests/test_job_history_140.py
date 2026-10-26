@@ -135,7 +135,9 @@ def finish_ok(m, output="3"):
 def test_success_moves_the_job_out_of_the_live_table_into_history(mode):
     job = mode.new_job()
     claimed = mode.claim()
-    assert live_status(mode, job.id) == "running" and history_row(mode, job.id) is None
+    # (a claim does not write the row: it stays queued and the open attempt makes it running)
+    assert live_status(mode, job.id) == "queued" and mode.status(job.id) == "running"
+    assert history_row(mode, job.id) is None
     done = mode.finish(claimed, ok=True)
     assert done.status == "success" and done.output == "3"
     assert live_status(mode, job.id) is None
@@ -189,13 +191,14 @@ def test_a_stale_completion_after_a_requeue_writes_no_history(mode):
 
 
 def test_a_completion_by_a_superseded_version_writes_no_history(mode):
+    """The version still fences a completion when the row was edited after the job was read
+    (a claim no longer bumps it: the attempt fences the claimers)."""
     from sqlery.compat import JobFencingError
 
     job = mode.new_job()
     claimed = mode.claim()
     seen_version = claimed.version
-    mode.backend.release_job(job.id)
-    mode.claim()  # claimed again: the version moved on
+    sql_exec(mode, f"UPDATE sqlery_queued_job SET version = version + 1 WHERE id = {job.id}")
     with pytest.raises(JobFencingError):
         mode.backend.mark_job_success(job.id, output="late", expected_version=seen_version)
     assert history_row(mode, job.id) is None
@@ -438,7 +441,7 @@ def test_retention_prunes_old_history_and_its_attempts_but_never_live_jobs(mode)
     assert history_row(mode, recent_done.id) is not None
     assert len(attempts_of(mode, recent_done.id)) == 1
     assert live_status(mode, queued.id) == "queued"  # live work is never retention's business
-    assert live_status(mode, running.id) == "running"
+    assert live_status(mode, running.id) == "queued" and mode.status(running.id) == "running"
     assert len(attempts_of(mode, running.id)) == 1  # an open attempt is never pruned
 
 

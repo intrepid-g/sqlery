@@ -7,11 +7,13 @@ import time
 from typing import Any
 
 import pytest
+from asgiref.sync import sync_to_async
 
 from sqlery.core.async_worker import AsyncWorker
 from sqlery.core.job import job as core_job
 from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
-from sqlery.django_sqlery.models import JobAll, QueuedJob
+from sqlery.django_sqlery.models import JobAll, JobAttempt, QueuedJob
+from tests.running_jobs import django_make_running
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.asyncio]
 
@@ -152,8 +154,8 @@ async def test_django_async_worker_fails_orphaned_running_job_at_startup():
     from datetime import datetime, timezone
 
     orphan = await _enqueue("one")
-    await QueuedJob.objects.filter(id=orphan.id).aupdate(
-        status="running", started_at=datetime(2020, 1, 1, tzinfo=timezone.utc), worker=None
+    await sync_to_async(django_make_running)(
+        orphan, started_at=datetime(2020, 1, 1, tzinfo=timezone.utc)
     )
     await _run(max_polls=2)
     assert (await JobAll.objects.aget(id=orphan.id)).status == "failed"
@@ -163,11 +165,9 @@ async def test_django_async_worker_sweep_spares_fresh_and_live_jobs():
     from datetime import datetime, timezone
 
     fresh = await _enqueue("one")
-    await QueuedJob.objects.filter(id=fresh.id).aupdate(
-        status="running", started_at=datetime.now(timezone.utc), worker=None
-    )
+    await sync_to_async(django_make_running)(fresh, started_at=datetime.now(timezone.utc))
     await _run(max_polls=2)
-    assert (await QueuedJob.objects.aget(id=fresh.id)).status == "running"
+    assert (await JobAll.objects.aget(id=fresh.id)).status == "running"
 
 
 async def test_django_async_worker_sweep_spares_long_job_of_live_worker():
@@ -181,11 +181,11 @@ async def test_django_async_worker_sweep_spares_long_job_of_live_worker():
     )
     claimed = await worker.backend.aclaim_job(["default"], str(worker.worker_id))
     assert claimed.id == job.id
-    await QueuedJob.objects.filter(id=job.id).aupdate(
-        started_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    await JobAttempt.objects.filter(job_id=job.id).aupdate(
+        claimed_at=datetime.now(timezone.utc) - timedelta(hours=1)
     )
     await worker._recover_orphans()
-    assert (await QueuedJob.objects.aget(id=job.id)).status == "running"
+    assert (await JobAll.objects.aget(id=job.id)).status == "running"
 
 
 async def test_django_async_worker_sweep_spares_own_job_with_unresolvable_worker_id():
@@ -197,9 +197,9 @@ async def test_django_async_worker_sweep_spares_own_job_with_unresolvable_worker
     worker = AsyncWorker(DjangoAsyncBackend(), ["default"], worker_id="wkr-x", poll_interval=0.05)
     claimed = await worker.backend.aclaim_job(["default"], worker.worker_id)
     assert claimed.id == job.id
-    await QueuedJob.objects.filter(id=job.id).aupdate(
-        started_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    await JobAttempt.objects.filter(job_id=job.id).aupdate(
+        claimed_at=datetime.now(timezone.utc) - timedelta(hours=1)
     )
     worker._inflight[job.id] = asyncio.ensure_future(asyncio.sleep(0))
     await worker._recover_orphans()
-    assert (await QueuedJob.objects.aget(id=job.id)).status == "running"
+    assert (await JobAll.objects.aget(id=job.id)).status == "running"

@@ -41,8 +41,9 @@ except ImportError:
 try:
     # Old: from ..django_sqlery.models import QueuedJob
     # Add ScheduledJob for staging_depth metric (Task 2, plan 16-03).
-    from ..django_sqlery.models import QueuedJob, ScheduledJob
+    from ..django_sqlery.models import JobAttempt, QueuedJob, ScheduledJob
 except Exception:
+    JobAttempt = None
     QueuedJob = None
     ScheduledJob = None
 
@@ -967,6 +968,24 @@ class DaemonManager:
             logger.info(f"Cleaned up {failed_count} zombie running jobs")
         return failed_count
 
+    @staticmethod
+    def _running_jobs_of_worker(worker_id) -> list:
+        """The jobs a worker is running: queued rows whose open attempt names that worker.
+
+        A claim writes nothing to the job row (#157), so the attempt, not ``QueuedJob.worker``,
+        says who holds a job. Each job is shown running (in memory).
+        """
+        attempts = {
+            a.job_id: a
+            for a in JobAttempt.objects.filter(
+                worker_id=worker_id, finished_at__isnull=True
+            ).order_by("id")
+        }
+        return [
+            job.show_running(attempts[job.id])
+            for job in QueuedJob.objects.running().filter(id__in=list(attempts))
+        ]
+
     def _fail_orphaned_jobs_for_worker(self, backend, inline_worker_id):
         """Fail running jobs assigned to our worker from a previous process life.
 
@@ -988,7 +1007,7 @@ class DaemonManager:
                 return
 
             # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
-            orphaned = QueuedJob.objects.filter(worker=worker_row, status="running")
+            orphaned = DaemonManager._running_jobs_of_worker(worker_row.id)
             count = 0
             for job in orphaned:
                 job.mark_failed(
@@ -1060,10 +1079,7 @@ class DaemonManager:
                     # Fail any running jobs assigned to this worker
                     try:
                         # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)
-                        orphaned_jobs = QueuedJob.objects.filter(
-                            worker_id=worker_id,
-                            status="running",
-                        )
+                        orphaned_jobs = DaemonManager._running_jobs_of_worker(worker_id)
                         for job in orphaned_jobs:
                             job.mark_failed(
                                 error="Worker died — no heartbeat",

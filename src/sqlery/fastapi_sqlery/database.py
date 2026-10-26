@@ -464,15 +464,43 @@ def _backfill_ready(engine) -> None:
         conn.execute(text(_ready.backfill_ready_sql()))
 
 
-def _ensure_job_view(engine) -> None:
-    """Create ``sqlery_job_all``, the read-only union of the live table and history, unless it
-    exists (an existing view is left alone: replacing it takes a lock for nothing)."""
-    from sqlalchemy import inspect as sa_inspect
+def _view_definition(conn) -> str | None:
+    """SQL text of ``sqlery_job_all`` as the database stores it, or None if it is missing."""
+    if conn.dialect.name == "postgresql":
+        return conn.execute(
+            text(
+                "SELECT pg_get_viewdef(c.oid) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = :n AND c.relkind = 'v' AND n.nspname = current_schema()"
+            ),
+            {"n": _history.JOB_ALL_VIEW},
+        ).scalar()
+    return conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = :n"),
+        {"n": _history.JOB_ALL_VIEW},
+    ).scalar()
 
-    if _history.JOB_ALL_VIEW in sa_inspect(engine).get_view_names():
-        return
+
+def _ensure_job_view(engine) -> None:
+    """Create ``sqlery_job_all``, the read-only union of the live table and history, in its
+    attempt-derived shape (a queued job with an open attempt reads as running, #157).
+
+    An up-to-date view is left alone (replacing it takes a lock for nothing). The first start
+    on a database whose view predates #157 moves the data to the new representation in the
+    same transaction that replaces the view: rows stored as ``running`` become ``queued`` rows
+    with an open attempt. Workers are stopped while upgrading, as documented; whichever of
+    this, the Alembic revision or the Django migration runs first wins, all are idempotent.
+    """
     with engine.begin() as conn:
-        for statement in _history.view_columns_ddl(_models.JOB_COLUMNS, engine.dialect.name):
+        definition = _view_definition(conn)
+        if definition is not None and _history.ATTEMPT_TABLE in definition:
+            return
+        conn.execute(text(_history.open_job_index_ddl()))
+        for statement in _history.normalize_running_sql(conn.dialect.name):
+            conn.execute(text(statement))
+        for statement in _history.view_columns_ddl(
+            _models.JOB_COLUMNS, engine.dialect.name, with_attempts=True
+        ):
             conn.execute(text(statement))
 
 

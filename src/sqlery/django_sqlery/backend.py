@@ -30,6 +30,8 @@ from .db_compat import (
     assert_in_atomic_block,
     atomic_claim_job_queryset,
     is_sqlite,
+    judge_claim,
+    lock_unclaimed,
 )
 # Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
 from . import history, ready
@@ -217,7 +219,8 @@ class DjangoBackend(DatabaseBackend):
             replaced = []
             for conflicting in self.QueuedJob.objects.filter(job_name=job_name):
                 replaced.append((conflicting.id, conflicting.parent_job_id))
-                if conflicting.status == "running":
+                # a running job is a queued row with an open attempt
+                if conflicting.show_running(conflicting.open_attempt()).status == "running":
                     conflicting.force_stop()
             with transaction.atomic():
                 self.QueuedJob.objects.filter(job_name=job_name).delete()
@@ -411,17 +414,20 @@ class DjangoBackend(DatabaseBackend):
 
     def request_job_revoke(self, job_id: int) -> bool:
         """Flag a running job for termination (see DatabaseBackend.request_job_revoke)."""
+        # One of the few writes to a running job's row (otherwise untouched while it runs).
         return (
-            self.QueuedJob.objects.filter(id=job_id, status="running").update(
-                termination_reason="revoke_requested"
-            )
+            self.QueuedJob.objects.running()
+            .filter(id=job_id)
+            .update(termination_reason="revoke_requested")
             > 0
         )
 
     def is_job_revoke_requested(self, job_id: int) -> bool:
-        return self.QueuedJob.objects.filter(
-            id=job_id, status="running", termination_reason="revoke_requested"
-        ).exists()
+        return (
+            self.QueuedJob.objects.running()
+            .filter(id=job_id, termination_reason="revoke_requested")
+            .exists()
+        )
 
     def get_jobs_pending_retry(self, older_than_seconds: float = 60, limit: int = 100) -> list:
         """Failed jobs whose retry was never created (see DatabaseBackend)."""
@@ -471,37 +477,23 @@ class DjangoBackend(DatabaseBackend):
         Locks go ready entry first, then job row (the order every claim uses). An entry that
         another claimer holds means the job is being claimed: return None instead of waiting.
         """
-        from django.db.models import F
-
         with transaction.atomic():
             if not is_sqlite():
                 entries = JobReady.objects.filter(slot__in=ready.SLOTS, job_id=job_id)
                 held = list(entries.select_for_update(skip_locked=True))
                 if not held and entries.exists():
                     return None  # the entry exists but is locked: someone else is claiming it
-            current = self.QueuedJob.objects.filter(id=job_id, status="queued").first()
+            current = self.QueuedJob.objects.waiting().filter(id=job_id).first()
             if current is None:
                 return None
             ready.remove([job_id])
-            updated = self.QueuedJob.objects.filter(
-                id=job_id,
-                created_at=current.created_at,
-                status="queued",
-                version=current.version or 0,
-            ).update(
-                status="running",
-                started_at=timezone.now(),
-                # worker_pid lives on the attempt now (#138).
-                # #CLEANUP: stop reading QueuedJob.worker_pid/child_pid, then drop the columns.
-                version=F("version") + 1,
-            )
-            if updated != 1:
+            # The job row is only read (and locked), never written: the attempt is the claim.
+            if not lock_unclaimed(current):
                 transaction.set_rollback(True)  # keeps the entries: not claimed by us
                 return None
             # Ephemeral claimers (lambda-/trigger-) have no Worker row: worker id stays NULL.
-            job = self.QueuedJob.objects.filter(id=job_id, created_at=current.created_at).first()
-            JobAttempt.open_new(job, self._attempt_worker_id(worker_id), os.getpid())
-        return job
+            JobAttempt.open_new(current, self._attempt_worker_id(worker_id), os.getpid())
+        return current
 
     def _attempt_worker_id(self, worker_id):
         """Id of the registered Worker row ``worker_id`` names, else None (ephemeral claimers)."""
@@ -518,22 +510,34 @@ class DjangoBackend(DatabaseBackend):
     def release_claimed_job(
         self, job, worker_id: str, status: str, jobs_processed: int = 0, **kwargs
     ):
-        """Release a job after processing and update worker state."""
+        """Release a job after processing and update worker state.
+
+        A terminal ``status`` moves the job to history; ``queued`` puts it back in the queue
+        (the attempt is abandoned and the ready entry returns; the row is not written).
+        """
         with transaction.atomic():
+            # When it started is on its attempt (the claim writes nothing to the job row).
+            attempt = JobAttempt.open_for(job.id)
+            started_at = attempt.claimed_at if attempt is not None else job.started_at
             JobAttempt.close_open(
                 job.id, OUTCOME_SUCCESS if status == "success" else OUTCOME_ABANDONED
             )
-            job.status = status
-            job.finished_at = timezone.now()
-            if job.started_at:
-                job.duration_seconds = (job.finished_at - job.started_at).total_seconds()
-            # job.worker = None  # Keep worker FK for historical tracking
-            update_fields = ["status", "finished_at", "duration_seconds"]
-            for key, value in kwargs.items():
-                if hasattr(job, key):
-                    setattr(job, key, value)
-                    update_fields.append(key)
-            job.save(update_fields=update_fields)
+            if status == "queued":
+                if hasattr(job, "hide_running"):
+                    job.hide_running()
+                ready.add([job])
+            else:
+                job.status = status
+                job.finished_at = timezone.now()
+                if started_at:
+                    job.duration_seconds = (job.finished_at - started_at).total_seconds()
+                # job.worker = None  # Keep worker FK for historical tracking
+                update_fields = ["status", "finished_at", "duration_seconds"]
+                for key, value in kwargs.items():
+                    if hasattr(job, key):
+                        setattr(job, key, value)
+                        update_fields.append(key)
+                job.save(update_fields=update_fields)
 
             # Update worker back to idle
             worker_row = self._resolve_worker(worker_id)
@@ -657,7 +661,9 @@ class DjangoBackend(DatabaseBackend):
         # updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
         #     status="failed", error="Cancelled by user"
         # )
-        row = self.QueuedJob.objects.filter(id=job_id, status="queued").values("created_at").first()
+        # Only a job that is queued and not running can be cancelled (a running one is revoked
+        # instead, see ``request_job_revoke``).
+        row = self.QueuedJob.objects.waiting().filter(id=job_id).values("created_at").first()
         if row:
             with transaction.atomic():
                 # Entries first, then the job row: the lock order of a claim. A claimer that
@@ -671,6 +677,7 @@ class DjangoBackend(DatabaseBackend):
                         "failed",
                         {"error": "Cancelled by user"},
                         require_status="queued",
+                        require_idle=True,
                     )
                 )
                 if updated == 0:
@@ -1172,9 +1179,14 @@ class DjangoBackend(DatabaseBackend):
         # critical than on UPDATE. Full row returned including created_at — no
         # .only() that would drop the field. No change needed; checklist item 10 verified.
         try:
-            return self.QueuedJob.objects.get(id=job_id)
+            job = self.QueuedJob.objects.get(id=job_id)
         except self.QueuedJob.DoesNotExist:
             pass
+        else:
+            if job.status == "queued":
+                # Running is derived from the open attempt (the claim leaves the row alone).
+                job.show_running(job.open_attempt())
+            return job
         # A finished job is in history (read-only).
         finished = JobHistory.objects.filter(id=job_id).first()
         if finished is not None:
@@ -1405,39 +1417,50 @@ class DjangoBackend(DatabaseBackend):
             return None
 
     def get_running_jobs(self, queue_name: str | None = None) -> list:
-        """Get currently running jobs."""
-        query = self.QueuedJob.objects.filter(status="running")
+        """Get currently running jobs: live jobs with an open attempt, shown running with the
+        attempt's start time, worker and PIDs (in memory; nothing is written back)."""
+        query = self.QueuedJob.objects.running()
 
         if queue_name:
             query = query.filter(queue_name=queue_name)
 
-        return list(query)
+        jobs = list(query)
+        attempts = self.get_open_attempts([j.id for j in jobs])
+        for job in jobs:
+            job.show_running(attempts.get(job.id))
+        return jobs
 
     def get_running_jobs_for_liveness(self, queue_names: list[str] | None = None) -> list:
         """Build RunningJobLiveness records for the zombie sweep.
 
-        Preserves the original daemon query: select_related('worker') over all
-        ``status='running'`` jobs, optionally filtered to ``queue_names``.
+        Every running job (a queued row with an open attempt), optionally filtered to
+        ``queue_names``, with the worker its attempt names.
         """
         from sqlery.core.liveness import RunningJobLiveness
 
-        query = self.QueuedJob.objects.filter(status="running")
+        query = self.QueuedJob.objects.running()
         if queue_names:
             query = query.filter(queue_name__in=queue_names)
-        query = query.select_related("worker")
 
         jobs = list(query)
         attempts = self.get_open_attempts([j.id for j in jobs])
+        workers = {
+            w.id: w
+            for w in self.Worker.objects.filter(
+                id__in={a.worker_id for a in attempts.values() if a.worker_id is not None}
+            )
+        }
         records = []
         for job in jobs:
-            worker = job.worker
             attempt = attempts.get(job.id)
+            if attempt is None:
+                continue  # finished since the query
+            worker = workers.get(attempt.worker_id)
             records.append(
                 RunningJobLiveness(
                     job_id=job.id,
-                    started_at=job.started_at,
-                    # The open attempt; the row column only for jobs claimed before attempts.
-                    worker_pid=attempt.worker_pid if attempt else job.worker_pid,
+                    started_at=attempt.claimed_at,
+                    worker_pid=attempt.worker_pid,
                     worker_node_id=worker.node_id if worker else None,
                     worker_status=worker.status if worker else None,
                     worker_current_job_id=worker.current_job_id if worker else None,
@@ -1449,19 +1472,30 @@ class DjangoBackend(DatabaseBackend):
         return records
 
     def fail_zombie_job(self, job_id: int, reason: str) -> bool:
-        """Mark a running job failed with termination_reason='zombie_job'."""
+        """Mark a running job failed with termination_reason='zombie_job'.
+
+        The open attempt is abandoned in the same transaction as the failure (a late completion
+        from the dead worker is rejected). A job that is not running (it finished, or was
+        requeued, since the sweep looked) is left alone and False is returned.
+        """
         job = self.QueuedJob.objects.filter(id=job_id).first()
-        if job is None:
+        if job is None or job.status != "queued":
             return False
-        job.mark_failed(error=reason, termination_reason="zombie_job")
+        attempt = job.open_attempt()
+        if attempt is None:
+            return False  # not running
+        job.show_running(attempt)
+        with transaction.atomic():
+            # Closing the open attempt is the arbiter between recovery, a completion and a
+            # requeue (each closes it exactly once): lose that race and there is nothing to do.
+            if JobAttempt.close_open(job_id, OUTCOME_ABANDONED) < 1:
+                return False
+            job.mark_failed(error=reason, termination_reason="zombie_job")
         return True
 
     def has_running_jobs_in_queue(self, queue_name: str, exclude_job_id: int | None = None) -> bool:
         """Check if queue has running jobs."""
-        query = self.QueuedJob.objects.filter(
-            queue_name=queue_name,
-            status="running",
-        )
+        query = self.QueuedJob.objects.running().filter(queue_name=queue_name)
 
         if exclude_job_id:
             query = query.exclude(id=exclude_job_id)
@@ -1516,7 +1550,7 @@ class DjangoBackend(DatabaseBackend):
 
     def count_running_with_tag(self, tag: str) -> int:
         """Count currently running jobs with the given tag."""
-        return self._count_with_tag(self.QueuedJob.objects.filter(status="running"), tag)
+        return self._count_with_tag(self.QueuedJob.objects.running(), tag)
 
     def count_started_with_tag_since(self, tag: str, threshold) -> int:
         """Count jobs with the given tag that started since threshold."""
@@ -1536,10 +1570,21 @@ class DjangoBackend(DatabaseBackend):
 
         now = timezone.now()
         expired = []
-        for job in self.QueuedJob.objects.filter(status="queued", ttl__isnull=False):
+        # A running job never expires (it is a queued row with an open attempt).
+        for job in self.QueuedJob.objects.waiting().filter(ttl__isnull=False):
             if job.created_at + timedelta(seconds=job.ttl) < now:
                 expired.append(job)
         return expired
+
+    def expire_queued_job(self, job, error: str, termination_reason: str = "expired") -> bool:
+        """Fail a job that is still waiting and move it to history (fenced: it must not be
+        running). Returns False, writing nothing, when the job started, finished or changed
+        since it was read."""
+        try:
+            job.mark_failed(error=error, termination_reason=termination_reason, idle_only=True)
+        except ConcurrentModificationError:
+            return False
+        return True
 
     def acquire_tag_locks(self, tags: list[str]) -> bool:
         """Acquire exclusive locks on tag coordination rows."""
@@ -1619,11 +1664,17 @@ class DjangoBackend(DatabaseBackend):
             # Not found by (created_at, id): the row's created_at differs from the entry's
             # (edited by hand); fall back to the id alone before calling the entry stale.
             rows.update({j.id: j for j in self.QueuedJob.objects.filter(id__in=missing)})
+        running = {
+            a.job_id
+            for a in JobAttempt.objects.filter(
+                job_id__in=[e.job_id for e in entries], finished_at__isnull=True
+            )
+        }
         jobs, stale = [], []
         for entry in entries:
             job = rows.get(entry.job_id)
-            if job is None or job.status != "queued":
-                stale.append(entry.job_id)  # claimed elsewhere, cancelled or deleted
+            if job is None or job.status != "queued" or job.id in running:
+                stale.append(entry.job_id)  # claimed elsewhere (or running), cancelled, deleted
                 continue
             job._ready_slot = entry.slot
             jobs.append(job)
@@ -1635,8 +1686,9 @@ class DjangoBackend(DatabaseBackend):
         """Atomically claim a specific job for a worker.
 
         Deleting the job's ready entry is the claim (it is locked on PostgreSQL, and its
-        rowcount decides the race on SQLite); the job row is then set running and the attempt
-        inserted. All of it is one unit inside the caller's transaction: if the attempt
+        rowcount decides the race on SQLite); the job row is then locked and verified
+        (still queued, same version, no open attempt) and the attempt inserted. The job row is
+        not written. All of it is one unit inside the caller's transaction: if the attempt
         cannot be recorded the claim is rolled back (savepoint) and the job stays ready.
         """
         with transaction.atomic():
@@ -1647,26 +1699,14 @@ class DjangoBackend(DatabaseBackend):
             deleted, _ = entries.delete()
             if deleted < 1:
                 return False  # claimed by someone else, or no longer ready
-            started_at = timezone.now()
-            expected_version = job.version or 0
-            updated = self.QueuedJob.objects.filter(
-                id=job.id, created_at=job.created_at, status="queued", version=expected_version
-            ).update(
-                status="running", worker=worker, started_at=started_at, version=db_models.F("version") + 1
-            )
-            if updated != 1:
-                # The job changed under the entry we own: whoever changed it owns it now;
-                # if it is somehow still queued, put the entry back.
-                if self.QueuedJob.objects.filter(
-                    id=job.id, created_at=job.created_at, status="queued"
-                ).exists():
-                    ready.add([job])
+            verdict = judge_claim(job)
+            if verdict != "ok":
+                # The job changed under the entry we own. A stale entry (the job is gone, not
+                # queued, or running) stays deleted; an entry of a job that merely moved is put
+                # back (savepoint rollback) so an edited job stays claimable.
+                if verdict == "restore":
+                    transaction.set_rollback(True)
                 return False
-            # The version check of the old claim is the entry delete now; mirror the write.
-            job.status = "running"
-            job.worker = worker
-            job.started_at = started_at
-            job.version = expected_version + 1
             JobAttempt.open_new(job, getattr(worker, "id", None), os.getpid())
             return True
 
@@ -1713,14 +1753,21 @@ class DjangoBackend(DatabaseBackend):
             return None
 
     def release_job(self, job_id: int):
-        """Release a claimed job back to queued status (its open attempt is abandoned)."""
+        """Release a claimed job back to the queue: abandon its open attempt and put its
+        ready entry back, in one transaction. The job row is not written (it never changed).
+
+        A job that is not running is left alone (nothing to release), so a repeated release
+        queues the job once.
+        """
         with transaction.atomic():
-            JobAttempt.close_open(job_id, OUTCOME_ABANDONED)
-            self.QueuedJob.objects.filter(id=job_id).update(
-                status="queued",
-                started_at=None,
-                worker_pid=None,
-            )
+            job = self.QueuedJob.objects.filter(id=job_id, status="queued").first()
+            if job is None:
+                return
+            # Closing the open attempt is the arbiter between a requeue, a completion and a
+            # recovery (each closes it exactly once).
+            if JobAttempt.close_open(job_id, OUTCOME_ABANDONED) < 1:
+                return
+            ready.add([job])
 
     def get_jobs(
         self,

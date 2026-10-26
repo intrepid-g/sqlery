@@ -20,6 +20,7 @@ from django.test import TestCase, RequestFactory, override_settings
 from django.utils import timezone
 
 from sqlery.django_sqlery.models import JobAll, QueuedJob, Worker, DaemonCommand
+from tests.running_jobs import django_running_job
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -48,19 +49,15 @@ def _create_worker(status="idle", heartbeat_age_seconds=0, current_job=None, pid
 
 
 def _create_running_job(started_seconds_ago=10, timeout_seconds=None, worker=None):
-    """Create a QueuedJob in running state."""
-    job = QueuedJob.objects.create(
+    """Create a QueuedJob in running state (a queued row with an open attempt)."""
+    return django_running_job(
         task_path="tests.test_intervention.dummy_task",
         queue_name="default",
-        status="running",
         started_at=timezone.now() - timedelta(seconds=started_seconds_ago),
         timeout_seconds=timeout_seconds,
         worker_pid=os.getpid(),
+        worker=worker,
     )
-    if worker:
-        job.worker = worker
-        job.save(update_fields=["worker"])
-    return job
 
 
 def dummy_task():

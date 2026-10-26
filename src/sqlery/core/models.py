@@ -463,6 +463,13 @@ class JobAttempt(SQLModel, table=True):
             postgresql_where=text("finished_at IS NULL"),
             sqlite_where=text("finished_at IS NULL"),
         ),
+        # "Is this job running / which jobs are running" (#157): the open attempts, by job.
+        Index(
+            "sqlery_attempt_open_job_idx",
+            "job_id",
+            postgresql_where=text("finished_at IS NULL"),
+            sqlite_where=text("finished_at IS NULL"),
+        ),
     )
 
     # Integer on SQLite so the primary key auto-increments (rowid alias).
@@ -672,11 +679,15 @@ def _create_job_view(target, connection, **kw):
     if connection.dialect.name not in ("sqlite", "postgresql"):
         return
     inspector = _inspect(connection)
-    if not (inspector.has_table(QueuedJob.__tablename__) and inspector.has_table(JobHistory.__tablename__)):
+    if not (
+        inspector.has_table(QueuedJob.__tablename__)
+        and inspector.has_table(JobHistory.__tablename__)
+        and inspector.has_table(JobAttempt.__tablename__)
+    ):
         return
     if _job_view_exists(connection):
         return
-    for statement in _history.view_columns_ddl(JOB_COLUMNS, connection.dialect.name):
+    for statement in _history.view_columns_ddl(JOB_COLUMNS, connection.dialect.name, with_attempts=True):
         connection.execute(text(statement))
 
 

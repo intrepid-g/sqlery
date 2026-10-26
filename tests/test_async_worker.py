@@ -8,6 +8,8 @@ Uses SQLAlchemyAsyncBackend on a temporary ``sqlite+aiosqlite`` file.
 from __future__ import annotations
 
 import asyncio
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -101,11 +103,32 @@ async def make_job(session_factory):
             kwargs={"x": 1},
         )
         defaults.update(kw)
+        # A running job is a queued row with an open attempt (#157): the start time, worker and
+        # PIDs go to the attempt, the row stays as enqueued.
+        running = defaults["status"] == "running"
+        attempt = {k: defaults.pop(k, None) for k in ("started_at", "worker_id", "worker_pid")}
+        if running:
+            defaults["status"] = "queued"
         async with session_factory() as s:
             job = QueuedJob(**defaults)
             s.add(job)
             await s.commit()
             await s.refresh(job)
+            if running:
+                from sqlery.core.models import JobAttempt
+                from sqlery.core.ready_sql import delete_ready_stmt
+
+                await s.execute(delete_ready_stmt([job.id]))
+                s.add(
+                    JobAttempt(
+                        job_id=job.id,
+                        token=str(uuid.uuid4()),
+                        worker_id=attempt["worker_id"],
+                        worker_pid=attempt["worker_pid"],
+                        claimed_at=attempt["started_at"] or datetime.now(UTC),
+                    )
+                )
+                await s.commit()
             return job
 
     return _factory
@@ -443,7 +466,15 @@ async def test_startup_sweep_fails_orphan_of_stale_worker(backend, make_job, ses
 def _update_started(job_id, when):
     from sqlalchemy import update
 
-    return update(QueuedJob).where(QueuedJob.id == job_id).values(started_at=when)
+    from sqlery.core.models import JobAttempt
+
+    # when it started is on the open attempt (a claim does not write the job row)
+    return (
+        update(JobAttempt)
+        .where(JobAttempt.job_id == job_id)
+        .where(JobAttempt.finished_at.is_(None))
+        .values(claimed_at=when)
+    )
 
 
 async def test_sweep_spares_own_inflight_job_with_non_uuid_worker_id(

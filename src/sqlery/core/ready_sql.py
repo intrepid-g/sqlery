@@ -19,6 +19,7 @@ from sqlalchemy import and_, delete, event, inspect, or_, select, text, update
 from sqlalchemy.orm import Session as _SASession
 
 from .models import (
+    JobAttempt,
     JobBlocked,
     JobReady,
     QueuedJob,
@@ -58,8 +59,26 @@ def _rotation_enabled() -> bool:
     return rotation.rotation_enabled(get_config)
 
 
-def write_ready(target, dialect_name: str, jobs) -> None:
+def open_attempt_job_ids_stmt(job_ids):
+    """Ids among ``job_ids`` that have an open attempt, i.e. jobs that are running (#157)."""
+    return (
+        select(JobAttempt.job_id)
+        .where(JobAttempt.job_id.in_(list(job_ids)))
+        .where(JobAttempt.finished_at.is_(None))
+    )
+
+
+def _scalar_ids(result) -> set:
+    return {row if isinstance(row, int) else row[0] for row in result.all()}
+
+
+def write_ready(target, dialect_name: str, jobs, fresh: bool = False) -> None:
     """Insert the ready entries of ``jobs`` through a Session or Connection.
+
+    A job that has an open attempt is running and gets no entry: this is the one place every
+    writer (restore, unblock, sweep, ORM hook) passes through, so none of them can make a
+    running job claimable a second time. ``fresh`` jobs (just inserted by the caller) cannot
+    have an attempt and skip the check.
 
     With rotation on (PostgreSQL) the shared generation lock is taken first and the slot read
     in the same transaction; otherwise slot 0 and no lock, as before #141.
@@ -68,17 +87,29 @@ def write_ready(target, dialect_name: str, jobs) -> None:
     if not jobs:
         return
     run = target.exec if hasattr(target, "exec") else target.execute
+    if not fresh:
+        running = _scalar_ids(run(open_attempt_job_ids_stmt(j.id for j in jobs)))
+        jobs = [j for j in jobs if j.id not in running]
+        if not jobs:
+            return
     slot = rotation.writer_slot(
         lambda sql: run(text(sql)).scalar(), _rotation_enabled(), dialect_name
     )
     run(insert_ready_stmt(dialect_name, [ready_values(j, slot) for j in jobs]))
 
 
-async def awrite_ready(session, dialect_name: str, jobs) -> None:
+async def awrite_ready(session, dialect_name: str, jobs, fresh: bool = False) -> None:
     """``write_ready`` for an async session."""
     jobs = list(jobs)
     if not jobs:
         return
+    if not fresh:
+        running = _scalar_ids(
+            await session.execute(open_attempt_job_ids_stmt(j.id for j in jobs))
+        )
+        jobs = [j for j in jobs if j.id not in running]
+        if not jobs:
+            return
 
     async def read_one(sql):
         return (await session.execute(text(sql))).scalar()
@@ -210,9 +241,9 @@ def _drop_entries(conn, job_ids) -> None:
         conn.execute(delete_blocked_stmt(ids))
 
 
-def _ensure_entry(conn, job) -> None:
+def _ensure_entry(conn, job, fresh: bool = False) -> None:
     dialect = conn.dialect.name
-    write_ready(conn, dialect, [job])
+    write_ready(conn, dialect, [job], fresh=fresh)
     conn.execute(
         update_ready_stmt(
             job.id,
@@ -243,7 +274,7 @@ def _sync_ready_with_jobs(session, flush_context, instances):
         if job.id is None:
             job.id = _generate_job_id_from_uuid7()
         if job.status == "queued":
-            _ensure_entry(conn, job)
+            _ensure_entry(conn, job, fresh=True)
     for job in dirty:
         if job.id is None:
             continue
