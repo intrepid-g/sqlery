@@ -188,7 +188,6 @@ class QueuedJob(SQLModel, table=True):
         table = True
         indexes = [
             ("queue_name", "status", "priority", "created_at"),
-            ("task_path", "status"),
         ]
 
     def mark_running(self):

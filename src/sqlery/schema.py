@@ -184,12 +184,6 @@ INDEXES_SQL = [
     CREATE INDEX IF NOT EXISTS idx_jobs_cleanup
     ON sqlery_queued_job(created_at, status)
     """,
-    # 5. Task path lookup (for checking existing jobs for a task)
-    # Query pattern: WHERE task_path = '...' AND status IN (...)
-    """
-    CREATE INDEX IF NOT EXISTS idx_jobs_task_status
-    ON sqlery_queued_job(task_path, status)
-    """,
     # 6. Registry job lookup
     # Query pattern: WHERE job_id = ... AND registry_type = ...
     """
