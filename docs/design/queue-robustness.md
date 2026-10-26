@@ -212,6 +212,58 @@ the same batch.
 - A final failure is `failed` in history even if someone later creates a retry
   for it by hand (history is not rewritten to `archived`).
 
+## #156 Live-table storage bound (partitioned PostgreSQL)
+
+`sqlery_queued_job` holds only work in flight (finished jobs live in history), so a
+`created_at` partition that has passed and has **no row at all** contains nothing but
+dead tuples. With the xmin horizon pinned VACUUM cannot clear them, so waiting for
+`SQLERY_PARTITION_RETENTION` (30 days) would let the live table grow by retention x rate.
+Retention therefore no longer applies to the live table (history and attempts keep it):
+
+- **Drop rule.** A live partition is dropped when it is not the DEFAULT partition, its
+  upper bound is older than now minus `SQLERY_LIVE_PARTITION_GRACE` (default `1 hour`,
+  never below 1 minute) and it holds no row of any status (queued, running,
+  retry-pending, webhook-pending, anything). The decision is the pure function
+  `partitioning.decide_partition_reclaim`.
+- **Storage bound.** With the default width of one hour the live table holds at most
+  (rows in flight) + about 2 hours of dead tuples per past partition that could not yet
+  be dropped, independent of retention and of the horizon.
+- **Order of operations per partition**, in one maintenance tick under the existing
+  advisory lock (one maintainer at a time): (1) cheap unlocked `EXISTS` look; a partition
+  with rows is never locked. (2) A transaction with `SET LOCAL lock_timeout = 50ms`:
+  `LOCK TABLE part IN ACCESS EXCLUSIVE MODE NOWAIT` as its first statement, emptiness
+  re-checked under the lock (an insert needs a lock on the partition, so none can slip in:
+  it either committed before, and is seen, or waits and then fails or re-routes after the
+  drop), `DETACH PARTITION`, `DROP TABLE`, commit. A late `created_at` (backfill, clock
+  skew) into a dropped range lands in the DEFAULT partition, which `check_default_partition`
+  reports and is never dropped.
+- **No stalls.** The partition lock is NOWAIT; the parent lock that DETACH needs gets
+  50 ms and is abandoned after that (a pending ACCESS EXCLUSIVE request makes later
+  claims and enqueues queue, so the window is bounded). Any failure rolls back and the
+  partition is retried next tick. The emptiness scans have a 5 s statement timeout.
+  A REPEATABLE READ transaction that read the partition is simply skipped.
+- **`DETACH ... CONCURRENTLY` is not used.** PostgreSQL refuses it on a table with a
+  DEFAULT partition (this table has one, so stray values are never rejected), and it cannot
+  run inside a transaction block, so the emptiness check and the detach could not be
+  atomic; an interrupted run also leaves a half-detached partition to FINALIZE. The
+  plain DETACH is held for milliseconds on a table whose partition is already empty and
+  locked.
+- **Width.** `SQLERY_LIVE_PARTITION_INTERVAL` (default `1 hour`) applies to the live table
+  only; `SQLERY_PARTITION_INTERVAL` (`1 day`) stays for history and attempts. Coverage
+  is premade at least `max(premake x width, 1 day)` ahead (`ensure_live_partitions`).
+  Existing partitions are never repartitioned: the walk starts at the bucket holding now,
+  jumps over ranges that exist (the daily ones of older installs) and clips a new
+  partition to the next existing one, so mixed widths and off-grid boundaries leave
+  neither overlap nor gap. Set the interval to `1 day` to keep the old shape.
+- **Maintenance cadence.** The standalone default of
+  `PARTITION_MAINTENANCE_INTERVAL_MINUTES` is 5 (it was 1440, which would drop drained
+  partitions once a day); the daemon warns when a configured cadence exceeds the live width.
+- **Health.** The `xmin_horizon` block gains `live_partitions`: the number and age
+  (seconds past the drop deadline) of drained partitions that still exist, and the number
+  still holding rows. Health is `degraded` when one has been undroppable for longer than
+  `PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS` (900; 0 disables). Candidates are judged by
+  `n_live_tup` and, for the oldest ten, an exact `EXISTS` with a 3 s cap.
+
 ## #141 Rotation (opt-in, PostgreSQL only)
 
 Reclaims `sqlery_job_ready` by `TRUNCATE` instead of VACUUM.

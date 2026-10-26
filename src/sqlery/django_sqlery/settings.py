@@ -149,6 +149,9 @@ DEFAULTS = {
     "PG_DEAD_TUPLE_RATIO_DEGRADED": 0.5,   # sqlery_queued_job dead/live tuples
     "PG_DEAD_TUPLE_MIN": 10000,            # ...but only with at least this many dead
     "PG_SLOT_XID_AGE_DEGRADED": 5000000,   # replication slot / standby xmin age (xids)
+    # A drained live partition (#156) that stays undroppable this many seconds past its
+    # grace (SQLERY_LIVE_PARTITION_GRACE, default "1 hour") degrades health.
+    "PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS": 900,
 
     # Opt-in rotation of the PostgreSQL ready queue (#141, docs/design/queue-robustness.md).
     "READY_ROTATION_ENABLED": False,
