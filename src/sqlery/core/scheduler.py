@@ -460,36 +460,89 @@ def _read_target_columns(cur) -> list[tuple[str, str, bool, bool]]:
     return [tuple(row) for row in cur.fetchall()]
 
 
-def _promotion_insert_parts(target_columns, staged: dict) -> tuple[str, str, list]:
+def _orm_column_defaults() -> dict:
+    """Column name -> default the normal enqueue path would give, from the active ORM.
+
+    Django: the model field defaults (``Field.get_default()``). Standalone: the SQLModel field
+    defaults, then SQLAlchemy column defaults. A column with no default anywhere is absent.
+    """
+    defaults: dict = {}
+    try:
+        if is_django_mode():
+            from django.utils import timezone
+
+            model = get_backend().QueuedJob
+            for field in model._meta.concrete_fields:
+                if getattr(field, "auto_now", False) or getattr(field, "auto_now_add", False):
+                    defaults[field.column] = timezone.now()
+                    continue
+                value = field.get_default()
+                if value is not None:
+                    defaults[field.column] = value
+        else:
+            from .models import QueuedJob as SqlModelQueuedJob
+
+            for name, info in SqlModelQueuedJob.model_fields.items():
+                value = info.get_default(call_default_factory=True)
+                if value is not None and not _is_undefined(value):
+                    defaults[name] = value
+            for column in SqlModelQueuedJob.__table__.columns:
+                default = column.default
+                if column.name not in defaults and default is not None and default.is_scalar:
+                    defaults[column.name] = default.arg
+    except Exception:
+        logger.warning("promotion: could not read ORM column defaults", exc_info=True)
+    return defaults
+
+
+def _is_undefined(value) -> bool:
+    return type(value).__name__ in ("PydanticUndefinedType", "UndefinedType")
+
+
+def _promotion_insert_parts(
+    target_columns, staged: dict, defaults: dict | None = None
+) -> tuple[str, str, list]:
     """Column list, placeholders and params for promoting one staged row.
 
-    A column is written when the staged row has a value for it. A column the table has but
-    the staged row lacks is left to its database default; if it is NOT NULL with no default
-    it gets a neutral value for its type. A staged value with no such column is dropped.
+    A column is written when the staged row has a value for it. A column the staged row lacks
+    gets the default the normal enqueue path would give (``defaults``, from the ORM models);
+    failing that it is left to its database default; a NOT NULL column with neither gets a
+    neutral value for its type, with a warning. A staged value with no such column is dropped.
     """
+    defaults = defaults or {}
     names: list[str] = []
     placeholders: list[str] = []
     params: list = []
     for name, udt, not_null, has_default in target_columns:
-        cast = f"::{udt}" if udt in ("json", "jsonb") else ""
+        is_json = udt in ("json", "jsonb")
+        cast = f"::{udt}" if is_json else ""
         if name in staged:
-            names.append(_quote_ident(name))
-            placeholders.append("%s" + cast)
-            params.append(staged[name])
+            value = staged[name]
+        elif name in defaults:
+            value = defaults[name]
+            if is_json and not isinstance(value, (str, bytes)):
+                value = json.dumps(value)
         elif not_null and not has_default:
-            if udt in ("json", "jsonb"):
-                names.append(_quote_ident(name))
-                placeholders.append("%s" + cast)
-                params.append("[]")
+            logger.warning(
+                f"promotion: column {name} has no default in the ORM or the database;"
+                " using a neutral value"
+            )
+            if is_json:
+                value = "[]"
             elif udt in _NEUTRAL_BY_TYPE:
-                names.append(_quote_ident(name))
-                placeholders.append("%s")
-                params.append(_NEUTRAL_BY_TYPE[udt])
+                value = _NEUTRAL_BY_TYPE[udt]
             elif udt in ("timestamptz", "timestamp"):
                 names.append(_quote_ident(name))
                 placeholders.append("now()")
+                continue
+            else:
+                continue
+        else:
+            continue
+        names.append(_quote_ident(name))
+        placeholders.append("%s" + cast)
+        params.append(value)
     return ", ".join(names), ", ".join(placeholders), params
-
 
 
 def promote_due_scheduled_jobs(cur) -> int:
@@ -523,6 +576,8 @@ def promote_due_scheduled_jobs(cur) -> int:
             "result_ttl": int | None,
             "failure_ttl": int | None,
             "parent_job_id": int | None,
+            "webhook_url": str, "webhook_events": list,   # optional (Django schema)
+            "webhook_max_retries": int,                    # optional (Django schema)
           }
         }
 
@@ -592,6 +647,7 @@ def promote_due_scheduled_jobs(cur) -> int:
             # JSON columns are supplied explicitly rather than relying on DB defaults.
             # payload column in staging stores {"kwargs": {...}, "job_spec": {...}}.
             target_columns = _read_target_columns(cur)
+            orm_defaults = _orm_column_defaults()
 
             for row in rows:
                 (job_id, queue_name, task_path, raw_payload,
@@ -660,7 +716,15 @@ def promote_due_scheduled_jobs(cur) -> int:
                     "tags": json.dumps(tags),
                     "created_at": created_at,
                 }
-                columns, placeholders, params = _promotion_insert_parts(target_columns, staged)
+                # Webhook settings staged with the job (Django schema) are carried through.
+                for key in ("webhook_url", "webhook_events", "webhook_max_retries"):
+                    if spec.get(key) is not None:
+                        staged[key] = (
+                            json.dumps(spec[key]) if key == "webhook_events" else spec[key]
+                        )
+                columns, placeholders, params = _promotion_insert_parts(
+                    target_columns, staged, orm_defaults
+                )
                 cur.execute(
                     f"INSERT INTO sqlery_queued_job ({columns}) VALUES ({placeholders})",
                     params,

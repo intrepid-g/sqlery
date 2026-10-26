@@ -414,6 +414,108 @@ class TestPayloadFidelity:
 
 
 # ---------------------------------------------------------------------------
+# #147 follow-up: promotion keeps webhook settings and uses ORM defaults
+# ---------------------------------------------------------------------------
+
+
+def _insert_by_column(cur) -> dict:
+    """Column -> param of the one INSERT INTO sqlery_queued_job the mock cursor saw."""
+    inserts = [
+        c for c in cur.execute.call_args_list
+        if "INSERT INTO sqlery_queued_job" in str(c.args[0])
+    ]
+    assert len(inserts) == 1
+    sql = str(inserts[0].args[0])
+    names = [c.strip().strip('"') for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+    return dict(zip(names, inserts[0].args[1]))
+
+
+@pytest.mark.django_db
+class TestPromotionKeepsEnqueueValues:
+    """A promoted row gets what the normal enqueue path would give it."""
+
+    def test_staged_job_with_webhook_settings_keeps_them_after_promotion(self, monkeypatch):
+        """Enqueue into staging with a webhook; promotion writes the same webhook values."""
+        import json
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        from sqlery.django_sqlery.backend import DjangoBackend
+        from sqlery.django_sqlery.models import ScheduledJob
+
+        backend = DjangoBackend()
+        monkeypatch.setattr(backend, "_partitioned_pg", lambda: True)
+        staged = backend.create_job(
+            task_path="tests.fake.staging_task",
+            kwargs={},
+            queue_name="default",
+            priority=0,
+            scheduled_at=datetime.now(timezone.utc) + timedelta(days=60),
+            max_retries=0,
+            retry_backoff=1.0,
+            allow_parallel=False,
+            timeout_seconds=None,
+            webhook_url="https://example.com/hook",
+            webhook_events=["failure"],
+            webhook_max_retries=7,
+        )
+        assert isinstance(staged, ScheduledJob)
+
+        now = datetime.now(timezone.utc)
+        row = (staged.id, "default", staged.task_path, staged.payload, now, 0, 0, now)
+        columns = QUEUED_JOB_COLUMNS + [
+            ("webhook_url", "varchar", False, False),
+            ("webhook_events", "jsonb", True, False),
+            ("webhook_retries", "int4", True, False),
+            ("webhook_max_retries", "int4", True, False),
+        ]
+        cur = _make_cursor(fetchone_sequence=[(True,)], fetchall_sequence=[[row], columns])
+        assert promote_due_scheduled_jobs(cur) == 1
+
+        got = _insert_by_column(cur)
+        assert got["webhook_url"] == "https://example.com/hook"
+        assert json.loads(got["webhook_events"]) == ["failure"]
+        assert got["webhook_max_retries"] == 7
+        assert got["webhook_retries"] == 0
+
+    @pytest.mark.parametrize("mode", ["django", "standalone"])
+    def test_missing_column_gets_orm_default_not_neutral_value(self, mode, monkeypatch):
+        """A NOT NULL column the staging row lacks gets the model default, not 0/''/[]."""
+        import sqlery.core.scheduler as scheduler
+        from sqlery.django_sqlery.backend import DjangoBackend
+
+        monkeypatch.setattr(scheduler, "is_django_mode", lambda: mode == "django")
+        if mode == "django":
+            monkeypatch.setattr(scheduler, "get_backend", lambda: DjangoBackend())
+        columns = QUEUED_JOB_COLUMNS + [("webhook_max_retries", "int4", True, False)]
+        now = datetime.now(timezone.utc)
+        staged = {  # no retry_backoff
+            "id": 1, "queue_name": "default", "task_path": "m.f",
+            "scheduled_at": now, "created_at": now,
+        }
+        defaults = scheduler._orm_column_defaults()
+
+        names, _, params = scheduler._promotion_insert_parts(columns, staged, defaults)
+        got = dict(zip([n.strip('"') for n in names.split(", ")], params))
+
+        assert got["retry_backoff"] == 1.0
+        assert got["status"] == "queued"
+        if mode == "django":
+            assert got["webhook_max_retries"] == 3  # the ORM default, not the neutral 0
+        else:
+            assert "webhook_max_retries" in got  # no model default: neutral fallback
+
+    def test_column_without_any_default_gets_neutral_value_and_warning(self, caplog):
+        """Only a column with no default anywhere falls back to a neutral value, with a warning."""
+        import logging
+        from sqlery.core.scheduler import _promotion_insert_parts
+
+        columns = [("id", "int8", True, False), ("mystery", "int4", True, False)]
+        with caplog.at_level(logging.WARNING):
+            names, _, params = _promotion_insert_parts(columns, {"id": 1}, {})
+        assert params == [1, 0]
+        assert "mystery" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # SC-3: Config validation rejects retention <= threshold
 # ---------------------------------------------------------------------------
 
