@@ -388,9 +388,17 @@ async def test_async_completion_is_fenced_by_the_claim_attempt(dialect):
 
     url = "sqlite+aiosqlite:///:memory:" if dialect == "sqlite" else sqlalchemy_pg_url(PG_URL)
     db_mod.reset_async_engine()
+    if dialect == "pg":
+        # The real PostgreSQL schema is partitioned (live table, history, attempts) and is
+        # built by the bootstrap DDL; a bare ``create_all`` cannot express it (#140).
+        db_mod._engine = None
+        db_mod.init_database(url)
+        db_mod.get_engine().dispose()
+        db_mod._engine = None
     engine = db_mod.get_async_engine(url)
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+    if dialect != "pg":
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
     try:
         backend = SQLAlchemyAsyncBackend()
         factory = db_mod.get_async_session_factory()
