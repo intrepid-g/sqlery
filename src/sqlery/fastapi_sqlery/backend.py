@@ -582,6 +582,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                     .where(QueuedJob.id == job_id)
                     .where(QueuedJob.created_at == job.created_at)
                     .where(QueuedJob.status == "queued")
+                    .where(QueuedJob.version == (job.version or 0))
                     .values(
                         status="running",
                         started_at=now,
@@ -2615,6 +2616,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .where(QueuedJob.id == job.id)
                 .where(QueuedJob.created_at == job.created_at)
                 .where(QueuedJob.status == "queued")
+                .where(QueuedJob.version == (job.version or 0))
                 .values(status="running", started_at=now, version=QueuedJob.version + 1)
                 .execution_options(synchronize_session=False)
             )
