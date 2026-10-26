@@ -545,8 +545,10 @@ class TestStaleJobCleanup:
         assert job.status == "failed"
 
     def test_mark_running_stores_pid(self):
-        """Test that mark_running() stores worker PID."""
+        """Test that mark_running() stores the worker PID (on the job's execution attempt)."""
         import os
+
+        from sqlery.django_sqlery.models import JobAttempt
 
         job = QueuedJob.objects.create(
             task_path="tests.test_concurrency_and_timeout.fast_task",
@@ -556,8 +558,8 @@ class TestStaleJobCleanup:
         # Mark as running
         job.mark_running()
 
-        # Should have stored current process PID
-        assert job.worker_pid == os.getpid()
+        # Should have stored current process PID on the attempt (#138), not the job row
+        assert JobAttempt.open_for(job.id).worker_pid == os.getpid()
         assert job.status == "running"
 
 

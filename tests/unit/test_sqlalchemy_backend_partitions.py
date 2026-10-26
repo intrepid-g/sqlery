@@ -400,13 +400,13 @@ class TestWritePathPruning:
     def test_update_job_child_pid_with_created_at(self, sync_backend):
         """update_job_child_pid accepts optional created_at and stores child_pid."""
         job = _create_basic_job(sync_backend)
+        sync_backend.claim_job_by_id(job.id, "trigger-test")
         sync_backend.update_job_child_pid(job.id, child_pid=12345, created_at=job.created_at)
-        found = sync_backend.get_job_by_id(job.id)
-        assert found.child_pid == 12345
+        assert sync_backend.get_open_attempts([job.id])[job.id].child_pid == 12345
 
     def test_update_job_child_pid_without_created_at(self, sync_backend):
         """update_job_child_pid still works without created_at (SQLite compatibility)."""
         job = _create_basic_job(sync_backend)
+        sync_backend.claim_job_by_id(job.id, "trigger-test")
         sync_backend.update_job_child_pid(job.id, child_pid=99999)
-        found = sync_backend.get_job_by_id(job.id)
-        assert found.child_pid == 99999
+        assert sync_backend.get_open_attempts([job.id])[job.id].child_pid == 99999

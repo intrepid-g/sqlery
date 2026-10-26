@@ -10,7 +10,7 @@ import traceback as tb
 from django.core.management.base import BaseCommand, CommandError
 
 from sqlery.core.utils import import_task
-from sqlery.django_sqlery.models import QueuedJob
+from sqlery.django_sqlery.models import JobAttempt, QueuedJob
 
 
 class Command(BaseCommand):
@@ -75,12 +75,16 @@ class Command(BaseCommand):
 
         # Worker info
         w("")
+        # PIDs live on the execution attempt (newest one); legacy rows keep them on the job.
+        last_attempt = JobAttempt.latest_for(job.id)
+        worker_pid = last_attempt.worker_pid if last_attempt else job.worker_pid
+        child_pid = last_attempt.child_pid if last_attempt else job.child_pid
         if job.worker:
-            w(f"  Worker:      {job.worker.friendly_name} (PID {job.worker_pid})")
-        elif job.worker_pid:
-            w(f"  Worker PID:  {job.worker_pid}")
-        if job.child_pid:
-            w(f"  Child PID:   {job.child_pid}")
+            w(f"  Worker:      {job.worker.friendly_name} (PID {worker_pid})")
+        elif worker_pid:
+            w(f"  Worker PID:  {worker_pid}")
+        if child_pid:
+            w(f"  Child PID:   {child_pid}")
 
         # Timing
         w("")

@@ -351,10 +351,16 @@ def release_job(worker, job, status, **kwargs):
         )
 
     # Lazy import to keep core import-clean when Django is absent.
-    from sqlery.django_sqlery.models import QueuedJob
+    from sqlery.core.attempts import OUTCOME_ABANDONED, OUTCOME_SUCCESS
+    from sqlery.django_sqlery.models import JobAttempt, QueuedJob
     from sqlery.django_sqlery.settings import get_setting
 
     with _django_transaction.atomic():
+        # Unfenced by design: the executor already closed the attempt when it recorded the
+        # outcome; this only sweeps anything still open (a crash between the two writes).
+        JobAttempt.close_open(
+            job.id, OUTCOME_SUCCESS if status == "success" else OUTCOME_ABANDONED
+        )
         expected_version = job.version
         finished_at = _django_timezone.now()
         duration_seconds = None

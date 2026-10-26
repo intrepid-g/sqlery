@@ -17,7 +17,7 @@ from django.utils.safestring import mark_safe
 from sqlery.core.cleanup import CleanupManager
 
 from sqlery.core.worker import TaskExecutor
-from .models import ScheduledTask, QueuedJob
+from .models import JobAttempt, ScheduledTask, QueuedJob
 
 logger = logging.getLogger(__name__)
 
@@ -348,19 +348,21 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 #     worker.current_job = None
                 #     worker.save(update_fields=['status', 'current_job', 'last_heartbeat'])
 
-                # Kill the forked child (not the parent worker)
-                if job.child_pid:
+                # Kill the forked child (not the parent worker). PIDs come from the open
+                # execution attempt (legacy job-row columns for pre-attempt jobs).
+                worker_pid, child_pid = JobAttempt.process_ids(job)
+                if child_pid:
                     try:
-                        os.killpg(os.getpgid(job.child_pid), sig.SIGTERM)
+                        os.killpg(os.getpgid(child_pid), sig.SIGTERM)
                     except (OSError, ProcessLookupError):
                         try:
-                            os.kill(job.child_pid, sig.SIGTERM)
+                            os.kill(child_pid, sig.SIGTERM)
                         except OSError:
                             pass
-                elif job.worker_pid:
+                elif worker_pid:
                     # Legacy fallback for jobs without child_pid
                     try:
-                        os.kill(job.worker_pid, sig.SIGTERM)
+                        os.kill(worker_pid, sig.SIGTERM)
                     except OSError:
                         pass
 
@@ -600,7 +602,8 @@ class QueuedJobAdmin(admin.ModelAdmin):
         no_pid_count = 0
 
         for job in queryset.filter(status="running"):
-            if not job.worker_pid:
+            worker_pid, _child_pid = JobAttempt.process_ids(job)
+            if not worker_pid:
                 # No PID stored, can't kill - mark as failed
                 job.mark_failed(
                     error="Stopped by admin user (no worker PID available to kill process)",
@@ -610,18 +613,18 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 no_pid_count += 1
             else:
                 # Try to kill the worker process
-                kill_method = executor._kill_worker_process(job.worker_pid)
+                kill_method = executor._kill_worker_process(worker_pid)
 
                 if kill_method == "SIGTERM":
                     job.mark_failed(
-                        error=f"Stopped by admin user (worker process {job.worker_pid} terminated with SIGTERM)",
+                        error=f"Stopped by admin user (worker process {worker_pid} terminated with SIGTERM)",
                         traceback=f"Admin user requested job termination",
                         termination_reason="stopped_by_user_sigterm"
                     )
                     killed_count += 1
                 elif kill_method == "SIGKILL":
                     job.mark_failed(
-                        error=f"Stopped by admin user (worker process {job.worker_pid} forcefully killed with SIGKILL)",
+                        error=f"Stopped by admin user (worker process {worker_pid} forcefully killed with SIGKILL)",
                         traceback=f"Admin user requested job termination, SIGTERM did not work within 5 seconds",
                         termination_reason="stopped_by_user_sigkill"
                     )
@@ -629,7 +632,7 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 else:
                     # Process already dead or couldn't kill
                     job.mark_failed(
-                        error=f"Stopped by admin user (worker process {job.worker_pid} was already terminated)",
+                        error=f"Stopped by admin user (worker process {worker_pid} was already terminated)",
                         traceback="Worker process was not running when kill was attempted",
                         termination_reason="stopped_by_user_already_dead"
                     )

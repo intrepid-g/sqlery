@@ -35,7 +35,9 @@ import time
 import traceback as tb_module
 from typing import Any, Awaitable, Callable
 
-from sqlery.compat import AsyncDatabaseBackend
+from sqlery.compat import AsyncDatabaseBackend, JobFencingError
+
+from .attempts import MISSING_TABLE_MESSAGE, AttemptTableMissingError, attempt_kwargs, attempt_of
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +185,15 @@ class AsyncWorker:
         self._listen_task: asyncio.Task | None = None
         # Map of job_id -> asyncio.Task for in-flight jobs (up to ``concurrency``).
         self._inflight: dict[Any, asyncio.Task] = {}
+        # job_id -> attempt handle of the claim (a re-fetched job row does not carry it).
+        self._attempts: dict[Any, Any] = {}
+
+    def _attempt_kwargs(self, job_id: Any, method: str) -> dict:
+        """``{"attempt": handle}`` for the backend completion method ``method``; empty when the
+        claim had no handle or the backend method predates attempts."""
+        if job_id not in self._attempts:
+            return {}
+        return attempt_kwargs(self._attempts[job_id], getattr(self.backend, method))
 
     # ------------------------------------------------------------------ run
 
@@ -200,6 +211,10 @@ class AsyncWorker:
         - ``max_polls``: stop after this many poll iterations (claimed or
           empty).
         """
+        # Refuse to run without the attempt table: completions could not be fenced.
+        table_check = getattr(self.backend, "aattempt_table_exists", None)
+        if table_check is not None and not await table_check():
+            raise AttemptTableMissingError(MISSING_TABLE_MESSAGE)
         self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()
@@ -250,6 +265,9 @@ class AsyncWorker:
                     await self._idle_wait(await self._idle_timeout())
                     continue
 
+                handle = attempt_of(job)
+                if handle is not None:
+                    self._attempts[job.id] = handle
                 runner = asyncio.create_task(self._execute_job(job))
                 running.add(runner)
                 runner.add_done_callback(running.discard)
@@ -387,7 +405,17 @@ class AsyncWorker:
             args, kwargs = _deserialize_kwargs(getattr(job, "kwargs", {}))
         except Exception as e:
             tb = tb_module.format_exc()
-            await self.backend.amark_failed(job_id, error=str(e), traceback=tb)
+            try:
+                await self.backend.amark_failed(
+                    job_id,
+                    error=str(e),
+                    traceback=tb,
+                    **self._attempt_kwargs(job_id, "amark_failed"),
+                )
+            except JobFencingError as fence_err:
+                logger.warning(f"Job {job_id} failed to load but was superseded: {fence_err}")
+            finally:
+                self._attempts.pop(job_id, None)
             return
 
         from .execution import ainvoke_task
@@ -433,12 +461,36 @@ class AsyncWorker:
             return
 
     async def _on_job_success(self, job: Any, result: Any) -> None:
-        await self.backend.amark_success(job.id, result)
+        try:
+            await self.backend.amark_success(
+                job.id, result, **self._attempt_kwargs(job.id, "amark_success")
+            )
+        except JobFencingError as e:
+            logger.warning(
+                f"Job {job.id} succeeded but was superseded by recovery before completion "
+                f"could be recorded — discarding this result: {e}"
+            )
+        finally:
+            self._attempts.pop(job.id, None)
 
     async def _on_job_failed(
         self, job: Any, *, error: str, traceback: str | None = None
     ) -> None:
-        await self.backend.amark_failed(job.id, error=error, traceback=traceback)
+        try:
+            await self.backend.amark_failed(
+                job.id,
+                error=error,
+                traceback=traceback,
+                **self._attempt_kwargs(job.id, "amark_failed"),
+            )
+        except JobFencingError as e:
+            logger.warning(
+                f"Job {job.id} failed but was superseded by recovery before completion "
+                f"could be recorded — discarding this result: {e}"
+            )
+            return  # recovery owns the job now: no retry from this attempt
+        finally:
+            self._attempts.pop(job.id, None)
         if self._should_retry(job):
             try:
                 await self._requeue_for_retry(job)
@@ -542,9 +594,19 @@ class AsyncWorker:
                 if job is not None:
                     await self._on_job_failed(job, error=str(e), traceback=tb)
                 else:  # pragma: no cover
-                    await self.backend.amark_failed(job_id, error=str(e), traceback=tb)
+                    await self.backend.amark_failed(
+                        job_id,
+                        error=str(e),
+                        traceback=tb,
+                        **self._attempt_kwargs(job_id, "amark_failed"),
+                    )
             else:
-                await self.backend.amark_success(job_id, result)
+                try:
+                    await self.backend.amark_success(
+                        job_id, result, **self._attempt_kwargs(job_id, "amark_success")
+                    )
+                except JobFencingError as fence_err:
+                    logger.warning(f"Job {job_id} superseded before completion: {fence_err}")
         else:
             # Step 4: deadline wins → cancel + mark failed + retry path.
             task.cancel()
@@ -552,13 +614,24 @@ class AsyncWorker:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-            await self.backend.amark_failed(job_id, error=SHUTDOWN_TIMEOUT_ERROR)
+            try:
+                await self.backend.amark_failed(
+                    job_id,
+                    error=SHUTDOWN_TIMEOUT_ERROR,
+                    **self._attempt_kwargs(job_id, "amark_failed"),
+                )
+            except JobFencingError as fence_err:
+                logger.warning(f"Job {job_id} superseded before shutdown failure: {fence_err}")
+                self._attempts.pop(job_id, None)
+                self._inflight.pop(job_id, None)
+                return
             if job is not None and self._should_retry(job):
                 try:
                     await self._requeue_for_retry(job)
                 except Exception as e:  # pragma: no cover
                     logger.exception(f"Shutdown retry-requeue failed: {e}")
 
+        self._attempts.pop(job_id, None)
         self._inflight.pop(job_id, None)
 
     # ------------------------------------------------------------ recovery

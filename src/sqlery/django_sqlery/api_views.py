@@ -21,7 +21,7 @@ from sqlery.core.worker_admin import (
     worker_delete_staleness_threshold_seconds,
 )
 from .intervention import diagnose_system_health, do_manual_intervention_direct
-from .models import DaemonCommand, QueuedJob, ScheduledTask, Worker
+from .models import DaemonCommand, JobAttempt, QueuedJob, ScheduledTask, Worker
 from .utils import enqueue_task
 from .views import staff_required_json, _compute_health_warnings, _get_health_warnings, _job_display_name
 
@@ -191,6 +191,8 @@ def api_task_jobs(request, task_id):
         paginator = Paginator(jobs, limit)
         page_obj = paginator.get_page(page)
 
+        page_jobs = list(page_obj)
+        worker_pids = JobAttempt.worker_pids_for(page_jobs)
         data = {
             'page': page,
             'total_pages': paginator.num_pages,
@@ -207,8 +209,8 @@ def api_task_jobs(request, task_id):
                 'output': j.output,
                 'error': j.error,
                 'traceback': j.traceback,
-                'worker_pid': j.worker_pid,
-            } for j in page_obj]
+                'worker_pid': worker_pids.get(j.id),
+            } for j in page_jobs]
         }
 
         return JsonResponse(data)
@@ -345,21 +347,23 @@ def api_stop_job(request, job_id):
         #     worker.save(update_fields=['status', 'current_job', 'last_heartbeat'])
 
         killed = False
-        # Kill the forked child (not the parent worker)
-        if job.child_pid:
+        # Kill the forked child (not the parent worker). PIDs come from the open execution
+        # attempt (legacy job-row columns for pre-attempt jobs).
+        worker_pid, child_pid = JobAttempt.process_ids(job)
+        if child_pid:
             try:
-                os.killpg(os.getpgid(job.child_pid), signal.SIGTERM)
+                os.killpg(os.getpgid(child_pid), signal.SIGTERM)
                 killed = True
             except (OSError, ProcessLookupError):
                 try:
-                    os.kill(job.child_pid, signal.SIGTERM)
+                    os.kill(child_pid, signal.SIGTERM)
                     killed = True
                 except OSError:
                     pass
-        elif job.worker_pid:
+        elif worker_pid:
             # Legacy fallback for jobs without child_pid
             try:
-                os.kill(job.worker_pid, signal.SIGTERM)
+                os.kill(worker_pid, signal.SIGTERM)
                 killed = True
             except OSError:
                 pass
@@ -710,6 +714,8 @@ def api_queue_jobs(request, queue_name):
             '-created_at',
         )[:50]
 
+        jobs = list(jobs)
+        worker_pids = JobAttempt.worker_pids_for(jobs)
         data = [{
             'id': j.id,
             'status': j.status,
@@ -720,7 +726,7 @@ def api_queue_jobs(request, queue_name):
             'finished_at': j.finished_at.isoformat() if j.finished_at else None,
             'duration_seconds': j.duration_seconds,
             'error': j.error,
-            'worker_pid': j.worker_pid,
+            'worker_pid': worker_pids.get(j.id),
         } for j in jobs]
 
         return JsonResponse({'jobs': data, 'queue_name': queue_name})

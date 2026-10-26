@@ -12,13 +12,23 @@ from datetime import timedelta
 from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F, Q
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from uuid6 import uuid7
 
+from sqlery.core.attempts import (
+    OUTCOME_ABANDONED,
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    AttemptHandle,
+    attach_attempt,
+    attempt_of,
+    decide_close,
+    new_token,
+)
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.worker_admin import is_worker_beating
 
@@ -669,29 +679,51 @@ class QueuedJob(models.Model):
         expected_version = self.version
 
         # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
-        rows_updated = QueuedJob.objects.filter(
-            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 3
-        ).update(
-            status="running",
-            started_at=timezone.now(),
-            worker_pid=os.getpid(),
-            version=F("version") + 1,
-        )
-
-        if rows_updated == 0:
-            raise ConcurrentModificationError(
-                f"Job {self.id} was modified by another process (version conflict)"
+        with transaction.atomic():
+            rows_updated = QueuedJob.objects.filter(
+                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 3
+            ).update(
+                status="running",
+                started_at=timezone.now(),
+                # worker_pid is no longer written: it lives on the attempt (#138).
+                # #CLEANUP: drop QueuedJob.worker_pid/child_pid once no reader falls back to them.
+                version=F("version") + 1,
             )
+
+            if rows_updated == 0:
+                raise ConcurrentModificationError(
+                    f"Job {self.id} was modified by another process (version conflict)"
+                )
+
+            JobAttempt.open_new(self, self.worker_id, os.getpid())
 
         self.refresh_from_db()
 
-    def mark_success(self, output=""):
+    def _close_attempt(self, attempt, outcome):
+        """Close the attempt this completion belongs to (inside the completion transaction).
+
+        With a handle (the claimed job's), only that exact attempt may be closed: a stale
+        completion raises ``JobFencingError`` before the job row is touched. Without one
+        (unfenced callers: admin, recovery, a job that was never claimed), every open attempt
+        of the job is closed; a failure there means the attempt was abandoned.
+        """
+        attempt = attempt or attempt_of(self)
+        if attempt is not None:
+            JobAttempt.close(attempt, outcome)
+        else:
+            JobAttempt.close_open(
+                self.id, OUTCOME_SUCCESS if outcome == OUTCOME_SUCCESS else OUTCOME_ABANDONED
+            )
+
+    def mark_success(self, output="", attempt=None):
         """Mark job as successful.
 
-        Uses optimistic locking to ensure atomic state transition.
+        Uses optimistic locking to ensure atomic state transition. The attempt is closed in
+        the same transaction (``attempt`` or the one this object was claimed with).
 
         Raises:
             ConcurrentModificationError: If job was modified by another process
+            JobFencingError: If the attempt is no longer open (completion is stale)
         """
         # from django.db.models import F  # moved to top-level
 
@@ -709,22 +741,24 @@ class QueuedJob(models.Model):
         self._record_run(status="success", output=str(output))
 
         # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
-        rows_updated = QueuedJob.objects.filter(
-            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 4
-        ).update(
-            status="success",
-            finished_at=self.finished_at,
-            duration_seconds=self.duration_seconds,
-            output=str(output),
-            runs=self.runs,
-            # worker FK kept for historical tracking (Worker.current_job is cleared separately)
-            version=F("version") + 1,
-        )
-
-        if rows_updated == 0:
-            raise ConcurrentModificationError(
-                f"Job {self.id} was modified by another process (version conflict)"
+        with transaction.atomic():
+            self._close_attempt(attempt, OUTCOME_SUCCESS)
+            rows_updated = QueuedJob.objects.filter(
+                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 4
+            ).update(
+                status="success",
+                finished_at=self.finished_at,
+                duration_seconds=self.duration_seconds,
+                output=str(output),
+                runs=self.runs,
+                # worker FK kept for historical tracking (Worker.current_job is cleared separately)
+                version=F("version") + 1,
             )
+
+            if rows_updated == 0:
+                raise ConcurrentModificationError(
+                    f"Job {self.id} was modified by another process (version conflict)"
+                )
 
         self.refresh_from_db()
 
@@ -737,7 +771,7 @@ class QueuedJob(models.Model):
 
             send_webhook_with_retry(self, event="success")
 
-    def mark_failed(self, error, traceback="", termination_reason=""):
+    def mark_failed(self, error, traceback="", termination_reason="", attempt=None):
         """Mark job as failed with optional termination reason.
 
         Uses optimistic locking to ensure atomic state transition.
@@ -747,9 +781,12 @@ class QueuedJob(models.Model):
             traceback: Full traceback if available
             termination_reason: Human-readable reason for termination
                               (e.g., "timeout", "killed_by_user", "sigterm", "sigkill", "cancelled")
+            attempt: Attempt handle to close (default: the one this object was claimed with).
+                Without any handle every open attempt of the job is abandoned.
 
         Raises:
             ConcurrentModificationError: If job was modified by another process
+            JobFencingError: If the attempt is no longer open (completion is stale)
         """
         # from django.db.models import F  # moved to top-level
 
@@ -763,24 +800,26 @@ class QueuedJob(models.Model):
         self._record_run(status="failed", error=str(error))
 
         # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
-        rows_updated = QueuedJob.objects.filter(
-            id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
-        ).update(
-            status="failed",
-            finished_at=self.finished_at,
-            duration_seconds=self.duration_seconds,
-            error=str(error),
-            traceback=traceback,
-            termination_reason=termination_reason,
-            runs=self.runs,
-            # worker FK kept for historical tracking (Worker.current_job is cleared separately)
-            version=F("version") + 1,
-        )
-
-        if rows_updated == 0:
-            raise ConcurrentModificationError(
-                f"Job {self.id} was modified by another process (version conflict)"
+        with transaction.atomic():
+            self._close_attempt(attempt, OUTCOME_FAILED)
+            rows_updated = QueuedJob.objects.filter(
+                id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
+            ).update(
+                status="failed",
+                finished_at=self.finished_at,
+                duration_seconds=self.duration_seconds,
+                error=str(error),
+                traceback=traceback,
+                termination_reason=termination_reason,
+                runs=self.runs,
+                # worker FK kept for historical tracking (Worker.current_job is cleared separately)
+                version=F("version") + 1,
             )
+
+            if rows_updated == 0:
+                raise ConcurrentModificationError(
+                    f"Job {self.id} was modified by another process (version conflict)"
+                )
 
         self.refresh_from_db()
 
@@ -1355,6 +1394,115 @@ class ScheduledJob(models.Model):
 
     def __str__(self):
         return f"ScheduledJob {self.id} → {self.task_path} at {self.scheduled_at}"
+
+
+def _attempt_outcome_check():
+    """CheckConstraint kwargs across Django versions (``check`` became ``condition`` in 5.1)."""
+    import django
+
+    q = Q(outcome__isnull=True) | Q(
+        outcome__in=[OUTCOME_SUCCESS, OUTCOME_FAILED, OUTCOME_ABANDONED]
+    )
+    key = "condition" if django.VERSION >= (5, 1) else "check"
+    return models.CheckConstraint(name="sqlery_attempt_outcome_chk", **{key: q})
+
+
+class JobAttempt(models.Model):
+    """One execution attempt of a job: inserted on claim, closed exactly once.
+
+    ``job_id`` is a plain indexed column, not a foreign key: on partitioned PostgreSQL the
+    ``sqlery_queued_job`` primary key is ``(created_at, id)``, so ``id`` alone cannot be
+    referenced. A completion closes the attempt with a compare-and-set on ``(id, token)``
+    where ``finished_at IS NULL``; zero rows updated means the completion is stale (see
+    ``sqlery.core.attempts``). Mirrors the SQLModel ``JobAttempt``.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    job_id = models.BigIntegerField(help_text="Claimed job (no FK: partitioned PK)")
+    token = models.CharField(max_length=36, help_text="Random fencing token of this attempt")
+    worker_id = models.UUIDField(null=True, blank=True, help_text="Claiming worker, if registered")
+    worker_pid = models.IntegerField(null=True, blank=True, help_text="PID of the claiming process")
+    child_pid = models.IntegerField(null=True, blank=True, help_text="PID of the forked child")
+    claimed_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    outcome = models.CharField(
+        max_length=10, null=True, blank=True, help_text="success / failed / abandoned"
+    )
+
+    class Meta:
+        db_table = "sqlery_job_attempt"
+        indexes = [
+            models.Index(fields=["job_id"], name="sqlery_attempt_job_idx"),
+            models.Index(
+                fields=["worker_id"],
+                name="sqlery_attempt_open_worker_idx",
+                condition=Q(finished_at__isnull=True),
+            ),
+        ]
+        constraints = [_attempt_outcome_check()]
+
+    def __str__(self):
+        return f"JobAttempt {self.id} (job {self.job_id}, {self.outcome or 'open'})"
+
+    @classmethod
+    def open_for(cls, job_id):
+        """The open attempt of ``job_id`` (newest if several), or None."""
+        return cls.objects.filter(job_id=job_id, finished_at__isnull=True).order_by("-id").first()
+
+    @classmethod
+    def latest_for(cls, job_id):
+        """The newest attempt of ``job_id`` (open or finished), or None."""
+        return cls.objects.filter(job_id=job_id).order_by("-id").first()
+
+    @classmethod
+    def process_ids(cls, job):
+        """``(worker_pid, child_pid)`` of a running job, read from its open attempt.
+
+        Falls back to the legacy job-row columns for rows claimed before attempts existed.
+        """
+        attempt = cls.open_for(job.id)
+        if attempt is not None:
+            return attempt.worker_pid, attempt.child_pid
+        return job.worker_pid, job.child_pid
+
+    @classmethod
+    def worker_pids_for(cls, jobs):
+        """``{job_id: worker_pid}`` of each job's newest attempt, in one query (dashboards)."""
+        ids = [j.id for j in jobs]
+        pids = {}
+        if ids:
+            rows = cls.objects.filter(job_id__in=ids).order_by("id")
+            pids = {r.job_id: r.worker_pid for r in rows}  # newest attempt wins
+        return {j.id: pids.get(j.id, j.worker_pid) for j in jobs}
+
+    @classmethod
+    def close(cls, handle, outcome):
+        """Close ``handle``'s attempt (compare-and-set on id+token); raise if it is stale."""
+        rows = cls.objects.filter(
+            id=handle.id, token=handle.token, finished_at__isnull=True
+        ).update(finished_at=timezone.now(), outcome=outcome)
+        decide_close(rows, handle)
+
+    @classmethod
+    def close_open(cls, job_id, outcome):
+        """Close every open attempt of ``job_id`` (recovery / unfenced completions)."""
+        return cls.objects.filter(job_id=job_id, finished_at__isnull=True).update(
+            finished_at=timezone.now(), outcome=outcome
+        )
+
+    @classmethod
+    def open_new(cls, job, worker_id, worker_pid):
+        """Insert the attempt for a claim of ``job`` and attach its handle to the object.
+
+        Must run inside the claim transaction. A job is claimed only while queued, so any
+        attempt still open for it is a leftover of a requeue that skipped closing: it is
+        abandoned here, which keeps "one open attempt per job" and fences the old holder.
+        """
+        cls.close_open(job.id, OUTCOME_ABANDONED)
+        row = cls.objects.create(
+            job_id=job.id, token=new_token(), worker_id=worker_id, worker_pid=worker_pid
+        )
+        return attach_attempt(job, AttemptHandle(row.id, row.token, job.id))
 
 
 # Backward compatibility alias

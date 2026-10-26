@@ -171,17 +171,46 @@ class DatabaseBackend(ABC):
         """Check if worker is currently paused (paused_until is in the future)."""
         return False
 
-    def update_job_child_pid(self, job_id: int, child_pid: int):
-        """Store the forked child PID on the job row.
+    def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
+        """Store the forked child PID on the job's open execution attempt.
 
         Used by WorkerProcess to record which child process is running a job,
-        enabling admin "Stop Job" to target the correct process.
+        enabling admin "Stop Job" to target the correct process. The PID is written to
+        the attempt (``sqlery_job_attempt``), not the job row.
 
         Args:
             job_id: Job ID
             child_pid: PID of the forked child process
+            created_at: Accepted for call compatibility; the attempt table has no
+                partition key, so it is not needed.
+            attempt: Handle of the attempt the caller holds. When given, only that exact
+                attempt is updated (a superseded worker cannot stamp a newer attempt).
         """
         pass
+
+    def attempt_table_exists(self) -> bool:
+        """Whether the execution attempt table exists (workers refuse to start without it).
+
+        Backends that do not record attempts return True (nothing to require).
+        """
+        return True
+
+    def get_open_attempts(self, job_ids: list) -> dict:
+        """Open (unfinished) execution attempts for ``job_ids``, as ``{job_id: AttemptInfo}``.
+
+        Readers that used ``queued_job.worker_pid`` / ``child_pid`` (kill, zombie detection,
+        dashboard) read the open attempt instead. Backends without attempts return ``{}``.
+        """
+        return {}
+
+    def abandon_attempts(self, job_id: int) -> int:
+        """Close every open attempt of ``job_id`` with outcome ``abandoned`` (recovery).
+
+        A late completion from an abandoned attempt is rejected with ``JobFencingError``.
+        Returns the number of attempts closed. Recovery paths that also change the job row
+        close the attempt in the same transaction as that write.
+        """
+        return 0
 
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete stale Worker row from a previous crash.
@@ -575,7 +604,13 @@ class DatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    def mark_job_success(self, job_id: int, output: str = "", expected_version: int | None = None):
+    def mark_job_success(
+        self,
+        job_id: int,
+        output: str = "",
+        expected_version: int | None = None,
+        attempt=None,
+    ):
         """Mark job as successful.
 
         Args:
@@ -586,12 +621,17 @@ class DatabaseBackend(ABC):
                 observed before executing the job). Raises JobFencingError
                 if the row's current version has moved on — another worker
                 already reclaimed and possibly re-ran this job.
+            attempt: ``sqlery.core.attempts.AttemptHandle`` of the claim being completed.
+                The attempt is closed in the same transaction as the job update; if it is
+                no longer open (already finished, or abandoned by recovery) the completion
+                is stale and the job row is left untouched. Without a handle, every open
+                attempt of the job is closed.
 
         Returns:
             Updated job instance
 
         Raises:
-            JobFencingError: expected_version given and no longer current
+            JobFencingError: expected_version no longer current, or attempt no longer open
         """
         pass
 
@@ -602,6 +642,7 @@ class DatabaseBackend(ABC):
         error: str,
         traceback: str = "",
         expected_version: int | None = None,
+        attempt=None,
     ):
         """Mark job as failed.
 
@@ -610,12 +651,14 @@ class DatabaseBackend(ABC):
             error: Error message
             traceback: Full traceback
             expected_version: See mark_job_success.
+            attempt: See mark_job_success (outcome ``failed``; without a handle the open
+                attempts are ``abandoned``).
 
         Returns:
             Updated job instance
 
         Raises:
-            JobFencingError: expected_version given and no longer current
+            JobFencingError: expected_version no longer current, or attempt no longer open
         """
         pass
 
@@ -873,6 +916,11 @@ class AsyncDatabaseBackend(ABC):
         """
         return None
 
+    async def aattempt_table_exists(self) -> bool:
+        """Whether the execution attempt table exists (the AsyncWorker refuses to start
+        without it). Backends that do not record attempts return True."""
+        return True
+
     @abstractmethod
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Async analog of DatabaseBackend.claim_job."""
@@ -884,13 +932,15 @@ class AsyncDatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def amark_success(self, job_id, result) -> None:
-        """Async analog of DatabaseBackend.mark_job_success."""
+    async def amark_success(self, job_id, result, attempt=None) -> None:
+        """Async analog of DatabaseBackend.mark_job_success (``attempt`` fences the write)."""
         pass
 
     @abstractmethod
-    async def amark_failed(self, job_id, error: str, traceback: str | None = None) -> None:
-        """Async analog of DatabaseBackend.mark_job_failed."""
+    async def amark_failed(
+        self, job_id, error: str, traceback: str | None = None, attempt=None
+    ) -> None:
+        """Async analog of DatabaseBackend.mark_job_failed (``attempt`` fences the write)."""
         pass
 
     @abstractmethod

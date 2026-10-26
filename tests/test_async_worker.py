@@ -404,7 +404,16 @@ async def test_aclaim_job_records_registered_worker_on_job(backend, make_job, se
     claimed = await backend.aclaim_job(["default"], str(worker.id))
     assert claimed.id == job.id
     assert claimed.worker_id == worker.id
-    assert claimed.worker_pid == os.getpid()
+    # The claiming PID is recorded on the execution attempt, not the job row (#138).
+    from sqlalchemy import select
+
+    from sqlery.core.attempts import attempt_of
+    from sqlery.core.models import JobAttempt
+
+    handle = attempt_of(claimed)
+    async with session_factory() as s:
+        row = (await s.execute(select(JobAttempt).where(JobAttempt.id == handle.id))).scalar_one()
+    assert row.worker_pid == os.getpid() and row.job_id == job.id
 
 
 async def test_startup_sweep_fails_orphan_of_dead_worker(backend, make_job, session_factory):

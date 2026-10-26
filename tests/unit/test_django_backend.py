@@ -729,9 +729,10 @@ class TestMiscMethods:
 
     def test_update_job_child_pid(self, django_backend):
         j = _create_basic_job(django_backend)
+        django_backend.claim_job_by_id(j.id, "trigger-test")
         django_backend.update_job_child_pid(j.id, 4242)
-        j.refresh_from_db()
-        assert j.child_pid == 4242
+        # The child PID lives on the open execution attempt (#138), not the job row.
+        assert django_backend.get_open_attempts([j.id])[j.id].child_pid == 4242
 
     def test_cascade_ancestor_status(self, django_backend):
         grandparent = _create_basic_job(django_backend)

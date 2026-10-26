@@ -22,7 +22,6 @@ table. Alembic migration will follow in a later plan.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
@@ -30,11 +29,20 @@ from typing import Any
 from sqlalchemy import delete, or_, select, text, update
 from sqlmodel import Field, SQLModel
 
-from sqlery.compat import AsyncDatabaseBackend
+from sqlery.compat import AsyncDatabaseBackend, JobFencingError
+from sqlery.core.attempts import (
+    OUTCOME_ABANDONED,
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    AttemptHandle,
+    attach_attempt,
+    decide_close,
+)
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
 from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.utils import reject_unawaited_coroutine
 
+from . import attempt_sql
 from .database import get_async_session_factory
 
 # Partition maintenance helpers — guarded against psycopg absence (SQLite installs).
@@ -147,6 +155,18 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             nxt = nxt.replace(tzinfo=UTC)
         return (nxt - now).total_seconds()
 
+    async def aattempt_table_exists(self) -> bool:
+        from sqlalchemy import inspect as sa_inspect
+
+        from sqlery.core.models import JobAttempt
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            conn = await session.connection()
+            return await conn.run_sync(
+                lambda sync_conn: sa_inspect(sync_conn).has_table(JobAttempt.__tablename__)
+            )
+
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
 
@@ -159,7 +179,8 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         async with factory() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             owner_id = await self._registered_worker_id(session, worker_id)
-            owner = {"worker_id": owner_id, "worker_pid": os.getpid()} if owner_id else {}
+            # The claiming PID is recorded on the attempt, not the job row (#138).
+            owner = {"worker_id": owner_id} if owner_id else {}
             stmt = (
                 select(QueuedJob)
                 .where(QueuedJob.queue_name.in_(list(queues)))
@@ -184,9 +205,11 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                     setattr(job, key, value)
                 job.version = (job.version or 0) + 1
                 session.add(job)
+                # The attempt joins the claim's transaction: both commit or neither does.
+                handle = await self._aopen_attempt(session, job.id, owner_id)
                 await session.commit()
                 await session.refresh(job)
-                return job
+                return attach_attempt(job, handle)
 
             # SQLite (and others): optimistic CAS on version.
             current_version = job.version or 0
@@ -202,14 +225,45 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 )
             )
             res = await session.execute(cas_stmt)
-            await session.commit()
             if res.rowcount != 1:
+                await session.commit()
                 return None
+            handle = await self._aopen_attempt(session, job.id, owner_id)
+            await session.commit()
             # Re-fetch to return current state.
             refreshed = await session.execute(
                 select(QueuedJob).where(QueuedJob.id == job.id)
             )
-            return refreshed.scalars().first()
+            return attach_attempt(refreshed.scalars().first(), handle)
+
+    @staticmethod
+    async def _aopen_attempt(session, job_id, worker_id) -> AttemptHandle:
+        """Insert the attempt of a claim inside the claim's transaction (caller commits).
+
+        Any attempt still open for the (queued) job is a leftover of a requeue that skipped
+        closing: it is abandoned, keeping "one open attempt per job".
+        """
+        now = _utcnow()
+        await session.execute(attempt_sql.abandon_open_stmt(job_id, now))
+        row = attempt_sql.new_attempt(job_id, worker_id, now)
+        session.add(row)
+        await session.flush()
+        return AttemptHandle(row.id, row.token, job_id)
+
+    @staticmethod
+    async def _aclose_attempt(session, job_id, attempt, outcome) -> None:
+        """Close the attempt a completion belongs to, inside the completion's transaction.
+
+        A stale handle raises ``JobFencingError`` (the caller rolls back, leaving the job row
+        untouched). Without a handle every open attempt of the job is closed (see
+        ``SQLAlchemyBackend._close_attempt``).
+        """
+        now = _utcnow()
+        if attempt is not None:
+            res = await session.execute(attempt_sql.close_exact_stmt(attempt, outcome, now))
+            decide_close(res.rowcount, attempt)
+            return
+        await session.execute(attempt_sql.close_unfenced_stmt(job_id, outcome, now))
 
     @staticmethod
     async def _registered_worker_id(session, worker_id) -> uuid.UUID | None:
@@ -243,6 +297,12 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             if queue_names:
                 stmt = stmt.where(QueuedJob.queue_name.in_(list(queue_names)))
             jobs = list((await session.execute(stmt)).scalars().all())
+            attempts = {}
+            if jobs:
+                rows = (
+                    await session.execute(attempt_sql.open_attempts_stmt([j.id for j in jobs]))
+                ).scalars()
+                attempts = {r.job_id: r for r in rows}  # newest wins (ordered by id)
             worker_ids = {j.worker_id for j in jobs if j.worker_id is not None}
             workers: dict[Any, Worker] = {}
             if worker_ids:
@@ -263,7 +323,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 RunningJobLiveness(
                     job_id=job.id,
                     started_at=_aware(job.started_at),
-                    worker_pid=job.worker_pid,
+                    # The open attempt; the row column only for jobs claimed before attempts.
+                    worker_pid=(
+                        attempts[job.id].worker_pid if job.id in attempts else job.worker_pid
+                    ),
                     worker_node_id=worker.node_id if worker else None,
                     worker_status=worker.status if worker else None,
                     worker_current_job_id=worker.current_job_id if worker else None,
@@ -282,6 +345,8 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             job = res.scalars().first()
             if job is None or job.status != "running":
                 return False
+            # Abandon the open attempt in the same transaction as the failure.
+            await self._aclose_attempt(session, job_id, None, OUTCOME_ABANDONED)
             job.mark_failed(error=reason, termination_reason="zombie_job")
             job.version = (job.version or 0) + 1
             session.add(job)
@@ -313,7 +378,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             await session.execute(stmt)
             await session.commit()
 
-    async def amark_success(self, job_id, result) -> None:
+    async def amark_success(self, job_id, result, attempt=None) -> None:
         # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
         # (raw update() statement), so it needs its own guard against unawaited
         # coroutines.
@@ -336,11 +401,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             if created_at is not None:
                 stmt = stmt.where(QueuedJob.created_at == created_at)
             stmt = stmt.values(status="success", finished_at=now, output=output)
-            await session.execute(stmt)
-            await session.commit()
+            await self._afinish(session, job_id, attempt, OUTCOME_SUCCESS, stmt)
 
     async def amark_failed(
-        self, job_id, error: str, traceback: str | None = None
+        self, job_id, error: str, traceback: str | None = None, attempt=None
     ) -> None:
         now = _utcnow()
         factory = get_async_session_factory()
@@ -364,8 +428,20 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 error=error or "",
                 traceback=traceback or "",
             )
-            await session.execute(stmt)
-            await session.commit()
+            await self._afinish(session, job_id, attempt, OUTCOME_FAILED, stmt)
+
+    async def _afinish(self, session, job_id, attempt, outcome, job_stmt) -> None:
+        """Close the attempt and write the terminal job row in one transaction.
+
+        A stale attempt raises ``JobFencingError`` and rolls back: the job row is untouched.
+        """
+        try:
+            await self._aclose_attempt(session, job_id, attempt, outcome)
+        except JobFencingError:
+            await session.rollback()
+            raise
+        await session.execute(job_stmt)
+        await session.commit()
 
     async def amark_shutting_down(self, job_id) -> None:
         factory = get_async_session_factory()

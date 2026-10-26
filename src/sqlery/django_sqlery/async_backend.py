@@ -19,10 +19,12 @@ from django.db import connection
 from django.utils import timezone
 
 from sqlery.compat import AsyncDatabaseBackend
+from sqlery.core.attempts import OUTCOME_ABANDONED, OUTCOME_FAILED, OUTCOME_SUCCESS
 from sqlery.core.utils import reject_unawaited_coroutine
 
 from .models import (
     DaemonLease,
+    JobAttempt,
     JobRegistry,
     QueuedJob,
     ScheduledTask,
@@ -87,6 +89,13 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             ).aaggregate(m=Min("scheduled_at"))
         )["m"]
         return None if nxt is None else (nxt - now).total_seconds()
+
+    async def aattempt_table_exists(self) -> bool:
+        from asgiref.sync import sync_to_async
+
+        from .backend import DjangoBackend
+
+        return await sync_to_async(DjangoBackend().attempt_table_exists)()
 
     async def aclaim_job(self, queues: list[str], worker_id: str):
         """Atomically claim the next queued job for one of ``queues``.
@@ -166,43 +175,64 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                 status="running", started_at=now
             )
 
-    async def amark_success(self, job_id, result) -> None:
+    @staticmethod
+    def _finish_sync(job_id, outcome, attempt, values) -> None:
+        """Close the attempt and write the terminal job row in one transaction.
+
+        Django has no ``transaction.aatomic``, so the two statements run through
+        ``sync_to_async`` (like ``aclaim_job``). A stale attempt raises ``JobFencingError``
+        and the transaction rolls back: the job row is untouched. Without a handle every
+        open attempt of the job is closed.
+        """
+        from django.db import transaction
+
+        # Write-path pruning: fetch created_at first so PG prunes to one partition.
+        row = QueuedJob.objects.filter(id=job_id).values("created_at").first()
+        with transaction.atomic():
+            if attempt is not None:
+                JobAttempt.close(attempt, outcome)
+            else:
+                JobAttempt.close_open(
+                    job_id, OUTCOME_SUCCESS if outcome == OUTCOME_SUCCESS else OUTCOME_ABANDONED
+                )
+            if row:
+                QueuedJob.objects.filter(id=job_id, created_at=row["created_at"]).update(**values)
+
+    async def amark_success(self, job_id, result, attempt=None) -> None:
         # REGRESSION 2026-08-08: this write path bypasses QueuedJob.mark_success
-        # (raw .aupdate()), so it needs its own guard against unawaited coroutines.
+        # (raw .update()), so it needs its own guard against unawaited coroutines.
         reject_unawaited_coroutine(result)
-        now = timezone.now()
-        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
-        # Add created_at to filter for partition pruning (write-path item, async mirror).
-        # Old (id-only — does not prune to partition on PG):
-        # await QueuedJob.objects.filter(id=job_id).aupdate(
-        #     status="success", finished_at=now, output=...
-        # )
-        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
-        if job:
-            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
-                status="success",
-                finished_at=now,
-                output="" if result is None else str(result),
-            )
+        from asgiref.sync import sync_to_async
+
+        # Old: native await QueuedJob.objects.filter(id=..., created_at=...).aupdate(...)
+        # (no fencing); now fenced by the attempt, which needs a transaction.
+        await sync_to_async(self._finish_sync)(
+            job_id,
+            OUTCOME_SUCCESS,
+            attempt,
+            {
+                "status": "success",
+                "finished_at": timezone.now(),
+                "output": "" if result is None else str(result),
+            },
+        )
 
     async def amark_failed(
-        self, job_id, error: str, traceback: str | None = None
+        self, job_id, error: str, traceback: str | None = None, attempt=None
     ) -> None:
-        now = timezone.now()
-        # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(...)
-        # Add created_at to filter for partition pruning (write-path item, async mirror).
-        # Old (id-only — does not prune to partition on PG):
-        # await QueuedJob.objects.filter(id=job_id).aupdate(
-        #     status="failed", finished_at=now, error=error or "", traceback=traceback or ""
-        # )
-        job = await QueuedJob.objects.filter(id=job_id).values("created_at").afirst()
-        if job:
-            await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
-                status="failed",
-                finished_at=now,
-                error=error or "",
-                traceback=traceback or "",
-            )
+        from asgiref.sync import sync_to_async
+
+        await sync_to_async(self._finish_sync)(
+            job_id,
+            OUTCOME_FAILED,
+            attempt,
+            {
+                "status": "failed",
+                "finished_at": timezone.now(),
+                "error": error or "",
+                "traceback": traceback or "",
+            },
+        )
 
     async def amark_shutting_down(self, job_id) -> None:
         # Old: await QueuedJob.objects.filter(pk=job_id).aupdate(status="shutting_down")
