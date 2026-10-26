@@ -474,10 +474,18 @@ class TestCronSemanticsHardening:
 
         def fire():
             scheduler = self._scheduler()
-            jobs = scheduler.run_due_tasks()
-            mine = [j for j in jobs if j.scheduled_task_id == task.id]
-            with results_lock:
-                results.extend(mine)
+            # The in-memory SQLite test database is shared by table-level locks that fail
+            # at once ("table is locked") instead of waiting, and the job insert now holds
+            # its locks together with its ready-queue entry (#139); the scheduler logs such
+            # a collision and moves on, so a thread tries again until the task has fired.
+            for _ in range(5):
+                jobs = scheduler.run_due_tasks()
+                mine = [j for j in jobs if j.scheduled_task_id == task.id]
+                with results_lock:
+                    results.extend(mine)
+                if mine or QueuedJob.objects.filter(scheduled_task_id=task.id).exists():
+                    break
+                time.sleep(0.05)
 
         threads = [threading.Thread(target=fire) for _ in range(2)]
         for t in threads:

@@ -179,22 +179,26 @@ class TestStandaloneLifecycle:
             f"Expected sqlery_queued_job relkind='p' (partitioned), got '{row[0]}'"
         )
 
-    def test_fresh_install_creates_pending_index(self):
-        """SC-2: init_database(PG_URL) creates sqlery_job_pending_idx (R1 precondition)."""
+    def test_fresh_install_creates_ready_claim_index(self):
+        """SC-2 (#139): init_database(PG_URL) creates the ready-queue claim index on the
+        partitioned ready table; the claiming-only sqlery_job_pending_idx is gone."""
         from sqlery.fastapi_sqlery.database import get_engine
         from sqlalchemy import text
 
         _make_pg_backend()
         engine = get_engine()
         with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT indexname FROM pg_indexes "
-                    "WHERE indexname = 'sqlery_job_pending_idx'"
-                )
-            ).fetchone()
-        assert row is not None, (
-            "sqlery_job_pending_idx not found after init_database — R1 (partial index) precondition failed"
+            names = {
+                r[0]
+                for r in conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE indexname IN ('sqlery_ready_claim_idx', 'sqlery_job_pending_idx')"
+                    )
+                ).fetchall()
+            }
+        assert names == {"sqlery_ready_claim_idx"}, (
+            f"expected only the ready claim index after init_database, found {names}"
         )
 
     def test_fresh_install_creates_shared_sequence(self):
@@ -321,13 +325,12 @@ class TestStandaloneLifecycle:
         )
 
     def test_r1_explain_shows_index_scan_for_claim(self):
-        """R1: EXPLAIN on claim_job SELECT uses index scans (not seq scans) on PG.
+        """R1 (#139): the claim reads the ready table in index order, not sqlery_queued_job.
 
-        On partitioned tables PG applies indexes per-child partition. The parent-level
-        sqlery_job_pending_idx is propagated as per-partition indexes named
-        sqlery_queued_job_<date>_queue_name_priority_created_at_idx. The R1 acceptance
-        criterion is that an index path (not a sequential scan) is used for the claiming
-        query. The exact index name differs per partition.
+        The claim index (queue_name, priority DESC, created_at, job_id) is propagated to the
+        three slot partitions. With sequential scans disabled (a near-empty table would
+        otherwise prefer one), the claim's ordered read must be served by index scans over
+        the partitions alone: no Sort, and no access to the job table.
         """
         from sqlery.fastapi_sqlery.database import get_engine
         from sqlalchemy import text
@@ -337,30 +340,27 @@ class TestStandaloneLifecycle:
 
         engine = get_engine()
         sql = (
-            "SELECT * FROM sqlery_queued_job "
-            "WHERE queue_name = :q AND status = 'queued' "
-            "AND (scheduled_at IS NULL OR scheduled_at <= now()) "
-            "ORDER BY priority DESC, created_at "
+            "SELECT * FROM sqlery_job_ready "
+            "WHERE queue_name = :q AND (scheduled_at IS NULL OR scheduled_at <= now()) "
+            "ORDER BY priority DESC, created_at, job_id "
             "LIMIT 1 "
             "FOR UPDATE SKIP LOCKED"
         )
         with engine.connect() as conn:
+            conn.execute(text("SET LOCAL enable_seqscan = off"))
             rows = conn.execute(
                 text(f"EXPLAIN (ANALYZE FALSE, FORMAT TEXT) {sql}"),
                 {"q": "r1-index-test"},
             ).fetchall()
         plan = "\n".join(r[0] for r in rows)
 
-        # R1: Claiming must use Index Scan (not Seq Scan) for the queue+status filter.
-        # On partitioned PG the pending-index is materialized per-child; verify index
-        # scans are used (not seq scans) and the pending index columns appear in the plan.
         assert "Index Scan" in plan or "Index Only Scan" in plan, (
-            f"R1: Expected Index Scan in EXPLAIN output (not Seq Scan).\nPlan:\n{plan}"
+            f"R1: Expected Index Scan in EXPLAIN output.\nPlan:\n{plan}"
         )
-        # The parent-level sqlery_job_pending_idx existence is verified separately (SC-2).
-        assert "Seq Scan" not in plan, (
-            f"R1: Claiming SELECT must not use Seq Scan on a non-trivial table.\nPlan:\n{plan}"
+        assert "Merge Append" in plan and "->  Sort" not in plan, (
+            f"R1: the claim index must provide the order (merge of the partitions).\nPlan:\n{plan}"
         )
+        assert "sqlery_queued_job" not in plan, f"R1: the claim must not read the job table.\n{plan}"
 
     def test_r4_back_pressure_today_partition_not_dropped(self):
         """R4: back-pressure invariant — today's partition is NOT dropped by cleanup_jobs."""

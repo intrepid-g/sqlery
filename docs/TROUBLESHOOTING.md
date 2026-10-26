@@ -231,6 +231,25 @@ python manage.py migrate sqlery
 sqlery-migrate upgrade
 ```
 
+### Worker Refuses to Start: Ready-Queue Tables Missing
+
+**Symptoms:**
+- A worker exits at start-up with `The ready-queue tables 'sqlery_job_ready' / 'sqlery_job_blocked' do not exist`
+- Jobs stay `queued` after an upgrade although workers are running
+
+Workers claim from `sqlery_job_ready`, a narrow table with one entry per claimable job, not by
+scanning `sqlery_queued_job`; jobs waiting on dependencies wait in `sqlery_job_blocked` until a
+dependency finishes. Workers refuse to run without the tables.
+
+**Solution:** stop all workers (and the daemon), apply the migrations (see above), then start
+them again. Workers started before the migration keep claiming from `sqlery_queued_job` and
+never see the new entries. The migration gives every queued job its ready entry.
+
+If a job stays `queued` and nothing claims it, its entry was probably lost (for example by a
+raw `UPDATE sqlery_queued_job SET status = 'queued'`, which bypasses the library). The
+scheduler leader repairs this on its next sweep (default every 60 seconds,
+`READY_QUEUE_SWEEP_INTERVAL`); the log says `Restored N queued job(s) that had no ready entry`.
+
 ### Daemon Keeps Restarting
 
 **Symptoms:**

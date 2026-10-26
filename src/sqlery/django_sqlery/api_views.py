@@ -897,10 +897,15 @@ def api_archive_scheduled_jobs(request):
         if not job_ids:
             return JsonResponse({'error': 'job_ids is required and must be non-empty'}, status=400)
 
-        updated = QueuedJob.objects.filter(
-            id__in=job_ids,
-            status='queued',
-        ).update(status='archived')
+        from django.db import transaction
+
+        from . import ready
+
+        with transaction.atomic():
+            queued = QueuedJob.objects.filter(id__in=job_ids, status='queued')
+            archived_ids = list(queued.values_list('id', flat=True))
+            ready.remove(archived_ids)  # archived jobs are no longer claimable (entries first)
+            updated = queued.update(status='archived')
 
         return JsonResponse({'success': True, 'archived': updated})
 

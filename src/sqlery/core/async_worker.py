@@ -38,6 +38,8 @@ from typing import Any, Awaitable, Callable
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
 
 from .attempts import MISSING_TABLE_MESSAGE, AttemptTableMissingError, attempt_kwargs, attempt_of
+from .ready import MISSING_TABLE_MESSAGE as READY_MISSING_TABLE_MESSAGE
+from .ready import ReadyTablesMissingError
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +217,10 @@ class AsyncWorker:
         table_check = getattr(self.backend, "aattempt_table_exists", None)
         if table_check is not None and not await table_check():
             raise AttemptTableMissingError(MISSING_TABLE_MESSAGE)
+        # ... and without the ready-queue tables there would be nothing to claim from.
+        ready_check = getattr(self.backend, "aready_tables_exist", None)
+        if ready_check is not None and not await ready_check():
+            raise ReadyTablesMissingError(READY_MISSING_TABLE_MESSAGE)
         self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()
@@ -496,6 +502,19 @@ class AsyncWorker:
                 await self._requeue_for_retry(job)
             except Exception as e:  # pragma: no cover - logged
                 logger.exception(f"Retry-requeue failed for job {job.id}: {e}")
+        # The failure is final, or its retry now exists: re-check the jobs waiting on it.
+        await self._release_dependents(job)
+
+    async def _release_dependents(self, job: Any) -> None:
+        """Ask the backend to re-check the jobs blocked on ``job`` (best effort: the
+        scheduler leader's periodic sweep repairs a missed release)."""
+        release = getattr(self.backend, "arelease_dependents", None)
+        if release is None:
+            return
+        try:
+            await release(job.id)
+        except Exception as e:  # pragma: no cover - logged
+            logger.warning(f"Releasing dependents of job {job.id} failed: {e}")
 
     # --------------------------------------------------------- retry path
 

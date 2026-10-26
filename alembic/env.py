@@ -18,6 +18,8 @@ from sqlmodel import SQLModel
 from sqlery.core.models import (
     DaemonLease,
     JobAttempt,
+    JobBlocked,
+    JobReady,
     JobRegistry,
     QueuedJob,
     ScheduledTask,

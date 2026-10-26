@@ -584,11 +584,21 @@ class QueuedJobAdmin(admin.ModelAdmin):
 
     def cancel_queued(self, request, queryset):
         """Cancel queued jobs by marking as failed."""
-        updated = queryset.filter(status="queued").update(
-            status="failed",
-            error="Cancelled by admin user before execution started",
-            termination_reason="cancelled_by_user"
-        )
+        from django.db import transaction
+
+        from . import ready
+
+        with transaction.atomic():
+            queued = queryset.filter(status="queued")
+            ids = list(queued.values_list("id", flat=True))
+            ready.remove(ids)  # cancelled jobs are no longer claimable (entries before rows)
+            updated = queued.update(
+                status="failed",
+                error="Cancelled by admin user before execution started",
+                termination_reason="cancelled_by_user"
+            )
+        for job_id in ids:
+            ready.release_dependents_quietly(job_id)  # jobs waiting on them fail now
         self.message_user(request, f"Cancelled {updated} queued jobs")
 
     cancel_queued.short_description = "Cancel selected queued jobs"

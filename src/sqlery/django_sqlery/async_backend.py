@@ -25,6 +25,7 @@ from sqlery.core.utils import reject_unawaited_coroutine
 from .models import (
     DaemonLease,
     JobAttempt,
+    JobReady,
     JobRegistry,
     QueuedJob,
     ScheduledTask,
@@ -83,12 +84,28 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
         from django.db.models import Min
 
         now = timezone.now()
+        # The earliest not-yet-due entry of the ready table (no scan of the job table).
         nxt = (
-            await QueuedJob.objects.filter(
-                queue_name__in=list(queues), status="queued", scheduled_at__gt=now
+            await JobReady.objects.filter(
+                queue_name__in=list(queues), scheduled_at__gt=now
             ).aaggregate(m=Min("scheduled_at"))
         )["m"]
         return None if nxt is None else (nxt - now).total_seconds()
+
+    async def aready_tables_exist(self) -> bool:
+        from asgiref.sync import sync_to_async
+
+        from .backend import DjangoBackend
+
+        return await sync_to_async(DjangoBackend().ready_tables_exist)()
+
+    async def arelease_dependents(self, job_id, parent_job_id=None) -> int:
+        """Re-check the jobs blocked on a job that reached its final state."""
+        from asgiref.sync import sync_to_async
+
+        from . import ready
+
+        return await sync_to_async(ready.release_dependents)(job_id, parent_job_id)
 
     async def aattempt_table_exists(self) -> bool:
         from asgiref.sync import sync_to_async
@@ -174,6 +191,12 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
             await QueuedJob.objects.filter(id=job_id, created_at=job["created_at"]).aupdate(
                 status="running", started_at=now
             )
+            # A running job is not claimable: drop any ready / blocked entry.
+            from asgiref.sync import sync_to_async
+
+            from . import ready
+
+            await sync_to_async(ready.remove)([job_id])
 
     @staticmethod
     def _finish_sync(job_id, outcome, attempt, values) -> None:
@@ -216,6 +239,13 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                 "output": "" if result is None else str(result),
             },
         )
+        # Jobs waiting on this one are re-checked. (A failure is released by the worker once
+        # it has decided on the retry; releasing here would fail the dependents of a job
+        # whose retry is not queued yet.)
+        try:
+            await self.arelease_dependents(job_id)
+        except Exception:
+            logger.warning(f"arelease_dependents({job_id}) failed", exc_info=True)
 
     async def amark_failed(
         self, job_id, error: str, traceback: str | None = None, attempt=None

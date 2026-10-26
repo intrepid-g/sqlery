@@ -13,7 +13,16 @@ from typing import Optional
 from uuid import UUID
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, Integer, DateTime, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    text,
+)
 
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.sqltypes import UTCDateTime
@@ -471,6 +480,68 @@ class JobAttempt(SQLModel, table=True):
     outcome: str | None = Field(default=None, max_length=10)
 
 
+class JobReady(SQLModel, table=True):
+    """A claimable job: one narrow entry per queued job that is neither waiting on
+    dependencies nor already claimed (issue #139, see ``sqlery.core.ready``).
+
+    A claim deletes the entry; an enqueue, retry, requeue or unblock inserts it. On
+    PostgreSQL the table is ``PARTITION BY LIST (slot)`` (created by the bootstrap /
+    migration DDL, not by ``create_all``); on SQLite it is a plain table. Mirrors the Django
+    ``JobReady`` model.
+    """
+
+    __tablename__ = "sqlery_job_ready"
+
+    slot: int = Field(
+        default=0,
+        sa_column=Column(
+            SmallInteger, primary_key=True, nullable=False, autoincrement=False,
+            server_default=text("0"),
+        ),
+    )
+    job_id: int = Field(
+        sa_column=Column(BigInteger, primary_key=True, nullable=False, autoincrement=False)
+    )
+    queue_name: str = Field(max_length=50)
+    priority: int = Field(default=0)
+    created_at: datetime = Field(sa_type=UTCDateTime)
+    scheduled_at: datetime | None = Field(sa_type=UTCDateTime, default=None)
+
+
+Index(
+    "sqlery_ready_claim_idx",
+    JobReady.__table__.c.queue_name,
+    JobReady.__table__.c.priority.desc(),
+    JobReady.__table__.c.created_at,
+    JobReady.__table__.c.job_id,
+)
+
+
+class JobBlocked(SQLModel, table=True):
+    """One row per dependency of a queued job whose dependencies are unmet (issue #139).
+
+    The job has no ready entry while any row exists here; when a dependency reaches a
+    terminal state the dependents are looked up by ``dependency_id`` and re-checked.
+    ``created_at`` is the job's partition key, so the job is read by primary key.
+    """
+
+    __tablename__ = "sqlery_job_blocked"
+
+    job_id: int = Field(
+        sa_column=Column(BigInteger, primary_key=True, nullable=False, autoincrement=False)
+    )
+    dependency_id: int = Field(
+        sa_column=Column(
+            BigInteger, primary_key=True, nullable=False, autoincrement=False, index=False
+        )
+    )
+    created_at: datetime = Field(sa_type=UTCDateTime)
+    blocked_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
+
+
+Index("sqlery_blocked_dependency_idx", JobBlocked.__table__.c.dependency_id)
+
+
 class DaemonLease(SQLModel, table=True):
     """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone).
 
@@ -541,3 +612,8 @@ def _assign_composite_pk_ids(session, flush_context, instances):
     for obj in session.new:
         if isinstance(obj, (QueuedJob, ScheduledJob)) and obj.id is None:
             obj.id = _generate_job_id_from_uuid7()
+
+
+# The ready-queue session hook (keeps sqlery_job_ready in step with ORM writes of QueuedJob)
+# must be registered after the id-assignment hook above.
+from . import ready_sql as _ready_sql  # noqa: E402,F401

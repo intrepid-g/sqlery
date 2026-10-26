@@ -377,7 +377,7 @@ class TestPayloadFidelity:
         # Find the INSERT call and verify field values are present in the params.
         insert_calls = [
             c for c in cur.execute.call_args_list
-            if "INSERT" in str(c.args[0])
+            if "INSERT INTO sqlery_queued_job" in str(c.args[0])
         ]
         assert len(insert_calls) == 1, "Expected exactly one INSERT call"
         params = insert_calls[0].args[1]

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Claiming reads a ready queue (#139).** Workers claim from `sqlery_job_ready` (one narrow entry per claimable job; `PARTITION BY LIST (slot)` on PostgreSQL) instead of scanning `sqlery_queued_job`, and jobs waiting on dependencies sit in `sqlery_job_blocked` until a dependency finishes instead of being re-examined by every claim. Enqueue, retry, requeue, cancel, expiry and the other paths that make a job claimable or not write their entry in the same transaction as the job row; a periodic sweep run by the scheduler leader (`READY_QUEUE_SWEEP_INTERVAL`, default 60 s, `READY_QUEUE_SWEEP_TIMEOUT`, default 10 s) repairs entries lost to raw SQL. The claiming-only partial index `sqlery_job_pending_idx` is dropped. **Upgrade:** stop all workers, run the migrations (Django `0038_job_ready_queue`, Alembic `20261026_0020`), then start them; workers refuse to start without the new tables. A raw `UPDATE sqlery_queued_job SET status = 'queued'` no longer makes a job claimable by itself (the sweep restores it within a minute); go through the library (`retry_failed_jobs`, `QueuedJob.objects.update(status="queued")`, `release_job`) instead.
+
 ### Added
 
 - `run_jobs --max-jobs N` and `--idle-linger S`, plus the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings passed through by the subprocess trigger. Defaults keep one job per process.

@@ -212,6 +212,41 @@ class DatabaseBackend(ABC):
         """
         return 0
 
+    def ready_tables_exist(self) -> bool:
+        """Whether the ready-queue tables exist (workers refuse to start without them).
+
+        Backends that do not use a ready queue return True (nothing to require).
+        """
+        return True
+
+    def block_job(self, job) -> bool:
+        """Move a claim candidate whose dependencies are unmet out of the ready queue.
+
+        The job waits in the blocked set and is not examined again until a dependency
+        reaches a terminal state (``release_dependents``). Returns False when the backend
+        keeps no blocked set (the claim algorithm then just skips the candidate, as before).
+        """
+        return False
+
+    def release_dependents(self, job_id: int, parent_job_id: int | None = None) -> int:
+        """Re-check the jobs blocked on ``job_id``, which reached a terminal state.
+
+        A dependent whose dependencies are all met becomes claimable again; one with a
+        failed dependency fails. ``parent_job_id`` (the retry chain parent) lets callers
+        that know it skip a lookup. Returns how many dependents became claimable.
+        """
+        return 0
+
+    def maintain_ready_queue(
+        self, queue_names: list[str] | None = None, limit: int = 200, after_job_id: int = 0
+    ) -> dict:
+        """Periodic repair of the ready queue (run by the scheduler leader).
+
+        Queued jobs with neither a ready nor a blocked entry get a ready entry, and a page of
+        blocked jobs is re-judged. Returns counters and the cursor for the next page.
+        """
+        return {}
+
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete stale Worker row from a previous crash.
 
@@ -915,6 +950,17 @@ class AsyncDatabaseBackend(ABC):
         AsyncWorker keeps its normal poll interval.
         """
         return None
+
+    async def aready_tables_exist(self) -> bool:
+        """Whether the ready-queue tables exist (the AsyncWorker refuses to start without
+        them). Backends that keep no ready queue return True."""
+        return True
+
+    async def arelease_dependents(self, job_id, parent_job_id=None) -> int:
+        """Re-check the jobs blocked on ``job_id``, which reached its final state (the worker
+        calls this after it has decided on the retry). Backends without a blocked set
+        return 0."""
+        return 0
 
     async def aattempt_table_exists(self) -> bool:
         """Whether the execution attempt table exists (the AsyncWorker refuses to start

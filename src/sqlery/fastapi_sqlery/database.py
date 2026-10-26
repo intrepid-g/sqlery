@@ -12,6 +12,7 @@ from sqlalchemy.pool import QueuePool, StaticPool
 from sqlmodel import Session, create_engine, SQLModel
 
 from ..core import models as _models  # noqa: F401  # ensures SQLModel.metadata is populated
+from ..core import ready as _ready
 # IN-01: unused — the table name "sqlery_queued_job" is interpolated inline in the
 # partition DDL builders, never via this constant. Commented out (not deleted) per
 # project convention; remove in a future cleanup pass.
@@ -122,8 +123,9 @@ def _init_partitioned_pg(engine) -> None:
          already partitioned (relkind='p') → skip table creation.
       4. Create DEFAULT partition.
       5. Create today's daily partition + PREMAKE-day lookahead window.
-      6. Create partial pending index sqlery_job_pending_idx (byte-identical to
-         Django migration 0028 / D7 invariant).
+      6. Create the ready-queue tables (``sqlery_job_ready`` partitioned by LIST (slot),
+         ``sqlery_job_blocked``). The partial pending index ``sqlery_job_pending_idx`` is
+         no longer created: claiming reads the ready table (#139).
     """
     # Step 1 — create the jobs table first (partitioned) so that other tables
     # referencing sqlery_queued_job.id via FK can resolve the FK target.
@@ -240,14 +242,10 @@ def _init_partitioned_pg(engine) -> None:
                 f" FOR VALUES FROM ('{from_ts}') TO ('{to_ts}')"
             ))
 
-        # Step 4 — partial pending index (byte-identical to Django 0028 / D7 invariant).
-        # For fresh installs (no legacy table) we can use IF NOT EXISTS safely.
-        # For the inline-cutover path the DROP above cleared the old name first.
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS sqlery_job_pending_idx
-                ON sqlery_queued_job (queue_name, priority DESC, created_at)
-                WHERE status = 'queued';
-        """))
+        # Step 4 — ready-queue tables (#139). Claiming reads these instead of scanning
+        # sqlery_queued_job, so the partial pending index is not created any more.
+        for statement in _ready.postgres_ready_ddl():
+            conn.execute(text(statement))
 
         conn.commit()
 
@@ -260,7 +258,14 @@ def _init_partitioned_pg(engine) -> None:
     # decision demotes these FKs to plain BIGINT at application level.
     # We therefore skip sqlery_worker and sqlery_registry in the SQLModel
     # create_all pass and create them manually without FK constraints.
-    _FK_DEMOTED_TABLES = {"sqlery_worker", "sqlery_registry"}
+    # The ready-queue tables are created by the explicit DDL above (the ready table is
+    # partitioned, which create_all cannot express).
+    _FK_DEMOTED_TABLES = {
+        "sqlery_worker",
+        "sqlery_registry",
+        "sqlery_job_ready",
+        "sqlery_job_blocked",
+    }
     safe_tables = [
         t for t in SQLModel.metadata.sorted_tables
         if t.name not in _FK_DEMOTED_TABLES
@@ -377,6 +382,8 @@ def init_database(database_url: str, **kwargs):
     # Import models so SQLModel.metadata is populated before create_all
     # from ..core import models as _models  # noqa: F401  # moved to top-level
 
+    had_ready = _has_table(_engine, _ready.READY_TABLE)
+
     if database_url.startswith('sqlite'):
         # D6 — SQLite: keep plain create_all (no partitioning)
         SQLModel.metadata.create_all(_engine)
@@ -387,6 +394,22 @@ def init_database(database_url: str, **kwargs):
     else:
         # Other dialects (e.g. MySQL future): plain create_all fallback
         SQLModel.metadata.create_all(_engine)
+
+    if not had_ready:
+        _backfill_ready(_engine)
+
+
+def _has_table(engine, name: str) -> bool:
+    from sqlalchemy import inspect as sa_inspect
+
+    return sa_inspect(engine).has_table(name)
+
+
+def _backfill_ready(engine) -> None:
+    """First start on a database that predates the ready queue: give every queued job its
+    entry (the Alembic revision does the same; whichever runs first wins, both idempotent)."""
+    with engine.begin() as conn:
+        conn.execute(text(_ready.backfill_ready_sql()))
 
 
 def get_engine():
