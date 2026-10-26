@@ -201,11 +201,17 @@ def expire_ttl_jobs(backend) -> int:
 
     expired_count = 0
     for job in expired_jobs:
+        error = f"Job expired after {job.ttl}s in queue"
         try:
-            job.mark_failed(
-                error=f"Job expired after {job.ttl}s in queue",
-                termination_reason="expired",
-            )
+            # The backend persists the expiry through its fenced terminal path (detached rows
+            # of the standalone backend would otherwise be mutated in memory only).
+            expire = getattr(backend, "expire_queued_job", None)
+            if expire is not None:
+                if not expire(job, error, "expired"):
+                    logger.debug(f"Job {job.id} is no longer queued; skipping expiry")
+                    continue
+            else:
+                job.mark_failed(error=error, termination_reason="expired")
         except Exception as e:
             if not _is_lost_race(e):
                 raise
