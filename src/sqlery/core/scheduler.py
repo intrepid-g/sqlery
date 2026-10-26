@@ -432,6 +432,66 @@ class Scheduler:
 # ---------------------------------------------------------------------------
 
 
+# Types a NOT NULL column without a database default is filled with when the staging row has
+# nothing for it (the Django schema carries its defaults in the ORM, not in the database).
+_NEUTRAL_BY_TYPE = {
+    **dict.fromkeys(("int2", "int4", "int8", "numeric", "float4", "float8"), 0),
+    "bool": False,
+    **dict.fromkeys(("text", "varchar", "bpchar"), ""),
+}
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _read_target_columns(cur) -> list[tuple[str, str, bool, bool]]:
+    """Real columns of sqlery_queued_job: (name, type, not_null, has_default).
+
+    Read from the catalog so the INSERT follows whichever schema (standalone or Django) is
+    installed, instead of assuming one.
+    """
+    cur.execute(
+        "SELECT column_name, udt_name, is_nullable = 'NO', column_default IS NOT NULL"
+        " FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'sqlery_queued_job'"
+        " ORDER BY ordinal_position"
+    )
+    return [tuple(row) for row in cur.fetchall()]
+
+
+def _promotion_insert_parts(target_columns, staged: dict) -> tuple[str, str, list]:
+    """Column list, placeholders and params for promoting one staged row.
+
+    A column is written when the staged row has a value for it. A column the table has but
+    the staged row lacks is left to its database default; if it is NOT NULL with no default
+    it gets a neutral value for its type. A staged value with no such column is dropped.
+    """
+    names: list[str] = []
+    placeholders: list[str] = []
+    params: list = []
+    for name, udt, not_null, has_default in target_columns:
+        cast = f"::{udt}" if udt in ("json", "jsonb") else ""
+        if name in staged:
+            names.append(_quote_ident(name))
+            placeholders.append("%s" + cast)
+            params.append(staged[name])
+        elif not_null and not has_default:
+            if udt in ("json", "jsonb"):
+                names.append(_quote_ident(name))
+                placeholders.append("%s" + cast)
+                params.append("[]")
+            elif udt in _NEUTRAL_BY_TYPE:
+                names.append(_quote_ident(name))
+                placeholders.append("%s")
+                params.append(_NEUTRAL_BY_TYPE[udt])
+            elif udt in ("timestamptz", "timestamp"):
+                names.append(_quote_ident(name))
+                placeholders.append("now()")
+    return ", ".join(names), ", ".join(placeholders), params
+
+
+
 def promote_due_scheduled_jobs(cur) -> int:
     """Atomically move due rows from sqlery_scheduled_job into sqlery_queued_job.
 
@@ -531,6 +591,8 @@ def promote_due_scheduled_jobs(cur) -> int:
             # field fidelity from payload["job_spec"] (WR-01/WR-02). All non-nullable
             # JSON columns are supplied explicitly rather than relying on DB defaults.
             # payload column in staging stores {"kwargs": {...}, "job_spec": {...}}.
+            target_columns = _read_target_columns(cur)
+
             for row in rows:
                 (job_id, queue_name, task_path, raw_payload,
                  scheduled_at, priority, max_retries, created_at) = row
@@ -568,38 +630,40 @@ def promote_due_scheduled_jobs(cur) -> int:
                 parent_job_id = spec.get("parent_job_id", None)
                 tags = spec.get("tags") or []
 
+                staged = {
+                    "id": job_id,
+                    "queue_name": queue_name,
+                    "task_path": task_path,
+                    "kwargs": json.dumps(kwargs),
+                    "scheduled_at": scheduled_at,
+                    "priority": priority,
+                    "max_retries": max_retries,
+                    "status": "queued",
+                    "version": 0,
+                    "retry_count": retry_count,
+                    "retry_backoff": retry_backoff,
+                    "allow_parallel": allow_parallel,
+                    "timeout_seconds": timeout_seconds,
+                    "scheduled_task_id": scheduled_task_id,
+                    "job_name": job_name,
+                    "retry_intervals": (
+                        json.dumps(retry_intervals) if retry_intervals is not None else None
+                    ),
+                    "meta": json.dumps(meta) if meta is not None else None,
+                    "dependencies": json.dumps(dependencies),
+                    "on_success_path": on_success_path,
+                    "on_failure_path": on_failure_path,
+                    "ttl": ttl,
+                    "result_ttl": result_ttl,
+                    "failure_ttl": failure_ttl,
+                    "parent_job_id": parent_job_id,
+                    "tags": json.dumps(tags),
+                    "created_at": created_at,
+                }
+                columns, placeholders, params = _promotion_insert_parts(target_columns, staged)
                 cur.execute(
-                    "INSERT INTO sqlery_queued_job"
-                    " (id, queue_name, task_path, kwargs, scheduled_at,"
-                    "  priority, max_retries, status, version, retry_count,"
-                    "  retry_backoff, allow_parallel, timeout_seconds,"
-                    "  scheduled_task_id, job_name, retry_intervals, meta,"
-                    "  dependencies, on_success_path, on_failure_path,"
-                    "  ttl, result_ttl, failure_ttl, parent_job_id,"
-                    "  runs, tags, webhook_events, output, error, traceback,"
-                    "  termination_reason, created_at)"
-                    " VALUES (%s, %s, %s, %s::jsonb, %s,"
-                    "  %s, %s, 'queued', 0, %s,"
-                    "  %s, %s, %s,"
-                    "  %s, %s, %s::jsonb, %s::jsonb,"
-                    "  %s::jsonb, %s, %s,"
-                    "  %s, %s, %s, %s,"
-                    "  '[]'::jsonb, %s::jsonb, '[]'::jsonb, '', '', '',"
-                    "  '', %s)",
-                    [
-                        job_id, queue_name, task_path,
-                        json.dumps(kwargs), scheduled_at,
-                        priority, max_retries, retry_count,
-                        retry_backoff, allow_parallel, timeout_seconds,
-                        scheduled_task_id, job_name,
-                        json.dumps(retry_intervals) if retry_intervals is not None else None,
-                        json.dumps(meta) if meta is not None else None,
-                        json.dumps(dependencies),
-                        on_success_path, on_failure_path,
-                        ttl, result_ttl, failure_ttl, parent_job_id,
-                        json.dumps(tags),
-                        created_at,
-                    ],
+                    f"INSERT INTO sqlery_queued_job ({columns}) VALUES ({placeholders})",
+                    params,
                 )
 
                 # The promoted job is claimable: its ready entry joins the same transaction

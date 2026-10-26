@@ -32,6 +32,23 @@ def _make_cursor(fetchall_sequence=None, fetchone_sequence=None):
     return cur
 
 
+# What information_schema reports for sqlery_queued_job: (name, type, not_null, has_default).
+QUEUED_JOB_COLUMNS = [
+    (name, udt, True, False)
+    for name, udt in [
+        ("id", "int8"), ("queue_name", "varchar"), ("task_path", "varchar"),
+        ("kwargs", "jsonb"), ("scheduled_at", "timestamptz"), ("priority", "int4"),
+        ("max_retries", "int4"), ("status", "varchar"), ("version", "int4"),
+        ("retry_count", "int4"), ("retry_backoff", "float8"), ("allow_parallel", "bool"),
+        ("timeout_seconds", "int4"), ("scheduled_task_id", "int4"), ("job_name", "varchar"),
+        ("retry_intervals", "jsonb"), ("meta", "jsonb"), ("dependencies", "jsonb"),
+        ("on_success_path", "varchar"), ("on_failure_path", "varchar"), ("ttl", "int4"),
+        ("result_ttl", "int4"), ("failure_ttl", "int4"), ("parent_job_id", "int8"),
+        ("tags", "jsonb"), ("created_at", "timestamptz"),
+    ]
+]
+
+
 # ---------------------------------------------------------------------------
 # SC-1: Far-future job routing + dual-table visibility
 # ---------------------------------------------------------------------------
@@ -206,7 +223,7 @@ class TestPromotion:
         ]
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         result = promote_due_scheduled_jobs(cur)
         assert result == 2
@@ -244,7 +261,7 @@ class TestPromotion:
 
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         cur.execute.side_effect = execute_side_effect
 
@@ -369,7 +386,7 @@ class TestPayloadFidelity:
         rows = [(101, "default", "m.f", full_payload, now, 0, 0, now)]
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         result = promote_due_scheduled_jobs(cur)
         assert result == 1
@@ -381,23 +398,19 @@ class TestPayloadFidelity:
         ]
         assert len(insert_calls) == 1, "Expected exactly one INSERT call"
         params = insert_calls[0].args[1]
-        # params order: job_id, queue_name, task_path, kwargs_json, scheduled_at,
-        # priority, max_retries, retry_count, retry_backoff, allow_parallel,
-        # timeout_seconds, scheduled_task_id, job_name, retry_intervals_json,
-        # meta_json, dependencies_json, on_success_path, on_failure_path,
-        # ttl, result_ttl, failure_ttl, parent_job_id, created_at
+        sql = str(insert_calls[0].args[0])
+        columns = [c.strip().strip('"') for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+        by_column = dict(zip(columns, params))
         import json
-        kwargs_idx = 3
-        assert json.loads(params[kwargs_idx]) == {"x": 99}
-        # retry_backoff at index 8 (after: id, queue, path, kwargs, sched_at, prio, max_ret, retry_cnt)
-        assert params[8] == 3.0, f"retry_backoff expected 3.0, got {params[8]}"
-        assert params[9] is True, f"allow_parallel expected True, got {params[9]}"
-        assert params[10] == 300, f"timeout_seconds expected 300, got {params[10]}"
-        assert params[11] == 42, f"scheduled_task_id expected 42, got {params[11]}"
-        assert params[12] == "round-trip-job", f"job_name expected 'round-trip-job', got {params[12]}"
-        assert params[16] == "mod.success", f"on_success_path expected 'mod.success', got {params[16]}"
-        assert params[17] == "mod.failure", f"on_failure_path expected 'mod.failure', got {params[17]}"
-        assert params[18] == 7200, f"ttl expected 7200, got {params[18]}"
+        assert json.loads(by_column["kwargs"]) == {"x": 99}
+        assert by_column["retry_backoff"] == 3.0
+        assert by_column["allow_parallel"] is True
+        assert by_column["timeout_seconds"] == 300
+        assert by_column["scheduled_task_id"] == 42
+        assert by_column["job_name"] == "round-trip-job"
+        assert by_column["on_success_path"] == "mod.success"
+        assert by_column["on_failure_path"] == "mod.failure"
+        assert by_column["ttl"] == 7200
 
 
 # ---------------------------------------------------------------------------
