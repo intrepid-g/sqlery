@@ -252,3 +252,38 @@ affects only long external readers (e.g. ad-hoc reporting), never claims.
 Guarantee: ready-table storage is bounded by the rotation interval x write
 rate, provided the rotator obtains its locks; otherwise health is degraded
 and behaviour equals the non-rotating mode.
+
+### #141 implementation notes
+
+- **Settings** (`DJANGO_SQL_JOBS` / env `SQLERY_<NAME>` standalone): `READY_ROTATION_ENABLED`
+  (default off), `READY_ROTATION_INTERVAL` (60 s), `READY_ROTATION_DRAIN_BATCH` (1000),
+  `READY_ROTATION_LAG_DEGRADED_SECONDS` (0 = 3 x interval + 60). Django migration 0041 and
+  Alembic `20261026_0022` (and the standalone start-up) create three sequences on PostgreSQL:
+  `sqlery_ready_gen_seq` (generation), `sqlery_ready_switch_ts_seq` and
+  `sqlery_ready_reclaim_ts_seq` (epoch seconds). Reversible; nothing happens until enabled.
+- **Lock key** `int.from_bytes(b"SQLEROTA", "big")`. Fenced writers: Django `ready.add` and
+  `ready.after_update` (so `QueuedJob.save()`, `QuerySet.update`, bulk create, retries, release,
+  unblock, sweep restore, claim put-back), staging promotion (`core/scheduler.py`), standalone
+  `create_job` / retries through the `before_flush` hook, `_restore_entry_if_queued`,
+  `_recheck_blocked`, the sweep restore, and the async backend's put-back and unblock. Writers
+  that only update or delete an entry take no lock.
+- **Rotator**: `Scheduler.run_due_tasks` (leader loop) calls `Rotator.tick()` after the ready
+  sweep. One tick advances as far as possible (at most one switch, bounded drain batches), each
+  protocol step its own transaction. Decisions: `core.rotation.decide_rotation_step`.
+- **Health**: `check_horizon` adds `ready_rotation` (`lag_seconds` since the last reclaim, or
+  since the last switch before the first reclaim) and reports `degraded` past the threshold.
+
+### #141 deviations from the section above
+
+- The switch time and the reclaim time are kept in two extra sequences (non-transactional, no
+  dead tuples) so the interval survives restarts and health can read the lag from any process.
+- "Needs reclaim" is derived as "visible rows, or `pg_relation_size(partition) > 0`", so a
+  drained slot is truncated exactly once and a crash between drain and reclaim is repaired.
+- The drain also takes the shared key (and re-reads the generation) so that two overlapping
+  rotators cannot drain into a slot that is being retired.
+- A writer that finds the sequence missing (rotation enabled before migrating) uses slot 0
+  without a lock instead of failing; it logs a warning and re-checks every 30 s.
+- A job can have two entries (one per slot) if a writer re-inserts while a drain moved the
+  first; the claim treats the second as a stale entry and drops it.
+- The rotator refuses to run inside an outer Django transaction (its locks must end with
+  each step).

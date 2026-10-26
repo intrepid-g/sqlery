@@ -432,6 +432,14 @@ def init_database(database_url: str, **kwargs):
         # Other dialects (e.g. MySQL future): plain create_all fallback
         SQLModel.metadata.create_all(_engine)
 
+    if _engine.dialect.name == "postgresql":
+        # Sequences of the opt-in ready-queue rotation (#141); idempotent, inert until enabled.
+        from ..core import rotation as _rotation
+
+        with _engine.begin() as conn:
+            for statement in _rotation.postgres_rotation_ddl():
+                conn.execute(text(statement))
+
     if not had_ready:
         _backfill_ready(_engine)
 

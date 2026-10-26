@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from sqlery.compat import get_config
 from sqlery.core import ready as ready_core
+from sqlery.core import rotation
 from sqlery.core.ready import SLOT_CURRENT, SLOTS
 
 logger = logging.getLogger(__name__)
@@ -37,11 +38,40 @@ def _chunks(items, size=_CHUNK):
         yield items[i : i + size]
 
 
-def entry_for(job):
+def _rotating() -> bool:
+    return connection.vendor == "postgresql" and rotation.rotation_enabled(get_config)
+
+
+def _write_slot() -> int:
+    """Slot to insert into. With rotation on this takes the shared generation lock and reads
+    the generation; it must run inside the transaction that inserts (see ``add``)."""
+    if not _rotating():
+        return SLOT_CURRENT
+
+    def read_one(sql):
+        with connection.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchone()[0]
+
+    return rotation.writer_slot(read_one, True, connection.vendor)
+
+
+@contextmanager
+def _fenced_write():
+    """Yield the slot for ready-entry inserts; with rotation on, inside one transaction so
+    the shared lock lives until the insert has committed (or the outer transaction ends)."""
+    if _rotating():
+        with transaction.atomic():
+            yield _write_slot()
+    else:
+        yield SLOT_CURRENT
+
+
+def entry_for(job, slot: int = SLOT_CURRENT):
     """The ready entry (unsaved) of ``job``."""
     m = _models()
     return m.JobReady(
-        slot=SLOT_CURRENT,
+        slot=slot,
         job_id=job.id,
         queue_name=job.queue_name,
         priority=job.priority or 0,
@@ -53,8 +83,11 @@ def entry_for(job):
 def add(jobs) -> None:
     """Give each job a ready entry; an existing entry is left alone (idempotent)."""
     m = _models()
-    entries = [entry_for(j) for j in jobs]
-    if entries:
+    jobs = list(jobs)
+    if not jobs:
+        return
+    with _fenced_write() as slot:
+        entries = [entry_for(j, slot) for j in jobs]
         m.JobReady.objects.bulk_create(entries, ignore_conflicts=True)
 
 
@@ -122,20 +155,21 @@ def after_update(rows, requeue: bool, edits: dict) -> None:
     scheduled_at`` as they were before it)."""
     m = _models()
     if requeue:
-        entries = []
-        for job_id, created_at, queue_name, priority, scheduled_at in rows:
-            entries.append(
-                m.JobReady(
-                    slot=SLOT_CURRENT,
-                    job_id=job_id,
-                    queue_name=edits.get("queue_name", queue_name),
-                    priority=edits.get("priority", priority) or 0,
-                    created_at=created_at,
-                    scheduled_at=edits.get("scheduled_at", scheduled_at),
+        with _fenced_write() as slot:
+            entries = []
+            for job_id, created_at, queue_name, priority, scheduled_at in rows:
+                entries.append(
+                    m.JobReady(
+                        slot=slot,
+                        job_id=job_id,
+                        queue_name=edits.get("queue_name", queue_name),
+                        priority=edits.get("priority", priority) or 0,
+                        created_at=created_at,
+                        scheduled_at=edits.get("scheduled_at", scheduled_at),
+                    )
                 )
-            )
-        for chunk in _chunks(entries):
-            m.JobReady.objects.bulk_create(chunk, ignore_conflicts=True)
+            for chunk in _chunks(entries):
+                m.JobReady.objects.bulk_create(chunk, ignore_conflicts=True)
 
 
 # --------------------------------------------------------------------------------------------
