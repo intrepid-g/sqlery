@@ -240,6 +240,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                     .where(QueuedJob.id == job_id)
                     .where(QueuedJob.created_at == created_at)
                     .where(QueuedJob.status == "queued")
+                    .where(QueuedJob.version == (job.version or 0))
                     .values(
                         status="running",
                         started_at=now,
