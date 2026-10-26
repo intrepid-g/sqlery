@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-10-26
+
+### Fixed
+
+- **Every claim is fenced on status and version (#30, #153).** The legacy Django helpers `atomic_claim_job_postgres` / `_sqlite` (re-exported as `sqlery.db_compat.atomic_claim_job`) now delete the ready entry first (rowcount 1 is the claim) and update with `status = 'queued' AND version = <read>`, rolling back on a lost race. Before this, a candidate cancelled by raw SQL could still be claimed. The other claim paths gain the same `version` predicate.
+- **TTL expiry persists in standalone mode (#29, #154).** `expire_ttl_jobs` changed detached rows, so a queued job past its TTL stayed claimable (for example through `claim_job_by_id`). It now expires through the backend's fenced path: the job moves to history and its ready and blocked entries are removed. A naive `created_at` counts as UTC.
+
 ## [0.26.0] - 2026-10-26
 
 ### Upgrade notes
