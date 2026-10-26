@@ -141,6 +141,14 @@ DEFAULTS = {
     "SQLITE_WAL_MODE": True,          # Enable WAL journal mode for SQLite
     "PG_STATEMENT_TIMEOUT_MS": 30000, # PostgreSQL statement_timeout (ms), 0=disabled
     "PG_LOCK_TIMEOUT_MS": 10000,      # PostgreSQL lock_timeout (ms), 0=disabled
+    # xmin-horizon guard (see docs/TROUBLESHOOTING.md): sqlery's own worker/daemon
+    # sessions are killed by PostgreSQL if idle inside a transaction this long.
+    "PG_IDLE_IN_TRANSACTION_TIMEOUT_MS": 60000,  # ms, 0=disabled
+    # Health reports "degraded" past these (0 disables a check).
+    "PG_XMIN_AGE_DEGRADED_SECONDS": 300,   # oldest xmin-holding transaction age
+    "PG_DEAD_TUPLE_RATIO_DEGRADED": 0.5,   # sqlery_queued_job dead/live tuples
+    "PG_DEAD_TUPLE_MIN": 10000,            # ...but only with at least this many dead
+    "PG_SLOT_XID_AGE_DEGRADED": 5000000,   # replication slot / standby xmin age (xids)
 
     # Opt-in PG LISTEN/NOTIFY dispatch (Phase 18 — D1/D8).
     # Default False = byte-identical polling behaviour when off.

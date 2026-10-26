@@ -339,7 +339,31 @@ def _compute_health_warnings(
                     },
                 })
 
+    warnings_list.extend(_horizon_warnings(now))
+
     return warnings_list
+
+
+def _horizon_warnings(now) -> list[dict]:
+    """Dashboard warning when the PostgreSQL xmin horizon is pinned (30s cache)."""
+    from sqlery.core.horizon import DEGRADED, check_horizon, describe
+
+    try:
+        result = caches['default'].get('sqlery_xmin_horizon')
+        if result is None:
+            result = check_horizon()
+            caches['default'].set('sqlery_xmin_horizon', result, timeout=30)
+        if result["status"] != DEGRADED:
+            return []
+        return [{
+            'type': 'warning',
+            'msg': describe(result),
+            'time': now.isoformat() if hasattr(now, 'isoformat') else str(now),
+            'action': None,
+        }]
+    except Exception:
+        logger.exception("xmin horizon warning failed")
+        return []
 
 
 def _get_health_warnings(now, **kwargs) -> list[dict]:
@@ -491,9 +515,13 @@ async def health_check(request):
             lambda: QueuedJob.objects.filter(status="queued").count()
         )
 
+        from sqlery.core.horizon import DEGRADED, check_horizon
+
+        horizon = await asyncio.to_thread(check_horizon)
         return JsonResponse({
-            "status": "healthy",
+            "status": "degraded" if horizon["status"] == DEGRADED else "healthy",
             "queued_jobs": queued_count,
+            "xmin_horizon": horizon,
         })
 
     except Exception as e:
