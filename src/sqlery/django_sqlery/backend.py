@@ -1318,7 +1318,7 @@ class DjangoBackend(DatabaseBackend):
                 expired.append(job)
         return expired
 
-    def acquire_tag_locks(self, tags: list[str]) -> None:
+    def acquire_tag_locks(self, tags: list[str]) -> bool:
         """Acquire exclusive locks on tag coordination rows."""
         # from .models import TagLock  # moved to top-level
         # from .db_compat import is_sqlite  # moved to top-level
@@ -1332,18 +1332,23 @@ class DjangoBackend(DatabaseBackend):
                 ignore_conflicts=True,
             )
 
-        # Acquire exclusive locks (Postgres: SELECT FOR UPDATE, SQLite: no-op)
+        # Acquire exclusive locks (Postgres: SELECT FOR UPDATE SKIP LOCKED, SQLite: no-op).
+        # Never wait on another worker's transaction: a row we cannot lock means the tag
+        # is busy, and the caller treats the candidate as tag-limited.
         tag_queryset = TagLock.objects.filter(tag__in=tags)
-        if not is_sqlite():
-            assert_in_atomic_block("acquire_tag_locks")
-            tag_queryset = tag_queryset.select_for_update()
-        list(tag_queryset)  # Force evaluation to actually acquire locks
+        if is_sqlite():
+            list(tag_queryset)
+            return True
+        assert_in_atomic_block("acquire_tag_locks")
+        locked = {row.tag for row in tag_queryset.select_for_update(skip_locked=True)}
+        return locked >= set(tags)
 
     def get_claimable_jobs(
         self,
         queues: list[str],
         priority_weights: dict[str, int] | None = None,
         limit: int = 1,
+        exclude_ids: list | None = None,
     ) -> list:
         """Get next claimable jobs ordered by queue priority, job priority, age."""
         # from django.db import models as db_models  # moved to top-level
@@ -1351,6 +1356,9 @@ class DjangoBackend(DatabaseBackend):
         queryset = self.QueuedJob.objects.filter(status="queued", queue_name__in=queues).filter(
             db_models.Q(scheduled_at__isnull=True) | db_models.Q(scheduled_at__lte=timezone.now())
         )
+
+        if exclude_ids:
+            queryset = queryset.exclude(id__in=exclude_ids)
 
         queryset = atomic_claim_job_queryset(queryset)
 
