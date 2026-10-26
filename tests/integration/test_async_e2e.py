@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlmodel import SQLModel
 
 from sqlery.core.async_worker import AsyncWorker
-from sqlery.core.models import QueuedJob
+from sqlery.core.models import QueuedJob, JobAll
 from sqlery.fastapi_sqlery import async_backend as _ab  # registers Lease on metadata  # noqa: F401
 from sqlery.fastapi_sqlery import database as _db_mod
 from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
@@ -111,7 +111,7 @@ async def test_async_e2e_standalone(_standalone_async_engine):
 
     async with factory() as s:
         row = (
-            await s.execute(select(QueuedJob).where(QueuedJob.id == job_id))
+            await s.execute(select(JobAll).where(JobAll.id == job_id))
         ).scalars().first()
     assert row.output == "3", f"expected output '3' but got {row.output!r}"
 
@@ -172,7 +172,7 @@ async def test_async_e2e_standalone_pg(_standalone_async_engine_pg):
 
     async with factory() as s:
         row = (
-            await s.execute(select(QueuedJob).where(QueuedJob.id == job_id))
+            await s.execute(select(JobAll).where(JobAll.id == job_id))
         ).scalars().first()
     assert row.output == "30", f"expected output '30' but got {row.output!r}"
 
@@ -186,6 +186,7 @@ async def test_async_e2e_standalone_pg(_standalone_async_engine_pg):
 async def test_async_e2e_django():
     """(async, django, sqlite) — AsyncWorker on the native-async Django ORM."""
     from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
+    from sqlery.django_sqlery.models import JobAll as DjangoJobAll
     from sqlery.django_sqlery.models import QueuedJob as DjangoQueuedJob
 
     job = await DjangoQueuedJob.objects.acreate(
@@ -203,7 +204,7 @@ async def test_async_e2e_django():
     run_task = asyncio.create_task(worker.run(max_jobs=1))
     await asyncio.wait_for(run_task, timeout=10)
 
-    refreshed = await DjangoQueuedJob.objects.aget(id=job.id)
+    refreshed = await DjangoJobAll.objects.aget(id=job.id)  # finished: in history
     assert refreshed.status == "success", (
         f"expected 'success' but got {refreshed.status!r}"
     )
@@ -222,6 +223,7 @@ async def test_async_e2e_django_pg():
     Django DB is already PostgreSQL.
     """
     from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
+    from sqlery.django_sqlery.models import JobAll as DjangoJobAll
     from sqlery.django_sqlery.models import QueuedJob as DjangoQueuedJob
 
     job = await DjangoQueuedJob.objects.acreate(
@@ -239,7 +241,7 @@ async def test_async_e2e_django_pg():
     run_task = asyncio.create_task(worker.run(max_jobs=1))
     await asyncio.wait_for(run_task, timeout=10)
 
-    refreshed = await DjangoQueuedJob.objects.aget(id=job.id)
+    refreshed = await DjangoJobAll.objects.aget(id=job.id)  # finished: in history
     assert refreshed.status == "success", (
         f"expected 'success' but got {refreshed.status!r}"
     )

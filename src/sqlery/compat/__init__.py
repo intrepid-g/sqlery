@@ -247,6 +247,11 @@ class DatabaseBackend(ABC):
         """
         return {}
 
+    def history_table_exists(self) -> bool:
+        """Whether ``sqlery_job_history`` (finished jobs, insert-only) exists. Workers
+        refuse to start without it. Custom backends without a history report True."""
+        return True
+
     def delete_worker_registration(self, worker_id: str) -> int:
         """Delete stale Worker row from a previous crash.
 
@@ -954,6 +959,11 @@ class AsyncDatabaseBackend(ABC):
     async def aready_tables_exist(self) -> bool:
         """Whether the ready-queue tables exist (the AsyncWorker refuses to start without
         them). Backends that keep no ready queue return True."""
+        return True
+
+    async def ahistory_table_exists(self) -> bool:
+        """Whether the job history table exists (the AsyncWorker refuses to start without
+        it). Backends that keep no history return True."""
         return True
 
     async def arelease_dependents(self, job_id, parent_job_id=None) -> int:

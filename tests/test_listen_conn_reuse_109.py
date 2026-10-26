@@ -81,8 +81,8 @@ _SCRIPT = textwrap.dedent("""
 
     WorkerProcess(queues=["default"]).run(max_jobs=cfg["jobs"])
 
-    from sqlery.django_sqlery.models import QueuedJob
-    done = QueuedJob.objects.filter(status="success").count()
+    from sqlery.django_sqlery.models import JobAll
+    done = JobAll.objects.filter(status="success").count()
     print("RESULT" + json.dumps({"opens": len(opens), "connects": len(connects), "done": done}))
     """)
 

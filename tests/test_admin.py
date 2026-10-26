@@ -5,6 +5,7 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.messages.storage.cookie import CookieStorage
 from django.test import RequestFactory
 from sqlery.models import ScheduledTask, QueuedJob
+from sqlery.django_sqlery.models import JobAll
 from sqlery.admin import ScheduledTaskAdmin, QueuedJobAdmin
 
 
@@ -153,7 +154,9 @@ class TestQueuedJobAdmin:
         request = rf.post("/admin/sqlery/queuedjob/")
         request._messages = CookieStorage(request)
 
-        queryset = QueuedJob.objects.filter(id=job.id)
+        # The failed job is in history: the action is given the union view of live and
+        # finished jobs.
+        queryset = JobAll.objects.filter(id=job.id)
         admin.retry_failed(request, queryset)
 
         # Should have created new queued job
@@ -184,7 +187,7 @@ class TestQueuedJobAdmin:
         request = rf.post("/admin/sqlery/queuedjob/")
         request._messages = CookieStorage(request)
 
-        queryset = QueuedJob.objects.all()
+        queryset = JobAll.objects.all()
         admin.retry_failed(request, queryset)
 
         # Should only create retry job for failed job
@@ -291,14 +294,14 @@ class TestAdminDisplayMethods:
         """Test QueuedJobAdmin display methods."""
         from django.utils import timezone
 
+        # (A finished job is written once, into history: its duration is set at creation.)
         job = QueuedJob.objects.create(
             task_path="tests.test_executor.dummy_task",
             status="success",
             scheduled_at=timezone.now(),
             started_at=timezone.now(),
+            duration_seconds=1.5,
         )
-        job.duration_seconds = 1.5
-        job.save()
 
         site = AdminSite()
         admin = QueuedJobAdmin(QueuedJob, site)

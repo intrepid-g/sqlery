@@ -11,7 +11,7 @@ import pytest
 from sqlery.core.async_worker import AsyncWorker
 from sqlery.core.job import job as core_job
 from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
-from sqlery.django_sqlery.models import QueuedJob
+from sqlery.django_sqlery.models import JobAll, QueuedJob
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.asyncio]
 
@@ -63,7 +63,7 @@ async def _check_concurrent() -> None:
     await _run(max_jobs=4)
     elapsed = time.monotonic() - started
     assert elapsed < 1.5, f"4 x 0.5 s awaiting jobs took {elapsed:.2f}s: they ran one by one"
-    assert [j.status async for j in QueuedJob.objects.all()] == ["success"] * 4
+    assert [j.status async for j in JobAll.objects.all()] == ["success"] * 4
 
 
 async def _check_chain_passes_result() -> None:
@@ -73,7 +73,7 @@ async def _check_chain_passes_result() -> None:
 
     await sync_to_async(chain(one.si(), plus_one.s()).apply_async)()
     await _run(max_jobs=2)
-    last = await QueuedJob.objects.order_by("-created_at").afirst()
+    last = await JobAll.objects.order_by("-created_at").afirst()
     assert (last.status, last.output) == ("success", "2"), (last.status, last.error)
 
 
@@ -84,8 +84,8 @@ async def _check_retry_keeps_spec() -> None:
         tags=["t"], meta={"k": "v"}, dependencies=[], retry_intervals=[0.1],
     )
     await _run(max_jobs=1)
-    first = await QueuedJob.objects.aget(id=first.id)
-    retry = await QueuedJob.objects.aget(parent_job_id=first.id)
+    first = await JobAll.objects.aget(id=first.id)  # finished jobs are in history
+    retry = await JobAll.objects.aget(parent_job_id=first.id)
     assert (retry.job_name, retry.failure_ttl, retry.result_ttl) == ("my-job:retry:1", 60, 60)
     assert (retry.tags, retry.meta, retry.retry_intervals) == (["t"], {"k": "v"}, [0.1])
     assert retry.retry_count == 1
@@ -129,7 +129,7 @@ async def test_django_async_worker_bind_context_and_signals():
     finally:
         task_prerun.disconnect(pre)
         task_postrun.disconnect(post)
-    done = await QueuedJob.objects.aget(id=row.id)
+    done = await JobAll.objects.aget(id=row.id)
     assert (done.status, done.output) == ("success", "7"), done.error
     assert isinstance(_bound_seen[-1], TaskContext)
     assert seen == ["pre", "SUCCESS"]
@@ -156,7 +156,7 @@ async def test_django_async_worker_fails_orphaned_running_job_at_startup():
         status="running", started_at=datetime(2020, 1, 1, tzinfo=timezone.utc), worker=None
     )
     await _run(max_polls=2)
-    assert (await QueuedJob.objects.aget(id=orphan.id)).status == "failed"
+    assert (await JobAll.objects.aget(id=orphan.id)).status == "failed"
 
 
 async def test_django_async_worker_sweep_spares_fresh_and_live_jobs():

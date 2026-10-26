@@ -8,7 +8,7 @@ import pytest
 from sqlery.compat import get_backend
 from sqlery.core.claiming import check_job_dependencies, expire_ttl_jobs
 from sqlery.core.worker import JobExecutor
-from sqlery.django_sqlery.models import ConcurrentModificationError, QueuedJob
+from sqlery.django_sqlery.models import ConcurrentModificationError, JobAll, QueuedJob
 
 
 def add_one(n):
@@ -44,7 +44,7 @@ def test_trigger_executes_a_job_from_a_non_main_thread():
     t.start()
     t.join()
     assert not errors
-    row = QueuedJob.objects.get(id=job.id)
+    row = JobAll.objects.get(id=job.id)  # finished: in history
     assert row.status == "success", (row.status, row.error)
 
 

@@ -256,7 +256,14 @@ class TestStandaloneDivergenceMatrixSQLite:
         """mark_job_archived transitions a failed job to archived status on SQLite."""
         backend = _make_sqlite_backend()
         job = _create_basic_job(backend)
-        backend.mark_job_failed(job.id, error="forced failure")
+        # A failure awaiting its retry carries the marker and stays live; archiving it (the
+        # retry exists) makes it final. (History is insert-only: a plain final failure is not
+        # rewritten as archived any more.)
+        from sqlery.core.retry import pending_reason
+
+        backend.mark_job_failed(
+            job.id, error="forced failure", termination_reason=pending_reason()
+        )
         backend.mark_job_archived(job.id)
         archived = backend.get_job_by_id(job.id)
         assert archived is not None
@@ -396,7 +403,7 @@ class TestStandaloneDivergenceMatrixPG:
         with engine.connect() as conn:
             # Fetch created_at for the EXPLAIN query.
             row = conn.execute(
-                text("SELECT created_at, version FROM sqlery_queued_job WHERE id = :id"),
+                text("SELECT created_at, version FROM sqlery_job_all WHERE id = :id"),
                 {"id": job.id},
             ).fetchone()
         assert row is not None, f"Job {job.id} not found after mark_job_failed"

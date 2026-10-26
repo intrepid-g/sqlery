@@ -72,7 +72,7 @@ from .eventbridge_trigger import (
     invoke_lambda_worker,
 )
 from sqlery.core.worker import TaskExecutor
-from .models import QueuedJob, ScheduledTask
+from .models import JobHistory, QueuedJob, ScheduledTask
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +198,19 @@ def process_queue_action(event, context):
             }
 
         except QueuedJob.DoesNotExist:
+            finished = JobHistory.objects.filter(id=job_id).first()
+            if finished is not None:
+                # Already executed (it is in history): report its outcome, run nothing.
+                logger.info(f"Job {job_id} already finished ({finished.status})")
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({
+                        "job_id": job_id,
+                        "status": finished.status,
+                        "duration": finished.duration_seconds,
+                        "already_finished": True,
+                    }),
+                }
             logger.warning(f"Job {job_id} not found")
             return {
                 "statusCode": 404,

@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlery.fastapi_sqlery import async_backend as _ab  # registers Lease on metadata  # noqa: F401
 from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
 from sqlery.fastapi_sqlery import database as _db_mod
-from sqlery.core.models import QueuedJob, Worker
+from sqlery.core.models import QueuedJob, Worker, JobAll
 from sqlery.core.async_worker import AsyncWorker
 
 
@@ -155,7 +155,7 @@ async def test_async_job_happy_path(backend, make_job, session_factory):
     await asyncio.wait_for(run_task, timeout=5)
 
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
     assert row.status == "success"
     assert row.output == "10"
     assert "async_ok:5" in _call_log
@@ -173,7 +173,7 @@ async def test_sync_job_runs_in_executor(backend, make_job, session_factory):
     await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
 
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
     assert row.status == "success"
     assert row.output == "42"
     assert "sync_ok:41" in _call_log
@@ -191,7 +191,7 @@ async def test_failure_records_error_and_traceback(backend, make_job, session_fa
     await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
 
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == job.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == job.id))).scalars().first()
     assert row.status == "failed"
     assert "kaboom" in row.error
     assert "RuntimeError" in row.traceback
@@ -210,7 +210,7 @@ async def test_failure_with_max_retries_requeues(backend, make_job, session_fact
     await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
 
     async with session_factory() as s:
-        rows = (await s.execute(select(QueuedJob))).scalars().all()
+        rows = (await s.execute(select(JobAll))).scalars().all()
     statuses = sorted(r.status for r in rows)
     # Original failed (or archived), and a new retry row queued.
     assert "queued" in statuses, statuses
@@ -234,7 +234,7 @@ async def test_retry_keeps_job_spec_and_archives_failed_attempt(
     await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
 
     async with session_factory() as s:
-        rows = (await s.execute(select(QueuedJob))).scalars().all()
+        rows = (await s.execute(select(JobAll))).scalars().all()
     first = next(r for r in rows if r.id == job.id)
     retry = next(r for r in rows if r.parent_job_id == job.id)
     assert (retry.job_name, retry.failure_ttl, retry.result_ttl) == ("my-job:retry:1", 60, 60)
@@ -285,7 +285,7 @@ async def test_jobs_run_concurrently(backend, make_job, session_factory):
     elapsed = time.monotonic() - started
     assert elapsed < 0.9, f"jobs ran one after another ({elapsed:.2f}s)"
     async with session_factory() as s:
-        rows = (await s.execute(select(QueuedJob))).scalars().all()
+        rows = (await s.execute(select(JobAll))).scalars().all()
     assert [r.status for r in rows] == ["success"] * 4
 
 
@@ -334,7 +334,7 @@ async def test_chain_step_receives_upstream_result(
     worker = AsyncWorker(backend=backend, queues=["default"], poll_interval=0.01)
     await asyncio.wait_for(worker.run(max_jobs=1), timeout=5)
     async with session_factory() as s:
-        row = (await s.execute(select(QueuedJob).where(QueuedJob.id == step.id))).scalars().first()
+        row = (await s.execute(select(JobAll).where(JobAll.id == step.id))).scalars().first()
     assert (row.status, row.output) == ("success", "2"), row.error
 
 
@@ -362,7 +362,7 @@ async def test_bind_task_gets_context_and_signals_fire(backend, make_job, sessio
         task_prerun.disconnect(pre)
         task_postrun.disconnect(post)
     async with session_factory() as s:
-        done = (await s.execute(select(QueuedJob).where(QueuedJob.id == row.id))).scalars().first()
+        done = (await s.execute(select(JobAll).where(JobAll.id == row.id))).scalars().first()
     assert (done.status, done.output) == ("success", "7"), done.error
     assert isinstance(_bound_seen[-1], TaskContext)
     assert seen == ["pre", "SUCCESS"]
@@ -392,7 +392,7 @@ async def _make_worker_row(session_factory, **kw) -> Worker:
 
 async def _status(session_factory, job_id) -> str:
     async with session_factory() as s:
-        res = await s.execute(select(QueuedJob.status).where(QueuedJob.id == job_id))
+        res = await s.execute(select(JobAll.status).where(JobAll.id == job_id))
         return res.scalar_one()
 
 

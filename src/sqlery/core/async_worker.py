@@ -38,6 +38,8 @@ from typing import Any, Awaitable, Callable
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
 
 from .attempts import MISSING_TABLE_MESSAGE, AttemptTableMissingError, attempt_kwargs, attempt_of
+from .history import MISSING_TABLE_MESSAGE as HISTORY_MISSING_TABLE_MESSAGE
+from .history import HistoryTableMissingError
 from .ready import MISSING_TABLE_MESSAGE as READY_MISSING_TABLE_MESSAGE
 from .ready import ReadyTablesMissingError
 
@@ -221,6 +223,10 @@ class AsyncWorker:
         ready_check = getattr(self.backend, "aready_tables_exist", None)
         if ready_check is not None and not await ready_check():
             raise ReadyTablesMissingError(READY_MISSING_TABLE_MESSAGE)
+        # ... and without the history table a finished job could not be recorded.
+        history_check = getattr(self.backend, "ahistory_table_exists", None)
+        if history_check is not None and not await history_check():
+            raise HistoryTableMissingError(HISTORY_MISSING_TABLE_MESSAGE)
         self._shutdown_event = asyncio.Event()
         self._install_signal_handlers()
         await self._register()

@@ -20,14 +20,20 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    MetaData,
     SmallInteger,
+    Table,
     text,
 )
+from sqlalchemy import event as _sa_event
+from sqlalchemy.orm import registry as _sa_registry
 
+from sqlery.core import history as _history
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.worker_admin import is_worker_beating
 from sqlery.compat import get_config
+from sqlery.tables import JOB_ALL
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -542,6 +548,145 @@ class JobBlocked(SQLModel, table=True):
 Index("sqlery_blocked_dependency_idx", JobBlocked.__table__.c.dependency_id)
 
 
+class JobHistory(SQLModel, table=True):
+    """A job that reached a terminal state (success / failed / archived): insert-only (#140).
+
+    Has every column of ``sqlery_queued_job`` (see ``sqlery.core.history``); primary key
+    ``(finished_at, id)``. On PostgreSQL it is ``PARTITION BY RANGE (finished_at)`` (created by
+    the bootstrap / migration DDL, not by ``create_all``) and retention drops whole
+    partitions; elsewhere it is a plain table. A row is written once, by the terminal
+    transition (``INSERT .. SELECT`` + ``DELETE`` from the live table, one transaction) and
+    never updated; only retention removes it. ``scheduled_task_id`` / ``worker_id`` are plain
+    columns here (the referenced rows may be gone long before the history is). Mirrors the
+    Django ``JobHistory`` model.
+    """
+
+    __tablename__ = "sqlery_job_history"
+
+    id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, nullable=False, autoincrement=False),
+    )
+    finished_at: datetime = Field(
+        sa_type=UTCDateTime, primary_key=True, description="When the job reached its final state"
+    )
+    task_path: str = Field(max_length=500)
+    kwargs: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    queue_name: str = Field(default="default", max_length=50)
+    priority: int = Field(default=0)
+    status: str = Field(default="success", max_length=20)
+    parent_job_id: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    retry_count: int = Field(default=0)
+    max_retries: int = Field(default=0)
+    retry_backoff: float = Field(default=1.0)
+    allow_parallel: bool = Field(default=False)
+    timeout_seconds: int | None = Field(default=None)
+    worker_pid: int | None = Field(default=None)
+    child_pid: int | None = Field(default=None)
+    job_name: str | None = Field(default=None, max_length=255)
+    tags: list = Field(default_factory=list, sa_column=Column("tags", JSON))
+    retry_intervals: list | None = Field(
+        default=None, sa_column=Column("retry_intervals", JSON)
+    )
+    meta: dict | None = Field(default=None, sa_column=Column("meta", JSON))
+    dependencies: list = Field(default_factory=list, sa_column=Column("dependencies", JSON))
+    on_success_path: str = Field(default="", max_length=500)
+    on_failure_path: str = Field(default="", max_length=500)
+    ttl: int | None = Field(default=None)
+    result_ttl: int | None = Field(default=None)
+    failure_ttl: int | None = Field(default=None)
+    version: int = Field(default=0)
+    runs: list = Field(default_factory=list, sa_column=Column(JSON))
+    scheduled_task_id: int | None = Field(default=None)
+    worker_id: UUID | None = Field(default=None)
+    created_at: datetime = Field(sa_type=UTCDateTime, default_factory=lambda: datetime.now(UTC))
+    scheduled_at: datetime | None = Field(sa_type=UTCDateTime, default=None)
+    started_at: datetime | None = Field(sa_type=UTCDateTime, default=None)
+    duration_seconds: float | None = Field(default=None)
+    output: str = Field(default="")
+    error: str = Field(default="")
+    traceback: str = Field(default="")
+    termination_reason: str = Field(default="", max_length=100)
+
+    # Read helpers shared with QueuedJob (history is never executed, so nothing else).
+    def should_retry(self) -> bool:
+        return False
+
+
+# Indexes of the history table (shared DDL: ``sqlery.core.history.HISTORY_INDEXES``).
+for _name, _cols, _where in _history.HISTORY_INDEXES:
+    _expressions = []
+    for _part in _cols.split(","):
+        _col_name, *_order = _part.split()
+        _column = JobHistory.__table__.c[_col_name]
+        _expressions.append(_column.desc() if _order and _order[0].upper() == "DESC" else _column)
+    _kwargs = {}
+    if _where:
+        _kwargs = {"postgresql_where": text(_where), "sqlite_where": text(_where)}
+    Index(_name, *_expressions, **_kwargs)
+
+
+class JobAll:
+    """Read-only row of the ``sqlery_job_all`` view: the live table and history together.
+
+    Mapped imperatively onto the view (a separate registry, so ``create_all`` never tries to
+    create it). Attribute names are those of ``QueuedJob`` / ``JobHistory``.
+    """
+
+    #: Marks the row as read from the union view (not a live, writable job).
+    is_read_only_view = True
+
+    def should_retry(self) -> bool:
+        return False
+
+
+def _build_job_all_table() -> Table:
+    columns = [
+        Column(c.name, c.type, primary_key=(c.name == "id"), autoincrement=False)
+        for c in QueuedJob.__table__.columns
+    ]
+    return Table(JOB_ALL, MetaData(), *columns)
+
+
+JOB_ALL_TABLE = _build_job_all_table()
+_job_all_registry = _sa_registry()
+_job_all_registry.map_imperatively(JobAll, JOB_ALL_TABLE)
+
+#: Columns shared by the live table, history and the view (standalone model).
+JOB_COLUMNS = [c.name for c in QueuedJob.__table__.columns]
+
+
+def _job_view_exists(connection) -> bool:
+    from sqlalchemy import inspect as _inspect
+
+    return JOB_ALL in _inspect(connection).get_view_names()
+
+
+@_sa_event.listens_for(SQLModel.metadata, "after_create")
+def _create_job_view(target, connection, **kw):
+    """``SQLModel.metadata.create_all`` also creates the union view over the live table and
+    history (it is not a table, so ``create_all`` alone would miss it). Skipped while either
+    table is missing (a partial ``create_all``)."""
+    from sqlalchemy import inspect as _inspect
+
+    if connection.dialect.name not in ("sqlite", "postgresql"):
+        return
+    inspector = _inspect(connection)
+    if not (inspector.has_table(QueuedJob.__tablename__) and inspector.has_table(JobHistory.__tablename__)):
+        return
+    if _job_view_exists(connection):
+        return
+    for statement in _history.view_columns_ddl(JOB_COLUMNS, connection.dialect.name):
+        connection.execute(text(statement))
+
+
+@_sa_event.listens_for(SQLModel.metadata, "before_drop")
+def _drop_job_view(target, connection, **kw):
+    """The view depends on both tables: it goes before ``drop_all`` drops them."""
+    if connection.dialect.name in ("sqlite", "postgresql"):
+        connection.execute(text(_history.drop_view_ddl()))
+
+
 class DaemonLease(SQLModel, table=True):
     """DB-backed lease for queue-scoped scheduler/daemon ownership (standalone).
 
@@ -587,7 +732,6 @@ class DaemonLease(SQLModel, table=True):
 # The listener is registered on the SQLAlchemy Session class (not per-session)
 # so it applies to all sessions created from any engine.
 
-from sqlalchemy import event as _sa_event
 from sqlalchemy.orm import Session as _SASession
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 # from typing import Optional  # Replaced with X | None (Python 3.10+)
 
 from ..compat import get_backend, get_config, is_django_mode
+from . import history as history_core
 from .cleanup import CleanupManager
 # Old: from . import partitioning as _partitioning
 try:
@@ -670,11 +671,18 @@ class DaemonManager:
                                 )
                                 last_partition_maintenance_at = datetime.now(timezone.utc)
                             else:
-                                made = _partitioning.ensure_future_partitions(
-                                    cur, partition_table, partition_interval_str, partition_premake
+                                # The live table, the job history and the attempt table are
+                                # all time-partitioned (#140): keep and reclaim each of them.
+                                made = history_core.ensure_partitions(
+                                    cur, partition_interval_str, partition_premake, _partitioning
                                 )
-                                dropped = _partitioning.reclaim_drained_partitions(
-                                    cur, partition_table, partition_retention_str, partition_archive_hook
+                                dropped = sum(
+                                    history_core.reclaim_partitions(
+                                        cur,
+                                        partition_retention_str,
+                                        partition_archive_hook,
+                                        _partitioning,
+                                    ).values()
                                 )
                                 default_count = _partitioning.check_default_partition(
                                     cur, partition_table

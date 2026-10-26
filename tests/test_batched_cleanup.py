@@ -17,19 +17,20 @@ from django.utils import timezone
 
 from sqlery.models import QueuedJob
 from sqlery.django_sqlery.backend import DjangoBackend, CLEANUP_BATCH_SIZE, FINISHED_STATUSES
+from sqlery.django_sqlery.models import JobAll, JobHistory
 
 
 def _create_failed_job():
-    """Create a QueuedJob with status 'failed' and age > 15 days."""
+    """Create a job that failed more than 15 days ago (a failed job is in history, whose
+    retention reads the time it finished)."""
     job = QueuedJob.objects.create(
         task_path="tests.test_batched_cleanup.dummy_task",
         queue_name="default",
         priority=0,
         status="failed",
     )
-    QueuedJob.objects.filter(id=job.id).update(
-        created_at=timezone.now() - timedelta(days=15)
-    )
+    old = timezone.now() - timedelta(days=15)
+    JobHistory.objects.filter(id=job.id).update(created_at=old, finished_at=old)
     return job
 
 
@@ -40,25 +41,21 @@ def dummy_task():
 
 @pytest.mark.django_db
 def test_cleanup_never_deletes_claimed_job():
-    """A job whose status changes to 'queued' before the DELETE is not deleted.
+    """Retention never deletes live work, however old.
 
-    Simulates the mid-loop claim race: job is 'failed' when the SELECT for IDs
-    runs, but by the time the batch DELETE executes the status is already 'queued'.
-    The status re-check (status__in=FINISHED_STATUSES) inside the DELETE protects it.
+    Only finished jobs (history) are pruned, so a queued job can not be hit by the mid-loop
+    claim race that the old live-table loop had to guard against.
     """
     backend = DjangoBackend()
-    job = _create_failed_job()
+    job = QueuedJob.objects.create(
+        task_path="tests.test_batched_cleanup.dummy_task", queue_name="default", status="queued"
+    )
+    QueuedJob.objects.filter(id=job.id).update(created_at=timezone.now() - timedelta(days=15))
 
-    # Simulate the race: update the job status to 'queued' before cleanup runs.
-    # In production this would happen between the SELECT ids and the batch DELETE,
-    # but for test correctness we set it before calling cleanup_jobs so the
-    # status re-check always filters it out.
-    QueuedJob.objects.filter(id=job.id).update(status="queued")
-
-    result = backend.cleanup_jobs(status="failed", max_age_days=5)
+    result = backend.cleanup_jobs(max_age_days=5)
 
     assert QueuedJob.objects.filter(id=job.id).exists(), (
-        "Job that transitioned to 'queued' must not be deleted by cleanup"
+        "A queued job must not be deleted by cleanup"
     )
     assert result["deleted"] == 0
 
@@ -96,7 +93,7 @@ def test_cleanup_dry_run_does_not_delete():
     assert result["count"] == 5
     assert result["deleted"] == 0
     for job in jobs:
-        assert QueuedJob.objects.filter(id=job.id).exists(), (
+        assert JobAll.objects.filter(id=job.id).exists(), (
             f"Job {job.id} should not have been deleted in dry_run mode"
         )
 

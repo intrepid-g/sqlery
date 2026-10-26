@@ -140,9 +140,10 @@ class ScheduledTaskAdmin(admin.ModelAdmin):
     next_run_display.short_description = "Next Run"
 
     def job_count(self, obj):
-        total = obj.jobs.count()
-        queued = obj.jobs.filter(status="queued").count()
-        failed = obj.jobs.filter(status="failed").count()
+        jobs = obj.all_jobs.order_by()  # live and finished
+        total = jobs.count()
+        queued = jobs.filter(status="queued").count()
+        failed = jobs.filter(status="failed").count()
 
         parts = []
         if queued > 0:
@@ -558,7 +559,12 @@ class QueuedJobAdmin(admin.ModelAdmin):
     actions = ["retry_failed", "cancel_queued", "stop_running"]
 
     def retry_failed(self, request, queryset):
-        """Retry failed jobs by creating new queued jobs."""
+        """Retry failed jobs by creating new queued jobs.
+
+        The queryset may be live jobs or finished ones (``JobAll`` / ``JobHistory``): a failed
+        job that is in history is final and stays as it is (insert-only); the retry job
+        links back to it through ``parent_job_id``.
+        """
         count = 0
         for job in queryset.filter(status="failed"):
             QueuedJob.objects.create(
@@ -574,9 +580,10 @@ class QueuedJobAdmin(admin.ModelAdmin):
                 runs=[],  # Fresh run history
                 parent_job_id=job.id,
             )
-            # Mark original as archived (retry created)
-            job.status = 'archived'
-            job.save(update_fields=['status'])
+            if isinstance(job, QueuedJob):
+                # Mark original as archived (retry created); it leaves the live table.
+                job.status = 'archived'
+                job.save(update_fields=['status'])
             count += 1
         self.message_user(request, f"Created {count} retry jobs")
 

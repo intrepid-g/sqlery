@@ -20,7 +20,7 @@ import pytest
 import time
 from django.utils import timezone
 from sqlery.executor import TaskExecutor
-from sqlery.models import QueuedJob
+from sqlery.models import JobAll, QueuedJob
 
 
 # Dummy tasks for testing
@@ -268,7 +268,7 @@ class TestOneJobPerSubprocess:
         assert len(processed) == 1
 
         # Exactly one job should be success, two should still be queued
-        success_count = QueuedJob.objects.filter(status="success").count()
+        success_count = JobAll.objects.filter(status="success").count()
         queued_count = QueuedJob.objects.filter(status="queued").count()
 
         assert success_count == 1

@@ -11,7 +11,8 @@ from pathlib import Path
 
 from django.conf import settings as django_settings
 from django.core.paginator import Paginator
-from django.db.models import Avg, Count, Max, Min, Q
+from django.db.models import Avg, Count, IntegerField, Max, Min, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce
 from django.http import JsonResponse
 from django.utils import timezone
 
@@ -21,11 +22,20 @@ from sqlery.core.worker_admin import (
     worker_delete_staleness_threshold_seconds,
 )
 from .intervention import diagnose_system_health, do_manual_intervention_direct
-from .models import DaemonCommand, JobAttempt, QueuedJob, ScheduledTask, Worker
+from .models import DaemonCommand, JobAll, JobAttempt, JobHistory, QueuedJob, ScheduledTask, Worker
 from .utils import enqueue_task
 from .views import staff_required_json, _compute_health_warnings, _get_health_warnings, _job_display_name
 
 logger = logging.getLogger(__name__)
+
+
+def _job_gone_response(job_id, wanted):
+    """Response for an action on a job that is not live: 400 if it already finished (it is in
+    history, which is final), else 404."""
+    status = JobHistory.objects.filter(id=job_id).values_list('status', flat=True).first()
+    if status is not None:
+        return JsonResponse({'error': f'Job is not {wanted} (status: {status})'}, status=400)
+    return JsonResponse({'error': 'Job not found'}, status=404)
 
 
 @staff_required_json
@@ -38,10 +48,18 @@ def api_scheduled_tasks_list(request):
         JSON with tasks array containing task details and statistics
     """
     try:
+        # Counts cover live and finished jobs (the union view), one subquery each.
+        def _jobs_of_task(status=None):
+            counted = JobAll.objects.filter(scheduled_task_id=OuterRef('pk'))
+            if status:
+                counted = counted.filter(status=status)
+            counted = counted.order_by().values('scheduled_task_id').annotate(c=Count('id'))
+            return Coalesce(Subquery(counted.values('c'), output_field=IntegerField()), 0)
+
         tasks = ScheduledTask.objects.annotate(
-            total_jobs=Count('jobs'),
-            failed_jobs=Count('jobs', filter=Q(jobs__status='failed')),
-            queued_jobs=Count('jobs', filter=Q(jobs__status='queued'))
+            total_jobs=_jobs_of_task(),
+            failed_jobs=_jobs_of_task('failed'),
+            queued_jobs=_jobs_of_task('queued'),
         ).order_by('-enabled', 'name')
 
         # from django.utils import timezone as _tz  # moved to top-level
@@ -103,10 +121,10 @@ def api_task_detail(request, task_id):
 
     try:
         # Get latest job
-        latest_job = task.jobs.order_by('-created_at').first()
+        latest_job = task.all_jobs.order_by('-created_at').first()
 
-        # Get job statistics
-        jobs = task.jobs.all()
+        # Get job statistics (live and finished jobs)
+        jobs = task.all_jobs.order_by()
         stats = {
             'total': jobs.count(),
             'queued': jobs.filter(status='queued').count(),
@@ -183,7 +201,7 @@ def api_task_jobs(request, task_id):
         status_filter = request.GET.get('status')  # queued, running, success, failed
 
         # Query jobs
-        jobs = task.jobs.order_by('-created_at')
+        jobs = task.all_jobs.order_by('-created_at', '-id')
         if status_filter:
             jobs = jobs.filter(status=status_filter)
 
@@ -305,10 +323,9 @@ def api_stop_job(request, job_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-    try:
-        job = QueuedJob.objects.get(id=job_id)
-    except QueuedJob.DoesNotExist:
-        return JsonResponse({'error': 'Job not found'}, status=404)
+    job = QueuedJob.objects.filter(id=job_id).first()
+    if job is None:
+        return _job_gone_response(job_id, 'running')
 
     if job.status != 'running':
         return JsonResponse({'error': f'Job is not running (status: {job.status})'}, status=400)
@@ -491,10 +508,9 @@ def api_remove_queued_job(request, job_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-    try:
-        job = QueuedJob.objects.get(id=job_id)
-    except QueuedJob.DoesNotExist:
-        return JsonResponse({'error': 'Job not found'}, status=404)
+    job = QueuedJob.objects.filter(id=job_id).first()
+    if job is None:
+        return _job_gone_response(job_id, 'queued')
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -513,10 +529,9 @@ def api_enqueue_job_now(request, job_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-    try:
-        job = QueuedJob.objects.get(id=job_id)
-    except QueuedJob.DoesNotExist:
-        return JsonResponse({'error': 'Job not found'}, status=404)
+    job = QueuedJob.objects.filter(id=job_id).first()
+    if job is None:
+        return _job_gone_response(job_id, 'queued')
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -569,9 +584,8 @@ def api_worker_detail(request, worker_id):
             }
 
     # Job history — query by worker FK (persisted after completion)
-    recent_jobs = QueuedJob.objects.filter(
-        worker=worker
-    ).exclude(status__in=['queued', 'running']).select_related('scheduled_task').order_by('-finished_at')[:50]
+    # (finished jobs are in history, which keeps the worker column)
+    recent_jobs = JobHistory.objects.filter(worker_id=worker.pk).order_by('-finished_at')[:50]
 
     jobs_history = [{
         'id': j.id,
@@ -610,7 +624,7 @@ def api_worker_detail(request, worker_id):
 
     # Stats — use worker FK to find all jobs this worker has processed
     # from django.db.models import Avg  # moved to top-level
-    worker_jobs_qs = QueuedJob.objects.filter(worker=worker)
+    worker_jobs_qs = JobAll.objects.filter(worker_id=worker.pk).order_by()
     job_stats = worker_jobs_qs.aggregate(
         total=Count('id'),
         success=Count('id', filter=Q(status='success')),
@@ -653,10 +667,9 @@ def api_job_priority(request, job_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-    try:
-        job = QueuedJob.objects.get(id=job_id)
-    except QueuedJob.DoesNotExist:
-        return JsonResponse({'error': 'Job not found'}, status=404)
+    job = QueuedJob.objects.filter(id=job_id).first()
+    if job is None:
+        return _job_gone_response(job_id, 'queued')
 
     if job.status != 'queued':
         return JsonResponse({'error': f'Job is not queued (status: {job.status})'}, status=400)
@@ -705,10 +718,10 @@ def api_queue_jobs(request, queue_name):
         now = timezone.now()
         cutoff = now - timedelta(seconds=60)
 
-        jobs = QueuedJob.objects.filter(queue_name=queue_name).filter(
+        jobs = JobAll.objects.filter(queue_name=queue_name).filter(
             Q(status__in=['queued', 'running']) |
             Q(status__in=['success', 'failed'], finished_at__gte=cutoff)
-        ).select_related('scheduled_task').order_by(
+        ).order_by(
             # running first, then queued, then finished
             '-status',  # running > queued > success > failed (alphabetically desc)
             '-created_at',
@@ -763,11 +776,15 @@ def api_activity_feed(request):
         limit = min(int(request.GET.get('limit', 100)), 500)
 
         # Fetch jobs that had any activity since the cutoff
-        jobs = QueuedJob.objects.filter(
+        # A finished job had its last activity when it finished, so history is read by
+        # finish time (which prunes its partitions); live jobs by any of their timestamps.
+        live = QueuedJob.objects.filter(
             Q(created_at__gte=since) |
             Q(started_at__gte=since) |
             Q(finished_at__gte=since)
-        ).select_related('scheduled_task').order_by('-created_at')[:limit]
+        ).order_by('-created_at')[:limit]
+        finished = JobHistory.objects.filter(finished_at__gte=since).order_by('-created_at')[:limit]
+        jobs = sorted([*live, *finished], key=lambda j: j.created_at, reverse=True)[:limit]
 
         events = []
         for j in jobs:
@@ -864,7 +881,10 @@ def api_clear_jobs(request):
         if status not in ('failed', 'success', 'archived'):
             return JsonResponse({'error': 'status must be "failed", "success", or "archived"'}, status=400)
 
-        deleted_count, _ = QueuedJob.objects.filter(status=status).delete()
+        # Finished jobs are in history, which retention (and this) alone removes.
+        from .cleanup import _delete_history
+
+        deleted_count = _delete_history(JobHistory.objects.filter(status=status))
         return JsonResponse({'success': True, 'deleted': deleted_count, 'status': status})
 
     except json.JSONDecodeError:

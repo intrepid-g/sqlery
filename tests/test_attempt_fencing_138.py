@@ -382,15 +382,23 @@ async def test_async_completion_is_fenced_by_the_claim_attempt(dialect):
     from sqlmodel import SQLModel
 
     from sqlery.core.attempts import attempt_of
-    from sqlery.core.models import QueuedJob
+    from sqlery.core.models import JobAll, QueuedJob
     from sqlery.fastapi_sqlery import database as db_mod
     from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
 
     url = "sqlite+aiosqlite:///:memory:" if dialect == "sqlite" else sqlalchemy_pg_url(PG_URL)
     db_mod.reset_async_engine()
+    if dialect == "pg":
+        # The real PostgreSQL schema is partitioned (live table, history, attempts) and is
+        # built by the bootstrap DDL; a bare ``create_all`` cannot express it (#140).
+        db_mod._engine = None
+        db_mod.init_database(url)
+        db_mod.get_engine().dispose()
+        db_mod._engine = None
     engine = db_mod.get_async_engine(url)
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+    if dialect != "pg":
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
     try:
         backend = SQLAlchemyAsyncBackend()
         factory = db_mod.get_async_session_factory()
@@ -405,11 +413,11 @@ async def test_async_completion_is_fenced_by_the_claim_attempt(dialect):
         # completion is rejected and the job row keeps the recovery outcome.
         assert await backend.afail_zombie_job(job.id, "worker died")
         async with factory() as s:
-            recovered = (await s.execute(select(QueuedJob.status, QueuedJob.output))).one()
+            recovered = (await s.execute(select(JobAll.status, JobAll.output))).one()  # in history
         with pytest.raises(_fencing_error()):
             await backend.amark_success(job.id, "late", attempt=first)
         async with factory() as s:
-            after = (await s.execute(select(QueuedJob.status, QueuedJob.output))).one()
+            after = (await s.execute(select(JobAll.status, JobAll.output))).one()
         assert recovered[0] == "failed" and after == recovered
     finally:
         if dialect == "pg":
