@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
+from .attempts import attempt_kwargs, attempt_of, require_attempt_table
 from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task, run_failure_callback, run_success_callback
@@ -109,6 +110,11 @@ class JobExecutor:
         """Execute a single job with error handling and retry logic."""
         logger.info(f"Executing job {job.id}: {job.task_path}")
 
+        # The claim's attempt handle rides on the claimed job object; capture it before the
+        # refresh below replaces the object. Every completion write closes exactly this
+        # attempt, so a worker superseded by recovery cannot record an outcome.
+        attempt = attempt_of(job)
+
         # Refresh job state from database
         job = self.backend.get_job_by_id(job.id)
         # Captured before execution runs so mark_job_success/failed below can
@@ -169,7 +175,10 @@ class JobExecutor:
 
                 try:
                     job = self.backend.mark_job_success(
-                        job.id, output=serialize_result(result), expected_version=expected_version
+                        job.id,
+                        output=serialize_result(result),
+                        expected_version=expected_version,
+                        **attempt_kwargs(attempt, self.backend.mark_job_success),
                     )
                 except JobFencingError as e:
                     logger.warning(
@@ -198,7 +207,8 @@ class JobExecutor:
             will_retry = self._should_retry(job, e)
             try:
                 job = self._mark_failed(
-                    job.id, error_msg, error_traceback, expected_version, will_retry
+                    job.id, error_msg, error_traceback, expected_version, will_retry,
+                    attempt=attempt,
                 )
             except JobFencingError as fence_err:
                 logger.warning(
@@ -227,6 +237,9 @@ class JobExecutor:
         """
         # write_fd = int(os.environ.pop('_SQLERY_RESULT_FD'))
         expected_version = None  # set below; kept here so the except: block never NameErrors
+        # The claim's attempt handle (inherited through fork); captured before the refresh
+        # below replaces the job object.
+        attempt = attempt_of(job)
 
         try:
             # Configure DB resilience for child's fresh connection.
@@ -280,7 +293,10 @@ class JobExecutor:
             # instead of clobbering the reclaiming worker's outcome.
             try:
                 job = self.backend.mark_job_success(
-                    job.id, output=serialize_result(result), expected_version=expected_version
+                    job.id,
+                    output=serialize_result(result),
+                    expected_version=expected_version,
+                    **attempt_kwargs(attempt, self.backend.mark_job_success),
                 )
             except JobFencingError as e:
                 logger.warning(
@@ -319,7 +335,8 @@ class JobExecutor:
                 self._reset_db_connections()
                 will_retry = self._should_retry(job, e)
                 failed_job = self._mark_failed(
-                    job.id, error_msg, error_traceback, expected_version, will_retry
+                    job.id, error_msg, error_traceback, expected_version, will_retry,
+                    attempt=attempt,
                 )
 
                 run_failure_callback(failed_job)
@@ -367,7 +384,7 @@ class JobExecutor:
         return import_task(task_path)
 
     def _mark_failed(self, job_id, error, traceback, expected_version=None, will_retry=False,
-                     reason=""):
+                     reason="", attempt=None):
         """Fail a job; if it will be retried, tag it ``retry_pending`` in the same write.
 
         Custom/older backends whose ``mark_job_failed`` lacks ``termination_reason`` are called
@@ -376,6 +393,7 @@ class JobExecutor:
         kwargs = {"error": error, "traceback": traceback}
         if expected_version is not None:
             kwargs["expected_version"] = expected_version
+        kwargs.update(attempt_kwargs(attempt, self.backend.mark_job_failed))
         if will_retry and "termination_reason" in inspect.signature(
             self.backend.mark_job_failed
         ).parameters:
@@ -500,6 +518,10 @@ class JobExecutor:
         """Reset stale jobs stuck in 'running' state (crashed workers)."""
         now = datetime.now(timezone.utc)
         running_jobs = self.backend.get_running_jobs(queue_name)
+        # Claiming PIDs live on the open attempts (job-row column only for pre-attempt jobs).
+        attempts = self.backend.get_open_attempts([j.id for j in running_jobs])
+        if not isinstance(attempts, dict):  # custom backends that predate attempts
+            attempts = {}
 
         for job in running_jobs:
             if not job.started_at:
@@ -522,11 +544,15 @@ class JobExecutor:
             running_duration = (now - started_at).total_seconds()
 
             if running_duration > threshold_seconds:
-                if hasattr(job, 'worker_pid') and job.worker_pid:
-                    killed = self._kill_worker_process(job.worker_pid)
+                open_attempt = attempts.get(job.id)
+                worker_pid = (
+                    open_attempt.worker_pid if open_attempt else getattr(job, 'worker_pid', None)
+                )
+                if worker_pid:
+                    killed = self._kill_worker_process(worker_pid)
                     if killed:
                         logger.warning(
-                            f"Killed hung worker process {job.worker_pid} for job {job.id}"
+                            f"Killed hung worker process {worker_pid} for job {job.id}"
                         )
 
                 self._mark_failed(
@@ -685,6 +711,9 @@ class WorkerProcess:
         # Pinned to first line BEFORE the fork loop so it fires exactly once
         # per WorkerProcess.run, never inside forked children.
         warn_if_unconfigured(get_config("ALLOWED_TASK_MODULES", None))
+
+        # Refuse to run without the attempt table: completions could not be fenced.
+        require_attempt_table(self.backend)
 
         logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
 
@@ -975,7 +1004,9 @@ class WorkerProcess:
         logger.info(f"Forked child PID {child_pid} for job {job_id}")
 
         try:
-            self.backend.update_job_child_pid(job_id, child_pid)
+            self.backend.update_job_child_pid(
+                job_id, child_pid, **attempt_kwargs(job, self.backend.update_job_child_pid)
+            )
         except Exception:
             pass
 
@@ -1043,6 +1074,7 @@ class WorkerProcess:
                         job_id,
                         error=f"Job {job_id} exceeded timeout of {timeout} seconds (parent safety net at {int(elapsed)}s)",
                         traceback=f"Parent killed child PID {child_pid} after {int(elapsed)}s",
+                        **attempt_kwargs(job, self.backend.mark_job_failed),
                     )
                 except Exception:
                     pass
@@ -1071,6 +1103,7 @@ class WorkerProcess:
                             job_id,
                             error=REVOKED_ERROR,
                             traceback=f"Child PID {child_pid} terminated on revoke request",
+                            **attempt_kwargs(job, self.backend.mark_job_failed),
                         )
                     except Exception as e:
                         logger.error(f"Failed to mark revoked job {job_id}: {e}")
@@ -1142,6 +1175,7 @@ class WorkerProcess:
                     job_id,
                     error=f"Child process exited with status {exit_status}",
                     traceback=f"Child PID {child_pid} exited abnormally",
+                    **attempt_kwargs(job, self.backend.mark_job_failed),
                 )
             except Exception as e:
                 logger.error(f"Failed to mark crashed job {job_id}: {e}")

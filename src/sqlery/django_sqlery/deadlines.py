@@ -17,10 +17,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from django.db import transaction
 from django.db.models import F
 from django.utils import timezone as django_tz
 
-from .models import QueuedJob, Worker
+from sqlery.core.attempts import OUTCOME_ABANDONED
+
+from .models import JobAttempt, QueuedJob, Worker
 
 logger = logging.getLogger(__name__)
 
@@ -164,10 +167,14 @@ def rebuild_deadlines() -> int:
         for p in DEADLINE_DIR.glob("worker-*.json")
     }
 
-    running_jobs = QueuedJob.objects.filter(
-        status='running',
-        started_at__isnull=False,
-    ).select_related('worker')
+    running_jobs = list(
+        QueuedJob.objects.filter(
+            status='running',
+            started_at__isnull=False,
+        ).select_related('worker')
+    )
+    # The claiming PID lives on the open attempt (row column only for pre-attempt jobs).
+    worker_pids = JobAttempt.worker_pids_for(running_jobs)
 
     rebuilt = 0
     for job in running_jobs:
@@ -183,7 +190,7 @@ def rebuild_deadlines() -> int:
         path = DEADLINE_DIR / f"worker-{worker_id}.json"
         path.write_text(json.dumps({
             "job_id": job.id,
-            "worker_pid": job.worker_pid or 0,
+            "worker_pid": worker_pids.get(job.id) or 0,
             "timeout_seconds": timeout,
             "started_at": job.started_at.isoformat(),
             "deadline": deadline.isoformat(),
@@ -250,13 +257,17 @@ def _reconcile_overdue_job(QueuedJob, Worker, job_id, pid, timeout, process_aliv
     else:
         outcome = "already dead"
 
-    updated = QueuedJob.objects.filter(id=job_id, status='running').update(
-        status='failed',
-        error=f'Daemon watchdog: exceeded {timeout}s timeout (process was {outcome})',
-        termination_reason='daemon_timeout_kill',
-        finished_at=django_tz.now(),
-        version=F('version') + 1,
-    )
+    # The attempt is abandoned in the same transaction as the failure, so a late completion
+    # from the killed job's attempt is rejected (JobFencingError).
+    with transaction.atomic():
+        JobAttempt.close_open(job_id, OUTCOME_ABANDONED)
+        updated = QueuedJob.objects.filter(id=job_id, status='running').update(
+            status='failed',
+            error=f'Daemon watchdog: exceeded {timeout}s timeout (process was {outcome})',
+            termination_reason='daemon_timeout_kill',
+            finished_at=django_tz.now(),
+            version=F('version') + 1,
+        )
     # Old: Worker.objects.filter(...).update(status='dead', current_job=None)
     Worker.objects.filter(pid=pid, status__in=['idle', 'busy']).update(
         status='dead', current_job_id=None,

@@ -15,7 +15,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 # Import SQLModel and models
 from sqlmodel import SQLModel
-from sqlery.core.models import QueuedJob, ScheduledTask, JobRegistry, Worker, DaemonLease
+from sqlery.core.models import (
+    DaemonLease,
+    JobAttempt,
+    JobRegistry,
+    QueuedJob,
+    ScheduledTask,
+    Worker,
+)
 
 # Alembic Config object
 config = context.config

@@ -834,7 +834,8 @@ class DaemonManager:
         standalone modes. Checks every job in 'running' state for the given
         queues:
 
-        1. worker_pid is set but that PID doesn't exist → worker crashed
+        1. worker_pid (read from the job's open execution attempt) is set but that PID
+           doesn't exist → worker crashed
         2. No worker assigned at all → job was never properly claimed
         3. Assigned worker is marked dead → worker was killed/crashed
         4. Worker's current_job points elsewhere → worker moved on, job abandoned
@@ -871,6 +872,8 @@ class DaemonManager:
                 if rec.worker_node_id == current_node:
                     try:
                         os.kill(rec.worker_pid, 0)
+                    except PermissionError:
+                        pass  # the process exists but belongs to another user: it is alive
                     except OSError:
                         reason = f"Worker PID {rec.worker_pid} no longer exists on {current_node}"
                 # Remote nodes: rely on heartbeat staleness (Check 5)
@@ -921,6 +924,9 @@ class DaemonManager:
                     )
 
             if reason:
+                # fail_zombie_job closes the open attempt as 'abandoned' in the same
+                # transaction as the failure, so a late completion from the dead worker's
+                # attempt is rejected (JobFencingError) and cannot clobber the recovery.
                 try:
                     if backend.fail_zombie_job(rec.job_id, reason):
                         failed_count += 1
