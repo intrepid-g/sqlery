@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from ..compat import get_backend, get_config, is_django_mode
 from ..crontab import next_cron_occurrence
+from .ready import Throttle
 
 try:
     import psycopg
@@ -52,6 +53,36 @@ class Scheduler:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
         self.backend = backend
+        self._ready_sweep: Throttle | None = None
+        self._ready_cursor = 0
+
+    def maintain_ready_queue(self, queue_names: list[str] | None = None) -> dict:
+        """Repair the ready queue, at most once per ``READY_QUEUE_SWEEP_INTERVAL`` seconds.
+
+        Called with the queues this scheduler leads: queued jobs that lost their ready entry
+        get one back, and blocked jobs whose dependencies finished unnoticed are released.
+        It is the safety net behind the entry bookkeeping of every enqueue / requeue / cancel
+        path, so it never raises. ``READY_QUEUE_SWEEP_INTERVAL = 0`` disables it.
+        """
+        if self._ready_sweep is None:
+            try:
+                interval = float(get_config("READY_QUEUE_SWEEP_INTERVAL", 60))
+            except (TypeError, ValueError):
+                interval = 60.0
+            self._ready_sweep = Throttle(interval)
+        if not self._ready_sweep.due():
+            return {}
+        try:
+            with self.backend.idle_transaction():
+                result = self.backend.maintain_ready_queue(
+                    list(queue_names) if queue_names else None,
+                    after_job_id=self._ready_cursor,
+                )
+        except Exception as e:
+            logger.error(f"Ready-queue maintenance failed: {e}", exc_info=True)
+            return {}
+        self._ready_cursor = (result or {}).get("cursor", 0) or 0
+        return result or {}
 
     def run_due_tasks(self, queue_names: list[str] | None = None):
         """Find due scheduled tasks and enqueue jobs for them.
@@ -89,6 +120,9 @@ class Scheduler:
             except Exception as e:
                 logger.error(f"Error processing scheduled task '{task.name}': {e}")
                 continue
+
+        # The leader of these queues also keeps their ready queue consistent.
+        self.maintain_ready_queue(queue_names)
 
         return jobs
 
@@ -552,6 +586,16 @@ def promote_due_scheduled_jobs(cur) -> int:
                         json.dumps(tags),
                         created_at,
                     ],
+                )
+
+                # The promoted job is claimable: its ready entry joins the same transaction
+                # (#139). Slot 0: rotation (#141) is not enabled.
+                cur.execute(
+                    "INSERT INTO sqlery_job_ready"
+                    " (slot, job_id, queue_name, priority, created_at, scheduled_at)"
+                    " VALUES (0, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT DO NOTHING",
+                    [job_id, queue_name, priority, created_at, scheduled_at],
                 )
 
             cur.execute("COMMIT")

@@ -124,7 +124,9 @@ async def test_aclaim_job_waits_for_dependencies(backend, make_job):
     assert await backend.aclaim_job(["default"], "wkr-1") is None
     assert (await QueuedJob.objects.aget(id=dependent.id)).status == "queued"
 
-    await QueuedJob.objects.filter(id=blocker.id).aupdate(status="success")
+    # The dependent was moved to the blocked set by the first claim; the dependency's
+    # completion (not a raw status write) is what releases it (#139).
+    await backend.amark_success(blocker.id, "ok")
     claimed = await backend.aclaim_job(["default"], "wkr-1")
     assert claimed is not None and claimed.id == dependent.id
 

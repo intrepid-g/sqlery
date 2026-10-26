@@ -36,6 +36,7 @@ from sqlery.core.retry import (
     retry_countdown,
     shape_retry_delay,
 )
+from sqlery.core.ready import SLOTS
 from sqlery.core.signals import task_retry
 from sqlery.core.utils import describe_task_args
 
@@ -44,7 +45,7 @@ from sqlery.core.utils import describe_task_args
 from sqlery.core.worker import _current_job_var  # noqa: F401
 
 from .db_compat import atomic_claim_job_queryset
-from .models import JobAttempt, QueuedJob, ScheduledTask, Worker
+from .models import JobAttempt, JobReady, QueuedJob, ScheduledTask, Worker
 from .settings import get_setting
 from .subprocess_executor import get_manage_py_path, run_jobs_extra_args
 from .subprocess_slots import claim_slot
@@ -241,10 +242,15 @@ class TaskExecutor:
 
         # Filter: status=queued AND (scheduled_at is NULL OR scheduled_at <= now)
         # Use database-appropriate locking for atomic job claiming
-        queryset = atomic_claim_job_queryset(QueuedJob.objects).filter(
-            status="queued"
-        ).filter(
+        # Only jobs in the ready queue (#139): a job waiting on dependencies is in the
+        # blocked set instead and is picked up again once its dependencies are done.
+        in_ready = JobReady.objects.filter(slot__in=SLOTS).filter(
             Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
+        )
+        if queue_name:
+            in_ready = in_ready.filter(queue_name=queue_name)
+        queryset = atomic_claim_job_queryset(QueuedJob.objects).filter(
+            status="queued", id__in=in_ready.values("job_id")
         ).order_by(
             "-priority", "created_at"
         )
@@ -266,7 +272,7 @@ class TaskExecutor:
         jobs?" check needs no row lock, so it runs a plain query instead.
         """
         now = timezone.now()
-        queryset = QueuedJob.objects.filter(status="queued").filter(
+        queryset = JobReady.objects.filter(slot__in=SLOTS).filter(
             Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=now)
         )
         if queue_name:

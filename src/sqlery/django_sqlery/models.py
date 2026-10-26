@@ -363,6 +363,40 @@ class ScheduledTask(models.Model):
         return {}
 
 
+class QueuedJobQuerySet(models.QuerySet):
+    """QuerySet whose ``update()`` keeps the ready queue in step (issue #139).
+
+    A bulk ``update(status="queued")`` makes jobs claimable again, and an update of
+    ``queue_name`` / ``priority`` / ``scheduled_at`` changes where (or when) their ready
+    entry is claimed. Every other update (running, success, failed...) passes straight
+    through: an entry left behind by a job that stopped being queued is dropped by the next
+    claim that meets it.
+    """
+
+    _READY_FIELDS = ("queue_name", "priority", "scheduled_at")
+
+    def update(self, **kwargs):
+        requeue = kwargs.get("status") == "queued"
+        edits = {
+            k: v
+            for k, v in kwargs.items()
+            if k in self._READY_FIELDS and not hasattr(v, "resolve_expression")
+        }
+        if not requeue and not edits:
+            return super().update(**kwargs)
+        from . import ready
+
+        with transaction.atomic(using=self.db):
+            rows = list(
+                self.values_list("id", "created_at", "queue_name", "priority", "scheduled_at")
+            )
+            # Entries first, then the job rows: the lock order of a claim.
+            ready.before_update(rows, edits)
+            count = super().update(**kwargs)
+            ready.after_update(rows, requeue=requeue, edits=edits)
+        return count
+
+
 class QueuedJob(models.Model):
     """A job in the queue, waiting to be executed or already processed.
 
@@ -393,6 +427,8 @@ class QueuedJob(models.Model):
     #   (mirrors the standalone SQLModel listener) — globally unique, time-sortable,
     #   no collision with the Postgres sequence (which still backs raw-SQL inserts).
     id = models.BigIntegerField(default=_generate_job_id, editable=False)
+
+    objects = QueuedJobQuerySet.as_manager()
 
     # Task definition
     task_path = models.CharField(
@@ -642,11 +678,9 @@ class QueuedJob(models.Model):
         verbose_name_plural = "Jobs"
         indexes = [
             # Old: models.Index(fields=["queue_name", "status", "-priority", "created_at"]),
-            models.Index(
-                fields=["queue_name", "-priority", "created_at"],
-                name="sqlery_job_pending_idx",
-                condition=Q(status="queued"),
-            ),
+            # Dropped (migration 0038): models.Index(fields=["queue_name", "-priority",
+            # "created_at"], name="sqlery_job_pending_idx", condition=Q(status="queued")).
+            # Claiming reads the ready queue (sqlery_job_ready), not this table (#139).
             # Dropped (migration 0036): ("task_path", "status") -- no query filters on
             # task_path and `status` churns on every transition; and ("-created_at") --
             # served by the (created_at, id) primary key.
@@ -663,6 +697,42 @@ class QueuedJob(models.Model):
     def get_status(self) -> str:
         """Return the job status (RQ compat)."""
         return self.status
+
+    _READY_RELEVANT = frozenset({"status", "queue_name", "priority", "scheduled_at"})
+
+    def save(self, *args, **kwargs):
+        """Save the job and keep its ready-queue entry in step, in the same transaction.
+
+        A job saved as ``queued`` gets (or keeps) its ready entry; one saved as anything
+        else loses it. Saves that touch none of status / queue / priority / schedule skip
+        the extra statements.
+        """
+        update_fields = kwargs.get("update_fields")
+        adding = self._state.adding
+        if not (
+            adding or update_fields is None or self._READY_RELEVANT & set(update_fields)
+        ):
+            return super().save(*args, **kwargs)
+        from . import ready
+
+        with transaction.atomic(using=kwargs.get("using")):
+            # Lock order everywhere is ready entry first, then the job row (what a claim
+            # does), so edits to an existing entry come before the job write.
+            entry_updated = False if adding else ready.before_save(self)
+            super().save(*args, **kwargs)
+            ready.after_save(self, adding=adding, entry_updated=entry_updated)
+
+    def delete(self, *args, **kwargs):
+        """Delete the job together with its ready / blocked entries; jobs that waited on it
+        are re-checked (they fail, as a missing dependency always failed a job)."""
+        from . import ready
+
+        job_id, parent_job_id = self.id, self.parent_job_id
+        with transaction.atomic(using=kwargs.get("using")):
+            ready.remove([job_id])  # entries first: the lock order of a claim
+            result = super().delete(*args, **kwargs)
+        ready.release_dependents_quietly(job_id, parent_job_id)
+        return result
 
     def mark_running(self):
         """Mark job as running and record worker PID.
@@ -695,6 +765,11 @@ class QueuedJob(models.Model):
                     f"Job {self.id} was modified by another process (version conflict)"
                 )
 
+            # A running job is not claimable: drop its ready / blocked entries (without
+            # waiting on a claimer that holds the entry; see ready.remove).
+            from . import ready
+
+            ready.remove([self.id], wait=False)
             JobAttempt.open_new(self, self.worker_id, os.getpid())
 
         self.refresh_from_db()
@@ -765,6 +840,11 @@ class QueuedJob(models.Model):
         # Clear worker.current_job so worker shows as idle
         self._release_worker()
 
+        # Jobs waiting on this one are re-checked (moved back to the ready queue).
+        from . import ready
+
+        ready.release_dependents_quietly(self.id, self.parent_job_id)
+
         # Send webhook notification if configured
         if self.webhook_url:
             from .webhooks import send_webhook_with_retry
@@ -791,6 +871,7 @@ class QueuedJob(models.Model):
         # from django.db.models import F  # moved to top-level
 
         expected_version = self.version
+        was_queued = self.status == "queued"
         self.finished_at = timezone.now()
         self.duration_seconds = None
         if self.started_at:
@@ -801,6 +882,13 @@ class QueuedJob(models.Model):
 
         # Old: rows_updated = QueuedJob.objects.filter(id=self.id, version=expected_version).update(
         with transaction.atomic():
+            if was_queued:
+                # Failed before it ran (cancelled, expired, dependency failed): it is no
+                # longer claimable, so its ready / blocked entries go with the failure. Entries
+                # first, then the job row: the lock order of a claim.
+                from . import ready
+
+                ready.remove([self.id])
             self._close_attempt(attempt, OUTCOME_FAILED)
             rows_updated = QueuedJob.objects.filter(
                 id=self.id, created_at=self.created_at, version=expected_version  # checklist item 5
@@ -1507,6 +1595,62 @@ class JobAttempt(models.Model):
 
 # Backward compatibility alias
 TaskExecution = QueuedJob
+
+
+class JobReady(models.Model):
+    """A claimable job: one narrow entry per queued job that is neither waiting on
+    dependencies nor already claimed (issue #139, see ``sqlery.core.ready``).
+
+    A claim deletes the entry; an enqueue, retry, requeue or unblock inserts it. On
+    PostgreSQL the table is ``PARTITION BY LIST (slot)`` (created by migration 0038); on
+    SQLite it is a plain table. ``job_id`` is a plain column (no FK: partitioned PK).
+    Mirrors the SQLModel ``JobReady``.
+    """
+
+    pk = models.CompositePrimaryKey("slot", "job_id")
+    slot = models.SmallIntegerField(default=0)
+    job_id = models.BigIntegerField()
+    queue_name = models.CharField(max_length=50)
+    priority = models.IntegerField(default=0)
+    created_at = models.DateTimeField(help_text="The job's created_at (its partition key)")
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sqlery_job_ready"
+        indexes = [
+            models.Index(
+                fields=["queue_name", "-priority", "created_at", "job_id"],
+                name="sqlery_ready_claim_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"JobReady job {self.job_id} ({self.queue_name}, slot {self.slot})"
+
+
+class JobBlocked(models.Model):
+    """One row per dependency of a queued job whose dependencies are unmet (issue #139).
+
+    The job has no ready entry while any row exists here; when a dependency reaches a
+    terminal state the dependents are looked up by ``dependency_id`` and re-checked.
+    ``created_at`` is the job's partition key, so the job is read by primary key.
+    Mirrors the SQLModel ``JobBlocked``.
+    """
+
+    pk = models.CompositePrimaryKey("job_id", "dependency_id")
+    job_id = models.BigIntegerField()
+    dependency_id = models.BigIntegerField()
+    created_at = models.DateTimeField(help_text="The blocked job's created_at")
+    blocked_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "sqlery_job_blocked"
+        indexes = [
+            models.Index(fields=["dependency_id"], name="sqlery_blocked_dependency_idx"),
+        ]
+
+    def __str__(self):
+        return f"JobBlocked job {self.job_id} on {self.dependency_id}"
 
 
 # Signal handlers

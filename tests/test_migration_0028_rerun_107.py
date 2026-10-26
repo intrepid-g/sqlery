@@ -113,7 +113,9 @@ def test_migrate_succeeds_again_after_cancelled_concurrent_index_build(db_url):
             "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
             "WHERE c.relname = 'sqlery_job_pending_idx'"
         ).fetchall()
-        assert valid == [(True,)]
+        # The re-run built the index validly (no INVALID leftover above) and migration 0038
+        # (#139) then dropped it: claiming reads the ready queue now.
+        assert valid == []
         # a further migrate is a no-op
         assert _migrate(url, settings_dir).wait(timeout=300) == 0
     finally:

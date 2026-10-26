@@ -1,7 +1,7 @@
 """Tests for the partial pending index on QueuedJob (plan 12-01).
 
 Verifies:
-- sqlery_job_pending_idx exists with correct fields and condition
+- sqlery_job_pending_idx was created by 0028 and is replaced by the ready-queue claim index (#139)
 - Old unnamed full-composite index is absent from Meta.indexes
 - Migration 0028 exists with atomic=False, AddIndexConcurrently, RemoveIndexConcurrently
 """
@@ -22,39 +22,17 @@ def get_queued_job_indexes():
 class TestPartialPendingIndex:
     """QueuedJob.Meta.indexes: partial index assertions."""
 
-    def test_partial_index_exists(self):
-        """sqlery_job_pending_idx must exist in Meta.indexes."""
-        indexes = get_queued_job_indexes()
-        names = [getattr(i, "name", "") for i in indexes]
-        assert "sqlery_job_pending_idx" in names, (
-            f"sqlery_job_pending_idx not found in indexes: {names}"
-        )
+    def test_partial_index_replaced_by_ready_queue(self):
+        """#139: claiming reads sqlery_job_ready, so the claiming-only partial index
+        sqlery_job_pending_idx is gone from QueuedJob.Meta.indexes (migration 0038 drops it)
+        and the ready table carries the claim index (queue_name, -priority, created_at,
+        job_id) in its place."""
+        from sqlery.django_sqlery.models import JobReady
 
-    def test_partial_index_fields(self):
-        """sqlery_job_pending_idx must cover (queue_name, -priority, created_at)."""
-        indexes = get_queued_job_indexes()
-        idx = next(
-            (i for i in indexes if getattr(i, "name", "") == "sqlery_job_pending_idx"),
-            None,
-        )
-        assert idx is not None, "sqlery_job_pending_idx not found"
-        assert idx.fields == ["queue_name", "-priority", "created_at"], (
-            f"Expected ['queue_name', '-priority', 'created_at'], got {idx.fields}"
-        )
-
-    def test_partial_index_condition(self):
-        """sqlery_job_pending_idx must have condition=Q(status='queued')."""
-        from django.db.models import Q
-        indexes = get_queued_job_indexes()
-        idx = next(
-            (i for i in indexes if getattr(i, "name", "") == "sqlery_job_pending_idx"),
-            None,
-        )
-        assert idx is not None, "sqlery_job_pending_idx not found"
-        expected = Q(status="queued")
-        assert idx.condition == expected, (
-            f"Expected condition Q(status='queued'), got {idx.condition}"
-        )
+        names = [getattr(i, "name", "") for i in get_queued_job_indexes()]
+        assert "sqlery_job_pending_idx" not in names, names
+        ready = next(i for i in JobReady._meta.indexes if i.name == "sqlery_ready_claim_idx")
+        assert ready.fields == ["queue_name", "-priority", "created_at", "job_id"]
 
     def test_old_full_composite_index_absent(self):
         """The old unnamed index fields=['queue_name','status','-priority','created_at'] must be absent."""
