@@ -619,7 +619,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             .where(QueuedJob.created_at == job.created_at)
         ).first()
         if status == "queued":
-            session.exec(ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)]))
+            ready_sql.write_ready(session, dialect, [job])
 
     def _claim_decision(self, session, job, now) -> str:
         """Decide a claim candidate: ``ok``, ``pending`` (wait for dependencies),
@@ -2706,7 +2706,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 session.commit()
                 return "failed"
             session.exec(ready_sql.delete_blocked_stmt([job_id]))
-            session.exec(ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)]))
+            ready_sql.write_ready(session, dialect, [job])
             session.commit()
             return "ready"
 
@@ -2772,9 +2772,7 @@ class SQLAlchemyBackend(DatabaseBackend):
                 stmt = stmt.where(QueuedJob.queue_name.in_(list(queue_names)))
             lost = session.exec(stmt).all()
             if lost:
-                session.exec(
-                    ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(j) for j in lost])
-                )
+                ready_sql.write_ready(session, dialect, lost)
                 restored = len(lost)
             live = (
                 select(QueuedJob.id)

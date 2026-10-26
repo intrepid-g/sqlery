@@ -258,9 +258,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                         )
                     ).scalar()
                     if status == "queued":
-                        await session.execute(
-                            ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)])
-                        )
+                        await ready_sql.awrite_ready(session, dialect, [job])
                     await session.commit()
                     continue
                 # The attempt joins the claim's transaction: both commit or neither does.
@@ -820,9 +818,7 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 await session.commit()
                 return "failed"
             await session.execute(ready_sql.delete_blocked_stmt([job_id]))
-            await session.execute(
-                ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)])
-            )
+            await ready_sql.awrite_ready(session, dialect, [job])
             await session.commit()
             return "ready"
 

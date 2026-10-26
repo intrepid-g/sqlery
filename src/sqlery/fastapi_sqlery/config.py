@@ -182,6 +182,9 @@ class StandaloneConfig(Config):
             ("PG_DEAD_TUPLE_RATIO_DEGRADED", float),
             ("PG_DEAD_TUPLE_MIN", int),
             ("PG_SLOT_XID_AGE_DEGRADED", int),
+            ("READY_ROTATION_INTERVAL", float),
+            ("READY_ROTATION_DRAIN_BATCH", int),
+            ("READY_ROTATION_LAG_DEGRADED_SECONDS", float),
         ):
             raw = os.getenv("SQLERY_" + env_key)
             if raw is not None:
@@ -189,6 +192,11 @@ class StandaloneConfig(Config):
                     self._config[env_key] = cast(raw)
                 except ValueError:
                     pass  # invalid value: keep the built-in default
+
+        # Opt-in rotation of the PostgreSQL ready queue (#141).
+        raw_rotation = os.getenv("SQLERY_READY_ROTATION_ENABLED")
+        if raw_rotation is not None:
+            self._config["READY_ROTATION_ENABLED"] = raw_rotation.lower() in ("true", "1", "yes")
 
         # SEC-04: comma-separated allowlist. Strip whitespace, drop empties.
         # Absent env var leaves the default None (BC: allow all).

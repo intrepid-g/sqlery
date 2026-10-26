@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from ..compat import get_backend, get_config, is_django_mode
 from ..crontab import next_cron_occurrence
+from . import rotation
 from .ready import Throttle
 
 try:
@@ -55,6 +56,7 @@ class Scheduler:
         self.backend = backend
         self._ready_sweep: Throttle | None = None
         self._ready_cursor = 0
+        self._rotator = rotation.Rotator()
 
     def maintain_ready_queue(self, queue_names: list[str] | None = None) -> dict:
         """Repair the ready queue, at most once per ``READY_QUEUE_SWEEP_INTERVAL`` seconds.
@@ -123,6 +125,8 @@ class Scheduler:
 
         # The leader of these queues also keeps their ready queue consistent.
         self.maintain_ready_queue(queue_names)
+        # Opt-in rotation of the ready table (#141); a no-op unless enabled on PostgreSQL.
+        self._rotator.tick()
 
         return jobs
 
@@ -513,6 +517,16 @@ def promote_due_scheduled_jobs(cur) -> int:
                 cur.execute("COMMIT")
                 return 0
 
+            # Rotation (#141): the shared generation lock lives until this transaction ends;
+            # slot 0 and no lock when rotation is off.
+            def _read_one(sql):
+                cur.execute(sql)
+                return cur.fetchone()[0]
+
+            ready_slot = rotation.writer_slot(
+                _read_one, rotation.rotation_enabled(get_config), "postgresql"
+            )
+
             # Step 2c: INSERT each promoted row into sqlery_queued_job with full
             # field fidelity from payload["job_spec"] (WR-01/WR-02). All non-nullable
             # JSON columns are supplied explicitly rather than relying on DB defaults.
@@ -589,13 +603,13 @@ def promote_due_scheduled_jobs(cur) -> int:
                 )
 
                 # The promoted job is claimable: its ready entry joins the same transaction
-                # (#139). Slot 0: rotation (#141) is not enabled.
+                # (#139), in the slot writers use now (#141).
                 cur.execute(
                     "INSERT INTO sqlery_job_ready"
                     " (slot, job_id, queue_name, priority, created_at, scheduled_at)"
-                    " VALUES (0, %s, %s, %s, %s, %s)"
+                    " VALUES (%s, %s, %s, %s, %s, %s)"
                     " ON CONFLICT DO NOTHING",
-                    [job_id, queue_name, priority, created_at, scheduled_at],
+                    [ready_slot, job_id, queue_name, priority, created_at, scheduled_at],
                 )
 
             cur.execute("COMMIT")

@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, UTC
 from typing import Any
 
-from sqlalchemy import and_, delete, event, inspect, or_, select, update
+from sqlalchemy import and_, delete, event, inspect, or_, select, text, update
 from sqlalchemy.orm import Session as _SASession
 
 from .models import (
@@ -24,6 +24,7 @@ from .models import (
     QueuedJob,
     _generate_job_id_from_uuid7,
 )
+from . import rotation
 from .ready import SLOT_CURRENT, SLOTS, dependency_ids
 
 _EDITABLE = ("queue_name", "priority", "scheduled_at")
@@ -49,6 +50,41 @@ def ready_values(job: Any, slot: int = SLOT_CURRENT) -> dict:
         "created_at": job.created_at,
         "scheduled_at": job.scheduled_at,
     }
+
+
+def _rotation_enabled() -> bool:
+    from sqlery.compat import get_config
+
+    return rotation.rotation_enabled(get_config)
+
+
+def write_ready(target, dialect_name: str, jobs) -> None:
+    """Insert the ready entries of ``jobs`` through a Session or Connection.
+
+    With rotation on (PostgreSQL) the shared generation lock is taken first and the slot read
+    in the same transaction; otherwise slot 0 and no lock, as before #141.
+    """
+    jobs = list(jobs)
+    if not jobs:
+        return
+    run = target.exec if hasattr(target, "exec") else target.execute
+    slot = rotation.writer_slot(
+        lambda sql: run(text(sql)).scalar(), _rotation_enabled(), dialect_name
+    )
+    run(insert_ready_stmt(dialect_name, [ready_values(j, slot) for j in jobs]))
+
+
+async def awrite_ready(session, dialect_name: str, jobs) -> None:
+    """``write_ready`` for an async session."""
+    jobs = list(jobs)
+    if not jobs:
+        return
+
+    async def read_one(sql):
+        return (await session.execute(text(sql))).scalar()
+
+    slot = await rotation.awriter_slot(read_one, _rotation_enabled(), dialect_name)
+    await session.execute(insert_ready_stmt(dialect_name, [ready_values(j, slot) for j in jobs]))
 
 
 def insert_ready_stmt(dialect_name: str, rows: list[dict]):
@@ -176,7 +212,7 @@ def _drop_entries(conn, job_ids) -> None:
 
 def _ensure_entry(conn, job) -> None:
     dialect = conn.dialect.name
-    conn.execute(insert_ready_stmt(dialect, [ready_values(job)]))
+    write_ready(conn, dialect, [job])
     conn.execute(
         update_ready_stmt(
             job.id,
