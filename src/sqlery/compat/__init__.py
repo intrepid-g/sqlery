@@ -298,7 +298,7 @@ class DatabaseBackend(ABC):
         """
         return []
 
-    def acquire_tag_locks(self, tags: list[str]) -> None:
+    def acquire_tag_locks(self, tags: list[str]) -> bool | None:
         """Acquire exclusive locks on tag coordination rows.
 
         Used to serialize workers checking concurrency/rate limits for the same tags.
@@ -306,6 +306,10 @@ class DatabaseBackend(ABC):
 
         Args:
             tags: Sorted list of tag strings to lock
+
+        Returns:
+            False if a lock is held by another transaction (never waits; the caller
+            skips the candidate as tag-limited). None/True means the locks are held.
         """
         pass
 
@@ -314,6 +318,7 @@ class DatabaseBackend(ABC):
         queues: list[str],
         priority_weights: dict[str, int] | None = None,
         limit: int = 1,
+        exclude_ids: list | None = None,
     ) -> list:
         """Get next claimable jobs ordered by queue priority, job priority, age.
 
@@ -323,6 +328,7 @@ class DatabaseBackend(ABC):
             queues: List of queue names
             priority_weights: Optional {queue_name: weight} for ordering
             limit: Max jobs to return
+            exclude_ids: Job ids to leave out (already inspected and skipped)
 
         Returns:
             List of claimable job instances

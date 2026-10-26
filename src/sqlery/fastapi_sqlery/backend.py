@@ -410,7 +410,9 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             skipped_ids: list = []
             job = None
-            for _ in range(25):
+            # Scan until the candidate set is exhausted: every skipped id is excluded from
+            # the next query, so each pass makes progress and blocked jobs never hide work.
+            while True:
                 stmt = (
                     select(QueuedJob)
                     .where(
@@ -492,8 +494,14 @@ class SQLAlchemyBackend(DatabaseBackend):
             return False
         if session.bind is not None and session.bind.dialect.name == "postgresql":
             # Serialize limit check + claim per tag until this transaction ends.
+            # Never wait on another worker's transaction: if the tag lock is busy, treat the
+            # candidate as tag-limited (the caller skips it and releases our locks).
             for tag in limited:
-                session.exec(text("SELECT pg_advisory_xact_lock(hashtext(:t))").bindparams(t=tag))
+                got = session.exec(
+                    text("SELECT pg_try_advisory_xact_lock(hashtext(:t))").bindparams(t=tag)
+                ).scalar()
+                if not got:
+                    return True
         for tag in limited:
             limit = conc.get(tag)
             if limit is not None and self._count_tag_in_session(
@@ -2184,8 +2192,9 @@ class SQLAlchemyBackend(DatabaseBackend):
         queues: list[str],
         priority_weights: dict[str, int] | None = None,
         limit: int = 1,
+        exclude_ids: list | None = None,
     ) -> list:
-        """Get next claimable jobs ordered by priority."""
+        """Get next claimable jobs ordered by priority (skipping ``exclude_ids``)."""
         with self._get_session() as session:
             now = datetime.now(UTC)
             stmt = (
@@ -2203,6 +2212,8 @@ class SQLAlchemyBackend(DatabaseBackend):
                 .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
                 .limit(limit)
             )
+            if exclude_ids:
+                stmt = stmt.where(QueuedJob.id.not_in(exclude_ids))
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if determine_claim_strategy(dialect) == "skip_locked":
                 stmt = stmt.with_for_update(skip_locked=True)
