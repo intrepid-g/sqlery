@@ -32,6 +32,23 @@ def _make_cursor(fetchall_sequence=None, fetchone_sequence=None):
     return cur
 
 
+# What information_schema reports for sqlery_queued_job: (name, type, not_null, has_default).
+QUEUED_JOB_COLUMNS = [
+    (name, udt, True, False)
+    for name, udt in [
+        ("id", "int8"), ("queue_name", "varchar"), ("task_path", "varchar"),
+        ("kwargs", "jsonb"), ("scheduled_at", "timestamptz"), ("priority", "int4"),
+        ("max_retries", "int4"), ("status", "varchar"), ("version", "int4"),
+        ("retry_count", "int4"), ("retry_backoff", "float8"), ("allow_parallel", "bool"),
+        ("timeout_seconds", "int4"), ("scheduled_task_id", "int4"), ("job_name", "varchar"),
+        ("retry_intervals", "jsonb"), ("meta", "jsonb"), ("dependencies", "jsonb"),
+        ("on_success_path", "varchar"), ("on_failure_path", "varchar"), ("ttl", "int4"),
+        ("result_ttl", "int4"), ("failure_ttl", "int4"), ("parent_job_id", "int8"),
+        ("tags", "jsonb"), ("created_at", "timestamptz"),
+    ]
+]
+
+
 # ---------------------------------------------------------------------------
 # SC-1: Far-future job routing + dual-table visibility
 # ---------------------------------------------------------------------------
@@ -206,7 +223,7 @@ class TestPromotion:
         ]
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         result = promote_due_scheduled_jobs(cur)
         assert result == 2
@@ -244,7 +261,7 @@ class TestPromotion:
 
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         cur.execute.side_effect = execute_side_effect
 
@@ -369,7 +386,7 @@ class TestPayloadFidelity:
         rows = [(101, "default", "m.f", full_payload, now, 0, 0, now)]
         cur = _make_cursor(
             fetchone_sequence=[(True,)],
-            fetchall_sequence=[rows],
+            fetchall_sequence=[rows, QUEUED_JOB_COLUMNS],
         )
         result = promote_due_scheduled_jobs(cur)
         assert result == 1
@@ -381,23 +398,121 @@ class TestPayloadFidelity:
         ]
         assert len(insert_calls) == 1, "Expected exactly one INSERT call"
         params = insert_calls[0].args[1]
-        # params order: job_id, queue_name, task_path, kwargs_json, scheduled_at,
-        # priority, max_retries, retry_count, retry_backoff, allow_parallel,
-        # timeout_seconds, scheduled_task_id, job_name, retry_intervals_json,
-        # meta_json, dependencies_json, on_success_path, on_failure_path,
-        # ttl, result_ttl, failure_ttl, parent_job_id, created_at
+        sql = str(insert_calls[0].args[0])
+        columns = [c.strip().strip('"') for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+        by_column = dict(zip(columns, params))
         import json
-        kwargs_idx = 3
-        assert json.loads(params[kwargs_idx]) == {"x": 99}
-        # retry_backoff at index 8 (after: id, queue, path, kwargs, sched_at, prio, max_ret, retry_cnt)
-        assert params[8] == 3.0, f"retry_backoff expected 3.0, got {params[8]}"
-        assert params[9] is True, f"allow_parallel expected True, got {params[9]}"
-        assert params[10] == 300, f"timeout_seconds expected 300, got {params[10]}"
-        assert params[11] == 42, f"scheduled_task_id expected 42, got {params[11]}"
-        assert params[12] == "round-trip-job", f"job_name expected 'round-trip-job', got {params[12]}"
-        assert params[16] == "mod.success", f"on_success_path expected 'mod.success', got {params[16]}"
-        assert params[17] == "mod.failure", f"on_failure_path expected 'mod.failure', got {params[17]}"
-        assert params[18] == 7200, f"ttl expected 7200, got {params[18]}"
+        assert json.loads(by_column["kwargs"]) == {"x": 99}
+        assert by_column["retry_backoff"] == 3.0
+        assert by_column["allow_parallel"] is True
+        assert by_column["timeout_seconds"] == 300
+        assert by_column["scheduled_task_id"] == 42
+        assert by_column["job_name"] == "round-trip-job"
+        assert by_column["on_success_path"] == "mod.success"
+        assert by_column["on_failure_path"] == "mod.failure"
+        assert by_column["ttl"] == 7200
+
+
+# ---------------------------------------------------------------------------
+# #147 follow-up: promotion keeps webhook settings and uses ORM defaults
+# ---------------------------------------------------------------------------
+
+
+def _insert_by_column(cur) -> dict:
+    """Column -> param of the one INSERT INTO sqlery_queued_job the mock cursor saw."""
+    inserts = [
+        c for c in cur.execute.call_args_list
+        if "INSERT INTO sqlery_queued_job" in str(c.args[0])
+    ]
+    assert len(inserts) == 1
+    sql = str(inserts[0].args[0])
+    names = [c.strip().strip('"') for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+    return dict(zip(names, inserts[0].args[1]))
+
+
+@pytest.mark.django_db
+class TestPromotionKeepsEnqueueValues:
+    """A promoted row gets what the normal enqueue path would give it."""
+
+    def test_staged_job_with_webhook_settings_keeps_them_after_promotion(self, monkeypatch):
+        """Enqueue into staging with a webhook; promotion writes the same webhook values."""
+        import json
+        from sqlery.core.scheduler import promote_due_scheduled_jobs
+        from sqlery.django_sqlery.backend import DjangoBackend
+        from sqlery.django_sqlery.models import ScheduledJob
+
+        backend = DjangoBackend()
+        monkeypatch.setattr(backend, "_partitioned_pg", lambda: True)
+        staged = backend.create_job(
+            task_path="tests.fake.staging_task",
+            kwargs={},
+            queue_name="default",
+            priority=0,
+            scheduled_at=datetime.now(timezone.utc) + timedelta(days=60),
+            max_retries=0,
+            retry_backoff=1.0,
+            allow_parallel=False,
+            timeout_seconds=None,
+            webhook_url="https://example.com/hook",
+            webhook_events=["failure"],
+            webhook_max_retries=7,
+        )
+        assert isinstance(staged, ScheduledJob)
+
+        now = datetime.now(timezone.utc)
+        row = (staged.id, "default", staged.task_path, staged.payload, now, 0, 0, now)
+        columns = QUEUED_JOB_COLUMNS + [
+            ("webhook_url", "varchar", False, False),
+            ("webhook_events", "jsonb", True, False),
+            ("webhook_retries", "int4", True, False),
+            ("webhook_max_retries", "int4", True, False),
+        ]
+        cur = _make_cursor(fetchone_sequence=[(True,)], fetchall_sequence=[[row], columns])
+        assert promote_due_scheduled_jobs(cur) == 1
+
+        got = _insert_by_column(cur)
+        assert got["webhook_url"] == "https://example.com/hook"
+        assert json.loads(got["webhook_events"]) == ["failure"]
+        assert got["webhook_max_retries"] == 7
+        assert got["webhook_retries"] == 0
+
+    @pytest.mark.parametrize("mode", ["django", "standalone"])
+    def test_missing_column_gets_orm_default_not_neutral_value(self, mode, monkeypatch):
+        """A NOT NULL column the staging row lacks gets the model default, not 0/''/[]."""
+        import sqlery.core.scheduler as scheduler
+        from sqlery.django_sqlery.backend import DjangoBackend
+
+        monkeypatch.setattr(scheduler, "is_django_mode", lambda: mode == "django")
+        if mode == "django":
+            monkeypatch.setattr(scheduler, "get_backend", lambda: DjangoBackend())
+        columns = QUEUED_JOB_COLUMNS + [("webhook_max_retries", "int4", True, False)]
+        now = datetime.now(timezone.utc)
+        staged = {  # no retry_backoff
+            "id": 1, "queue_name": "default", "task_path": "m.f",
+            "scheduled_at": now, "created_at": now,
+        }
+        defaults = scheduler._orm_column_defaults()
+
+        names, _, params = scheduler._promotion_insert_parts(columns, staged, defaults)
+        got = dict(zip([n.strip('"') for n in names.split(", ")], params))
+
+        assert got["retry_backoff"] == 1.0
+        assert got["status"] == "queued"
+        if mode == "django":
+            assert got["webhook_max_retries"] == 3  # the ORM default, not the neutral 0
+        else:
+            assert "webhook_max_retries" in got  # no model default: neutral fallback
+
+    def test_column_without_any_default_gets_neutral_value_and_warning(self, caplog):
+        """Only a column with no default anywhere falls back to a neutral value, with a warning."""
+        import logging
+        from sqlery.core.scheduler import _promotion_insert_parts
+
+        columns = [("id", "int8", True, False), ("mystery", "int4", True, False)]
+        with caplog.at_level(logging.WARNING):
+            names, _, params = _promotion_insert_parts(columns, {"id": 1}, {})
+        assert params == [1, 0]
+        assert "mystery" in caplog.text
 
 
 # ---------------------------------------------------------------------------

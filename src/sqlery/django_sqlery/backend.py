@@ -196,8 +196,21 @@ class DjangoBackend(DatabaseBackend):
         failure_ttl: int | None = None,
         parent_job_id: int | None = None,
         tags: list | None = None,
+        webhook_url: str | None = None,
+        webhook_events: list | None = None,
+        webhook_max_retries: int | None = None,
     ):
         """Create a new job in the database."""
+        # Webhook settings are passed on only when given, so unset ones keep the model defaults.
+        webhook = {
+            key: value
+            for key, value in (
+                ("webhook_url", webhook_url),
+                ("webhook_events", webhook_events),
+                ("webhook_max_retries", webhook_max_retries),
+            )
+            if value is not None
+        }
         # If a named job is requested, the new job always wins.  Stop any running
         # conflict (SIGTERM + mark failed) before deleting all records with that name.
         if job_name:
@@ -252,6 +265,7 @@ class DjangoBackend(DatabaseBackend):
                     "failure_ttl": failure_ttl,
                     "parent_job_id": parent_job_id,
                     "tags": list(tags or []),
+                    **webhook,
                 },
             }
             return self.ScheduledJob.objects.create(
@@ -288,6 +302,7 @@ class DjangoBackend(DatabaseBackend):
             parent_job_id=parent_job_id,
             tags=list(tags or []),
             status="queued",
+            **webhook,
         )
         # Phase 18 (D1): emit pg_notify after commit when flag is on + PG.
         # No-op when SQLERY_PG_NOTIFY=False (default) or on SQLite.
