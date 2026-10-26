@@ -172,6 +172,24 @@ class StandaloneConfig(Config):
 
                 self._config[config_key] = env_value
 
+        # PostgreSQL session timeouts and xmin-horizon health thresholds
+        # (mirror the Django DJANGO_SQL_JOBS keys of the same name).
+        for env_key, cast in (
+            ("PG_STATEMENT_TIMEOUT_MS", int),
+            ("PG_LOCK_TIMEOUT_MS", int),
+            ("PG_IDLE_IN_TRANSACTION_TIMEOUT_MS", int),
+            ("PG_XMIN_AGE_DEGRADED_SECONDS", float),
+            ("PG_DEAD_TUPLE_RATIO_DEGRADED", float),
+            ("PG_DEAD_TUPLE_MIN", int),
+            ("PG_SLOT_XID_AGE_DEGRADED", int),
+        ):
+            raw = os.getenv("SQLERY_" + env_key)
+            if raw is not None:
+                try:
+                    self._config[env_key] = cast(raw)
+                except ValueError:
+                    pass  # invalid value: keep the built-in default
+
         # SEC-04: comma-separated allowlist. Strip whitespace, drop empties.
         # Absent env var leaves the default None (BC: allow all).
         raw_allowed = os.getenv("SQLERY_ALLOWED_TASK_MODULES")

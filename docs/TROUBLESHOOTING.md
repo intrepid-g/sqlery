@@ -8,6 +8,7 @@ Common issues and solutions for sqlery.
 - [Daemon Issues](#daemon-issues)
 - [Worker Issues](#worker-issues)
 - [Database Issues](#database-issues)
+- [Long Transactions and Table Bloat (PostgreSQL)](#long-transactions-and-table-bloat-postgresql)
 - [Performance Issues](#performance-issues)
 - [Configuration Issues](#configuration-issues)
 
@@ -472,6 +473,51 @@ python manage.py cleanup_jobs vacuum
 # Get current sizes
 python manage.py cleanup_jobs stats
 ```
+
+## Long Transactions and Table Bloat (PostgreSQL)
+
+`sqlery_queued_job` is updated on every job transition, so it relies on VACUUM
+reclaiming dead tuples quickly. VACUUM can only remove tuples older than the
+**xmin horizon**, the start of the oldest transaction or snapshot anywhere in the
+**same database**, including your application's own connections. One
+`idle in transaction` session, a multi-hour report query, a forgotten prepared
+transaction, an abandoned replication slot or a standby with `hot_standby_feedback`
+pins the horizon. Dead tuples then pile up (queue scans slow down, indexes bloat)
+no matter how aggressive autovacuum is, and the damage persists after the culprit
+ends until VACUUM catches up.
+
+What sqlery does about it:
+
+- sqlery's own worker, daemon and scheduler sessions set
+  `idle_in_transaction_session_timeout` (default 60000 ms) next to `statement_timeout`
+  and `lock_timeout`; job child processes (user code) are left alone. Set
+  `PG_IDLE_IN_TRANSACTION_TIMEOUT_MS` to `0` to disable. Your application's other
+  connections are not touched: set the same timeout there (or per role:
+  `ALTER ROLE app SET idle_in_transaction_session_timeout = '60s'`).
+- The health endpoints (`/_internal/health` in Django, `/health` in standalone) include an
+  `xmin_horizon` block and report `"status": "degraded"` (HTTP 200) when the oldest
+  xmin holder is older than `PG_XMIN_AGE_DEGRADED_SECONDS` (300), a replication slot or
+  standby is more than `PG_SLOT_XID_AGE_DEGRADED` xids behind (5000000), or
+  `sqlery_queued_job` has more than `PG_DEAD_TUPLE_RATIO_DEGRADED` (0.5) dead/live
+  tuples with at least `PG_DEAD_TUPLE_MIN` (10000) dead. `0` disables a check. If the
+  probe cannot run, the block reports `"unknown"`; health itself never fails because of it.
+  The Django dashboard shows the same condition as a warning. Standalone mode reads the
+  same names from `SQLERY_`-prefixed environment variables (e.g.
+  `SQLERY_PG_XMIN_AGE_DEGRADED_SECONDS`).
+
+Finding the culprit:
+
+```sql
+SELECT pid, usename, state, now() - xact_start AS xact_age, left(query, 80)
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL OR backend_xid IS NOT NULL
+ORDER BY xact_start;
+SELECT * FROM pg_prepared_xacts;
+SELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots;
+```
+
+Note that `pg_stat_activity` hides other roles' transaction times unless the monitoring
+role is a member of `pg_read_all_stats`; the probe then under-reports.
 
 ## Performance Issues
 
