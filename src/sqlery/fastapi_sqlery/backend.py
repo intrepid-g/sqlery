@@ -2525,7 +2525,8 @@ class SQLAlchemyBackend(DatabaseBackend):
             )
 
     def get_expired_ttl_jobs(self) -> list:
-        """Get queued jobs whose TTL has expired."""
+        """Get queued jobs whose TTL has expired (detached rows: expire them through
+        :meth:`expire_queued_job`, mutating the returned rows persists nothing)."""
         with self._get_session() as session:
             stmt = select(QueuedJob).where(
                 and_(
@@ -2536,9 +2537,29 @@ class SQLAlchemyBackend(DatabaseBackend):
             now = datetime.now(UTC)
             expired = []
             for job in session.exec(stmt).all():
-                if job.created_at + timedelta(seconds=job.ttl) < now:
+                created = job.created_at if job.created_at.tzinfo else job.created_at.replace(tzinfo=UTC)
+                if created + timedelta(seconds=job.ttl) < now:
                     expired.append(job)
             return expired
+
+    def expire_queued_job(
+        self, job, error: str, termination_reason: str = "expired"
+    ) -> bool:
+        """Fail a job that is still queued and move it to history (fenced on its status).
+
+        The ready / blocked entries go with it in the same transaction and the jobs waiting on
+        it are released afterwards. Returns False, writing nothing, when the job is no longer
+        queued (claimed, cancelled or already expired by someone else).
+        """
+        with self._get_session() as session:
+            done = self._fail_queued(session, job, error, termination_reason, datetime.now(UTC))
+            if done:
+                session.commit()
+            else:
+                session.rollback()
+        if done:
+            self._release_dependents_quietly(job.id)
+        return done
 
     def acquire_tag_locks(self, tags: list[str]) -> None:
         """Acquire exclusive locks on tag coordination rows (PostgreSQL)."""

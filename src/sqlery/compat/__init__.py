@@ -367,6 +367,18 @@ class DatabaseBackend(ABC):
         """
         return []
 
+    def expire_queued_job(
+        self, job, error: str, termination_reason: str = "expired"
+    ) -> bool:
+        """Fail a still-queued job (a TTL expiry) through the backend's fenced terminal path.
+
+        Returns True if the job was expired, False if it was no longer queued. The default
+        marks the job through its own ``mark_failed`` (which persists on Django models);
+        backends whose rows are detached override it.
+        """
+        job.mark_failed(error=error, termination_reason=termination_reason)
+        return True
+
     def acquire_tag_locks(self, tags: list[str]) -> bool | None:
         """Acquire exclusive locks on tag coordination rows.
 
