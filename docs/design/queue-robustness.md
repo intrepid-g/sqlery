@@ -264,6 +264,19 @@ Retention therefore no longer applies to the live table (history and attempts ke
   `PG_LIVE_PARTITION_STUCK_DEGRADED_SECONDS` (900; 0 disables). Candidates are judged by
   `n_live_tup` and, for the oldest ten, an exact `EXISTS` with a 3 s cap.
 
+## #157 Claim without a job-row UPDATE
+
+A claim deletes the ready entry (rowcount 1 is the mutex) and inserts an attempt; it
+does not touch `sqlery_queued_job`. A job is running iff it has an open attempt
+(`finished_at IS NULL`); its live row keeps `status = 'queued'`, with no ready entry, so
+it cannot be claimed again. `sqlery_job_all` / `JobAll` report `running` and take
+`started_at`, `worker_id`, `worker_pid` and `child_pid` from the open attempt; every
+reader (tag limits, `allow_parallel`, zombie detection, deadlines, the ready sweep, TTL
+expiry, dashboards) derives running state the same way. Completion is fenced by the
+attempt token. The job row is therefore written twice in its life: INSERT at enqueue and
+DELETE when it moves to history, both reclaimed by dropping drained partitions (#156).
+Migrations: Django `0042_claim_without_update`, Alembic `20261026_0023`.
+
 ## #141 Rotation (opt-in, PostgreSQL only)
 
 Reclaims `sqlery_job_ready` by `TRUNCATE` instead of VACUUM.
