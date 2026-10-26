@@ -77,6 +77,62 @@ table. Claim index: `(queue_name, priority DESC, created_at, job_id)`.
 - After claiming no longer reads `sqlery_queued_job`, drop its claiming
   indexes so status updates on the job row can be HOT.
 
+### #139 implementation notes
+
+What the code does where the section above leaves room, and where it deviates.
+
+- **Blocked set shape.** `sqlery_job_blocked(job_id, dependency_id, created_at, blocked_at)`,
+  primary key `(job_id, dependency_id)`, index on `dependency_id`: one row per dependency of
+  the blocked job, so "who waits on X" is an index lookup, and `created_at` (the job's
+  partition key) lets a re-check read the job by primary key.
+- **Every path that makes a job claimable or unclaimable writes its entry in the same
+  transaction as the job row**: enqueue (`create_job`, so also bulk / canvas / group / chain),
+  staging promotion (same transaction as the insert), scheduler-created jobs and retries
+  (both go through `create_job`), requeues (`release_job`, `retry_failed_jobs`, admin
+  re-queue), cancel / TTL expiry / dependency failure / archive (entries are removed),
+  `job_name` replacement (entries removed, jobs that waited on the replaced job fail as a
+  missing dependency always did), `claim_job_by_id` (Lambda / HTTP trigger), the async
+  workers and the legacy `run_jobs` executor. In Django mode `QueuedJob.save()` /
+  `.delete()` and `QueuedJob.objects.update(status="queued" | queue | priority | scheduled_at)`
+  carry the bookkeeping, so code that goes through the ORM cannot forget it; in standalone
+  mode a session hook does the same for ORM writes, and Core `UPDATE` statements are
+  handled explicitly in the backend.
+- **Lock order is ready entry first, then job row** in every writer. A claimer holds the
+  entry (`FOR UPDATE SKIP LOCKED`) and then updates the job row; a writer that did it the
+  other way round (job row, then entry) could deadlock with it.
+- **The claim does not use the job `version` as its mutex** any more: deleting the entry
+  (rowcount 1) is the claim, and the job update still requires `status = 'queued'`. If the
+  update finds the job changed under an entry the claimer owns, the entry is put back when
+  the job is still queued, so a claim can never lose a queued job.
+- **Stale entries are harmless.** An entry whose job is gone or not queued is dropped by the
+  claim that meets it (the claim reads the job row by `(created_at, id)`, falling back to the
+  id), so cancels done by raw SQL cannot make a job runnable.
+- **Dependency release.** When a job reaches a terminal state (success, final failure,
+  cancel, zombie failure, deletion) the jobs blocked on it, or on its retry ancestors, are
+  re-checked: all met -> back to ready, one failed -> failed (`dependency_failed`) and its
+  own dependents are released in turn. A failed dependency that is tagged `retry_pending`
+  and has no retry yet counts as pending, not failed (standalone mode; the worker releases
+  after the retry exists). After a job is moved to the blocked set it is re-checked once
+  more after the claim transaction commits, so a dependency that finished while the rows were
+  not yet visible cannot be missed.
+- **Sweep (addition).** `maintain_ready_queue`, run by the scheduler leader of a queue
+  (default every 60 s, `READY_QUEUE_SWEEP_INTERVAL`, 0 disables; PostgreSQL statements are
+  capped by `READY_QUEUE_SWEEP_TIMEOUT`, default 10 s): queued jobs with no ready or blocked
+  entry get a ready entry, entries of jobs that are no longer queued are dropped, and a page
+  of blocked jobs is re-judged. It is the safety net for raw SQL and third-party code that
+  changes `sqlery_queued_job` without going through the library: a lost entry delays a job by
+  one sweep, it never loses it.
+- **Migration.** Every queued job gets a ready entry (none is put in the blocked set; the
+  first claim that meets a dependency-blocked job moves it). Workers refuse to start when the
+  tables are missing (like #138's attempt table); stop all workers before migrating.
+- **Indexes.** Only the claiming-only partial index `sqlery_job_pending_idx` is dropped. The
+  `status`, `started_at`, `finished_at`, `worker_id` and `scheduled_at` indexes stay because
+  other queries need them (dashboards, rate limits, cleanup, zombie detection), so a status
+  update is still not HOT; what goes away is the partial-index entry written and killed by
+  every claim.
+- **Async workers** read the ready queue but, as before, apply no dependency / tag / TTL
+  checks to what they claim (the sync claim and the Django async claim, which shares it, do).
+
 ## #140 History
 
 Terminal transition = one transaction: `INSERT INTO sqlery_job_history

@@ -33,6 +33,7 @@ __all__ = [
     "check_tag_concurrency_limits",
     "check_tag_rate_limits",
     "check_job_dependencies",
+    "dependency_state",
     "expire_ttl_jobs",
     "claim_next_job_with_queue_priority",
     "release_job",
@@ -136,20 +137,18 @@ def _is_lost_race(exc: Exception) -> bool:
     return type(exc).__name__ in ("ConcurrentModificationError", "JobFencingError")
 
 
-def check_job_dependencies(job) -> bool:
-    """Check if all job dependencies have completed successfully.
+def dependency_state(job) -> str:
+    """Decide what a candidate's dependencies say: ``met``, ``pending``, ``failed`` or ``skip``.
 
-    If any dependency has failed, marks this job as failed.
-    If dependencies are not yet complete, returns False to skip claiming.
+    ``failed`` means a dependency failed and this job has been marked failed;
+    ``pending`` means a dependency is not complete yet; ``skip`` means the job was modified
+    concurrently (another worker handled it).
 
     Args:
         job: Job instance with dependencies field and check_dependencies_met() method
-
-    Returns:
-        True if job can run (dependencies met), False if should skip
     """
     if not getattr(job, 'dependencies', None):
-        return True
+        return "met"
 
     all_met, failed_deps = job.check_dependencies_met()
 
@@ -163,15 +162,30 @@ def check_job_dependencies(job) -> bool:
             if not _is_lost_race(e):
                 raise
             logger.debug(f"Job {job.id} was modified concurrently; skipping: {e}")
-            return False
+            return "skip"
         logger.info(f"Failed job {job.id} due to failed dependencies: {failed_deps}")
-        return False
+        return "failed"
 
     if not all_met:
         logger.debug(f"Skipping job {job.id} - dependencies not yet complete")
-        return False
+        return "pending"
 
-    return True
+    return "met"
+
+
+def check_job_dependencies(job) -> bool:
+    """Check if all job dependencies have completed successfully.
+
+    If any dependency has failed, marks this job as failed.
+    If dependencies are not yet complete, returns False to skip claiming.
+
+    Args:
+        job: Job instance with dependencies field and check_dependencies_met() method
+
+    Returns:
+        True if job can run (dependencies met), False if should skip
+    """
+    return dependency_state(job) == "met"
 
 
 def expire_ttl_jobs(backend) -> int:
@@ -297,8 +311,13 @@ def _claim_from_candidates(
         if not check_tag_rate_limits(job, tag_rate_limits, backend):
             continue
 
-        # Check job dependencies
-        if not check_job_dependencies(job):
+        # Check job dependencies. A job that has to wait leaves the ready queue for the
+        # blocked set, so later claims do not examine it again until a dependency finishes.
+        state = dependency_state(job)
+        if state == "pending":
+            backend.block_job(job)
+            continue
+        if state != "met":
             continue
 
         # All checks passed — atomically claim
@@ -332,6 +351,23 @@ def _claim_from_candidates(
 
 
 def release_job(worker, job, status, **kwargs):
+    """Release a job after processing (legacy Django-mode helper), then re-check the jobs
+    that were waiting on it.
+
+    See :func:`_release_job` for the arguments.
+    """
+    _release_job(worker, job, status, **kwargs)
+    if status in ("success", "failed"):
+        try:
+            from sqlery.compat import get_backend
+
+            get_backend().release_dependents(job.id, getattr(job, "parent_job_id", None))
+        except Exception as e:
+            # The scheduler leader's periodic sweep repairs a missed release.
+            logger.warning(f"Releasing dependents of job {job.id} failed: {e}")
+
+
+def _release_job(worker, job, status, **kwargs):
     """Release a job after processing (legacy Django-mode helper).
 
     Promoted verbatim from django_sqlery/worker_claiming.py so the Django

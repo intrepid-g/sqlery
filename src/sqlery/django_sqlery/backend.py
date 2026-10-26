@@ -27,15 +27,17 @@ from sqlery.core.attempts import (
 from ..compat import DatabaseBackend, JobFencingError
 from .db_compat import (
     assert_in_atomic_block,
-    atomic_claim_job,
     atomic_claim_job_queryset,
     is_sqlite,
 )
 # Old: from .models import DaemonLease, QueuedJob, ScheduledTask, JobRegistry, TagLock, Worker
+from . import ready
 from .models import (
     ConcurrentModificationError,
     DaemonLease,
     JobAttempt,
+    JobBlocked,
+    JobReady,
     QueuedJob,
     ScheduledTask,
     JobRegistry,
@@ -196,10 +198,17 @@ class DjangoBackend(DatabaseBackend):
         # If a named job is requested, the new job always wins.  Stop any running
         # conflict (SIGTERM + mark failed) before deleting all records with that name.
         if job_name:
+            replaced = []
             for conflicting in self.QueuedJob.objects.filter(job_name=job_name):
+                replaced.append((conflicting.id, conflicting.parent_job_id))
                 if conflicting.status == "running":
                     conflicting.force_stop()
-            self.QueuedJob.objects.filter(job_name=job_name).delete()
+            with transaction.atomic():
+                self.QueuedJob.objects.filter(job_name=job_name).delete()
+                ready.remove([job_id for job_id, _ in replaced])
+            # Jobs that waited on a replaced job learn that it is gone (they fail, as before).
+            for job_id, parent_id in replaced:
+                ready.release_dependents_quietly(job_id, parent_id)
 
         # Threshold routing (D1, Phase 14): jobs scheduled further out than the
         # configured threshold go into sqlery_scheduled_job instead of
@@ -294,9 +303,10 @@ class DjangoBackend(DatabaseBackend):
     # cannot recover an aborted statement; the caller is best-effort already.
     def next_due_delay(self, queues: list[str]) -> float | None:
         now = timezone.now()
-        nxt = self.QueuedJob.objects.filter(
-            queue_name__in=queues, status="queued", scheduled_at__gt=now
-        ).aggregate(m=db_models.Min("scheduled_at"))["m"]
+        # The earliest not-yet-due entry of the ready table (no scan of the job table).
+        nxt = JobReady.objects.filter(queue_name__in=queues, scheduled_at__gt=now).aggregate(
+            m=db_models.Min("scheduled_at")
+        )["m"]
         return None if nxt is None else (nxt - now).total_seconds()
 
     def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
@@ -426,11 +436,26 @@ class DjangoBackend(DatabaseBackend):
 
     @retry_on_db_error()
     def claim_job_by_id(self, job_id: int, worker_id: str):
-        """Atomically claim one specific queued job via a compare-and-set UPDATE."""
+        """Atomically claim one specific queued job (Lambda / HTTP-trigger paths).
+
+        Locks go ready entry first, then job row (the order every claim uses). An entry that
+        another claimer holds means the job is being claimed: return None instead of waiting.
+        """
         from django.db.models import F
 
         with transaction.atomic():
-            updated = self.QueuedJob.objects.filter(id=job_id, status="queued").update(
+            if not is_sqlite():
+                entries = JobReady.objects.filter(slot__in=ready.SLOTS, job_id=job_id)
+                held = list(entries.select_for_update(skip_locked=True))
+                if not held and entries.exists():
+                    return None  # the entry exists but is locked: someone else is claiming it
+            current = self.QueuedJob.objects.filter(id=job_id, status="queued").first()
+            if current is None:
+                return None
+            ready.remove([job_id])
+            updated = self.QueuedJob.objects.filter(
+                id=job_id, created_at=current.created_at, status="queued"
+            ).update(
                 status="running",
                 started_at=timezone.now(),
                 # worker_pid lives on the attempt now (#138).
@@ -438,9 +463,10 @@ class DjangoBackend(DatabaseBackend):
                 version=F("version") + 1,
             )
             if updated != 1:
+                transaction.set_rollback(True)  # keeps the entries: not claimed by us
                 return None
             # Ephemeral claimers (lambda-/trigger-) have no Worker row: worker id stays NULL.
-            job = self.QueuedJob.objects.filter(id=job_id).first()
+            job = self.QueuedJob.objects.filter(id=job_id, created_at=current.created_at).first()
             JobAttempt.open_new(job, self._attempt_worker_id(worker_id), os.getpid())
         return job
 
@@ -489,6 +515,8 @@ class DjangoBackend(DatabaseBackend):
                     update_fields=["status", "current_job_id", "jobs_processed", "last_heartbeat"]
                 )
 
+        if status in ("success", "failed"):
+            ready.release_dependents_quietly(job.id, job.parent_job_id)
         return job
 
     def _resolve_worker(self, worker_id: str):
@@ -598,12 +626,20 @@ class DjangoBackend(DatabaseBackend):
         # )
         row = self.QueuedJob.objects.filter(id=job_id, status="queued").values("created_at").first()
         if row:
-            updated = self.QueuedJob.objects.filter(
-                id=job_id, created_at=row["created_at"], status="queued"
-            ).update(status="failed", error="Cancelled by user")
+            with transaction.atomic():
+                # Entries first, then the job row: the lock order of a claim. A claimer that
+                # holds the entry finishes first; the cancel then finds the job running.
+                ready.remove([job_id])
+                updated = self.QueuedJob.objects.filter(
+                    id=job_id, created_at=row["created_at"], status="queued"
+                ).update(status="failed", error="Cancelled by user")
+                if updated == 0:
+                    transaction.set_rollback(True)  # not cancelled: keep the entries
         else:
             updated = 0
         if updated > 0:
+            # Jobs that waited on it fail now (they would at their next claim).
+            ready.release_dependents_quietly(job_id)
             return True
         deleted, _ = self.ScheduledJob.objects.filter(id=job_id).delete()
         return deleted > 0
@@ -1407,19 +1443,25 @@ class DjangoBackend(DatabaseBackend):
         limit: int = 1,
         exclude_ids: list | None = None,
     ) -> list:
-        """Get next claimable jobs ordered by queue priority, job priority, age."""
+        """Next claimable jobs in claim order, read through the ready queue (#139).
+
+        Reads ready entries in order (``FOR UPDATE SKIP LOCKED`` on PostgreSQL, so the
+        returned jobs are locked for the claim) and loads the job row under each by primary
+        key. Entries whose job is no longer queued are dropped on the way.
+        """
         # from django.db import models as db_models  # moved to top-level
 
-        queryset = self.QueuedJob.objects.filter(status="queued", queue_name__in=queues).filter(
+        queryset = JobReady.objects.filter(queue_name__in=queues).filter(
             db_models.Q(scheduled_at__isnull=True) | db_models.Q(scheduled_at__lte=timezone.now())
         )
 
         if exclude_ids:
-            queryset = queryset.exclude(id__in=exclude_ids)
+            queryset = queryset.exclude(job_id__in=exclude_ids)
 
         queryset = atomic_claim_job_queryset(queryset)
 
         # Build CASE expression for queue priority ordering
+        order = ["-priority", "created_at", "job_id"]
         if priority_weights:
             case_whens = [
                 db_models.When(queue_name=queue, then=db_models.Value(weight))
@@ -1433,25 +1475,87 @@ class DjangoBackend(DatabaseBackend):
                     output_field=db_models.IntegerField(),
                 )
                 queryset = queryset.annotate(queue_priority=queue_priority_expr)
-                queryset = queryset.order_by("-queue_priority", "-priority", "created_at")
-            else:
-                queryset = queryset.order_by("-priority", "created_at")
-        else:
-            queryset = queryset.order_by("-priority", "created_at")
+                order = ["-queue_priority", *order]
+        entries = list(queryset.order_by(*order)[:limit])
+        if not entries:
+            return []
 
-        return list(queryset[:limit])
+        pairs = db_models.Q()
+        for entry in entries:
+            pairs |= db_models.Q(id=entry.job_id, created_at=entry.created_at)
+        rows = {j.id: j for j in self.QueuedJob.objects.filter(pairs)}
+        missing = [e.job_id for e in entries if e.job_id not in rows]
+        if missing:
+            # Not found by (created_at, id): the row's created_at differs from the entry's
+            # (edited by hand); fall back to the id alone before calling the entry stale.
+            rows.update({j.id: j for j in self.QueuedJob.objects.filter(id__in=missing)})
+        jobs, stale = [], []
+        for entry in entries:
+            job = rows.get(entry.job_id)
+            if job is None or job.status != "queued":
+                stale.append(entry.job_id)  # claimed elsewhere, cancelled or deleted
+                continue
+            job._ready_slot = entry.slot
+            jobs.append(job)
+        if stale:
+            ready.remove(stale)
+        return jobs
 
     def atomic_claim_job(self, job, worker) -> bool:
-        """Atomically claim a specific job for a worker."""
-        # from .db_compat import atomic_claim_job  # moved to top-level
-        # The claim and its attempt row are one unit: if the attempt cannot be recorded the
-        # claim is rolled back (savepoint inside the caller's transaction) and the job stays
-        # queued.
+        """Atomically claim a specific job for a worker.
+
+        Deleting the job's ready entry is the claim (it is locked on PostgreSQL, and its
+        rowcount decides the race on SQLite); the job row is then set running and the attempt
+        inserted. All of it is one unit inside the caller's transaction: if the attempt
+        cannot be recorded the claim is rolled back (savepoint) and the job stays ready.
+        """
         with transaction.atomic():
-            if not atomic_claim_job(job, worker):
+            slot = getattr(job, "_ready_slot", None)
+            entries = JobReady.objects.filter(
+                slot__in=ready.SLOTS if slot is None else [slot], job_id=job.id
+            )
+            deleted, _ = entries.delete()
+            if deleted < 1:
+                return False  # claimed by someone else, or no longer ready
+            started_at = timezone.now()
+            updated = self.QueuedJob.objects.filter(
+                id=job.id, created_at=job.created_at, status="queued"
+            ).update(
+                status="running", worker=worker, started_at=started_at, version=db_models.F("version") + 1
+            )
+            if updated != 1:
+                # The job changed under the entry we own: whoever changed it owns it now;
+                # if it is somehow still queued, put the entry back.
+                if self.QueuedJob.objects.filter(
+                    id=job.id, created_at=job.created_at, status="queued"
+                ).exists():
+                    ready.add([job])
                 return False
+            # The version check of the old claim is the entry delete now; mirror the write.
+            expected_version = job.version
+            job.status = "running"
+            job.worker = worker
+            job.started_at = started_at
+            job.version = expected_version + 1
             JobAttempt.open_new(job, getattr(worker, "id", None), os.getpid())
             return True
+
+    # ----- ready queue (#139) ----------------------------------------------
+
+    def ready_tables_exist(self) -> bool:
+        tables = set(connection.introspection.table_names())
+        return JobReady._meta.db_table in tables and JobBlocked._meta.db_table in tables
+
+    def block_job(self, job) -> bool:
+        return ready.block(job)
+
+    def release_dependents(self, job_id: int, parent_job_id: int | None = None) -> int:
+        return ready.release_dependents(job_id, parent_job_id)
+
+    def maintain_ready_queue(
+        self, queue_names: list[str] | None = None, limit: int = 200, after_job_id: int = 0
+    ) -> dict:
+        return ready.maintain(queue_names, limit, after_job_id)
 
     def claim_due_scheduled_task(self, task_id: int):
         """Atomically claim a scheduled task for processing."""

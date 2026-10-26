@@ -273,6 +273,9 @@ def test_claim_abandons_a_leftover_open_attempt_of_the_queued_job(mode):
         with mode.backend._get_session() as session:
             session.exec(update(QueuedJob).where(QueuedJob.id == job.id).values(status="queued"))
             session.commit()
+    # A raw status reset bypasses the ready-queue bookkeeping (#139); the sweep restores the
+    # entry the job lost.
+    mode.backend.maintain_ready_queue()
     new = attempt_of(mode.claim())
     opens = [a for a in mode.attempts(job.id) if a["open"]]
     assert [a["id"] for a in opens] == [new.id]

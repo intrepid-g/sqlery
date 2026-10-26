@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import delete, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
@@ -38,7 +38,9 @@ from sqlery.core.attempts import (
     attach_attempt,
     decide_close,
 )
-from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker
+from sqlery.core import ready as ready_core
+from sqlery.core import ready_sql
+from sqlery.core.models import JobBlocked, JobReady, JobRegistry, QueuedJob, ScheduledTask, Worker
 from sqlery.core.sqltypes import UTCDateTime
 from sqlery.core.utils import reject_unawaited_coroutine
 
@@ -136,24 +138,32 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     async def anext_due_delay(self, queues: list[str]) -> float | None:
         """Seconds until the earliest queued-but-not-yet-due job on ``queues``."""
-        from sqlalchemy import func
-
         now = _utcnow()
         factory = get_async_session_factory()
         async with factory() as session:
-            result = await session.execute(
-                select(func.min(QueuedJob.scheduled_at)).where(
-                    QueuedJob.queue_name.in_(list(queues)),
-                    QueuedJob.status == "queued",
-                    QueuedJob.scheduled_at > now,
-                )
-            )
+            # The earliest not-yet-due entry of the ready table (no scan of the job table).
+            result = await session.execute(ready_sql.next_due_stmt(queues, now))
             nxt = result.scalar()
         if nxt is None:
             return None
         if nxt.tzinfo is None:
             nxt = nxt.replace(tzinfo=UTC)
         return (nxt - now).total_seconds()
+
+    async def aready_tables_exist(self) -> bool:
+        from sqlalchemy import inspect as sa_inspect
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            conn = await session.connection()
+
+            def _check(sync_conn):
+                inspector = sa_inspect(sync_conn)
+                return inspector.has_table(JobReady.__tablename__) and inspector.has_table(
+                    JobBlocked.__tablename__
+                )
+
+            return await conn.run_sync(_check)
 
     async def aattempt_table_exists(self) -> bool:
         from sqlalchemy import inspect as sa_inspect
@@ -168,73 +178,82 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             )
 
     async def aclaim_job(self, queues: list[str], worker_id: str):
-        """Atomically claim the next queued job for one of ``queues``.
+        """Atomically claim the next claimable job from the ready queue (#139).
 
-        Postgres branch uses ``with_for_update(skip_locked=True)``.
-        SQLite branch falls back to optimistic ``version``-CAS.
+        Postgres reads the entry with ``with_for_update(skip_locked=True)``; on both
+        databases deleting the entry (rowcount 1) is the claim. Like the sync claim it moves
+        on past stale entries; unlike it, it applies no dependency / tag checks (as before).
         Returns the claimed ``QueuedJob`` (status='running') or ``None``.
         """
         factory = get_async_session_factory()
         now = _utcnow()  # captured BEFORE await
         async with factory() as session:
+            session.sync_session.expire_on_commit = False
             dialect = session.bind.dialect.name if session.bind is not None else ""
             owner_id = await self._registered_worker_id(session, worker_id)
             # The claiming PID is recorded on the attempt, not the job row (#138).
             owner = {"worker_id": owner_id} if owner_id else {}
-            stmt = (
-                select(QueuedJob)
-                .where(QueuedJob.queue_name.in_(list(queues)))
-                .where(QueuedJob.status == "queued")
-                .where(or_(QueuedJob.scheduled_at.is_(None), QueuedJob.scheduled_at <= now))
-                .order_by(QueuedJob.priority.desc(), QueuedJob.created_at)
-                .limit(1)
-            )
-            if dialect == "postgresql":
-                stmt = stmt.with_for_update(skip_locked=True)
-            result = await session.execute(stmt)
-            job = result.scalars().first()
-            if job is None:
-                await session.commit()
-                return None
-
-            if dialect == "postgresql":
-                # Row is locked by SELECT FOR UPDATE; update inline.
-                job.status = "running"
-                job.started_at = now
-                for key, value in owner.items():
-                    setattr(job, key, value)
-                job.version = (job.version or 0) + 1
-                session.add(job)
-                # The attempt joins the claim's transaction: both commit or neither does.
-                handle = await self._aopen_attempt(session, job.id, owner_id)
-                await session.commit()
-                await session.refresh(job)
-                return attach_attempt(job, handle)
-
-            # SQLite (and others): optimistic CAS on version.
-            current_version = job.version or 0
-            cas_stmt = (
-                update(QueuedJob)
-                .where(QueuedJob.id == job.id)
-                .where(QueuedJob.version == current_version)
-                .values(
-                    status="running",
-                    started_at=now,
-                    version=current_version + 1,
-                    **owner,
+            cursor = None
+            while True:
+                result = await session.execute(
+                    ready_sql.next_entry_stmt(
+                        list(queues), now, cursor, lock=dialect == "postgresql"
+                    )
                 )
-            )
-            res = await session.execute(cas_stmt)
-            if res.rowcount != 1:
+                entry = result.scalars().first()
+                if entry is None:
+                    await session.commit()
+                    return None
+                slot, job_id, created_at = entry.slot, entry.job_id, entry.created_at
+                cursor = (entry.priority, created_at, job_id)
+                job = (await session.execute(ready_sql.job_of_entry_stmt(entry))).scalars().first()
+                if job is None or job.status != "queued":
+                    await session.execute(ready_sql.delete_entry_stmt(slot, job_id))
+                    await session.commit()
+                    continue
+                deleted = await session.execute(ready_sql.delete_entry_stmt(slot, job_id))
+                if deleted.rowcount != 1:
+                    await session.commit()
+                    continue
+                res = await session.execute(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at)
+                    .where(QueuedJob.status == "queued")
+                    .values(
+                        status="running",
+                        started_at=now,
+                        version=QueuedJob.version + 1,
+                        **owner,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if res.rowcount != 1:
+                    # The job changed under the entry we own; keep the entry if it is queued.
+                    status = (
+                        await session.execute(
+                            select(QueuedJob.status)
+                            .where(QueuedJob.id == job_id)
+                            .where(QueuedJob.created_at == created_at)
+                        )
+                    ).scalar()
+                    if status == "queued":
+                        await session.execute(
+                            ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)])
+                        )
+                    await session.commit()
+                    continue
+                # The attempt joins the claim's transaction: both commit or neither does.
+                handle = await self._aopen_attempt(session, job_id, owner_id)
                 await session.commit()
-                return None
-            handle = await self._aopen_attempt(session, job.id, owner_id)
-            await session.commit()
-            # Re-fetch to return current state.
-            refreshed = await session.execute(
-                select(QueuedJob).where(QueuedJob.id == job.id)
-            )
-            return attach_attempt(refreshed.scalars().first(), handle)
+                # The UPDATE above bypassed the identity map: load the row anew.
+                refreshed = await session.execute(
+                    select(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at)
+                    .execution_options(populate_existing=True)
+                )
+                return attach_attempt(refreshed.scalars().first(), handle)
 
     @staticmethod
     async def _aopen_attempt(session, job_id, worker_id) -> AttemptHandle:
@@ -350,8 +369,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             job.mark_failed(error=reason, termination_reason="zombie_job")
             job.version = (job.version or 0) + 1
             session.add(job)
+            parent = job.parent_job_id
             await session.commit()
-            return True
+        await self._arelease_dependents_quietly(job_id, parent)
+        return True
 
     # ----- terminal-status writes -----------------------------------------
 
@@ -376,6 +397,9 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
                 stmt = stmt.where(QueuedJob.created_at == created_at)
             stmt = stmt.values(status="running", started_at=now)
             await session.execute(stmt)
+            # Running jobs are not claimable: drop any entry (the claim path already did).
+            await session.execute(ready_sql.delete_ready_stmt([job_id]))
+            await session.execute(ready_sql.delete_blocked_stmt([job_id]))
             await session.commit()
 
     async def amark_success(self, job_id, result, attempt=None) -> None:
@@ -442,6 +466,10 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             raise
         await session.execute(job_stmt)
         await session.commit()
+        if outcome == OUTCOME_SUCCESS:
+            await self._arelease_dependents_quietly(job_id)
+        # A failure is released by the worker once it has decided on the retry (releasing
+        # here would fail dependents of a job whose retry is not queued yet).
 
     async def amark_shutting_down(self, job_id) -> None:
         factory = get_async_session_factory()
@@ -607,6 +635,140 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
             return list(res.scalars().all())
 
     # ----- registry --------------------------------------------------------
+
+    # ----- ready queue: dependents (#139) --------------------------------------
+
+    async def _arelease_dependents_quietly(self, job_id, parent_job_id=None) -> None:
+        """Re-check the jobs blocked on a finished job; never raises (the periodic sweep run
+        by the scheduler leader repairs whatever this misses)."""
+        try:
+            await self.arelease_dependents(job_id, parent_job_id)
+        except Exception:
+            logger.warning(f"arelease_dependents({job_id}) failed", exc_info=True)
+
+    async def arelease_dependents(self, job_id, parent_job_id=None) -> int:
+        """Async twin of ``SQLAlchemyBackend.release_dependents``."""
+        factory = get_async_session_factory()
+        released = 0
+        work = [(job_id, parent_job_id)]
+        seen: set = set()
+        while work:
+            current, parent = work.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            async with factory() as session:
+                ids = [current]
+                hops = 0
+                if parent is None:
+                    row = (
+                        await session.execute(
+                            select(QueuedJob.parent_job_id).where(QueuedJob.id == current)
+                        )
+                    ).first()
+                    parent = row[0] if row else None
+                while parent and parent not in ids and hops < ready_core.MAX_CHAIN_HOPS:
+                    ids.append(parent)
+                    row = (
+                        await session.execute(
+                            select(QueuedJob.parent_job_id).where(QueuedJob.id == parent)
+                        )
+                    ).first()
+                    parent = row[0] if row else None
+                    hops += 1
+                dependents = (
+                    await session.execute(
+                        select(JobBlocked.job_id, JobBlocked.created_at)
+                        .where(JobBlocked.dependency_id.in_(ids))
+                        .distinct()
+                    )
+                ).all()
+            for blocked_id, created_at in dependents:
+                outcome = await self._arecheck_blocked(blocked_id, created_at)
+                if outcome == "ready":
+                    released += 1
+                elif outcome == "failed":
+                    work.append((blocked_id, None))
+        return released
+
+    async def _arecheck_blocked(self, job_id, created_at) -> str:
+        """Re-judge one blocked job: ``ready``, ``failed``, ``blocked`` or ``gone``."""
+        from sqlery.core.retry import is_retry_pending
+
+        factory = get_async_session_factory()
+        async with factory() as session:
+            session.sync_session.expire_on_commit = False
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            job = (
+                await session.execute(
+                    select(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at)
+                )
+            ).scalars().first()
+            if job is None or job.status != "queued":
+                await session.execute(ready_sql.delete_blocked_stmt([job_id]))
+                await session.commit()
+                return "gone"
+            deps = ready_core.dependency_ids(job)
+            rows = {
+                d.id: d
+                for d in (
+                    await session.execute(select(QueuedJob).where(QueuedJob.id.in_(deps)))
+                ).scalars()
+            }
+            # Pre-fetch the retry chains the judgement may follow (it takes plain callables).
+            retries: dict = {}
+            frontier = [d for d in rows.values() if d.status in ("failed", "archived")]
+            hops = 0
+            while frontier and hops < ready_core.MAX_CHAIN_HOPS:
+                nxt = []
+                for dep in frontier:
+                    child = (
+                        await session.execute(
+                            select(QueuedJob)
+                            .where(QueuedJob.parent_job_id == dep.id)
+                            .order_by(QueuedJob.created_at.desc(), QueuedJob.id.desc())
+                            .limit(1)
+                        )
+                    ).scalars().first()
+                    retries[dep.id] = child
+                    if child is not None and child.status in ("failed", "archived"):
+                        nxt.append(child)
+                frontier = nxt
+                hops += 1
+            verdict = ready_core.judge_dependencies(
+                deps, rows.get, retries.get, is_retry_pending
+            )
+            if verdict.state == ready_core.PENDING:
+                await session.commit()
+                return "blocked"
+            if verdict.state == ready_core.FAILED:
+                # Entries first, then the job row: the lock order of a claim.
+                await session.execute(ready_sql.delete_ready_stmt([job_id]))
+                await session.execute(ready_sql.delete_blocked_stmt([job_id]))
+                await session.execute(
+                    update(QueuedJob)
+                    .where(QueuedJob.id == job_id)
+                    .where(QueuedJob.created_at == created_at)
+                    .where(QueuedJob.status == "queued")
+                    .values(
+                        status="failed",
+                        error=f"Dependencies failed: {verdict.failed}",
+                        termination_reason="dependency_failed",
+                        finished_at=_utcnow(),
+                        version=QueuedJob.version + 1,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                return "failed"
+            await session.execute(ready_sql.delete_blocked_stmt([job_id]))
+            await session.execute(
+                ready_sql.insert_ready_stmt(dialect, [ready_sql.ready_values(job)])
+            )
+            await session.commit()
+            return "ready"
 
     # ----- retry path --------------------------------------------------
 

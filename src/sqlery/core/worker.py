@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
 from .attempts import attempt_kwargs, attempt_of, require_attempt_table
+from .ready import require_ready_tables
 from .utils import describe_task_args, import_task
 from .result import serialize_result
 from .execution import invoke_task, run_failure_callback, run_success_callback
@@ -714,6 +715,8 @@ class WorkerProcess:
 
         # Refuse to run without the attempt table: completions could not be fenced.
         require_attempt_table(self.backend)
+        # ... and without the ready-queue tables there would be nothing to claim from.
+        require_ready_tables(self.backend)
 
         logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
 
