@@ -18,6 +18,7 @@ from ..compat import is_django_mode, get_backend, get_config, initialize as comp
 from ..crontab import parse_cron_string
 from .cleanup import CleanupManager
 from .daemon import DaemonManager
+from .pool import export_pool_options
 
 app = typer.Typer(
     name="sqlery",
@@ -39,6 +40,24 @@ app.add_typer(daemon_app, name="daemon")
 @daemon_app.command("start")
 def daemon_start(
     detach: bool = typer.Option(True, "--detach/--no-detach", help="Run daemon in background"),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", "-c", help="Worker processes (default: number of CPUs)"
+    ),
+    pool: str | None = typer.Option(
+        None, "--pool", "-P", help="prefork (default, like Celery) or fork (a child per job)"
+    ),
+    max_tasks_per_child: int | None = typer.Option(
+        None, "--max-tasks-per-child", help="Recycle the prefork child after N jobs"
+    ),
+    max_memory_per_child: int | None = typer.Option(
+        None, "--max-memory-per-child", help="Recycle it once its max RSS exceeds N KiB"
+    ),
+    db_reuse_max: int | None = typer.Option(
+        None, "--db-reuse-max", help="Refresh DB connections every N jobs"
+    ),
+    start_method: str | None = typer.Option(
+        None, "--start-method", help="fork (default: preloaded launcher, like Celery) or spawn"
+    ),
 ):
     """Start the job processing daemon."""
     # from ..compat import is_django_mode  # moved to top-level
@@ -50,6 +69,15 @@ def daemon_start(
     # from .daemon import DaemonManager  # moved to top-level
 
     console.print("[bold blue]Starting sqlery daemon...[/bold blue]")
+    # The daemon and the workers it spawns read these from the environment.
+    export_pool_options(
+        pool=pool,
+        max_tasks_per_child=max_tasks_per_child,
+        max_memory_per_child=max_memory_per_child,
+        db_reuse_max=db_reuse_max,
+        concurrency=concurrency,
+        start_method=start_method,
+    )
 
     daemon = DaemonManager()
     try:
@@ -1097,7 +1125,9 @@ def migrate_history():
 @app.command("init")
 def initialize(
     database_url: str = typer.Option(..., "--database-url", "-d", help="PostgreSQL connection URL"),
-    max_workers: int = typer.Option(3, "--max-workers", "-w", help="Maximum worker processes"),
+    max_workers: int | None = typer.Option(
+        None, "--max-workers", "-w", help="Worker processes (default: number of CPUs)"
+    ),
     pool_size: int = typer.Option(5, "--pool-size", help="Connection pool size"),
     max_overflow: int = typer.Option(10, "--max-overflow", help="Max overflow connections"),
     pool_timeout: int = typer.Option(30, "--pool-timeout", help="Connection pool timeout in seconds"),

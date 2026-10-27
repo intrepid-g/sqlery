@@ -3,6 +3,7 @@
 Updated in v0.11.0 to use core.worker_pool.WorkerPoolManager.
 """
 
+from sqlery.core.pool import worker_concurrency
 import os
 import signal
 
@@ -52,7 +53,7 @@ class Command(BaseCommand):
 
     def list_workers(self):
         """List all workers."""
-        max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+        max_workers = worker_concurrency()
         queues = get_setting('WORKER_QUEUES', ['default'])
 
         if max_workers == 1:
@@ -186,7 +187,7 @@ class Command(BaseCommand):
         self.stdout.write("Cleaning up dead workers...")
 
         try:
-            max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+            max_workers = worker_concurrency()
             queues = get_setting('WORKER_QUEUES', ['default'])
 
             pool = WorkerPoolManager(max_workers, queues)
@@ -210,7 +211,7 @@ class Command(BaseCommand):
         self.stdout.write("Stopping all workers...")
 
         try:
-            max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+            max_workers = worker_concurrency()
             queues = get_setting('WORKER_QUEUES', ['default'])
 
             pool = WorkerPoolManager(max_workers, queues)

@@ -71,11 +71,31 @@ DEFAULTS = {
     "DAEMON_CHECK_INTERVAL": 10,  # Daemon checks for jobs every 10 seconds
 
     # Worker pool settings
-    "MAX_WORKERS_PER_NODE": 1,  # Number of worker subprocess processes per node
+    # Number of worker processes per node. None = the number of CPUs (Celery's
+    # worker_concurrency default), capped to the container's CPU quota.
+    "MAX_WORKERS_PER_NODE": None,
     "WORKER_HEARTBEAT_INTERVAL": 5,  # Worker heartbeat interval in seconds
     "WORKER_POLL_INTERVAL": 5,  # Seconds between job polls when idle
     "WORKER_ALIVE_TIMEOUT": 30,  # Worker is considered dead after this many seconds without heartbeat
     "WORKER_QUEUES": ["high", "default", "low"],  # Queue priority order for workers
+    # #161: how a worker runs jobs. "prefork" (Celery's default) sends them to one
+    # long-lived child; "fork" (RQ) forks a child per job. Defaults follow Celery.
+    "WORKER_POOL": "prefork",
+    "WORKER_MAX_TASKS_PER_CHILD": None,  # Recycle the prefork child after N jobs (None = never)
+    "WORKER_MAX_MEMORY_PER_CHILD": None,  # ... or once its max RSS exceeds N KiB (None = never)
+    # Force-close DB connections every N jobs; None = WORKER_MAX_TASKS_PER_CHILD (the
+    # recycle rate). Neither set: close only unusable/CONN_MAX_AGE-expired ones per job.
+    "WORKER_DB_REUSE_MAX": None,
+    # #163: "fork" (Celery) forks daemon workers from a launcher that preloaded the task
+    # modules, so they share that memory; "spawn" starts each as a fresh interpreter.
+    "WORKER_START_METHOD": "fork",
+    # Modules the launcher imports first. None = each installed app's tasks module
+    # (Celery's autodiscover_tasks); [] = none.
+    "WORKER_PRELOAD_MODULES": None,
+    # A lost DB connection is reopened after a random delay up to BASE * 2**attempt seconds,
+    # capped at MAX (exponential backoff, full jitter). The worker claims nothing meanwhile.
+    "DB_RECONNECT_BACKOFF_BASE": 0.5,
+    "DB_RECONNECT_BACKOFF_MAX": 30,
     "QUEUE_PRIORITIES": {  # Queue priority weights (higher = processed first)
         "high": 100,
         "default": 50,

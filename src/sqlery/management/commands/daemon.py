@@ -1,5 +1,6 @@
 """Management command for controlling the daemon worker."""
 
+from sqlery.core.pool import worker_concurrency
 from django.core.management.base import BaseCommand
 
 from sqlery.daemon_manager import (
@@ -8,7 +9,7 @@ from sqlery.daemon_manager import (
     cleanup_stale_pid,
 )
 from sqlery.daemon_middleware import DaemonMiddleware
-from sqlery.settings import get_setting
+# Old: from sqlery.settings import get_setting  (MAX_WORKERS_PER_NODE -> worker_concurrency)
 from sqlery.worker_pool import get_worker_pool_status
 
 
@@ -77,7 +78,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING("⚠ Daemon is NOT running"))
 
         # Show worker pool status if multi-worker mode
-        max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+        max_workers = worker_concurrency()
         if max_workers > 1:
             self.stdout.write("\n=== Worker Pool Status ===\n")
             try:

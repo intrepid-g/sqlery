@@ -1,4 +1,4 @@
-"""Django-agnostic worker execution logic with fork-per-job support."""
+"""Django-agnostic worker execution logic: prefork pool or fork-per-job (#161)."""
 
 import asyncio
 import contextvars
@@ -11,8 +11,10 @@ import sys
 import traceback as tb
 import signal
 import os
+import select
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
@@ -34,7 +36,26 @@ from .result import REVOKED_ERROR
 from .scheduler import Scheduler
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
-from sqlery.core.db_resilience import configure_connection_resilience
+from .pool import (
+    POOL_FORK,
+    POOL_PREFORK,
+    db_refresh_due,
+    encode_frame,
+    load_pool_settings,
+    max_rss_kib,
+    read_frame,
+    refresh_db_connections,
+    should_recycle,
+    write_all,
+)
+from sqlery.core.db_resilience import (
+    configure_connection_resilience,
+    discard_connections,
+    is_connection_lost,
+    probe_database,
+    reconnect_backoff_settings,
+    reconnect_delay,
+)
 
 try:
     from django.db import connections, close_old_connections
@@ -71,6 +92,15 @@ _current_job_var: contextvars.ContextVar = contextvars.ContextVar('current_job',
 logger = logging.getLogger(__name__)
 
 
+def _disarm_alarm() -> None:
+    """Cancel a job's SIGALRM (hard timeout and soft limit) and drop its handler."""
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        pass  # no setitimer (Windows) or not the main thread
+
+
 def compute_retry_delay(
     backoff: float, retry_count: int, retry_intervals: list | None = None
 ) -> float:
@@ -96,6 +126,25 @@ def compute_retry_delay(
     return delay
 
 
+@dataclass
+class UnpersistedOutcome:
+    """A job outcome a worker child could not write because its DB connection was lost.
+
+    The child sends it to the worker parent (the supervisor), which reconnects and persists
+    it (``JobExecutor.persist_outcome``). The job is never run again for it.
+    """
+
+    job_id: int
+    success: bool
+    expected_version: int | None = None
+    attempt: object = None
+    output: str | None = None
+    error: str = ""
+    traceback: str = ""
+    will_retry: bool = False
+    countdown: float | None = None
+
+
 class JobExecutor:
     """Executes jobs with retry logic, timeout support, and crash recovery.
 
@@ -107,6 +156,11 @@ class JobExecutor:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
         self.backend = backend
+        # Set in a worker child when the connection was lost while recording the outcome;
+        # sent to the parent, which persists it (#161).
+        self.unpersisted: UnpersistedOutcome | None = None
+        # Fork pool child: the pipe that sends ``unpersisted`` to the parent.
+        self.outcome_fd: int | None = None
 
     def execute_job(self, job):
         """Execute a single job with error handling and retry logic."""
@@ -237,6 +291,23 @@ class JobExecutor:
         reads final status from the DB after waitpid() returns.
         This method never returns.
         """
+        exit_code = self.run_job_in_child(job)
+        if self.outcome_fd is not None and self.unpersisted is not None:
+            try:
+                write_all(self.outcome_fd, encode_frame(self.unpersisted))
+            except Exception as e:
+                logger.error(f"Could not hand job {self.unpersisted.job_id} to the parent: {e}")
+        os._exit(exit_code)
+
+    def run_job_in_child(self, job) -> int:
+        """Run one job in a worker child and return its exit code (0 success, 1 failure).
+
+        The fork pool's child exits with it; the prefork pool's long-lived child (#161)
+        reports it to the parent and waits for the next job, so the job's alarm is
+        disarmed before returning. If the DB connection is lost while the outcome is
+        recorded, the outcome is left in ``self.unpersisted`` for the parent.
+        """
+        self.unpersisted = None
         # write_fd = int(os.environ.pop('_SQLERY_RESULT_FD'))
         expected_version = None  # set below; kept here so the except: block never NameErrors
         # The claim's attempt handle (inherited through fork); captured before the refresh
@@ -305,7 +376,16 @@ class JobExecutor:
                     f"Job {job.id} succeeded but was superseded by another worker "
                     f"before completion could be recorded — discarding this result: {e}"
                 )
-                os._exit(0)
+                return 0
+            except Exception as e:
+                if not is_connection_lost(e):
+                    raise
+                # The job ran: never run it again. The supervisor persists the result.
+                self._hand_over(UnpersistedOutcome(
+                    job_id=job.id, success=True, output=serialize_result(result),
+                    expected_version=expected_version, attempt=attempt,
+                ), e)
+                return 0
             # If this is a retry, cascade success to all ancestor attempts
             if getattr(job, 'parent_job_id', None):
                 try:
@@ -322,9 +402,12 @@ class JobExecutor:
             # }).encode()
             # os.write(write_fd, result_payload)
             # os.close(write_fd)
-            os._exit(0)
+            return 0
 
         except Exception as e:
+            # Disarm first: a soft limit re-arms the alarm for the hard limit, which must
+            # not fire while the failure is being recorded.
+            _disarm_alarm()
             error_msg = str(e)
             error_traceback = tb.format_exc()
             logger.error(f"Job {job.id} failed: {error_msg}")
@@ -336,10 +419,20 @@ class JobExecutor:
                 # mark_job_failed to fail on the same broken connection.
                 self._reset_db_connections()
                 will_retry = self._should_retry(job, e)
-                failed_job = self._mark_failed(
-                    job.id, error_msg, error_traceback, expected_version, will_retry,
-                    attempt=attempt,
-                )
+                try:
+                    failed_job = self._mark_failed(
+                        job.id, error_msg, error_traceback, expected_version, will_retry,
+                        attempt=attempt,
+                    )
+                except Exception as lost:
+                    if not is_connection_lost(lost):
+                        raise
+                    self._hand_over(UnpersistedOutcome(
+                        job_id=job.id, success=False, error=error_msg,
+                        traceback=error_traceback, expected_version=expected_version,
+                        attempt=attempt, will_retry=will_retry, countdown=retry_countdown(e),
+                    ), lost)
+                    return 1
 
                 run_failure_callback(failed_job)
 
@@ -370,7 +463,55 @@ class JobExecutor:
             # except Exception:
             #     pass
 
-            os._exit(1)
+            return 1
+        finally:
+            _disarm_alarm()
+
+    def _hand_over(self, outcome: "UnpersistedOutcome", error: BaseException) -> None:
+        """Child: the connection is gone, so leave ``outcome`` for the supervisor to persist."""
+        logger.warning(
+            f"Job {outcome.job_id}: DB connection lost while recording its outcome ({error}); "
+            f"handing it to the worker parent"
+        )
+        discard_connections()
+        self.unpersisted = outcome
+
+    def persist_outcome(self, outcome: "UnpersistedOutcome") -> None:
+        """Supervisor: write an outcome a child could not, exactly as the child would have.
+
+        Success and failure callbacks are not run: they are task code and belong in the
+        child. Fenced like the child's write, so a superseded attempt records nothing.
+        """
+        try:
+            if outcome.success:
+                job = self.backend.mark_job_success(
+                    outcome.job_id,
+                    output=outcome.output,
+                    expected_version=outcome.expected_version,
+                    **attempt_kwargs(outcome.attempt, self.backend.mark_job_success),
+                )
+                if getattr(job, "parent_job_id", None):
+                    try:
+                        self.backend.cascade_ancestor_status(job.id, "success")
+                    except Exception as e:
+                        logger.warning(f"Failed to cascade success for job {job.id}: {e}")
+            else:
+                failed_job = self._mark_failed(
+                    outcome.job_id, outcome.error, outcome.traceback, outcome.expected_version,
+                    outcome.will_retry, attempt=outcome.attempt,
+                )
+                if outcome.will_retry:
+                    self._retry_job(failed_job, countdown=outcome.countdown)
+        except JobFencingError as e:
+            logger.warning(
+                f"Job {outcome.job_id} was superseded before its outcome could be recorded — "
+                f"discarding it: {e}"
+            )
+            return
+        logger.info(
+            f"Job {outcome.job_id}: outcome persisted by the worker parent "
+            f"({'success' if outcome.success else 'failed'}; callbacks not run)"
+        )
 
     def _reset_db_connections(self):
         """Close inherited DB connections after fork."""
@@ -446,7 +587,8 @@ class JobExecutor:
         # Task-declared policy (autoretry_for / Retry); crash-recovery callers pass no exc.
         return policy_allows_retry(job, exc)
 
-    def _retry_job(self, failed_job, exc: BaseException | None = None):
+    def _retry_job(self, failed_job, exc: BaseException | None = None,
+                   countdown: float | None = None):
         # Idempotent: if a retry already exists (e.g. recovery after a crash, or a stale-job
         # sweep racing the worker that failed it), reuse it instead of creating a duplicate.
         existing = self.backend.get_latest_retry(failed_job.id)
@@ -459,7 +601,9 @@ class JobExecutor:
             backoff, retry_count, getattr(failed_job, "retry_intervals", None)
         )
         delay_seconds = shape_retry_delay(
-            delay_seconds, failed_job, countdown=retry_countdown(exc)
+            delay_seconds,
+            failed_job,
+            countdown=countdown if countdown is not None else retry_countdown(exc),
         )
 
         scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
@@ -641,8 +785,23 @@ class JobExecutor:
         return not has_running_in_queue
 
 
+@dataclass
+class _PoolChild:
+    """The prefork pool's long-lived child as the parent sees it (#161)."""
+
+    pid: int
+    job_fd: int  # parent writes claimed jobs here
+    result_fd: int  # child reports each job's outcome here
+    recycling: bool = False  # the child said it exits after the job it just reported
+    reaped: bool = False
+
+
 class WorkerProcess:
     """Persistent worker process that polls for jobs and forks children to execute them.
+
+    WORKER_POOL picks how (#161): "prefork" (default, like Celery) sends each job to a
+    long-lived child recycled after WORKER_MAX_TASKS_PER_CHILD jobs; "fork" (like RQ) is
+    the fork-per-job model below.
 
     RQ-style fork-per-job model:
     - Parent process: claims jobs, forks children, monitors them, handles heartbeats
@@ -651,7 +810,28 @@ class WorkerProcess:
     - Parent is never blocked by job execution, so heartbeats always work
     """
 
-    def __init__(self, queues: list[str] | None = None, backend=None):
+    def __init__(
+        self,
+        queues: list[str] | None = None,
+        backend=None,
+        pool: str | None = None,
+        max_tasks_per_child: int | None = None,
+        max_memory_per_child: int | None = None,
+        db_reuse_max: int | None = None,
+    ):
+        """Create a worker.
+
+        Args:
+            queues: Queues to claim from, in priority order (default ``['default']``).
+            backend: Database backend (default: the active one).
+            pool: ``"prefork"`` or ``"fork"`` (default: WORKER_POOL, Celery's prefork).
+            max_tasks_per_child: Recycle the prefork child after N jobs (default:
+                WORKER_MAX_TASKS_PER_CHILD, never).
+            max_memory_per_child: ... or once its max RSS exceeds N KiB (default:
+                WORKER_MAX_MEMORY_PER_CHILD, never).
+            db_reuse_max: Force-refresh DB connections every N jobs (default:
+                WORKER_DB_REUSE_MAX, else the recycle rate).
+        """
         if backend is None:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
@@ -669,6 +849,12 @@ class WorkerProcess:
         self.queues = queues or ['default']
         self.executor = JobExecutor(backend)
         self._fork_ctx = ForkSafeExecutor.auto_configure()
+        self.pool_settings = load_pool_settings(
+            pool, max_tasks_per_child, max_memory_per_child, db_reuse_max
+        )
+        self._pool_child: _PoolChild | None = None
+        # An outcome the job's child could not persist (connection lost), set while waiting.
+        self._handed_over: UnpersistedOutcome | None = None
         self.shutdown_requested = False
         self.jobs_processed = 0
         self.current_job = None
@@ -721,7 +907,10 @@ class WorkerProcess:
         # ... and without the history table a finished job could not be recorded.
         require_history_table(self.backend)
 
-        logger.info(f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s)")
+        logger.info(
+            f"Worker {self.worker_id} starting (queues={self.queues}, poll={self.poll_interval}s, "
+            f"pool={self.pool_settings.pool})"
+        )
 
         # Configure DB resilience (WAL mode, busy_timeout, statement_timeout, etc.)
         # from sqlery.core.db_resilience import configure_connection_resilience  # moved to top-level
@@ -902,9 +1091,15 @@ class WorkerProcess:
 
                     try:
                         job_start = time.monotonic()
-                        result = self._fork_and_execute(job)
+                        # Old: result = self._fork_and_execute(job)
+                        result = self._execute_claimed(job)
                         self.total_busy_seconds += time.monotonic() - job_start
                         self.jobs_processed += 1
+                        # Prefork parent: refresh its DB connection at the recycle rate.
+                        if self.pool_settings.pool == POOL_PREFORK and db_refresh_due(
+                            self.jobs_processed, self.pool_settings.db_reuse_max
+                        ):
+                            refresh_db_connections(force=True)
                         status = 'SUCCESS' if result.get('success') else 'FAILED'
                         sys.stderr.write(f"[{status}] Job #{job.id}\n")
                         sys.stderr.flush()
@@ -923,6 +1118,10 @@ class WorkerProcess:
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
+                    if is_connection_lost(e):
+                        # Stop claiming until the database answers again (#161).
+                        self._wait_for_database(e)
+                        continue
                     logger.exception(f"Worker {self.worker_id}: Unhandled error in main loop")
                     # Reset DB connections in case they're corrupted
                     self.executor._reset_db_connections()
@@ -932,6 +1131,7 @@ class WorkerProcess:
         except KeyboardInterrupt:
             logger.info(f"Worker {self.worker_id} interrupted")
         finally:
+            self._stop_pool_child()
             # Phase 18: close LISTEN connection on graceful shutdown.
             self._close_listen_conn()
             try:
@@ -955,6 +1155,10 @@ class WorkerProcess:
 
         return self.jobs_processed
 
+    # Reconnect attempts made for an outcome after shutdown was requested.
+    SHUTDOWN_RECONNECT_ATTEMPTS = 3
+    # How long shutdown waits for an idle prefork child to exit before killing it.
+    POOL_CHILD_STOP_SECONDS = 2.0  # under WorkerPoolManager's 5 s SIGTERM -> SIGKILL
     # Parent wait-loop tick bounds (seconds) in _fork_and_execute.
     WAIT_TICK_MIN = 0.005
     WAIT_TICK_MAX = 0.5
@@ -980,18 +1184,21 @@ class WorkerProcess:
         """Fork a child process to execute the job.
 
         Parent waits for child via waitpid, enforces two-layer timeout,
-        reads final result from DB (no pipe IPC).
+        reads final result from DB. The only pipe carries an outcome the child could not
+        persist because its DB connection was lost (#161).
         Returns dict with 'success', 'output'/'error'/'traceback'.
         """
-        # from ..compat import get_config  # moved to top-level
-        timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
         job_id = job.id
 
+        # The child sends an outcome it could not persist (DB connection lost) here.
+        outcome_r, outcome_w = os.pipe()
         child_pid = self._fork_ctx.fork()
 
         if child_pid == 0:
             # === CHILD PROCESS ===
             try:
+                os.close(outcome_r)
+                self.executor.outcome_fd = outcome_w
                 try:
                     os.setpgrp()
                 except OSError:
@@ -1006,8 +1213,50 @@ class WorkerProcess:
             os._exit(0)
 
         # === PARENT PROCESS ===
-        self.child_pid = child_pid
+        os.close(outcome_w)
         logger.info(f"Forked child PID {child_pid} for job {job_id}")
+
+        def poll():
+            self._receive_handed_over(outcome_r)
+            done, exit_code = self._poll_forked_child(child_pid)
+            if done:
+                self._receive_handed_over(outcome_r)  # written just before the child exited
+            return done, exit_code
+
+        try:
+            return self._await_child(job, child_pid, poll)
+        finally:
+            os.close(outcome_r)
+
+    def _receive_handed_over(self, fd: int) -> None:
+        """Fork pool: pick up an outcome the child handed over, if one is waiting."""
+        readable, _, _ = select.select([fd], [], [], 0)
+        if readable:
+            outcome = read_frame(fd)  # None at EOF (the child exited without one)
+            if outcome is not None:
+                self._handed_over = outcome
+
+    @staticmethod
+    def _poll_forked_child(child_pid: int) -> tuple[bool, int | None]:
+        """Fork pool: the job is over once its child has exited; returns (done, exit code)."""
+        try:
+            pid, status = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            return True, 1  # child already reaped
+        if pid != 0:
+            return True, os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+        return False, None
+
+    def _await_child(self, job, child_pid: int, poll) -> dict:
+        """Wait for ``child_pid`` to finish ``job`` while heartbeating, then read the outcome.
+
+        ``poll()`` returns ``(done, exit_code)``. Enforces the parent safety-net timeout and
+        revoke requests by killing the child's process group. Shared by both pools.
+        """
+        timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
+        job_id = job.id
+        self.child_pid = child_pid
+        self._handed_over = None
 
         try:
             self.backend.update_job_child_pid(
@@ -1054,17 +1303,9 @@ class WorkerProcess:
         slept_since_duties = 0.0
 
         while not child_exited:
-            try:
-                pid, status = os.waitpid(child_pid, os.WNOHANG)
-            except ChildProcessError:
-                # Child already reaped
-                child_exited = True
-                exit_status = 1
-                break
-
-            if pid != 0:
-                child_exited = True
-                exit_status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            # Old: inline os.waitpid(child_pid, os.WNOHANG); now per-pool (_poll_forked_child)
+            child_exited, exit_status = poll()
+            if child_exited:
                 break
 
             # Check timeout — parent safety net fires after timeout + 60s
@@ -1158,14 +1399,33 @@ class WorkerProcess:
         # close+reopen is skipped for it (#127); a read error still resets and retries.
         # Old: self.executor._reset_db_connections()
         # Old: refreshed = self.backend.get_job_by_id(job_id)
-        if time.monotonic() - start_time >= self.FRESH_CONN_WAIT_SECONDS:
+        # The prefork parent keeps its connection across jobs: it is refreshed at the
+        # recycle rate (WORKER_DB_REUSE_MAX) instead.
+        if (
+            self.pool_settings.pool == POOL_FORK
+            and time.monotonic() - start_time >= self.FRESH_CONN_WAIT_SECONDS
+        ):
             self.executor._reset_db_connections()
-        try:
-            refreshed = self.backend.get_job_by_id(job_id)
-        except Exception as e:
-            logger.warning(f"Reading job {job_id} result failed ({e}); reconnecting")
-            self.executor._reset_db_connections()
-            refreshed = self.backend.get_job_by_id(job_id)
+        # The child lost its DB connection while recording the outcome: the supervisor
+        # reconnects and persists it. The job itself is never run again for this.
+        handed_over, self._handed_over = self._handed_over, None
+        if handed_over is not None:
+            self._with_reconnect(
+                lambda: self.executor.persist_outcome(handed_over), f"persisting job {job_id}"
+            )
+
+        def read_result():
+            try:
+                return self.backend.get_job_by_id(job_id)
+            except Exception as e:
+                if is_connection_lost(e):
+                    raise  # _with_reconnect backs off and reconnects
+                logger.warning(f"Reading job {job_id} result failed ({e}); reconnecting")
+                self.executor._reset_db_connections()
+                return self.backend.get_job_by_id(job_id)
+
+        # Old: refreshed = self.backend.get_job_by_id(job_id), reset + one retry on error
+        refreshed = self._with_reconnect(read_result, f"reading job {job_id} result")
         if refreshed and refreshed.status == 'success':
             return {'success': True, 'output': refreshed.output or ''}
         elif refreshed and refreshed.status in ('failed', 'archived'):
@@ -1186,6 +1446,221 @@ class WorkerProcess:
             except Exception as e:
                 logger.error(f"Failed to mark crashed job {job_id}: {e}")
             return {'success': False, 'error': f'Child exited with status {exit_status}'}
+
+    def _wait_for_database(self, error: BaseException) -> bool:
+        """Database unreachable: claim nothing, reconnect with backoff and jitter until it is.
+
+        Every attempt discards the old connections entirely and probes with a new one.
+        Returns False when shutdown was requested first.
+        """
+        logger.error(
+            f"Worker {self.worker_id}: database connection lost ({error}); "
+            f"not claiming new jobs until it is back"
+        )
+        base, cap = reconnect_backoff_settings()
+        attempt = 0
+        while not self.shutdown_requested:
+            discard_connections()
+            self._sleep_unless_shutdown(reconnect_delay(attempt, base, cap))
+            attempt += 1
+            if self.shutdown_requested:
+                break
+            try:
+                probe_database()
+            except Exception as e:
+                logger.warning(f"Worker {self.worker_id}: reconnect attempt {attempt} failed: {e}")
+                continue
+            logger.info(f"Worker {self.worker_id}: database reachable again, resuming claims")
+            return True
+        return False
+
+    def _with_reconnect(self, fn, what: str):
+        """Run ``fn``; on a lost connection, discard it, back off with jitter and retry.
+
+        Other errors propagate. After shutdown is requested it gives up after
+        SHUTDOWN_RECONNECT_ATTEMPTS more tries (the job's attempt then stays open and
+        recovery settles it).
+        """
+        base, cap = reconnect_backoff_settings()
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as e:
+                if not is_connection_lost(e):
+                    raise
+                if self.shutdown_requested and attempt >= self.SHUTDOWN_RECONNECT_ATTEMPTS:
+                    logger.error(f"Worker {self.worker_id}: gave up {what} on shutdown: {e}")
+                    raise
+                delay = reconnect_delay(attempt, base, cap)
+                attempt += 1
+                logger.warning(
+                    f"Worker {self.worker_id}: DB connection lost while {what} ({e}); "
+                    f"reconnecting in {delay:.2f}s (attempt {attempt})"
+                )
+                discard_connections()
+                time.sleep(delay)
+
+    def _sleep_unless_shutdown(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self.shutdown_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.2))
+            self._check_heartbeat()
+
+    def _execute_claimed(self, job) -> dict:
+        """Run a claimed job in the configured pool (WORKER_POOL, #161)."""
+        if self.pool_settings.pool == POOL_PREFORK:
+            return self._prefork_execute(job)
+        return self._fork_and_execute(job)
+
+    def _prefork_execute(self, job) -> dict:
+        """Hand ``job`` to the long-lived pool child, starting one if needed, and wait for it.
+
+        A job that cannot be pickled runs in a per-job fork instead.
+        """
+        try:
+            payload = encode_frame(job)
+        except Exception as e:
+            logger.warning(f"Job {job.id} cannot be sent to the prefork child ({e}); forking it")
+            return self._fork_and_execute(job)
+        pool = self._ensure_pool_child()
+        try:
+            write_all(pool.job_fd, payload)
+        except BrokenPipeError:
+            # The idle child died (e.g. killed from outside): start a fresh one, once.
+            self._stop_pool_child()
+            pool = self._ensure_pool_child()
+            write_all(pool.job_fd, payload)
+        logger.info(f"Sent job {job.id} to prefork child PID {pool.pid}")
+        try:
+            return self._await_child(job, pool.pid, lambda: self._poll_pool_child(pool))
+        finally:
+            if pool.recycling or not self._pool_child_alive(pool):
+                self._stop_pool_child()
+
+    def _poll_pool_child(self, pool: "_PoolChild") -> tuple[bool, int | None]:
+        """Prefork pool: the job is over once the child reports it, or once the child dies."""
+        readable, _, _ = select.select([pool.result_fd], [], [], 0)
+        if readable:
+            report = read_frame(pool.result_fd)  # None at EOF: the child died
+            if report is not None:
+                exit_code, pool.recycling, self._handed_over = report
+                return True, exit_code
+        done, exit_code = self._poll_forked_child(pool.pid)
+        if done:
+            pool.reaped = True
+        return done, exit_code
+
+    @staticmethod
+    def _pool_child_alive(pool: "_PoolChild") -> bool:
+        if pool.reaped:
+            return False
+        try:
+            pid, _ = os.waitpid(pool.pid, os.WNOHANG)
+        except ChildProcessError:
+            pid = pool.pid  # already reaped, e.g. by _kill_child
+        if pid != 0:
+            pool.reaped = True
+        return not pool.reaped
+
+    def _ensure_pool_child(self) -> "_PoolChild":
+        """The running prefork child, forking a new one when there is none.
+
+        Forking runs the fork-safety hooks, so the parent's DB connections are also
+        refreshed whenever the child is recycled.
+        """
+        if self._pool_child is not None and self._pool_child_alive(self._pool_child):
+            return self._pool_child
+        self._stop_pool_child()
+        job_r, job_w = os.pipe()
+        result_r, result_w = os.pipe()
+        child_pid = self._fork_ctx.fork()
+        if child_pid == 0:
+            # === PREFORK CHILD ===
+            exit_code = 1
+            try:
+                os.close(job_w)
+                os.close(result_r)
+                exit_code = self._pool_child_main(job_r, result_w)
+            except BaseException:
+                pass  # e.g. a task's SystemExit: leave, the parent sees a crash
+            os._exit(exit_code)
+        os.close(job_r)
+        os.close(result_w)
+        self._pool_child = _PoolChild(pid=child_pid, job_fd=job_w, result_fd=result_r)
+        logger.info(f"Worker {self.worker_id}: started prefork child PID {child_pid}")
+        return self._pool_child
+
+    def _pool_child_main(self, job_fd: int, result_fd: int) -> int:
+        """Prefork child loop: run each job the parent sends until recycled or told to stop.
+
+        Each report to the parent is a frame ``(exit code, recycle, unpersisted)``: whether
+        this child exits now (WORKER_MAX_TASKS_PER_CHILD / WORKER_MAX_MEMORY_PER_CHILD
+        reached), and an outcome it could not write because its DB connection was lost.
+        """
+        try:
+            os.setpgrp()  # timeout/revoke kill this group: the child and the job's subprocesses
+        except OSError:
+            pass
+        # The parent's handlers came through the fork; an idle child just dies on a signal.
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
+            signal.signal(signum, signal.SIG_DFL)
+        settings = self.pool_settings
+        jobs_done = 0
+        while True:
+            job = read_frame(job_fd)
+            if job is None:
+                return 0  # the parent closed the pipe: shutdown
+            # Like Celery's task_prerun: drop a connection that went stale while idle.
+            refresh_db_connections(force=False)
+            exit_code = self.executor.run_job_in_child(job)
+            jobs_done += 1
+            # Like Celery: the job always completes, then the limits decide.
+            used_kib = max_rss_kib() if settings.max_memory_per_child else None
+            if settings.max_memory_per_child and not used_kib:
+                logger.error("Prefork child unable to determine memory usage")
+            recycle = should_recycle(
+                jobs_done, settings.max_tasks_per_child, used_kib, settings.max_memory_per_child
+            )
+            limit_kib = settings.max_memory_per_child
+            if recycle and used_kib and limit_kib and used_kib > limit_kib:
+                logger.warning(
+                    f"Prefork child PID {os.getpid()} exiting after exceeding memory limit "
+                    f"({used_kib}KiB / {limit_kib}KiB)"
+                )
+            elif recycle:
+                logger.info(
+                    f"Prefork child PID {os.getpid()} exiting after {jobs_done} jobs "
+                    f"(WORKER_MAX_TASKS_PER_CHILD)"
+                )
+            if not recycle:
+                refresh_db_connections(force=db_refresh_due(jobs_done, settings.db_reuse_max))
+            write_all(result_fd, encode_frame((exit_code, recycle, self.executor.unpersisted)))
+            if recycle:
+                return 0
+
+    def _stop_pool_child(self) -> None:
+        """Close the pipes to the prefork child; an idle child then exits. Reaps it."""
+        pool, self._pool_child = self._pool_child, None
+        if pool is None:
+            return
+        for fd in (pool.job_fd, pool.result_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pool.reaped:
+            return
+        deadline = time.monotonic() + self.POOL_CHILD_STOP_SECONDS
+        while time.monotonic() < deadline:
+            if not self._pool_child_alive(pool):
+                return
+            time.sleep(0.01)
+        logger.warning(f"Prefork child PID {pool.pid} did not exit; killing it")
+        self._kill_child(pool.pid)
 
     def _kill_child(self, pid: int):
         """Kill a child process group: SIGTERM, wait, then SIGKILL.

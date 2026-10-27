@@ -1,5 +1,6 @@
 """Django-agnostic daemon process management."""
 
+from sqlery.core.pool import worker_concurrency
 import os
 import re
 import socket
@@ -232,6 +233,8 @@ class DaemonManager:
         Returns:
             True if process exists, False otherwise
         """
+        if not pid or pid <= 0:
+            return False  # os.kill(0 or -n, 0) would test a process group, not a process
         try:
             # Send signal 0 - doesn't kill, just checks if process exists
             os.kill(pid, 0)
@@ -460,7 +463,7 @@ class DaemonManager:
         # Get configuration
         check_interval = get_config("DAEMON_CHECK_INTERVAL", 10)
         if max_workers is None:
-            max_workers = get_config("MAX_WORKERS_PER_NODE", 1)
+            max_workers = worker_concurrency()
         queues = get_config("WORKER_QUEUES", ["default"])
 
         # Initialize components
@@ -825,6 +828,10 @@ class DaemonManager:
                 logger.info(f"Stopped {stopped} workers")
             except Exception as e:
                 logger.error(f"Error stopping workers: {e}")
+            try:
+                worker_pool.close()  # the worker launcher (#163)
+            except Exception as e:
+                logger.error(f"Error stopping the worker launcher: {e}")
 
             # Release queue leases on clean shutdown
             try:
@@ -1175,7 +1182,14 @@ class DaemonManager:
                 continue
 
             # Only manage workers on this node (skip daemon rows and other nodes)
-            if w_node != self.node_id or w_pid <= 0:
+            # Old: if w_node != self.node_id or w_pid <= 0: — the daemon's own heartbeat row
+            # ("daemon_<node>", its PID) matched, and SIGUSR1 killed the daemon (#163).
+            if (
+                w_node != self.node_id
+                or w_pid <= 0
+                or w_pid == os.getpid()
+                or str(w_id).startswith("daemon_")
+            ):
                 continue
 
             if self.is_process_running(w_pid):
