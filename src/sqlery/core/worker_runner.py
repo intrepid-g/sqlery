@@ -36,10 +36,21 @@ def main():
             # Django bootstrap — no-op in standalone mode
             pass
 
-    from sqlery.compat import get_config, initialize, is_standalone_mode
+    from sqlery.compat import initialize, is_standalone_mode
 
     if is_standalone_mode() and os.environ.get("SQLERY_DATABASE_URL"):
         initialize(database_url=os.environ["SQLERY_DATABASE_URL"], enable_daemon=False)
+
+    run_worker()
+
+
+def run_worker():
+    """Configure logging and run one worker until it is told to stop.
+
+    Called by main() in a fresh interpreter (WORKER_START_METHOD="spawn") and, with Django
+    or the database already set up, in a worker forked by the launcher ("fork", #163).
+    """
+    from sqlery.compat import get_config
 
     # Configure logging after Django/standalone setup so compat layer works.
     from sqlery.core.log_config import configure_logging

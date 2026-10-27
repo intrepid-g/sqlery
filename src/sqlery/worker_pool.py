@@ -1,5 +1,6 @@
 """Worker pool management for spawning and monitoring workers."""
 
+from sqlery.core.pool import worker_concurrency
 import os
 import signal
 import sys
@@ -17,7 +18,7 @@ from sqlery.django_sqlery.worker_registry import (
 )
 # from sqlery.django_sqlery.worker_claiming import get_node_id  # Promoted to core
 from sqlery.core.claiming import get_node_id
-from sqlery.django_sqlery.settings import get_setting
+# Old: from sqlery.django_sqlery.settings import get_setting  (-> worker_concurrency)
 
 
 def spawn_worker():
@@ -70,7 +71,7 @@ def ensure_worker_pool():
         dict: Status information about workers spawned/cleaned
     """
     node_id = get_node_id()
-    max_workers = get_setting("MAX_WORKERS_PER_NODE", 1)
+    max_workers = worker_concurrency()
 
     # Clean up dead workers first
     dead_count = cleanup_dead_workers(node_id)
@@ -151,7 +152,7 @@ def get_worker_pool_status(node_id=None):
     if node_id is None:
         node_id = get_node_id()
 
-    max_workers = get_setting("MAX_WORKERS_PER_NODE", 1)
+    max_workers = worker_concurrency()
 
     workers = Worker.objects.filter(node_id=node_id)
 

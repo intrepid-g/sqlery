@@ -16,6 +16,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from ..compat import get_backend, get_config, is_django_mode
+from .launcher import START_FORK, WorkerLauncher, load_start_method
 from .log_config import is_debug_mode
 
 try:
@@ -56,7 +57,14 @@ class WorkerPoolManager:
         self.max_workers = max_workers
         self.queues = queues
         self.node_id = self._get_node_id()
-        self._child_processes: list[subprocess.Popen] = []  # Track spawned workers for reaping
+        self._child_processes: list = []  # Popen / LaunchedWorker handles, for reaping
+        self._launcher: WorkerLauncher | None = None  # started on the first forked worker
+
+    def close(self) -> None:
+        """Stop the worker launcher, if one was started (workers are stopped separately)."""
+        if self._launcher is not None:
+            self._launcher.close()
+            self._launcher = None
 
     def _get_node_id(self) -> str:
         """Get unique node identifier.
@@ -89,9 +97,27 @@ class WorkerPoolManager:
         Creates a worker process that will process jobs from the configured queues.
         Registers the worker in the database for monitoring.
 
+        WORKER_START_METHOD="fork" (default, #163) has the preloaded launcher fork it;
+        "spawn", or a launcher failure, starts a fresh interpreter.
+
         Returns:
-            subprocess.Popen instance of the spawned worker
+            subprocess.Popen (spawn) or LaunchedWorker (fork) handle of the worker
         """
+        if load_start_method() == START_FORK:
+            try:
+                if self._launcher is None:
+                    stdout_path = (
+                        str(self._get_log_dir() / f'sqlery_worker_{os.getpid()}.log')
+                        if is_debug_mode() else None
+                    )
+                    self._launcher = WorkerLauncher(stdout_path=stdout_path)
+                worker = self._launcher.spawn(self.queues)
+                logger.info(f"Forked worker process: PID {worker.pid}")
+                self._child_processes.append(worker)
+                return worker
+            except Exception as e:
+                logger.error(f"Forking a worker failed ({e}); starting a fresh interpreter")
+
         # Debug mode: redirect stdout to raw log file (grows forever).
         # Normal mode: subprocess configures its own RotatingFileHandler; parent
         # sends stdout to DEVNULL since the child manages its own logging.
@@ -391,6 +417,11 @@ class WorkerPoolManager:
             else:
                 continue
 
+            # PID 0 is the daemon's own heartbeat row, and os.kill(0, sig) would signal the
+            # caller's whole process group (the daemon, its shell, a test runner) (#163).
+            if not pid or pid <= 0 or pid == os.getpid():
+                continue
+
             # Send signal to process
             try:
                 os.kill(pid, sig)
@@ -535,6 +566,9 @@ class WorkerPoolManager:
             True if process was killed, False if already dead or error
         """
         # import time  # moved to top-level
+
+        if not pid or pid <= 0 or pid == os.getpid():
+            return False  # never a process group or the caller itself (#163)
 
         try:
             # Check if process exists

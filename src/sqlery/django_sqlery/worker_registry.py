@@ -1,5 +1,6 @@
 """Worker registration and lifecycle management."""
 
+from sqlery.core.pool import worker_concurrency
 import logging
 import os
 import signal
@@ -221,7 +222,7 @@ def should_spawn_worker(node_id=None):
     if node_id is None:
         node_id = get_node_id()
 
-    max_workers = get_setting("MAX_WORKERS_PER_NODE", 1)
+    max_workers = worker_concurrency()
     current_count = count_active_workers(node_id)
 
     return current_count < max_workers

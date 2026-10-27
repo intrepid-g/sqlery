@@ -3,6 +3,7 @@
 Updated in v0.11.0 to use core.daemon.DaemonManager.
 """
 
+from sqlery.core.pool import add_pool_arguments, export_pool_arguments, worker_concurrency
 from django.core.management.base import BaseCommand
 from sqlery.core.daemon import DaemonManager
 from sqlery.core.worker_pool import WorkerPoolManager
@@ -25,11 +26,13 @@ class Command(BaseCommand):
             help='Force stop daemon (SIGKILL instead of SIGTERM)',
         )
         parser.add_argument(
-            '--workers', '-w',
+            '--workers', '-w', '--concurrency', '-c',
+            dest='workers',
             type=int,
             default=None,
-            help='Number of worker subprocess processes to maintain (default: 1)',
+            help='Number of worker processes to maintain (default: number of CPUs)',
         )
+        add_pool_arguments(parser)
         parser.add_argument(
             '--once',
             action='store_true',
@@ -45,6 +48,7 @@ class Command(BaseCommand):
 
         max_workers = options.get('workers')
         once = options.get('once', False)
+        export_pool_arguments(options)  # spawned workers inherit them
 
         if action == 'start':
             self.start_daemon(max_workers=max_workers, once=once)
@@ -99,7 +103,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING("⚠ Daemon is NOT running"))
 
         # Show worker pool status
-        max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+        max_workers = worker_concurrency()
         queues = get_setting('WORKER_QUEUES', ['default'])
 
         self.stdout.write("\n=== Worker Pool Status ===\n")

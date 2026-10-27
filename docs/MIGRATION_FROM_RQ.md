@@ -222,6 +222,16 @@ python manage.py workers list
 python manage.py workers stop
 ```
 
+RQ forks a work horse for every job. sqlery's default pool is Celery-style prefork: each worker
+keeps one child that runs many jobs. For RQ's per-job isolation (a leak or module-level state
+never outlives its job), set:
+
+```python
+DJANGO_SQL_JOBS = {"WORKER_POOL": "fork"}   # or WORKER_MAX_TASKS_PER_CHILD to recycle every N jobs
+```
+
+See [Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job).
+
 ### Step 6: Migrate Scheduled Jobs (from rq-scheduler)
 
 **RQ scheduler:**

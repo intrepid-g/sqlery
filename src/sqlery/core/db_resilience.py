@@ -332,3 +332,135 @@ def _configure_postgresql(connection, get_setting, for_job_child: bool = False):
                 logger.info("PostgreSQL %s set to: %dms", guc, ms)
     except Exception as exc:
         logger.warning("Failed to configure PostgreSQL resilience: %s", exc)
+
+
+# --- Connection loss (#161) ---------------------------------------------------
+# A lost connection is discarded entirely and reopened with exponential backoff and
+# jitter. Workers never re-run a job because its connection failed: the supervisor
+# (the worker parent) persists an outcome the child could not write, and stops
+# claiming while the database stays unreachable.
+
+try:
+    import psycopg as _psycopg
+except ImportError:  # pragma: no cover - SQLite-only installs
+    _psycopg = None
+
+try:
+    from django.db.utils import InterfaceError as _django_InterfaceError
+except ImportError:  # pragma: no cover
+    _django_InterfaceError = None
+
+# SQLSTATE class 08 (connection exception) and the server-shutdown codes of class 57.
+_CONNECTION_LOST_SQLSTATES = ("57P01", "57P02", "57P03")
+
+_CONNECTION_LOST_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"server closed the connection",
+        r"connection already closed",
+        r"the connection is (lost|closed)",
+        r"SSL connection has been closed unexpectedly",
+        r"could not connect to server",
+        r"connection to server .* failed",
+        r"connection refused",
+        r"terminating connection due to administrator command",
+        r"consuming input failed",
+        r"no connection to the server",
+        r"connection reset by peer",
+        r"broken pipe",
+    )
+]
+
+
+def is_connection_lost(exc: BaseException | None) -> bool:
+    """Whether ``exc`` (or an exception it was raised from) means the DB connection is gone.
+
+    Statement-level errors (lock or statement timeouts, deadlocks, constraint violations,
+    SQLite's "database is locked") are not connection loss: the connection still works.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if getattr(exc, "connection_invalidated", False):  # SQLAlchemy DBAPIError
+            return True
+        if _django_InterfaceError is not None and isinstance(exc, _django_InterfaceError):
+            return True
+        if _psycopg is not None and isinstance(exc, _psycopg.InterfaceError):
+            return True
+        if _psycopg is not None and isinstance(exc, _psycopg.OperationalError):
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate is None or sqlstate.startswith("08") or (
+                sqlstate in _CONNECTION_LOST_SQLSTATES
+            ):
+                return True
+        if any(pattern.search(str(exc)) for pattern in _CONNECTION_LOST_PATTERNS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def reconnect_delay(attempt: int, base: float = 0.5, cap: float = 30.0, rng=None) -> float:
+    """Seconds before reconnect ``attempt`` (0-based): exponential, capped, full jitter."""
+    import random
+
+    ceiling = min(float(cap), float(base) * (2 ** min(attempt, 32)))
+    return (rng or random.random)() * ceiling
+
+
+def reconnect_backoff_settings() -> tuple[float, float]:
+    """``(DB_RECONNECT_BACKOFF_BASE, DB_RECONNECT_BACKOFF_MAX)`` in seconds."""
+    try:
+        base = float(_get_setting("DB_RECONNECT_BACKOFF_BASE", 0.5))
+        cap = float(_get_setting("DB_RECONNECT_BACKOFF_MAX", 30.0))
+    except (TypeError, ValueError):
+        return 0.5, 30.0
+    return max(base, 0.001), max(cap, 0.001)
+
+
+def discard_connections() -> None:
+    """Drop every DB connection of this process without reusing any of it.
+
+    Django connections are closed (a close that fails on a dead socket is ignored);
+    the SQLAlchemy pool is disposed, so the next query opens a new connection.
+    """
+    if _django_connections is not None:
+        try:
+            from django.conf import settings
+
+            configured = settings.configured
+        except Exception:
+            configured = False
+        if configured:
+            for conn in _django_connections.all(initialized_only=True):
+                try:
+                    conn.close()
+                except Exception:
+                    conn.connection = None
+    try:
+        from sqlery.fastapi_sqlery import database
+
+        if database._engine is not None:
+            database._engine.dispose()
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.debug("Disposing the SQLAlchemy pool failed: %s", exc)
+
+
+def probe_database() -> None:
+    """Open a connection and run ``SELECT 1``; raises when the database is unreachable."""
+    try:
+        from sqlery.fastapi_sqlery import database
+
+        engine = database._engine
+    except ImportError:
+        engine = None
+    if engine is not None:
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return
+    if _django_connection is not None:
+        with _django_connection.cursor() as cursor:
+            cursor.execute("SELECT 1")

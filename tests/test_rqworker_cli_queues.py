@@ -12,8 +12,11 @@ from unittest import mock
 from sqlery.core import worker_pool
 
 
-def test_spawn_worker_passes_pool_queues_in_env():
+def test_spawn_worker_passes_pool_queues_in_env(monkeypatch):
     from sqlery.core.worker_pool import WORKER_QUEUES_ENV, WorkerPoolManager
+
+    # A fresh interpreter (spawn) gets the queues in its env; forked workers: #163 tests.
+    monkeypatch.setenv("SQLERY_WORKER_START_METHOD", "spawn")
 
     pool = WorkerPoolManager(1, ["reports", "other"], backend=mock.Mock())
     with mock.patch.object(worker_pool.subprocess, "Popen") as popen:

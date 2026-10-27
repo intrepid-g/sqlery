@@ -255,6 +255,124 @@ async def main():
 asyncio.run(main())
 ```
 
+### Worker Pool: prefork or fork-per-job
+
+`WorkerProcess` (what `sqlery-worker`, the daemon's pool and `manage.py daemon` run) never
+executes a job in its own process. The parent claims jobs, heartbeats, renews leases, polls
+revokes and enforces the timeout. `WORKER_POOL` decides what kind of child runs the job (#161):
+
+| | `"prefork"` (default) | `"fork"` |
+| --- | --- | --- |
+| Modelled on | Celery's default `prefork` pool | RQ's work horse |
+| Child process | One long-lived child per worker runs job after job | A new child is forked for every job |
+| Recycled | After `WORKER_MAX_TASKS_PER_CHILD` jobs, or once its max RSS passes `WORKER_MAX_MEMORY_PER_CHILD` KiB (both default `None` = never, as in Celery) | After every job |
+| Cost per job | Two pipe writes. Modules imported by a task and DB connections stay warm | A fork, a fresh DB connection in the child, and the parent reconnects |
+| Isolation | Memory a task leaks stays until the child is recycled; module-level state carries over between jobs | Complete |
+| Hard timeout, revoke, crash | The child's process group is killed and the next job gets a fresh child | The child's process group is killed |
+
+```python
+DJANGO_SQL_JOBS = {
+    "WORKER_POOL": "prefork",              # or "fork" for RQ semantics
+    "WORKER_MAX_TASKS_PER_CHILD": None,    # e.g. 1000 to bound leaks; 1 behaves like "fork"
+    "WORKER_MAX_MEMORY_PER_CHILD": None,   # KiB, e.g. 200_000
+    "WORKER_DB_REUSE_MAX": None,           # None = same as WORKER_MAX_TASKS_PER_CHILD
+}
+```
+
+Standalone mode reads the same keys from `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MAX_TASKS_PER_CHILD`,
+`SQLERY_WORKER_MAX_MEMORY_PER_CHILD` and `SQLERY_WORKER_DB_REUSE_MAX`.
+
+**DB connections follow the recycle rate.** With prefork, the child and the parent keep their
+connections across jobs and force-refresh them every `WORKER_DB_REUSE_MAX` jobs. Left unset,
+that is `WORKER_MAX_TASKS_PER_CHILD`, so connections are renewed when the child is. When neither
+is set (Celery's defaults), connections are never force-closed. Around each job, Django
+connections that are unusable or older than `CONN_MAX_AGE` are closed, which is what Celery's
+Django fixup does (with Django's default `CONN_MAX_AGE = 0` that means a connection per job;
+raise `CONN_MAX_AGE` to reuse it). SQLAlchemy connections are left to `pool_pre_ping` and
+`POOL_RECYCLE`. The fork pool keeps its old per-job behaviour and ignores `WORKER_DB_REUSE_MAX`.
+
+**Losing the database connection.** Both pools handle it the same way:
+
+- A lost connection is discarded entirely (Django connections closed, the SQLAlchemy pool
+  disposed), never reused. Statement errors such as a lock timeout or a deadlock don't count
+  as connection loss.
+- Reconnection uses exponential backoff with full jitter: a random delay up to
+  `DB_RECONNECT_BACKOFF_BASE * 2**attempt` seconds, capped at `DB_RECONNECT_BACKOFF_MAX`
+  (defaults `0.5` and `30`).
+- A job is never re-run because a connection failed. If the task itself fails on it, the job
+  fails like any other error, and only its own retry policy (`max_retries`, `autoretry_for`)
+  can run it again.
+- If the child loses its connection while recording a finished job's outcome, it hands the
+  outcome to the worker parent (the supervisor). The parent reconnects and persists it, still
+  fenced against the job's attempt and creating the retry if one is due. Success and failure
+  callbacks are task code, so they don't run in that case.
+- While the database stays unreachable, the worker claims nothing new and only probes for a
+  connection. A job that is already running continues; heartbeat, lease and revoke-poll
+  failures are logged, and the outcome is persisted once the database is back. On shutdown
+  the parent stops retrying after a few attempts; the job's attempt then stays open and
+  recovery settles it.
+
+**Concurrency.** A worker runs one job at a time. `MAX_WORKERS_PER_NODE` (Celery's
+`worker_concurrency`) sets how many run per node. Unset, it is the number of CPUs, as in Celery,
+except that sqlery caps it to the CPUs the process may use (CPU affinity and a container's
+cgroup CPU quota). A 2-CPU container on a 64-core host gets 2 workers, not 64.
+
+**Setting the options.** Every option has a Celery default and can be set in four places;
+the first one set wins:
+
+| Where | Pool / recycling | Concurrency |
+| --- | --- | --- |
+| `WorkerProcess(...)` arguments | `pool=`, `max_tasks_per_child=`, `max_memory_per_child=`, `db_reuse_max=` | n/a |
+| CLI flags | `--pool/-P`, `--max-tasks-per-child`, `--max-memory-per-child`, `--db-reuse-max` on `manage.py daemon start`, `manage.py rqworker`, `sqlery daemon start`, `sqlery worker run` | `--concurrency/-c` (`--workers/-w` on the Django commands) |
+| Environment | `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MAX_TASKS_PER_CHILD`, `SQLERY_WORKER_MAX_MEMORY_PER_CHILD`, `SQLERY_WORKER_DB_REUSE_MAX` (both modes) | `SQLERY_WORKER_CONCURRENCY` |
+| Settings | `WORKER_POOL`, `WORKER_MAX_TASKS_PER_CHILD`, `WORKER_MAX_MEMORY_PER_CHILD`, `WORKER_DB_REUSE_MAX` | `MAX_WORKERS_PER_NODE` |
+
+A CLI flag is exported to the environment, so it also reaches the worker processes the daemon spawns.
+
+**Memory.** `WORKER_MAX_MEMORY_PER_CHILD` works like Celery's `worker_max_memory_per_child`.
+After each job the child compares its peak resident set size (`ru_maxrss`, KiB) with the limit.
+A job that pushes it over still completes, and then the child exits with a warning
+(`exiting after exceeding memory limit (NKiB / MKiB)`) and is replaced. If the RSS can't be
+read, an error is logged and the child is not recycled. The limit applies to the job child,
+not the worker parent, as in Celery.
+
+**How the daemon starts workers (`WORKER_START_METHOD`, #163).** With `"fork"` (the default),
+the daemon forks one *launcher* process. The launcher imports the task modules, drops every
+DB connection, freezes the garbage collector (`gc.freeze()`) and then forks each worker. So
+the workers share the interpreter, Django or SQLAlchemy and your task modules copy-on-write,
+as Celery's pool children share its main process. The launcher holds no DB connection, lease
+or scheduler state, so a worker inherits none of the daemon's. With `"spawn"`, each worker is
+a fresh interpreter (`python -m sqlery.core.worker_runner`), the behaviour before #163.
+
+| | `"fork"` (default) | `"spawn"` |
+| --- | --- | --- |
+| Memory | Shared copy-on-write; task modules loaded once | Each worker loads everything again |
+| Code after a deploy | What the daemon loaded: restart the daemon (as with Celery) | A respawned worker runs the code on disk |
+| Platforms | Needs `os.fork` | Everywhere |
+
+The launcher preloads `WORKER_PRELOAD_MODULES` (a list, or a comma-separated
+`SQLERY_WORKER_PRELOAD_MODULES`). Left unset in Django mode, it preloads the `tasks` module of
+every installed app that has one, which is what Celery's `app.autodiscover_tasks()` imports.
+`[]` preloads nothing. A module that fails to import is logged and skipped. Set the start method
+with `WORKER_START_METHOD`, `SQLERY_WORKER_START_METHOD` or `--start-method` on the daemon
+commands.
+
+Total memory of the daemon's process tree (PSS, so shared pages are counted once), with every
+worker running a job. Measured on Linux in standalone mode with SQLite (Python 3.13). "Heavy"
+is a task module that builds about 60 MiB of objects at import, standing in for pandas, a
+model or a large lookup table.
+
+| Workers | `spawn`, light tasks | `fork`, light tasks | `spawn`, heavy module | `fork`, heavy module |
+| --- | --- | --- | --- | --- |
+| 1 | 167 MiB | 136 MiB | 267 MiB | 241 MiB |
+| 2 | 245 MiB | 171 MiB | 444 MiB | 272 MiB |
+| 4 | 400 MiB | 236 MiB (-41%) | 799 MiB | 336 MiB (-58%) |
+
+Each extra worker costs about 33 MiB with `fork`, against about 78 MiB with `spawn`, or 178 MiB
+when every worker imports the heavy module itself. Memory a task allocates while it runs stays
+in its prefork child until the child is recycled. Set `WORKER_MAX_MEMORY_PER_CHILD` (or
+`WORKER_MAX_TASKS_PER_CHILD`) to bound it, exactly as with Celery.
+
 ---
 
 ## Job Options

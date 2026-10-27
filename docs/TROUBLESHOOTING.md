@@ -468,7 +468,7 @@ For MySQL/SQLite (not recommended for production):
 ```python
 # settings.py
 DJANGO_SQL_JOBS = {
-    'MAX_WORKERS_PER_NODE': 1,  # Single worker only without SKIP LOCKED
+    'MAX_WORKERS_PER_NODE': 1,  # Single worker only without SKIP LOCKED (default: CPU count)
 }
 ```
 

@@ -1,5 +1,6 @@
 """Async views for internal worker trigger endpoint."""
 
+from sqlery.core.pool import worker_concurrency
 import asyncio
 import functools
 import logging
@@ -802,7 +803,7 @@ def dashboard_stats(request):
                 task['scheduled_time'] = task['scheduled_time'].isoformat()
 
         # Worker statistics
-        max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+        max_workers = worker_concurrency()
         multi_worker_enabled = max_workers > 1
 
         # Get worker counts
