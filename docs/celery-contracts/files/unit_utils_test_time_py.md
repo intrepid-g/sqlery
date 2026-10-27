@@ -1,0 +1,70 @@
+### `t/unit/utils/test_time.py`
+
+Portable guarantee: every schedule, retry delay, timeout and "is it due yet" decision is computed on real elapsed time, correct across timezones and DST, with bad or odd input handled predictably.
+
+**Local timezone**
+- Run on a machine with no DST, then one with DST; expect: standard and DST offsets reported correctly, DST adjustment reported as none, a name and repr always available.
+- Convert a UTC time to a western-hemisphere zone (UTC-4) during DST; expect: the sign survives (12:00 UTC becomes 08:00 local, not +20:00).
+
+**Parsing timestamps**
+- Parse ISO timestamps with -01:00, +01:00 and Z; expect: offsets preserved, Z becomes UTC, an aware time round-trips equal.
+- Parse naive, Z, space-separated with milliseconds, and +04:00 strings; expect: matching datetimes. Pass a datetime instead of a string; expect: returned unchanged.
+
+**Durations and display**
+- Round a timestamp to day, hour or minute resolution depending on the delta size; expect: coarser delta gives coarser rounding.
+- Humanize 4 days down to 1 second, fractions, and 0; expect: singular/plural units, 2 decimals, "now" for 0, optional prefix honoured.
+- Give a delay as int, float or timedelta; expect: all normalised to the same duration type.
+
+**Time until next run (scheduler)**
+- Ask for time remaining on a relative schedule; expect: it works.
+- Last run in UTC but "now" in another zone, or two different non-UTC zones; expect: remaining is about one interval, zone mix does not skew it.
+- Last run in winter time, next run by calendar rule (10:00) after DST begins; expect: next run is 10:00 local, not shifted an hour.
+- Now and next run straddle a spring-forward gap (01:30 to 03:30); expect: remaining is real elapsed time (1 hour), not wall-clock (2 hours).
+- Clocks fall back (last run 02:59:55 first pass, now 02:00:05 second pass, 10 s interval); expect: 10 real seconds elapsed, so remaining is 0 and the task is due, not delayed an hour.
+
+**Timezone helpers**
+- Look up UTC by name, ask for default zone, convert aware or naive-UTC times to local (including fallback path); expect: always yields a usable local time.
+- Make a naive time aware with a standard zone or a ZoneInfo; expect: the zone is attached.
+- Schedule a time that does not exist (02:30 on spring-forward day); expect: moved forward to 03:30 daylight time, offset -4h.
+- Check nonexistent-time detection with an unsupported zone, or when the checker raises ValueError; expect: treated as a normal time, no crash.
+- Make "maybe aware": aware input left alone, naive defaults to UTC, naive with explicit zone uses that zone; expect: existing zone never overwritten.
+- Localize into a zone with no offset info, an ambiguous time (fall-back repeat), or an already-aware time; expect: no crash, same instant preserved, idempotent across equivalent zones.
+
+**Rate limits**
+- Parse rate strings: 999, 7.5, "2.5/s", "1456/s", "100/m", "10/h"; expect: normalised to per second.
+- Parse 0, None, "0/s", "0/m", "0/h", "0.0/s"; expect: 0 (no limit), never a divide error.
+
+**Relative-date rule object**
+- Print the rule; expect: readable repr.
+- Add it to an unsupported type; expect: not supported (NotImplemented), not a crash.
+
+**Machine UTC offset**
+- Compute offset with DST on and off; expect: always a value.
+- Whole-hour zone (UTC-5); expect: exactly 5.
+- Half-hour zone (UTC+5:30, with and without DST); expect: exactly -5.5, no flooring or truncating.
+- Quarter-hour zone (UTC+5:45); expect: exactly -5.75.
+
+**Retry backoff**
+- Retry 3 with factor 4, no jitter; expect: 32 seconds (factor times 2 to the power of retries).
+- Same with full jitter; expect: a random value within the range (never above the computed delay).
+- Delay grows beyond the maximum; expect: capped at the maximum.
+- Negative factor; expect: 0, never a negative wait.
+- Jitter with large retry count; expect: random range bounded by maximum + 1 exactly once.
+
+**Adding seconds to a time**
+- Add 90 minutes across spring-forward (01:30 EST); expect: 04:00 EDT, exactly 90 real minutes later.
+- Add 90 minutes across fall-back (01:30 first pass); expect: 02:00 standard, 90 real minutes later.
+- Start in the repeated hour's second pass, add 15 minutes; expect: 01:45, still second pass, 15 real minutes.
+- Naive datetime; expect: plain wall-clock addition.
+- Local zone, dateutil zone, fixed offset, UTC; expect: correct offset kept, elapsed always 90 minutes, fixed offset and UTC unaffected by DST dates.
+
+**Subtracting two times**
+- Both aware across spring-forward, fall-back, different zones, fixed offsets, same instant, dateutil zones; expect: real elapsed time (90 min, 1 h, 0).
+- End before start; expect: negative duration, not an error.
+- Both naive (positive, negative, same); expect: plain difference.
+- One naive, one aware (either side); expect: naive treated as UTC, result is real elapsed time.
+- A zone that returns no offset; expect: treated as naive.
+
+---
+
+_Generated by [Claude Code](https://claude.ai/code)_

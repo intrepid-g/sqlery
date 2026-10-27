@@ -1,0 +1,52 @@
+### `t/unit/utils/test_collections.py`
+
+Portable guarantees: layered settings, a bounded "seen/revoked job ids" set with expiry, and bounded pending-message buffers. No broker or job logic here.
+
+**Layered settings (overrides over defaults)**
+1. Set a value at runtime while a default exists; expect: the override is read, the default is untouched underneath.
+2. Same key in several default layers; expect: first layer wins, and overrides always beat defaults.
+3. Old-style and new-style names of one setting sit in different layers; expect: the earlier layer wins whichever naming it uses.
+4. Read a missing key; expect: KeyError naming the key (and its prefixed form). `get` with a default returns the default, no error.
+5. `setdefault` on an existing key leaves it alone; on a missing key sets it once.
+6. Legacy setting names are readable via the new names (and vice versa); membership checks agree with reads.
+7. Key normalisation (e.g. uppercasing) is applied consistently on read, membership, get, pop and setdefault, and only once (never doubled).
+8. `update` accepts a mapping, list of pairs, tuple of pairs, generator of pairs, or keyword args; all are recorded as overrides.
+9. Clear overrides; expect: defaults reappear, overrides gone. Length, iteration, keys, values, items merge all layers without duplicates (3 keys; 4 after adding one; 2 after clear).
+10. A config with no layers is falsy. Defaults can be added from a dict or from an object's attributes.
+11. Copy the config (0 to 4 default layers); expect: equal contents, independent overrides (changing the copy never changes the original), default layers shared by reference so a later default change shows in both, nested values shared, key conversion and prefix preserved.
+12. Register a change observer; expect: it fires on update with the changes; copies and separate configs never share observers.
+13. Swap one config with another; expect: it adopts the other's contents and key conversions.
+14. Attribute-style access: set by attribute or by key gives the same value; missing attribute raises AttributeError, missing key raises KeyError, `get` of a missing key returns None.
+
+**Bounded "seen job ids" set (dedupe / revoked ids)**
+15. Capacity 2, add 3 ids; expect: oldest evicted, newest 2 kept.
+16. Add 150 ids into capacity 10; expect: at most 10 kept and internal bookkeeping does not grow without bound.
+17. Shrink capacity then purge; expect: trimmed to the new size.
+18. Purge with entries past their expiry; expect: removed. Not yet expired; expect: kept. Expired but a minimum size is configured; expect: that minimum is retained.
+19. Several ids added with identical timestamps (even mixed types); expect: no comparing ids with each other, insertion order kept, oldest popped first.
+20. Timestamp zero is valid: stored, survives serialisation, still expires.
+21. Merge ids from another host's list; expect: stamped with local clock. Merge its set or dict; expect: original stamps kept.
+22. Equality: equals its serialise/deserialise round trip, differs from an empty set and from a plain set.
+23. Iterate; expect: insertion order. Pop; expect: oldest first, then None when empty.
+24. Discard a missing id; expect: no error. Discard a present id; expect: fully gone. Discard must not cause a neighbouring id to expire.
+25. Add the same id repeatedly (also thousands of times); expect: one entry and bookkeeping stays small.
+26. Re-add an old id; expect: expiry and recency refreshed, never evicted as "oldest", stale earlier entry cannot expire it, pop skips the stale entry.
+27. Update from another set; expect: capacity respected (newest kept), order preserved, source untouched. Works from set, dict or raw data, merge order does not change the result, init from a set works, later adds with equal timestamp order after.
+28. Clear; expect: empty.
+
+**Bounded pending-message buffers**
+29. Capacity 10, put 20; expect: 10 newest kept, first is item 10. Unbounded buffer keeps all 20. Same for bulk extend.
+30. Bulk-add far over capacity; expect: transiently over, then explicit evict brings it to capacity.
+31. Take from empty buffer; expect: given default returned, or Empty raised if none.
+32. Iterating drains the buffer; contains, index access, reversed and repr work.
+33. Per-key buffers with an overall cap: oldest evicted when over cap; per-buffer cap honoured; total count tracks evictions correctly.
+34. Regression: 1500 messages to one busy key with per-buffer cap 1000, plus 1 for another key; expect: total 1001, busy key holds 1000, the other key's pending message is not evicted early.
+35. Buffers seeded from initial data respect the cap, even when over by more than 100; values are wrapped as buffers.
+36. Take from an empty or unknown key; expect: default returned or Empty raised.
+
+**Error capture**
+37. Capture an in-flight exception; expect: string form equals the traceback, original exception and args retrievable, repr non-empty.
+
+---
+
+_Generated by [Claude Code](https://claude.ai/code)_
