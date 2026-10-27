@@ -18,7 +18,8 @@ is the queue, the result store and the scheduler.
 | `beat` solar | `solar:sunset 40.71 -74.00 -15m` | in the cron field |
 | Task rate limits / routing | tag limits + named queues | `TAG_RATE_LIMITS`, `TAG_CONCURRENCY_LIMITS` |
 | Priority queues | `priority=` | higher runs first |
-| Worker pool / prefork | fork-per-job `WorkerProcess` | crash isolation |
+| `--pool=prefork`, `worker_max_tasks_per_child`, `worker_max_memory_per_child` | `WORKER_POOL="prefork"`, `WORKER_MAX_TASKS_PER_CHILD`, `WORKER_MAX_MEMORY_PER_CHILD` | same defaults; `"fork"` = RQ's fork-per-job |
+| `CELERY_DB_REUSE_MAX` | `WORKER_DB_REUSE_MAX` | defaults to the child recycle rate |
 
 Not provided: exchanges and routing keys, Flower-style remote control (ping, pool grow/shrink,
 broadcast), per-task `prefetch` or autoscale, and a pluggable result backend (results live in
@@ -167,6 +168,11 @@ PostgreSQL it is serialised per tag.
 | --- | --- | --- |
 | `RETRY_BACKOFF_MAX` | none | cap on the retry delay (seconds) |
 | `RETRY_JITTER` | `False` | randomise the retry delay |
+| `WORKER_POOL` | `"prefork"` | `"fork"` forks a child per job (RQ) |
+| `WORKER_MAX_TASKS_PER_CHILD` | none | recycle the prefork child after N jobs |
+| `WORKER_MAX_MEMORY_PER_CHILD` | none | recycle it once its max RSS exceeds N KiB |
+| `WORKER_DB_REUSE_MAX` | none | force-refresh DB connections every N jobs (none = the recycle rate) |
+| `DB_RECONNECT_BACKOFF_BASE` / `_MAX` | `0.5` / `30` | reconnect backoff (seconds, full jitter) after a lost DB connection |
 | `REVOKE_POLL_INTERVAL` | `2.0` | seconds between terminate-flag checks (`0` disables) |
 | `LOG_TASK_ARGUMENTS` | `False` | log task argument values (they can contain secrets) |
 | `REQUIRE_BODY_SIGNATURE` | `False` | reject timestamp-only trigger signatures |

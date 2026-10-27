@@ -255,6 +255,66 @@ async def main():
 asyncio.run(main())
 ```
 
+### Worker Pool: prefork or fork-per-job
+
+`WorkerProcess` (what `sqlery-worker`, the daemon's pool and `manage.py daemon` run) never
+executes a job in its own process. The parent claims jobs, heartbeats, renews leases, polls
+revokes and enforces the timeout. `WORKER_POOL` decides what kind of child runs the job (#161):
+
+| | `"prefork"` (default) | `"fork"` |
+| --- | --- | --- |
+| Modelled on | Celery's default `prefork` pool | RQ's work horse |
+| Child process | One long-lived child per worker runs job after job | A new child is forked for every job |
+| Recycled | After `WORKER_MAX_TASKS_PER_CHILD` jobs, or once its max RSS passes `WORKER_MAX_MEMORY_PER_CHILD` KiB (both default `None` = never, as in Celery) | After every job |
+| Cost per job | Two pipe writes. Modules imported by a task and DB connections stay warm | A fork, a fresh DB connection in the child, and the parent reconnects |
+| Isolation | Memory a task leaks stays until the child is recycled; module-level state carries over between jobs | Complete |
+| Hard timeout, revoke, crash | The child's process group is killed and the next job gets a fresh child | The child's process group is killed |
+
+```python
+DJANGO_SQL_JOBS = {
+    "WORKER_POOL": "prefork",              # or "fork" for RQ semantics
+    "WORKER_MAX_TASKS_PER_CHILD": None,    # e.g. 1000 to bound leaks; 1 behaves like "fork"
+    "WORKER_MAX_MEMORY_PER_CHILD": None,   # KiB, e.g. 200_000
+    "WORKER_DB_REUSE_MAX": None,           # None = same as WORKER_MAX_TASKS_PER_CHILD
+}
+```
+
+Standalone mode reads the same keys from `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MAX_TASKS_PER_CHILD`,
+`SQLERY_WORKER_MAX_MEMORY_PER_CHILD` and `SQLERY_WORKER_DB_REUSE_MAX`.
+
+**DB connections follow the recycle rate.** With prefork, the child and the parent keep their
+connections across jobs and force-refresh them every `WORKER_DB_REUSE_MAX` jobs. Left unset,
+that is `WORKER_MAX_TASKS_PER_CHILD`, so connections are renewed when the child is. When neither
+is set (Celery's defaults), connections are never force-closed. Around each job, Django
+connections that are unusable or older than `CONN_MAX_AGE` are closed, which is what Celery's
+Django fixup does (with Django's default `CONN_MAX_AGE = 0` that means a connection per job;
+raise `CONN_MAX_AGE` to reuse it). SQLAlchemy connections are left to `pool_pre_ping` and
+`POOL_RECYCLE`. The fork pool keeps its old per-job behaviour and ignores `WORKER_DB_REUSE_MAX`.
+
+**Losing the database connection.** Both pools handle it the same way:
+
+- A lost connection is discarded entirely (Django connections closed, the SQLAlchemy pool
+  disposed), never reused. Statement errors such as a lock timeout or a deadlock don't count
+  as connection loss.
+- Reconnection uses exponential backoff with full jitter: a random delay up to
+  `DB_RECONNECT_BACKOFF_BASE * 2**attempt` seconds, capped at `DB_RECONNECT_BACKOFF_MAX`
+  (defaults `0.5` and `30`).
+- A job is never re-run because a connection failed. If the task itself fails on it, the job
+  fails like any other error, and only its own retry policy (`max_retries`, `autoretry_for`)
+  can run it again.
+- If the child loses its connection while recording a finished job's outcome, it hands the
+  outcome to the worker parent (the supervisor). The parent reconnects and persists it, still
+  fenced against the job's attempt and creating the retry if one is due. Success and failure
+  callbacks are task code, so they don't run in that case.
+- While the database stays unreachable, the worker claims nothing new and only probes for a
+  connection. A job that is already running continues; heartbeat, lease and revoke-poll
+  failures are logged, and the outcome is persisted once the database is back. On shutdown
+  the parent stops retrying after a few attempts; the job's attempt then stays open and
+  recovery settles it.
+
+Concurrency is unchanged: one worker runs one job at a time, and `MAX_WORKERS_PER_NODE` sets how
+many workers run (Celery's `worker_concurrency`).
+
 ---
 
 ## Job Options

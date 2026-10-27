@@ -24,6 +24,17 @@ class StandaloneConfig(Config):
             # Worker settings
             'MAX_WORKERS_PER_NODE': 3,
             'WORKER_QUEUES': ['default'],
+            # #161: "prefork" (Celery's default) or "fork" (RQ); see core/pool.py.
+            # Loaded from SQLERY_WORKER_POOL, SQLERY_WORKER_MAX_TASKS_PER_CHILD,
+            # SQLERY_WORKER_MAX_MEMORY_PER_CHILD (KiB) and SQLERY_WORKER_DB_REUSE_MAX.
+            'WORKER_POOL': 'prefork',
+            'WORKER_MAX_TASKS_PER_CHILD': None,
+            'WORKER_MAX_MEMORY_PER_CHILD': None,
+            'WORKER_DB_REUSE_MAX': None,
+            # Reconnect backoff after a lost DB connection (seconds; exponential, full jitter).
+            # Loaded from SQLERY_DB_RECONNECT_BACKOFF_BASE / SQLERY_DB_RECONNECT_BACKOFF_MAX.
+            'DB_RECONNECT_BACKOFF_BASE': 0.5,
+            'DB_RECONNECT_BACKOFF_MAX': 30,
             'QUEUE_PRIORITIES': {'default': 50},
 
             # Daemon settings
@@ -198,6 +209,12 @@ class StandaloneConfig(Config):
             ("READY_ROTATION_INTERVAL", float),
             ("READY_ROTATION_DRAIN_BATCH", int),
             ("READY_ROTATION_LAG_DEGRADED_SECONDS", float),
+            ("WORKER_POOL", str),
+            ("WORKER_MAX_TASKS_PER_CHILD", int),
+            ("WORKER_MAX_MEMORY_PER_CHILD", int),
+            ("WORKER_DB_REUSE_MAX", int),
+            ("DB_RECONNECT_BACKOFF_BASE", float),
+            ("DB_RECONNECT_BACKOFF_MAX", float),
         ):
             raw = os.getenv("SQLERY_" + env_key)
             if raw is not None:
