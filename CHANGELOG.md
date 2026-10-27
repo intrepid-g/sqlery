@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-27
+
 ### Upgrade notes
 
 - **Daemon workers are forked from a preloaded launcher (#163).** They run the code the daemon loaded, so restart the daemon after a deploy, as with Celery. Set `WORKER_START_METHOD = "spawn"` to start each worker as a fresh interpreter, as before. In Django mode the launcher imports each installed app's `tasks` module at startup (`WORKER_PRELOAD_MODULES = []` turns that off).
