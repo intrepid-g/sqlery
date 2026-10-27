@@ -191,6 +191,7 @@ def export_pool_options(
     max_memory_per_child: int | None = None,
     db_reuse_max: int | None = None,
     concurrency: int | None = None,
+    start_method: str | None = None,
 ) -> None:
     """Make CLI options visible to this process and the workers it spawns (via env vars)."""
     for name, value in (
@@ -203,6 +204,8 @@ def export_pool_options(
             os.environ[POOL_ENV[name]] = str(value)
     if concurrency is not None:
         os.environ[CONCURRENCY_ENV] = str(concurrency)
+    if start_method is not None:
+        os.environ["SQLERY_WORKER_START_METHOD"] = str(start_method)  # launcher.START_METHOD_ENV
 
 
 def add_pool_arguments(parser) -> None:
@@ -232,6 +235,13 @@ def add_pool_arguments(parser) -> None:
         default=None,
         help="Refresh DB connections every N jobs (default: the recycle rate)",
     )
+    parser.add_argument(
+        "--start-method",
+        choices=("fork", "spawn"),
+        default=None,
+        help="Start daemon workers by forking a preloaded launcher (default, like Celery) "
+        "or as fresh interpreters",
+    )
 
 
 def export_pool_arguments(options: dict) -> None:
@@ -241,6 +251,7 @@ def export_pool_arguments(options: dict) -> None:
         max_tasks_per_child=options.get("max_tasks_per_child"),
         max_memory_per_child=options.get("max_memory_per_child"),
         db_reuse_max=options.get("db_reuse_max"),
+        start_method=options.get("start_method"),
     )
 
 

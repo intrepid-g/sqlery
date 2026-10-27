@@ -168,7 +168,11 @@ export SQLERY_WORKER_DB_REUSE_MAX=1000         # refresh DB connections every N 
 (Celery's defaults). These variables work in both modes and override the settings; the CLI
 flags of the same names set them, so workers spawned by a daemon inherit them.
 
-`SQLERY_WORKER_CONCURRENCY` overrides `MAX_WORKERS_PER_NODE` (default: the number of CPUs). See [Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job).
+`SQLERY_WORKER_CONCURRENCY` overrides `MAX_WORKERS_PER_NODE` (default: the number of CPUs).
+
+`SQLERY_WORKER_START_METHOD` (`fork`, default, or `spawn`) and `SQLERY_WORKER_PRELOAD_MODULES`
+(comma-separated) control how the daemon starts workers (#163). See
+[Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job). See [Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job).
 
 ---
 

@@ -1410,7 +1410,10 @@ class SQLAlchemyBackend(DatabaseBackend):
                 worker = Worker(
                     id=self._worker_pk(worker_id),
                     node_id=socket.gethostname(),
-                    pid=os.getpid(),
+                    # PID 0 marks the daemon's own row, as in the Django backend; readers
+                    # skip it. Old: pid=os.getpid() for every row, so the daemon counted
+                    # itself as a worker and sent itself SIGUSR1 (#163).
+                    pid=0 if str(worker_id).startswith("daemon_") else os.getpid(),
                     status=status,
                     current_job_id=current_job_id,
                     last_heartbeat=datetime.now(UTC),

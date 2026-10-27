@@ -336,21 +336,41 @@ A job that pushes it over still completes, and then the child exits with a warni
 read, an error is logged and the child is not recycled. The limit applies to the job child,
 not the worker parent, as in Celery.
 
-The process layout differs from Celery. Celery's prefork pool forks N children from one main
-process. sqlery runs N worker processes, each with one child of its own. Measured on Linux in
-standalone mode with SQLite (Python 3.13, before any task-specific allocation):
+**How the daemon starts workers (`WORKER_START_METHOD`, #163).** With `"fork"` (the default),
+the daemon forks one *launcher* process. The launcher imports the task modules, drops every
+DB connection, freezes the garbage collector (`gc.freeze()`) and then forks each worker. So
+the workers share the interpreter, Django or SQLAlchemy and your task modules copy-on-write,
+as Celery's pool children share its main process. The launcher holds no DB connection, lease
+or scheduler state, so a worker inherits none of the daemon's. With `"spawn"`, each worker is
+a fresh interpreter (`python -m sqlery.core.worker_runner`), the behaviour before #163.
 
-| Process | RSS | PSS | USS (private) |
-| --- | --- | --- | --- |
-| Worker parent | 75 MiB | 35 MiB | 14 MiB |
-| Prefork child (one job done) | 73 MiB | 35 MiB | 15 MiB |
-| Fork-mode child | 73 MiB | 33 MiB | 11 MiB |
+| | `"fork"` (default) | `"spawn"` |
+| --- | --- | --- |
+| Memory | Shared copy-on-write; task modules loaded once | Each worker loads everything again |
+| Code after a deploy | What the daemon loaded: restart the daemon (as with Celery) | A respawned worker runs the code on disk |
+| Platforms | Needs `os.fork` | Everywhere |
 
-A child shares its parent's pages copy-on-write and costs about 11-15 MiB of its own, like a
-Celery child. Each worker parent is a separate interpreter, though, so N workers cost about
-N x 75 MiB plus the children, where Celery costs one main process plus N children. Size
-`MAX_WORKERS_PER_NODE` with that in mind on small hosts. Memory a task allocates stays in a
-prefork child until it is recycled; set `WORKER_MAX_MEMORY_PER_CHILD` (or
+The launcher preloads `WORKER_PRELOAD_MODULES` (a list, or a comma-separated
+`SQLERY_WORKER_PRELOAD_MODULES`). Left unset in Django mode, it preloads the `tasks` module of
+every installed app that has one, which is what Celery's `app.autodiscover_tasks()` imports.
+`[]` preloads nothing. A module that fails to import is logged and skipped. Set the start method
+with `WORKER_START_METHOD`, `SQLERY_WORKER_START_METHOD` or `--start-method` on the daemon
+commands.
+
+Total memory of the daemon's process tree (PSS, so shared pages are counted once), with every
+worker running a job. Measured on Linux in standalone mode with SQLite (Python 3.13). "Heavy"
+is a task module that builds about 60 MiB of objects at import, standing in for pandas, a
+model or a large lookup table.
+
+| Workers | `spawn`, light tasks | `fork`, light tasks | `spawn`, heavy module | `fork`, heavy module |
+| --- | --- | --- | --- | --- |
+| 1 | 167 MiB | 136 MiB | 267 MiB | 241 MiB |
+| 2 | 245 MiB | 171 MiB | 444 MiB | 272 MiB |
+| 4 | 400 MiB | 236 MiB (-41%) | 799 MiB | 336 MiB (-58%) |
+
+Each extra worker costs about 33 MiB with `fork`, against about 78 MiB with `spawn`, or 178 MiB
+when every worker imports the heavy module itself. Memory a task allocates while it runs stays
+in its prefork child until the child is recycled. Set `WORKER_MAX_MEMORY_PER_CHILD` (or
 `WORKER_MAX_TASKS_PER_CHILD`) to bound it, exactly as with Celery.
 
 ---

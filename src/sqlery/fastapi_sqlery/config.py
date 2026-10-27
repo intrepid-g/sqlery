@@ -32,6 +32,11 @@ class StandaloneConfig(Config):
             'WORKER_MAX_TASKS_PER_CHILD': None,
             'WORKER_MAX_MEMORY_PER_CHILD': None,
             'WORKER_DB_REUSE_MAX': None,
+            # #163: "fork" (Celery) or "spawn"; modules the launcher preloads (list or
+            # comma-separated). SQLERY_WORKER_START_METHOD / SQLERY_WORKER_PRELOAD_MODULES
+            # override them (read in core/launcher.py, both modes).
+            'WORKER_START_METHOD': 'fork',
+            'WORKER_PRELOAD_MODULES': None,
             # Reconnect backoff after a lost DB connection (seconds; exponential, full jitter).
             # Loaded from SQLERY_DB_RECONNECT_BACKOFF_BASE / SQLERY_DB_RECONNECT_BACKOFF_MAX.
             'DB_RECONNECT_BACKOFF_BASE': 0.5,

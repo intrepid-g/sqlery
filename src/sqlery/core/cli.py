@@ -55,6 +55,9 @@ def daemon_start(
     db_reuse_max: int | None = typer.Option(
         None, "--db-reuse-max", help="Refresh DB connections every N jobs"
     ),
+    start_method: str | None = typer.Option(
+        None, "--start-method", help="fork (default: preloaded launcher, like Celery) or spawn"
+    ),
 ):
     """Start the job processing daemon."""
     # from ..compat import is_django_mode  # moved to top-level
@@ -73,6 +76,7 @@ def daemon_start(
         max_memory_per_child=max_memory_per_child,
         db_reuse_max=db_reuse_max,
         concurrency=concurrency,
+        start_method=start_method,
     )
 
     daemon = DaemonManager()

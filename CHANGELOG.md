@@ -8,16 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Upgrade notes
 
+- **Daemon workers are forked from a preloaded launcher (#163).** They run the code the daemon loaded, so restart the daemon after a deploy, as with Celery. Set `WORKER_START_METHOD = "spawn"` to start each worker as a fresh interpreter, as before. In Django mode the launcher imports each installed app's `tasks` module at startup (`WORKER_PRELOAD_MODULES = []` turns that off).
 - **Workers now run jobs in a long-lived prefork child by default (#161).** Before, every job got its own forked child (RQ's model). Now each worker keeps one child that runs job after job (Celery's default `prefork` pool). Module-level state and leaked memory now carry over between jobs until the child is recycled. Set `WORKER_POOL = "fork"` for the old behaviour, or `WORKER_MAX_TASKS_PER_CHILD` to recycle every N jobs.
-
 - **Concurrency now defaults to the number of CPUs, like Celery (#161).** `MAX_WORKERS_PER_NODE` used to default to 1 (Django) or 3 (standalone). Unset, it is now the number of CPUs this process may use (CPU affinity and the container's cgroup quota). Set `MAX_WORKERS_PER_NODE`, `SQLERY_WORKER_CONCURRENCY` or `--concurrency` to keep a fixed count. Each worker is a separate process of about 75 MiB plus its job child, so check memory limits on small hosts.
 
 ### Added
 
+- **Workers share memory like Celery's pool (#163).** With `WORKER_START_METHOD = "fork"` (the default) the daemon forks a launcher that preloads the task modules (`WORKER_PRELOAD_MODULES`, or each Django app's `tasks` module), drops its DB connections, runs `gc.freeze()` and forks every worker. Measured total memory with four workers: 236 MiB instead of 400 MiB, and 336 MiB instead of 799 MiB with a 60 MiB task module. `--start-method fork|spawn` on the daemon commands.
 - **Every worker option is settable, with Celery's defaults (#161).** Precedence: `WorkerProcess(...)` arguments, then CLI flags (`--pool/-P`, `--max-tasks-per-child`, `--max-memory-per-child`, `--db-reuse-max`, `--concurrency/-c`), then `SQLERY_WORKER_*` environment variables (both modes; spawned workers inherit them), then settings. A child recycled for memory logs Celery's warning.
 - **Configurable worker pool (#161).** `WORKER_POOL` (`"prefork"`, default, or `"fork"`), `WORKER_MAX_TASKS_PER_CHILD` and `WORKER_MAX_MEMORY_PER_CHILD` (KiB), with Celery's defaults (never recycle). The parent keeps claiming, heartbeats, lease renewal, revoke polling and the two-layer timeout. A hard timeout, a revoke or a crashed child kills the child, and the next job gets a fresh one. A job that cannot be pickled to the child runs in a per-job fork.
 - **Workers survive losing the database connection (#161).** A lost connection is discarded and reopened with exponential backoff and full jitter (`DB_RECONNECT_BACKOFF_BASE`, default `0.5` s; `DB_RECONNECT_BACKOFF_MAX`, default `30` s). A worker claims nothing while the database is unreachable, and a running job keeps running. If a child cannot record a finished job's outcome, the worker parent reconnects and persists it (callbacks are not run in that case). A job is never re-run because a connection failed; only its own retry policy can run it again.
 - **DB connections are refreshed at the child recycle rate (#161).** `WORKER_DB_REUSE_MAX` (Celery's `CELERY_DB_REUSE_MAX`; default: `WORKER_MAX_TASKS_PER_CHILD`) force-closes the child's and the parent's connections every N jobs. With neither set, only unusable or `CONN_MAX_AGE`-expired Django connections are closed around each job, as Celery does. The prefork parent no longer reconnects after every job (#111). Standalone: `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MAX_TASKS_PER_CHILD`, `SQLERY_WORKER_MAX_MEMORY_PER_CHILD`, `SQLERY_WORKER_DB_REUSE_MAX`.
+
+### Fixed
+
+- **The standalone daemon no longer kills itself (#163).** Its heartbeat row carried its own PID, so it sent itself SIGUSR1 on its first cycle (exit 138), and it counted itself as one of its workers, so at concurrency 1 it ran none. Daemon rows now use PID 0, as in Django mode.
+- **Stopping workers never signals a process group (#163).** `stop_all_workers()` sent SIGTERM to every heartbeat row, including the daemon's own PID-0 row. `os.kill(0, SIGTERM)` signals the caller's whole process group: a foreground daemon's shutdown also terminated its shell, and in Django mode that had been the case since daemon rows got PID 0.
 
 ## [0.27.0] - 2026-10-26
 

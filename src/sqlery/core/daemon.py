@@ -233,6 +233,8 @@ class DaemonManager:
         Returns:
             True if process exists, False otherwise
         """
+        if not pid or pid <= 0:
+            return False  # os.kill(0 or -n, 0) would test a process group, not a process
         try:
             # Send signal 0 - doesn't kill, just checks if process exists
             os.kill(pid, 0)
@@ -826,6 +828,10 @@ class DaemonManager:
                 logger.info(f"Stopped {stopped} workers")
             except Exception as e:
                 logger.error(f"Error stopping workers: {e}")
+            try:
+                worker_pool.close()  # the worker launcher (#163)
+            except Exception as e:
+                logger.error(f"Error stopping the worker launcher: {e}")
 
             # Release queue leases on clean shutdown
             try:
@@ -1176,7 +1182,14 @@ class DaemonManager:
                 continue
 
             # Only manage workers on this node (skip daemon rows and other nodes)
-            if w_node != self.node_id or w_pid <= 0:
+            # Old: if w_node != self.node_id or w_pid <= 0: — the daemon's own heartbeat row
+            # ("daemon_<node>", its PID) matched, and SIGUSR1 killed the daemon (#163).
+            if (
+                w_node != self.node_id
+                or w_pid <= 0
+                or w_pid == os.getpid()
+                or str(w_id).startswith("daemon_")
+            ):
                 continue
 
             if self.is_process_running(w_pid):

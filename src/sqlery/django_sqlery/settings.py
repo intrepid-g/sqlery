@@ -86,6 +86,12 @@ DEFAULTS = {
     # Force-close DB connections every N jobs; None = WORKER_MAX_TASKS_PER_CHILD (the
     # recycle rate). Neither set: close only unusable/CONN_MAX_AGE-expired ones per job.
     "WORKER_DB_REUSE_MAX": None,
+    # #163: "fork" (Celery) forks daemon workers from a launcher that preloaded the task
+    # modules, so they share that memory; "spawn" starts each as a fresh interpreter.
+    "WORKER_START_METHOD": "fork",
+    # Modules the launcher imports first. None = each installed app's tasks module
+    # (Celery's autodiscover_tasks); [] = none.
+    "WORKER_PRELOAD_MODULES": None,
     # A lost DB connection is reopened after a random delay up to BASE * 2**attempt seconds,
     # capped at MAX (exponential backoff, full jitter). The worker claims nothing meanwhile.
     "DB_RECONNECT_BACKOFF_BASE": 0.5,
