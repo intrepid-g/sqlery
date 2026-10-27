@@ -20,6 +20,7 @@ is the queue, the result store and the scheduler.
 | Priority queues | `priority=` | higher runs first |
 | `--pool=prefork`, `worker_max_tasks_per_child`, `worker_max_memory_per_child` | `WORKER_POOL="prefork"`, `WORKER_MAX_TASKS_PER_CHILD`, `WORKER_MAX_MEMORY_PER_CHILD` | same defaults; `"fork"` = RQ's fork-per-job |
 | `CELERY_DB_REUSE_MAX` | `WORKER_DB_REUSE_MAX` | defaults to the child recycle rate |
+| `-c` / `worker_concurrency` | `--concurrency` / `MAX_WORKERS_PER_NODE` | defaults to the CPU count, capped to the container quota |
 
 Not provided: exchanges and routing keys, Flower-style remote control (ping, pool grow/shrink,
 broadcast), per-task `prefetch` or autoscale, and a pluggable result backend (results live in
@@ -168,6 +169,7 @@ PostgreSQL it is serialised per tag.
 | --- | --- | --- |
 | `RETRY_BACKOFF_MAX` | none | cap on the retry delay (seconds) |
 | `RETRY_JITTER` | `False` | randomise the retry delay |
+| `MAX_WORKERS_PER_NODE` | CPU count | workers per node (was 1 / 3) |
 | `WORKER_POOL` | `"prefork"` | `"fork"` forks a child per job (RQ) |
 | `WORKER_MAX_TASKS_PER_CHILD` | none | recycle the prefork child after N jobs |
 | `WORKER_MAX_MEMORY_PER_CHILD` | none | recycle it once its max RSS exceeds N KiB |

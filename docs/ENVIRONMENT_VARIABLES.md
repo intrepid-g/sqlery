@@ -165,7 +165,10 @@ export SQLERY_WORKER_DB_REUSE_MAX=1000         # refresh DB connections every N 
 ```
 
 **Default:** `prefork`, never recycled, and DB connections refreshed at the recycle rate
-(Celery's defaults). See [Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job).
+(Celery's defaults). These variables work in both modes and override the settings; the CLI
+flags of the same names set them, so workers spawned by a daemon inherit them.
+
+`SQLERY_WORKER_CONCURRENCY` overrides `MAX_WORKERS_PER_NODE` (default: the number of CPUs). See [Worker Pool](CONFIGURATION.md#worker-pool-prefork-or-fork-per-job).
 
 ---
 

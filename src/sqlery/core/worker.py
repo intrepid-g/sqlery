@@ -810,7 +810,28 @@ class WorkerProcess:
     - Parent is never blocked by job execution, so heartbeats always work
     """
 
-    def __init__(self, queues: list[str] | None = None, backend=None):
+    def __init__(
+        self,
+        queues: list[str] | None = None,
+        backend=None,
+        pool: str | None = None,
+        max_tasks_per_child: int | None = None,
+        max_memory_per_child: int | None = None,
+        db_reuse_max: int | None = None,
+    ):
+        """Create a worker.
+
+        Args:
+            queues: Queues to claim from, in priority order (default ``['default']``).
+            backend: Database backend (default: the active one).
+            pool: ``"prefork"`` or ``"fork"`` (default: WORKER_POOL, Celery's prefork).
+            max_tasks_per_child: Recycle the prefork child after N jobs (default:
+                WORKER_MAX_TASKS_PER_CHILD, never).
+            max_memory_per_child: ... or once its max RSS exceeds N KiB (default:
+                WORKER_MAX_MEMORY_PER_CHILD, never).
+            db_reuse_max: Force-refresh DB connections every N jobs (default:
+                WORKER_DB_REUSE_MAX, else the recycle rate).
+        """
         if backend is None:
             # from ..compat import get_backend  # moved to top-level
             backend = get_backend()
@@ -828,7 +849,9 @@ class WorkerProcess:
         self.queues = queues or ['default']
         self.executor = JobExecutor(backend)
         self._fork_ctx = ForkSafeExecutor.auto_configure()
-        self.pool_settings = load_pool_settings()
+        self.pool_settings = load_pool_settings(
+            pool, max_tasks_per_child, max_memory_per_child, db_reuse_max
+        )
         self._pool_child: _PoolChild | None = None
         # An outcome the job's child could not persist (connection lost), set while waiting.
         self._handed_over: UnpersistedOutcome | None = None
@@ -1595,12 +1618,24 @@ class WorkerProcess:
             refresh_db_connections(force=False)
             exit_code = self.executor.run_job_in_child(job)
             jobs_done += 1
+            # Like Celery: the job always completes, then the limits decide.
+            used_kib = max_rss_kib() if settings.max_memory_per_child else None
+            if settings.max_memory_per_child and not used_kib:
+                logger.error("Prefork child unable to determine memory usage")
             recycle = should_recycle(
-                jobs_done,
-                settings.max_tasks_per_child,
-                max_rss_kib() if settings.max_memory_per_child else None,
-                settings.max_memory_per_child,
+                jobs_done, settings.max_tasks_per_child, used_kib, settings.max_memory_per_child
             )
+            limit_kib = settings.max_memory_per_child
+            if recycle and used_kib and limit_kib and used_kib > limit_kib:
+                logger.warning(
+                    f"Prefork child PID {os.getpid()} exiting after exceeding memory limit "
+                    f"({used_kib}KiB / {limit_kib}KiB)"
+                )
+            elif recycle:
+                logger.info(
+                    f"Prefork child PID {os.getpid()} exiting after {jobs_done} jobs "
+                    f"(WORKER_MAX_TASKS_PER_CHILD)"
+                )
             if not recycle:
                 refresh_db_connections(force=db_refresh_due(jobs_done, settings.db_reuse_max))
             write_all(result_fd, encode_frame((exit_code, recycle, self.executor.unpersisted)))

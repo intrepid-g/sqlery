@@ -1,5 +1,6 @@
 """Django-agnostic daemon process management."""
 
+from sqlery.core.pool import worker_concurrency
 import os
 import re
 import socket
@@ -460,7 +461,7 @@ class DaemonManager:
         # Get configuration
         check_interval = get_config("DAEMON_CHECK_INTERVAL", 10)
         if max_workers is None:
-            max_workers = get_config("MAX_WORKERS_PER_NODE", 1)
+            max_workers = worker_concurrency()
         queues = get_config("WORKER_QUEUES", ["default"])
 
         # Initialize components

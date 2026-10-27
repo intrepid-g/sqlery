@@ -543,3 +543,95 @@ def kill_other_backends(path):
             )
         )
     return "killed"
+
+
+# --- options: Celery defaults, settable everywhere ----------------------------------------
+
+
+def test_concurrency_defaults_to_the_cpus_capped_by_the_container_quota():
+    from sqlery.core.pool import cpus_from, resolve_concurrency
+
+    assert cpus_from(64, "200000 100000") == 2  # cgroup v2: a 2-CPU container
+    assert cpus_from(64, "150000 100000") == 2  # 1.5 CPUs round up
+    assert cpus_from(64, "max 100000") == 64  # no quota
+    assert cpus_from(8, None, "50000", "100000") == 1  # cgroup v1
+    assert cpus_from(8, None, "-1", "100000") == 8
+    assert cpus_from(0, None) == 1
+    assert resolve_concurrency(None, 4) == 4  # Celery: one worker per CPU
+    assert resolve_concurrency(0, 4) == 4
+    assert resolve_concurrency(3, 4) == 3
+
+
+def test_concurrency_setting_and_env_override(monkeypatch):
+    from sqlery import compat
+    from sqlery.core import pool
+
+    monkeypatch.setattr(pool, "available_cpus", lambda: 6)
+    monkeypatch.setattr(compat, "get_config", lambda name, default=None: default)
+    assert pool.worker_concurrency() == 6
+    monkeypatch.setattr(
+        compat,
+        "get_config",
+        lambda name, default=None: 2 if name == "MAX_WORKERS_PER_NODE" else default,
+    )
+    assert pool.worker_concurrency() == 2
+    monkeypatch.setenv("SQLERY_WORKER_CONCURRENCY", "5")
+    assert pool.worker_concurrency() == 5
+    assert pool.worker_concurrency(1) == 1
+
+
+def test_django_defaults_follow_celery():
+    from sqlery.django_sqlery.settings import DEFAULTS
+
+    assert DEFAULTS["MAX_WORKERS_PER_NODE"] is None
+    assert DEFAULTS["WORKER_POOL"] == POOL_PREFORK
+    assert DEFAULTS["WORKER_MAX_TASKS_PER_CHILD"] is None
+    assert DEFAULTS["WORKER_MAX_MEMORY_PER_CHILD"] is None
+
+
+def test_arguments_beat_env_beat_config(backend, monkeypatch):
+    from sqlery import compat
+
+    config = {"WORKER_POOL": "fork", "WORKER_MAX_TASKS_PER_CHILD": 10}
+    real = compat.get_config
+    monkeypatch.setattr(compat, "get_config", lambda n, d=None: config.get(n, real(n, d)))
+    assert WorkerProcess(backend=backend).pool_settings == PoolSettings(POOL_FORK, 10, None, 10)
+    monkeypatch.setenv("SQLERY_WORKER_POOL", "prefork")
+    monkeypatch.setenv("SQLERY_WORKER_MAX_MEMORY_PER_CHILD", "250000")
+    assert WorkerProcess(backend=backend).pool_settings == PoolSettings(
+        POOL_PREFORK, 10, 250000, 10
+    )
+    worker = WorkerProcess(
+        backend=backend, pool="fork", max_tasks_per_child=3, max_memory_per_child=1, db_reuse_max=7
+    )
+    assert worker.pool_settings == PoolSettings(POOL_FORK, 3, 1, 7)
+
+
+def test_cli_flags_reach_spawned_workers(monkeypatch):
+    import argparse
+
+    from sqlery.core.pool import add_pool_arguments, export_pool_arguments, load_pool_settings
+
+    for name in pool_module.POOL_ENV.values():
+        monkeypatch.delenv(name, raising=False)
+    parser = argparse.ArgumentParser()
+    add_pool_arguments(parser)
+    options = vars(
+        parser.parse_args(
+            ["-P", "fork", "--max-tasks-per-child", "50", "--max-memory-per-child", "300000"]
+        )
+    )
+    export_pool_arguments(options)
+    assert os.environ["SQLERY_WORKER_POOL"] == "fork"  # inherited by worker_runner
+    assert load_pool_settings() == PoolSettings(POOL_FORK, 50, 300000, 50)
+    for name in pool_module.POOL_ENV.values():
+        os.environ.pop(name, None)
+
+
+def test_daemon_command_accepts_celery_style_options():
+    from sqlery.django_sqlery.management.commands.daemon import Command
+
+    parser = Command().create_parser("manage.py", "daemon")
+    options = vars(parser.parse_args(["start", "-c", "2", "-P", "prefork", "--db-reuse-max", "9"]))
+    assert options["workers"] == 2 and options["pool"] == "prefork"
+    assert options["db_reuse_max"] == 9

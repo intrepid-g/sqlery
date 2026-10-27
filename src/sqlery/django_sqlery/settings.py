@@ -71,7 +71,9 @@ DEFAULTS = {
     "DAEMON_CHECK_INTERVAL": 10,  # Daemon checks for jobs every 10 seconds
 
     # Worker pool settings
-    "MAX_WORKERS_PER_NODE": 1,  # Number of worker subprocess processes per node
+    # Number of worker processes per node. None = the number of CPUs (Celery's
+    # worker_concurrency default), capped to the container's CPU quota.
+    "MAX_WORKERS_PER_NODE": None,
     "WORKER_HEARTBEAT_INTERVAL": 5,  # Worker heartbeat interval in seconds
     "WORKER_POLL_INTERVAL": 5,  # Seconds between job polls when idle
     "WORKER_ALIVE_TIMEOUT": 30,  # Worker is considered dead after this many seconds without heartbeat

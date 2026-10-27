@@ -28,6 +28,18 @@ def worker_command(
     database_url: str | None = typer.Option(
         None, "--database-url", envvar="SQLERY_DATABASE_URL", help="Database URL"
     ),
+    pool: str | None = typer.Option(
+        None, "--pool", "-P", help="prefork (default, like Celery) or fork (a child per job)"
+    ),
+    max_tasks_per_child: int | None = typer.Option(
+        None, "--max-tasks-per-child", help="Recycle the prefork child after N jobs"
+    ),
+    max_memory_per_child: int | None = typer.Option(
+        None, "--max-memory-per-child", help="Recycle it once its max RSS exceeds N KiB"
+    ),
+    db_reuse_max: int | None = typer.Option(
+        None, "--db-reuse-max", help="Refresh DB connections every N jobs"
+    ),
 ):
     """Run a standalone worker process."""
     # from ..compat import is_django_mode  # moved to top-level
@@ -46,7 +58,13 @@ def worker_command(
             from ..compat import initialize
 
             initialize(database_url=database_url, enable_daemon=False)
-        worker = Worker(queues=queue_list)
+        worker = Worker(
+            queues=queue_list,
+            pool=pool,
+            max_tasks_per_child=max_tasks_per_child,
+            max_memory_per_child=max_memory_per_child,
+            db_reuse_max=db_reuse_max,
+        )
         worker.run(max_jobs=max_jobs)
     except KeyboardInterrupt:
         console.print("\n[yellow]Worker stopped by user[/yellow]")

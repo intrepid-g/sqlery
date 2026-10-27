@@ -514,7 +514,7 @@ def send_email(to, subject):
 | `CELERY_TASK_MAX_RETRIES` | `@job(max_retries=N)` |
 | `CELERY_BEAT_SCHEDULE` | Django Admin → Scheduled Tasks |
 | `task_serializer` | JSON (automatic) |
-| `worker_concurrency` | `DJANGO_SQL_JOBS['MAX_WORKERS_PER_NODE']` |
+| `worker_concurrency` / `-c` | `DJANGO_SQL_JOBS['MAX_WORKERS_PER_NODE']` / `manage.py daemon start -c N` (default: CPU count) |
 | `worker_pool` (`prefork`) | `DJANGO_SQL_JOBS['WORKER_POOL']` (default `"prefork"`) |
 | `worker_max_tasks_per_child` | `DJANGO_SQL_JOBS['WORKER_MAX_TASKS_PER_CHILD']` |
 | `worker_max_memory_per_child` | `DJANGO_SQL_JOBS['WORKER_MAX_MEMORY_PER_CHILD']` (KiB) |

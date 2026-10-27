@@ -1270,7 +1270,8 @@ def is_standalone_mode() -> bool:
 def initialize(
     database_url: str | None = None,
     # max_workers: int = 3,
-    max_workers: int = 1,
+    # Old: max_workers: int = 1,
+    max_workers: int | None = None,
     worker_queues: list[str] | None = None,
     enable_daemon: bool = True,
     daemon_check_interval: int = 10,
@@ -1286,7 +1287,7 @@ def initialize(
 
     Args:
         database_url: PostgreSQL connection URL
-        max_workers: Maximum worker processes per node
+        max_workers: Worker processes per node (default: the number of CPUs, like Celery)
         worker_queues: List of queue names to process
         enable_daemon: Enable daemon mode
         daemon_check_interval: Seconds between daemon checks
@@ -1318,7 +1319,8 @@ def initialize(
     if database_url:
         set_config("DATABASE_URL", database_url)
 
-    set_config("MAX_WORKERS_PER_NODE", max_workers)
+    if max_workers is not None:  # unset: keep the config/env value, else one per CPU
+        set_config("MAX_WORKERS_PER_NODE", max_workers)
     set_config("WORKER_QUEUES", worker_queues or ["default"])
     set_config("ENABLE_DAEMON", enable_daemon)
     set_config("DAEMON_CHECK_INTERVAL", daemon_check_interval)

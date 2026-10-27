@@ -312,8 +312,46 @@ raise `CONN_MAX_AGE` to reuse it). SQLAlchemy connections are left to `pool_pre_
   the parent stops retrying after a few attempts; the job's attempt then stays open and
   recovery settles it.
 
-Concurrency is unchanged: one worker runs one job at a time, and `MAX_WORKERS_PER_NODE` sets how
-many workers run (Celery's `worker_concurrency`).
+**Concurrency.** A worker runs one job at a time. `MAX_WORKERS_PER_NODE` (Celery's
+`worker_concurrency`) sets how many run per node. Unset, it is the number of CPUs, as in Celery,
+except that sqlery caps it to the CPUs the process may use (CPU affinity and a container's
+cgroup CPU quota). A 2-CPU container on a 64-core host gets 2 workers, not 64.
+
+**Setting the options.** Every option has a Celery default and can be set in four places;
+the first one set wins:
+
+| Where | Pool / recycling | Concurrency |
+| --- | --- | --- |
+| `WorkerProcess(...)` arguments | `pool=`, `max_tasks_per_child=`, `max_memory_per_child=`, `db_reuse_max=` | n/a |
+| CLI flags | `--pool/-P`, `--max-tasks-per-child`, `--max-memory-per-child`, `--db-reuse-max` on `manage.py daemon start`, `manage.py rqworker`, `sqlery daemon start`, `sqlery worker run` | `--concurrency/-c` (`--workers/-w` on the Django commands) |
+| Environment | `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MAX_TASKS_PER_CHILD`, `SQLERY_WORKER_MAX_MEMORY_PER_CHILD`, `SQLERY_WORKER_DB_REUSE_MAX` (both modes) | `SQLERY_WORKER_CONCURRENCY` |
+| Settings | `WORKER_POOL`, `WORKER_MAX_TASKS_PER_CHILD`, `WORKER_MAX_MEMORY_PER_CHILD`, `WORKER_DB_REUSE_MAX` | `MAX_WORKERS_PER_NODE` |
+
+A CLI flag is exported to the environment, so it also reaches the worker processes the daemon spawns.
+
+**Memory.** `WORKER_MAX_MEMORY_PER_CHILD` works like Celery's `worker_max_memory_per_child`.
+After each job the child compares its peak resident set size (`ru_maxrss`, KiB) with the limit.
+A job that pushes it over still completes, and then the child exits with a warning
+(`exiting after exceeding memory limit (NKiB / MKiB)`) and is replaced. If the RSS can't be
+read, an error is logged and the child is not recycled. The limit applies to the job child,
+not the worker parent, as in Celery.
+
+The process layout differs from Celery. Celery's prefork pool forks N children from one main
+process. sqlery runs N worker processes, each with one child of its own. Measured on Linux in
+standalone mode with SQLite (Python 3.13, before any task-specific allocation):
+
+| Process | RSS | PSS | USS (private) |
+| --- | --- | --- | --- |
+| Worker parent | 75 MiB | 35 MiB | 14 MiB |
+| Prefork child (one job done) | 73 MiB | 35 MiB | 15 MiB |
+| Fork-mode child | 73 MiB | 33 MiB | 11 MiB |
+
+A child shares its parent's pages copy-on-write and costs about 11-15 MiB of its own, like a
+Celery child. Each worker parent is a separate interpreter, though, so N workers cost about
+N x 75 MiB plus the children, where Celery costs one main process plus N children. Size
+`MAX_WORKERS_PER_NODE` with that in mind on small hosts. Memory a task allocates stays in a
+prefork child until it is recycled; set `WORKER_MAX_MEMORY_PER_CHILD` (or
+`WORKER_MAX_TASKS_PER_CHILD`) to bound it, exactly as with Celery.
 
 ---
 

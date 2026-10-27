@@ -4,6 +4,7 @@ This daemon runs continuously in the background, checking for and processing
 jobs at regular intervals without requiring HTTP requests.
 """
 
+from sqlery.core.pool import worker_concurrency
 import os
 import sys
 import time
@@ -161,7 +162,7 @@ def run_daemon():
 
     # Get configuration
     check_interval = get_setting('DAEMON_CHECK_INTERVAL', 10)
-    max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+    max_workers = worker_concurrency()
 
     logger.info(f"Daemon started (workers: {max_workers}, interval: {check_interval}s)")
 

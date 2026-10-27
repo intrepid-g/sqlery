@@ -22,7 +22,8 @@ class StandaloneConfig(Config):
             'DATABASE_URL': None,
 
             # Worker settings
-            'MAX_WORKERS_PER_NODE': 3,
+            # None = the number of CPUs (Celery's worker_concurrency default).
+            'MAX_WORKERS_PER_NODE': None,
             'WORKER_QUEUES': ['default'],
             # #161: "prefork" (Celery's default) or "fork" (RQ); see core/pool.py.
             # Loaded from SQLERY_WORKER_POOL, SQLERY_WORKER_MAX_TASKS_PER_CHILD,

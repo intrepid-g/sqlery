@@ -17,6 +17,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from sqlery.core.daemon import DaemonManager
+from sqlery.core.pool import add_pool_arguments, export_pool_arguments
 from sqlery.core.worker import TaskExecutor
 from sqlery.django_sqlery.settings import get_setting
 
@@ -40,15 +41,18 @@ class Command(BaseCommand):
             help="Process all pending jobs then exit (like rqworker --burst)",
         )
         parser.add_argument(
-            "--workers", "-w",
+            "--workers", "-w", "--concurrency", "-c",
+            dest="workers",
             type=int,
             default=None,
-            help="Number of worker subprocess processes to maintain (default: 1)",
+            help="Number of worker processes to maintain (default: number of CPUs)",
         )
+        add_pool_arguments(parser)
 
     def handle(self, *args, **options):
         queues = options["queues"] or get_setting("WORKER_QUEUES", ["default"])
         burst = options.get("burst", False)
+        export_pool_arguments(options)
 
         self.stdout.write(
             "rqworker: django-tasks-scheduler compatibility command — "

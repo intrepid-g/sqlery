@@ -1,10 +1,11 @@
 """Management command for worker control."""
 
+from sqlery.core.pool import worker_concurrency
 from django.core.management.base import BaseCommand
 from sqlery.models import Worker
 from sqlery.worker_pool import get_worker_pool_status, stop_all_workers
 from sqlery.worker_registry import kill_worker, cleanup_dead_workers
-from sqlery.settings import get_setting
+# Old: from sqlery.settings import get_setting  (MAX_WORKERS_PER_NODE -> worker_concurrency)
 
 
 class Command(BaseCommand):
@@ -46,7 +47,7 @@ class Command(BaseCommand):
 
     def list_workers(self):
         """List all workers."""
-        max_workers = get_setting('MAX_WORKERS_PER_NODE', 1)
+        max_workers = worker_concurrency()
 
         if max_workers == 1:
             self.stdout.write(
