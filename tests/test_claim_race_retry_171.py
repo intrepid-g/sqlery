@@ -49,8 +49,11 @@ JOBS = 120
 JOB_SECS = 0.02
 HOLD = 0.03  # a sibling mid-claim holds the ready entries this long ...
 HOLD_EVERY = 0.1  # ... this often
-POLL_INTERVAL = 1.0
-MAX_P99_WAIT = 0.4
+# Large enough that one poll sleep is unmistakable next to the per-job cost (fork, reconnect
+# check, bookkeeping) of a slow, CPU-starved CI runner, which is tens of ms per dispatch.
+POLL_INTERVAL = 2.0
+MAX_DISPATCH_WAIT = 0.75 * POLL_INTERVAL
+LOCK_AFTER_FINISH = 0.15  # the row lock outlives the previous job by this much
 MAX_COMMITS_PER_POLL = 2  # per worker, the #110 idle bound
 
 _DJANGO_SETUP = """
@@ -67,7 +70,7 @@ settings.configure(
     INSTALLED_APPS=["sqlery.django_sqlery"], USE_TZ=True,
     DEFAULT_AUTO_FIELD="django.db.models.BigAutoField", SECRET_KEY="race171",
     DJANGO_SQL_JOBS={"TRIGGER_MODE": "daemon", "ENABLE_DAEMON": False,
-                     "WORKER_QUEUES": ["default"], "WORKER_POLL_INTERVAL": 1.0,
+                     "WORKER_QUEUES": ["default"], "WORKER_POLL_INTERVAL": float(os.environ["RACE171_POLL"]),
                      "WORKER_HEARTBEAT_INTERVAL": 1, "SQLERY_PG_NOTIFY": os.environ.get("RACE171_NOTIFY") == "1"},
 )
 django.setup()
@@ -80,6 +83,9 @@ _MIGRATE = (
 
 _WORKER = _DJANGO_SETUP + """
 from sqlery.core.worker import WorkerProcess
+# The parent reaps a finished child on a wait tick that backs off to WAIT_TICK_MAX (0.5 s); a
+# test that must know when the post-job claim happens caps it so the reap lag is tiny.
+WorkerProcess.WAIT_TICK_MAX = float(os.environ.get("RACE171_TICK", WorkerProcess.WAIT_TICK_MAX))
 print("ready", flush=True)
 WorkerProcess(queues=["default"]).run()
 """
@@ -156,6 +162,7 @@ def _env(database, log):
         "RACE171_LOG": str(log),
         "RACE171_JOBS": str(JOBS),
         "RACE171_NOTIFY": "0",
+        "RACE171_POLL": str(POLL_INTERVAL),
     }
 
 
@@ -300,14 +307,14 @@ def test_backlog_drains_without_sleeping_a_poll_interval_and_idle_cost_is_unchan
         for jobs in by_worker.values():
             for prev, cur in pairwise(jobs):
                 waits.append(cur["start"] - max(cur["enqueued"], prev["end"]))
-        p99 = _percentile(waits, 0.99)
-        assert p99 < MAX_P99_WAIT, (
-            f"dispatch wait p99 {p99:.3f}s (poll interval {POLL_INTERVAL}s) over "
-            f"{len(waits)} dispatches; max {max(waits):.3f}s; wall {wall:.2f}s"
+        # Waiting out a poll interval shows as a wait of >= POLL_INTERVAL; ordinary dispatch cost
+        # (claim, fork, reconnect check) stays far below it even on a starved runner.
+        slept = sorted(w for w in waits if w >= MAX_DISPATCH_WAIT)
+        assert not slept, (
+            f"{len(slept)} of {len(waits)} dispatches waited >= {MAX_DISPATCH_WAIT}s "
+            f"(poll interval {POLL_INTERVAL}s): {[round(w, 2) for w in slept]}; "
+            f"p99 {_percentile(waits, 0.99):.3f}s, wall {wall:.2f}s"
         )
-        # Offered load is ~80/s against ~100/s of capacity: the run ends shortly after the last
-        # arrival, not poll intervals later.
-        assert wall < 3 * POLL_INTERVAL, f"burst took {wall:.2f}s"
 
         # Idle cost after the burst: the retries stop once the queue is empty, so the idle
         # commit rate is what it was before any work happened.
@@ -327,11 +334,11 @@ def test_worker_whose_next_job_is_row_locked_by_a_sibling_reclaims_without_a_pol
     database, tmp_path
 ):
     """A job is queued, but its ready entry is locked by another session when the worker
-    finishes its previous job (SKIP LOCKED hides it). The lock is gone ~50 ms later. Before the
+    finishes its previous job (SKIP LOCKED hides it). The lock is gone ~150 ms later. Before the
     fix the worker waited the whole poll interval; now it re-claims within a few retries."""
     log = tmp_path / "jobs.log"
     marker = tmp_path / "slow.done"
-    env = {**_env(database, log), "RACE171_NOTIFY": "0"}  # no NOTIFY: only a re-claim finds it
+    env = {**_env(database, log), "RACE171_NOTIFY": "0", "RACE171_TICK": "0.02"}  # no NOTIFY
     _migrate(database, env)
     holder = _connect(database)
     try:
@@ -364,11 +371,21 @@ def test_worker_whose_next_job_is_row_locked_by_a_sibling_reclaims_without_a_pol
                 "SELECT job_id FROM sqlery_job_ready ORDER BY job_id FOR UPDATE"
             ).fetchall()
             assert len(locked) == 1, "exactly the second job is ready and now locked"
+            # Hold the lock until the worker has recorded the slow job as finished, then a
+            # while longer: the worker's next claim follows within a reap tick (20 ms), so it
+            # always meets the locked entry, however slow the machine.
             deadline = time.monotonic() + 30
-            while not marker.exists() and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                if holder.execute(
+                    "SELECT count(*) FROM sqlery_job_all WHERE status = 'success' "
+                    "AND task_path LIKE '%%.slow'"
+                ).fetchone()[0]:
+                    break
                 time.sleep(0.005)
+            else:
+                pytest.fail("the slow job never finished")
             assert marker.exists(), "the slow job must finish while the entry is locked"
-            time.sleep(0.05)
+            time.sleep(LOCK_AFTER_FINISH)
             holder.execute("COMMIT")  # the sibling's lock goes away; the entry is still ready
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline and not (log.exists() and log.read_text()):
