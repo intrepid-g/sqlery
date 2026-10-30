@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A worker whose claim comes back empty while jobs are queued no longer sleeps a poll interval (#171).** With several workers, a claim can return nothing although jobs are ready: siblings hold the ready entries with `FOR UPDATE SKIP LOCKED` (each locks a page, claims one), won the race for the head, or a whole page of entries was stale. Right after work (a job finished, or a NOTIFY woke the worker) an empty claim is now followed by one plain read, `has_claimable_ready()`; only if due ready entries exist does the worker re-claim at once, up to 4 times with a jittered, doubling pause (10 to 160 ms), before falling back to the normal wait. A worker that was idle runs no probe and no retry, and when the queue really is empty the probe is the only extra query (once per job finish or NOTIFY), so idle queries and commits per second are unchanged. This also covers #167 (a stale page makes the claim return None): the retry re-claims once the stale entries are dropped; the claim itself is unchanged.
+
 ## [0.28.0] - 2026-10-27
 
 ### Upgrade notes
