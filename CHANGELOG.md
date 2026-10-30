@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **The worker parent wakes as soon as the job's child reports (#170).** It used to sleep-poll at 5, 15, 35, 75, 155 ... ms, so a finished job sat unnoticed for a mean ~15 ms (a 50 ms job was reaped at the 75 ms tick). The prefork parent now blocks on the result pipe and the fork-per-job parent on a pidfd (Linux; elsewhere the old tick), with the same tick as timeout. Median lag after a 50 ms job: 23 ms to 8 ms. Heartbeats, revoke polling, signals and the parent safety-net timeout keep their cadence.
+- **The worker parent wakes as soon as the job's child reports (#170).** It used to sleep-poll at 5, 15, 35, 75, 155 ... ms, so a finished job sat unnoticed for a mean ~15 ms (a 50 ms job was reaped at the 75 ms tick). The prefork parent now blocks on the result pipe and the fork-per-job parent on a pidfd where `os.pidfd_open` works and otherwise on its outcome pipe (EOF when the child exits), so the wake does not depend on `pidfd_open` being available, with the same tick as timeout (via `poll`, so no 1024-fd `select` limit). Median lag after a 50 ms job: 23 ms to 8 ms. Heartbeats, revoke polling, signals and the parent safety-net timeout keep their cadence.
 
 ## [0.28.0] - 2026-10-27
 
