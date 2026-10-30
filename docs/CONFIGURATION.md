@@ -285,10 +285,12 @@ Standalone mode reads the same keys from `SQLERY_WORKER_POOL`, `SQLERY_WORKER_MA
 **DB connections follow the recycle rate.** With prefork, the child and the parent keep their
 connections across jobs and force-refresh them every `WORKER_DB_REUSE_MAX` jobs. Left unset,
 that is `WORKER_MAX_TASKS_PER_CHILD`, so connections are renewed when the child is. When neither
-is set (Celery's defaults), connections are never force-closed. Around each job, Django
-connections that are unusable or older than `CONN_MAX_AGE` are closed, which is what Celery's
-Django fixup does (with Django's default `CONN_MAX_AGE = 0` that means a connection per job;
-raise `CONN_MAX_AGE` to reuse it). SQLAlchemy connections are left to `pool_pre_ping` and
+is set (Celery's defaults), connections are never force-closed. Around each job, and on every
+iteration of the worker loop, only Django connections that are unusable are closed (an idle
+connection is probed with `SELECT 1` before the child runs a job; one inside a transaction is
+never closed; one whose autocommit a job left off is). Workers keep their own connection regardless of `CONN_MAX_AGE`, even at Django's
+default of 0, so a worker opens O(1) sessions rather than two per job; `CONN_MAX_AGE` still
+applies to web requests. SQLAlchemy connections are left to `pool_pre_ping` and
 `POOL_RECYCLE`. The fork pool keeps its old per-job behaviour and ignores `WORKER_DB_REUSE_MAX`.
 
 **Losing the database connection.** Both pools handle it the same way:

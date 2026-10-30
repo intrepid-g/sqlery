@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workers keep their DB connection between jobs at `CONN_MAX_AGE = 0` (#169).** The worker loop and the prefork child ran Django's request-cycle `close_old_connections()`, which closes a `CONN_MAX_AGE = 0` connection every time: about two new PostgreSQL sessions per job. They now close only connections that are unusable (never one inside a transaction), whatever `CONN_MAX_AGE` says; an idle child connection is probed with `SELECT 1` before each job (one extra round trip per job, far cheaper than the reconnect it replaces). Like Django's request cycle, a connection whose autocommit a job left off is still closed, so a leaked transaction never reaches the next job. `WORKER_DB_REUSE_MAX` and the #161 reconnect are unchanged, and `CONN_MAX_AGE` still applies to web requests.
+
 ## [0.28.0] - 2026-10-27
 
 ### Upgrade notes

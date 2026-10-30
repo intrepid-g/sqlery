@@ -20,8 +20,9 @@ variables (so a CLI flag reaches the worker processes a daemon spawns), and per 
 
 DB connections are refreshed at the recycle rate: ``WORKER_DB_REUSE_MAX`` (default ``None``
 = ``WORKER_MAX_TASKS_PER_CHILD``) force-closes them every N jobs, in the child and in the
-parent. When neither is set, connections are closed around each job only when unusable or
-past ``CONN_MAX_AGE`` (what Celery's Django fixup does by default).
+parent. When neither is set, connections are closed around each job only when unusable.
+``CONN_MAX_AGE`` is a request-cycle setting and is ignored here (#169): a worker keeps its
+own connection from job to job, even at Django's default ``CONN_MAX_AGE = 0``.
 """
 
 from __future__ import annotations
@@ -296,12 +297,50 @@ def max_rss_kib() -> int | None:
     return rss // 1024 if sys.platform == "darwin" else rss  # macOS reports bytes
 
 
-def refresh_db_connections(force: bool) -> None:
-    """Close this process's DB connections; they reopen on the next query.
+def _close_unusable_django_connections(ping: bool = False) -> None:
+    """Close Django connections that are broken, keeping every healthy one open.
 
-    ``force`` closes every connection (Django) and empties the SQLAlchemy pool. Otherwise
-    only Django connections that are unusable or past ``CONN_MAX_AGE`` are closed, and the
-    SQLAlchemy pool is left to ``pool_pre_ping`` / ``pool_recycle``.
+    Unlike ``close_old_connections()`` (the request cycle), this ignores ``CONN_MAX_AGE``:
+    with Django's default of 0 that would close the connection after every job. A
+    connection inside a transaction is left alone. One that saw an error is closed unless
+    ``is_usable()`` still answers; with ``ping`` an idle connection is probed too (one
+    ``SELECT 1``), to catch a session the server dropped while the process sat idle. Like
+    Django's ``close_if_unusable_or_obsolete()``, a connection whose autocommit no longer
+    matches its settings is closed: a job that left autocommit off (and maybe a transaction
+    open) must not hand that to the next job.
+    """
+    from django.db import connections
+
+    try:
+        conns = list(connections.all(initialized_only=True))
+    except TypeError:  # Django < 4.1
+        conns = list(connections.all())
+    for conn in conns:
+        if conn.connection is None or conn.in_atomic_block:
+            continue
+        conn.health_check_done = False  # let CONN_HEALTH_CHECKS run again, as per request
+        try:
+            autocommit_restored = conn.get_autocommit() == conn.settings_dict["AUTOCOMMIT"]
+        except Exception:
+            autocommit_restored = False
+        if not autocommit_restored:
+            conn.close()
+            continue
+        if conn.errors_occurred or ping:
+            if conn.is_usable():
+                conn.errors_occurred = False
+            else:
+                conn.close()
+
+
+def refresh_db_connections(force: bool) -> None:
+    """Close this process's broken DB connections, or all of them when ``force``.
+
+    ``force`` closes every connection (Django) and empties the SQLAlchemy pool; they reopen
+    on the next query. Otherwise only Django connections that are unusable are closed (see
+    :func:`_close_unusable_django_connections`), whatever ``CONN_MAX_AGE`` says, so a worker
+    keeps its own connection from job to job; the SQLAlchemy pool is left to
+    ``pool_pre_ping`` / ``pool_recycle``.
     """
     if force:
         from .db_resilience import discard_connections
@@ -310,14 +349,30 @@ def refresh_db_connections(force: bool) -> None:
         return
     try:
         from django.conf import settings
-        from django.db import close_old_connections
 
         if settings.configured:
-            close_old_connections()
+            _close_unusable_django_connections()
     except ImportError:
         pass
     except Exception as e:
         logger.warning(f"Refreshing Django DB connections failed: {e}")
+
+
+def ping_db_connections() -> None:
+    """Probe idle Django connections (one ``SELECT 1``) and close the dead ones.
+
+    For a process that sat idle (the prefork child between jobs), where the server may have
+    dropped the session without the connection having seen an error yet.
+    """
+    try:
+        from django.conf import settings
+
+        if settings.configured:
+            _close_unusable_django_connections(ping=True)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"Probing Django DB connections failed: {e}")
 
 
 def encode_frame(obj) -> bytes:
