@@ -6,6 +6,7 @@ This backend wraps Django ORM operations to implement the DatabaseBackend interf
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -91,6 +92,8 @@ class DjangoBackend(DatabaseBackend):
         self.Worker = Worker
         self.ScheduledJob = ScheduledJob
         self._partitioned_pg_cache: bool | None = None
+        # Depth of the worker's idle_transaction() savepoints open in this thread (#172).
+        self._idle = threading.local()
 
     def _partitioned_pg(self) -> bool:
         """True iff running on PostgreSQL AND sqlery_queued_job is partitioned.
@@ -343,8 +346,18 @@ class DjangoBackend(DatabaseBackend):
             enabled=True, next_run_at__isnull=False, queue_name__in=queue_names
         ).aggregate(m=db_models.Min("next_run_at"))["m"]
 
+    # The claim itself sets the worker row busy on this job (with a fresh heartbeat), so the
+    # worker need not heartbeat "busy" again right after it (#172).
+    claim_marks_worker_busy = True
+
+    @contextmanager
     def idle_transaction(self):
-        return transaction.atomic()
+        self._idle.depth = getattr(self._idle, "depth", 0) + 1
+        try:
+            with transaction.atomic():
+                yield
+        finally:
+            self._idle.depth -= 1
 
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job using the unified claiming path.
@@ -405,7 +418,10 @@ class DjangoBackend(DatabaseBackend):
         # Fix: restore transaction.atomic() that existed in the old claim_job body
         # #110: resolve the worker inside the claim transaction so an idle claim attempt
         # is one commit, not two.
-        with transaction.atomic():
+        # #172: inside the worker's idle_transaction() the claim already runs in its own
+        # savepoint, so it opens none; called from anywhere else it keeps its own, so a caller's
+        # enclosing atomic block that catches the claim's error is not marked for rollback.
+        with transaction.atomic(savepoint=not getattr(self._idle, "depth", 0)):
             worker_row = self._resolve_worker(worker_id)
             if not worker_row:
                 # I wish I had the time to: add a retry loop with exponential backoff
@@ -1223,8 +1239,12 @@ class DjangoBackend(DatabaseBackend):
         output: str = "",
         expected_version: int | None = None,
         attempt=None,
+        job=None,
     ):
         """Mark job as successful (the job moves to history, see ``QueuedJob.mark_success``).
+
+        ``job`` is the caller's own object for the job (the worker child's claimed job), used
+        instead of reading the job back (#172); the version fence still decides the write.
 
         Staged ScheduledJob rows (not yet promoted) do not have mark_success;
         the guard prevents AttributeError if an operator calls this for a staged id.
@@ -1236,7 +1256,8 @@ class DjangoBackend(DatabaseBackend):
         superseded worker would silently "win" the CAS against a version
         it never actually held.
         """
-        job = self.get_job_by_id(job_id)
+        if not (isinstance(job, self.QueuedJob) and job.id == job_id):
+            job = self.get_job_by_id(job_id)
         if isinstance(job, JobHistory):
             return self._already_finished(job, expected_version, attempt)
         # Old: if job: job.mark_success(...)  <-- AttributeError for ScheduledJob (IN-01)
