@@ -167,6 +167,19 @@ def attempt_kwargs(job_or_handle: Any, fn: Any = None) -> dict:
     return {"attempt": handle}
 
 
+def job_kwargs(job: Any, fn: Any) -> dict:
+    """``{"job": job}`` when the backend method ``fn`` takes a ``job`` keyword, else ``{}``.
+
+    The worker child hands the job it already holds to the completion call, so the backend
+    does not read it back (#172). Backends whose method has no ``job`` keyword read it as before.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"job": job} if "job" in params else {}
+
+
 def decide_close(rowcount: int, handle: AttemptHandle) -> None:
     """Accept the completion (``rowcount == 1``) or reject it as stale.
 

@@ -66,6 +66,7 @@ def move(
     expected_version: int | None = None,
     require_status=None,
     require_idle: bool = False,
+    close_attempts: bool = True,
 ) -> bool:
     """Move one live job into history with the final ``status``; True iff it moved.
 
@@ -78,6 +79,11 @@ def move(
     version is the live version plus one, and its ``finished_at`` is the given value, else
     the row's own, else now. Nothing is written when the job is not (or no longer) in the
     state the fences demand.
+
+    ``close_attempts=False`` skips closing the job's open attempts afterwards: the caller
+    closed its own attempt in the same transaction (a fenced completion). This relies on a job
+    having at most one open attempt; the code maintains that, but no database constraint
+    enforces it (a partial unique index on open attempts would).
     """
     values = dict(values or {})
     overrides: dict[str, str] = {}
@@ -150,6 +156,8 @@ def move(
             raise RuntimeError(f"moving job {job_id} to history touched an unexpected row count")
         # A finished job is not running: close any attempt a caller without a handle (an
         # admin stop, a recovery sweep) left open. A fenced completion closed its own already.
+        if not close_attempts:
+            return True
         cur.execute(
             f"UPDATE {history_core.ATTEMPT_TABLE} SET finished_at = %s, outcome = %s "
             f"WHERE job_id = %s AND finished_at IS NULL",

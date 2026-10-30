@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from ..compat import get_backend, get_config, initialize, is_standalone_mode, JobFencingError
-from .attempts import attempt_kwargs, attempt_of, require_attempt_table
+from .attempts import attempt_kwargs, attempt_of, job_kwargs, require_attempt_table
 from .history import require_history_table
 from .ready import require_ready_tables
 from .utils import describe_task_args, import_task
@@ -162,6 +162,10 @@ class JobExecutor:
         self.unpersisted: UnpersistedOutcome | None = None
         # Fork pool child: the pipe that sends ``unpersisted`` to the parent.
         self.outcome_fd: int | None = None
+        # Set by ``run_job_in_child`` when this process itself recorded the job's terminal
+        # state: ``(success, output_or_error)``. The prefork child reports it, so the parent
+        # does not read the job back (#172). None: the parent reads the job's state.
+        self.recorded: tuple[bool, str] | None = None
 
     def execute_job(self, job):
         """Execute a single job with error handling and retry logic."""
@@ -309,6 +313,7 @@ class JobExecutor:
         recorded, the outcome is left in ``self.unpersisted`` for the parent.
         """
         self.unpersisted = None
+        self.recorded = None
         # write_fd = int(os.environ.pop('_SQLERY_RESULT_FD'))
         expected_version = None  # set below; kept here so the except: block never NameErrors
         # The claim's attempt handle (inherited through fork); captured before the refresh
@@ -327,28 +332,32 @@ class JobExecutor:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-            # Refresh job from DB (new connection)
-            job = self.backend.get_job_by_id(job.id)
-            # Captured before execution so the completion write below is
-            # fenced against this exact version (see JobFencingError).
+            # The job is the one the parent claimed a moment ago, handed over whole (#172): not
+            # read again. The claim does not write the job row, so its version is the one the
+            # completion write below is fenced against (see JobFencingError). The attempt shown
+            # as running was opened before this child's pid was known.
             expected_version = getattr(job, 'version', None)
+            if hasattr(job, 'child_pid'):
+                job.child_pid = os.getpid()
 
             # Apply timeout
-            if not job.timeout_seconds:
+            timeout_seconds = job.timeout_seconds
+            if not timeout_seconds:
                 # from ..compat import get_config  # moved to top-level
-                job.timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
+                timeout_seconds = get_config('DEFAULT_TIMEOUT_SECONDS', 600)
 
-            if job.timeout_seconds:
+            if timeout_seconds:
                 def timeout_handler(signum, frame):
                     raise TimeoutError(
-                        f"Job {job.id} exceeded timeout of {job.timeout_seconds} seconds"
+                        f"Job {job.id} exceeded timeout of {timeout_seconds} seconds"
                     )
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(job.timeout_seconds)
+                signal.alarm(timeout_seconds)
 
             # Import and execute
             task_func = self._import_task(job.task_path)
-            kwargs = job.kwargs if isinstance(job.kwargs, dict) else {}
+            # A copy: the job object itself goes on to record the outcome, kwargs intact.
+            kwargs = dict(job.kwargs) if isinstance(job.kwargs, dict) else {}
             positional_args = kwargs.pop('_args', ())
             logger.info(f"Job {job.id} executing with {describe_task_args(positional_args, kwargs)}")
 
@@ -366,12 +375,15 @@ class JobExecutor:
             # mid-run), the version has moved on and the write is rejected
             # instead of clobbering the reclaiming worker's outcome.
             try:
+                output = serialize_result(result)
                 job = self.backend.mark_job_success(
                     job.id,
-                    output=serialize_result(result),
+                    output=output,
                     expected_version=expected_version,
                     **attempt_kwargs(attempt, self.backend.mark_job_success),
+                    **job_kwargs(job, self.backend.mark_job_success),
                 )
+                self.recorded = (True, output)
             except JobFencingError as e:
                 logger.warning(
                     f"Job {job.id} succeeded but was superseded by another worker "
@@ -444,6 +456,7 @@ class JobExecutor:
                         f"Job {job.id} will be retried as job {retry_job.id} "
                         f"(attempt {retry_job.retry_count + 1}/{retry_job.max_retries + 1})"
                     )
+                self.recorded = (False, getattr(failed_job, 'error', None) or error_msg)
             except JobFencingError as fence_err:
                 logger.warning(
                     f"Job {job.id} failed but was superseded by another worker "
@@ -856,6 +869,8 @@ class WorkerProcess:
         self._pool_child: _PoolChild | None = None
         # An outcome the job's child could not persist (connection lost), set while waiting.
         self._handed_over: UnpersistedOutcome | None = None
+        # What the job's child said it recorded as the outcome (#172).
+        self._recorded: tuple[bool, str] | None = None
         self.shutdown_requested = False
         self.jobs_processed = 0
         self.current_job = None
@@ -1274,6 +1289,7 @@ class WorkerProcess:
         job_id = job.id
         self.child_pid = child_pid
         self._handed_over = None
+        self._recorded = None
 
         try:
             self.backend.update_job_child_pid(
@@ -1282,8 +1298,10 @@ class WorkerProcess:
         except Exception:
             pass
 
-        # Update heartbeat with child info
-        self._heartbeat('busy', job_id=job_id)
+        # Update heartbeat with child info. Not when the claim just wrote this worker's row
+        # (busy, this job, fresh heartbeat): the wait loop below renews it (#172).
+        if not getattr(self.backend, "claim_marks_worker_busy", False):
+            self._heartbeat('busy', job_id=job_id)
 
         # Two-layer timeout: child SIGALRM fires at `timeout`, parent
         # force-kills at `timeout + 60s` as safety net (like RQ).
@@ -1431,6 +1449,14 @@ class WorkerProcess:
                 lambda: self.executor.persist_outcome(handed_over), f"persisting job {job_id}"
             )
 
+        # The child recorded the outcome itself and said so: nothing to read back (#172).
+        recorded, self._recorded = self._recorded, None
+        if handed_over is None and recorded is not None:
+            success, text = recorded
+            if success:
+                return {'success': True, 'output': text}
+            return {'success': False, 'error': text}
+
         def read_result():
             try:
                 return self.backend.get_job_by_id(job_id)
@@ -1564,7 +1590,7 @@ class WorkerProcess:
         if readable:
             report = read_frame(pool.result_fd)  # None at EOF: the child died
             if report is not None:
-                exit_code, pool.recycling, self._handed_over = report
+                exit_code, pool.recycling, self._handed_over, self._recorded = report
                 return True, exit_code
         done, exit_code = self._poll_forked_child(pool.pid)
         if done:
@@ -1614,9 +1640,11 @@ class WorkerProcess:
     def _pool_child_main(self, job_fd: int, result_fd: int) -> int:
         """Prefork child loop: run each job the parent sends until recycled or told to stop.
 
-        Each report to the parent is a frame ``(exit code, recycle, unpersisted)``: whether
-        this child exits now (WORKER_MAX_TASKS_PER_CHILD / WORKER_MAX_MEMORY_PER_CHILD
-        reached), and an outcome it could not write because its DB connection was lost.
+        Each report to the parent is a frame ``(exit code, recycle, unpersisted, recorded)``:
+        whether this child exits now (WORKER_MAX_TASKS_PER_CHILD / WORKER_MAX_MEMORY_PER_CHILD
+        reached), an outcome it could not write because its DB connection was lost, and the
+        outcome it did write (``(success, output or error)``), so the parent need not read the
+        job back (#172).
         """
         try:
             os.setpgrp()  # timeout/revoke kill this group: the child and the job's subprocesses
@@ -1656,7 +1684,12 @@ class WorkerProcess:
                 )
             if not recycle:
                 refresh_db_connections(force=db_refresh_due(jobs_done, settings.db_reuse_max))
-            write_all(result_fd, encode_frame((exit_code, recycle, self.executor.unpersisted)))
+            write_all(
+                result_fd,
+                encode_frame(
+                    (exit_code, recycle, self.executor.unpersisted, self.executor.recorded)
+                ),
+            )
             if recycle:
                 return 0
 

@@ -1099,6 +1099,7 @@ class QueuedJob(models.Model):
         }
 
         with transaction.atomic():
+            fenced = (attempt or attempt_of(self)) is not None
             self._close_attempt(attempt, OUTCOME_SUCCESS)
             if self._awaits_webhook("success"):
                 rows_updated = QueuedJob.objects.filter(
@@ -1107,7 +1108,12 @@ class QueuedJob(models.Model):
                 moved = rows_updated == 1
             else:
                 moved = history.move(
-                    self.id, self.created_at, "success", values, expected_version=expected_version
+                    self.id,
+                    self.created_at,
+                    "success",
+                    values,
+                    expected_version=expected_version,
+                    close_attempts=not fenced,  # its own attempt was closed just above
                 )
             if not moved:
                 raise ConcurrentModificationError(

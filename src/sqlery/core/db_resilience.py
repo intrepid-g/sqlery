@@ -289,6 +289,9 @@ def configure_connection_resilience(for_job_child: bool = False):
             logger.warning("Failed to configure standalone PostgreSQL resilience: %s", exc)
         return
 
+    if for_job_child and _is_configured(connection):
+        return  # #172: a job child's session keeps its settings; do not SET them for every job
+
     if connection is None:
         # Standalone mode with vendor known but no cursor handle: nothing to do.
         logger.debug(
@@ -302,6 +305,28 @@ def configure_connection_resilience(for_job_child: bool = False):
         _configure_sqlite(connection, _get_setting)
     elif vendor == "postgresql":
         _configure_postgresql(connection, _get_setting, for_job_child=for_job_child)
+    if for_job_child:
+        _mark_configured(connection)  # the cursor above opened it, if it was not open
+
+
+# The raw DB connection a job child configured last (#172). Held strongly (sqlite3 connections
+# cannot be weakly referenced); a closed one is replaced by the next, so at most one lingers.
+_job_child_configured = None
+
+
+def _raw_connection(connection):
+    return getattr(connection, "connection", None)
+
+
+def _is_configured(connection) -> bool:
+    """True if the raw connection under ``connection`` was configured by the last job child call."""
+    raw = _raw_connection(connection)
+    return raw is not None and raw is _job_child_configured
+
+
+def _mark_configured(connection) -> None:
+    global _job_child_configured
+    _job_child_configured = _raw_connection(connection)
 
 
 def _configure_sqlite(connection, get_setting):
