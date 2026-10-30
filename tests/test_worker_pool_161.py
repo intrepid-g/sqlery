@@ -457,7 +457,9 @@ def test_parent_reconnects_with_backoff_to_read_the_result(
             raise lost_connection()
         return real(job_id)
 
-    worker = make_worker()
+    # The fork pool has no report channel, so its parent reads the outcome back (#172: the
+    # prefork parent is told by the child and reads nothing).
+    worker = make_worker(pool=POOL_FORK)
     whoami.enqueue()
     claimed = backend.claim_job(["default"], worker.worker_id)
     monkeypatch.setattr(backend, "get_job_by_id", flaky)
@@ -465,6 +467,39 @@ def test_parent_reconnects_with_backoff_to_read_the_result(
     result = worker._execute_claimed(claimed)
     assert result["success"], result
     assert failures["left"] == 0 and len(discarded) == 2
+
+
+def test_prefork_parent_reconnects_to_read_what_a_silent_child_recorded(
+    backend, make_worker, monkeypatch, fast_reconnect
+):
+    """The child records the job, then exits without its report frame (#172): the parent has
+    no outcome from it, loses its own connection once, reconnects and reads the result."""
+    real = backend.get_job_by_id
+    failures = {"left": 1}
+    discarded = []
+    parent = os.getpid()
+
+    def flaky(job_id):
+        if os.getpid() == parent and failures["left"]:
+            failures["left"] -= 1
+            raise lost_connection()
+        return real(job_id)
+
+    def die_silently(*args, **kwargs):
+        if os.getpid() != parent:
+            os._exit(0)  # after the outcome is recorded, before the frame is written
+
+    worker = make_worker()
+    queued = whoami.enqueue()
+    claimed = backend.claim_job(["default"], worker.worker_id)
+    monkeypatch.setattr("sqlery.core.worker.refresh_db_connections", die_silently)
+    monkeypatch.setattr(backend, "get_job_by_id", flaky)
+    monkeypatch.setattr("sqlery.core.worker.discard_connections", lambda: discarded.append(1))
+    result = worker._execute_claimed(claimed)
+    assert result["success"], result
+    assert failures["left"] == 0 and len(discarded) == 1
+    monkeypatch.undo()
+    assert backend.get_job_by_id(queued.id).status == "success"
 
 
 def test_running_job_finishes_while_the_parent_cannot_reach_the_db(
