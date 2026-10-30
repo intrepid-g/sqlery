@@ -259,8 +259,6 @@ class TestForkLifecycle:
         monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)
         # Ensure we don't actually sleep waiting.
         monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
-        # Prevent Django from checking real DB connections (no django_db mark).
-        monkeypatch.setattr("sqlery.core.worker.close_old_connections", lambda: None)
 
         result = wp._fork_and_execute(job)
         assert result["success"] is True
@@ -330,7 +328,6 @@ class TestForkLifecycle:
         monkeypatch.setattr(os, "WIFEXITED", lambda s: True)
         monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)
         monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
-        monkeypatch.setattr("sqlery.core.worker.close_old_connections", lambda: None)
 
         wp._fork_and_execute(job)
 
@@ -413,8 +410,6 @@ def _run_one_election_cycle(wp, monkeypatch):
     during the cycle.
     """
     monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
-    if worker_module.close_old_connections is not None:
-        monkeypatch.setattr(worker_module, "close_old_connections", lambda: None)
 
     # FakeBackend does not _record lease calls, so wrap them here to capture
     # the (queues, daemon_id) the worker passed DURING the cycle. This is the

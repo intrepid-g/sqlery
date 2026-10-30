@@ -84,7 +84,7 @@ DEFAULTS = {
     "WORKER_MAX_TASKS_PER_CHILD": None,  # Recycle the prefork child after N jobs (None = never)
     "WORKER_MAX_MEMORY_PER_CHILD": None,  # ... or once its max RSS exceeds N KiB (None = never)
     # Force-close DB connections every N jobs; None = WORKER_MAX_TASKS_PER_CHILD (the
-    # recycle rate). Neither set: close only unusable/CONN_MAX_AGE-expired ones per job.
+    # recycle rate). Neither set: close only unusable ones (CONN_MAX_AGE is ignored by workers).
     "WORKER_DB_REUSE_MAX": None,
     # #163: "fork" (Celery) forks daemon workers from a launcher that preloaded the task
     # modules, so they share that memory; "spawn" starts each as a fresh interpreter.
