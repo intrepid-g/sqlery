@@ -1223,10 +1223,19 @@ class WorkerProcess:
                 self._receive_handed_over(outcome_r)  # written just before the child exited
             return done, exit_code
 
+        # A pidfd turns readable when the child exits, so the wait wakes at once (#170).
+        pidfd = None
+        if hasattr(os, "pidfd_open"):
+            try:
+                pidfd = os.pidfd_open(child_pid)
+            except OSError:
+                pidfd = None  # old kernel or sandbox: the wait falls back to its tick
         try:
-            return self._await_child(job, child_pid, poll)
+            return self._await_child(job, child_pid, poll, wait_fd=pidfd)
         finally:
             os.close(outcome_r)
+            if pidfd is not None:
+                os.close(pidfd)
 
     def _receive_handed_over(self, fd: int) -> None:
         """Fork pool: pick up an outcome the child handed over, if one is waiting."""
@@ -1247,11 +1256,14 @@ class WorkerProcess:
             return True, os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
         return False, None
 
-    def _await_child(self, job, child_pid: int, poll) -> dict:
+    def _await_child(self, job, child_pid: int, poll, wait_fd: int | None = None) -> dict:
         """Wait for ``child_pid`` to finish ``job`` while heartbeating, then read the outcome.
 
         ``poll()`` returns ``(done, exit_code)``. Enforces the parent safety-net timeout and
         revoke requests by killing the child's process group. Shared by both pools.
+        ``wait_fd`` is an optional fd that turns readable when the child reports or exits
+        (the prefork result pipe, a pidfd): each tick then ends as soon as it does, instead
+        of at the end of the sleep (#170).
         """
         timeout = job.timeout_seconds or get_config('DEFAULT_TIMEOUT_SECONDS', 600)
         job_id = job.id
@@ -1301,6 +1313,7 @@ class WorkerProcess:
         # 0.5 s, the first DB pass lands ~0.635 s into a job.
         wait_sleep = self.WAIT_TICK_MIN
         slept_since_duties = 0.0
+        fd_woke = False
 
         while not child_exited:
             # Old: inline os.waitpid(child_pid, os.WNOHANG); now per-pool (_poll_forked_child)
@@ -1328,7 +1341,23 @@ class WorkerProcess:
                 return {'success': False, 'error': f'Timeout after {int(elapsed)}s'}
 
             # Sleep briefly so parent stays responsive to signals
-            time.sleep(wait_sleep)
+            tick_start = time.monotonic()
+            if wait_fd is not None and not fd_woke:
+                try:
+                    fd_woke = bool(select.select([wait_fd], [], [], wait_sleep)[0])
+                except (OSError, ValueError):
+                    wait_fd = None  # unusable fd: fall back to plain sleeping
+                    time.sleep(wait_sleep)
+            else:
+                # An fd that woke us without the child being done (EOF just before the
+                # exit is reapable) must not spin: sleep this tick instead.
+                time.sleep(wait_sleep)
+                fd_woke = False
+            if fd_woke:
+                # Woken early: the poll at the top decides; count the time actually waited.
+                slept_since_duties += time.monotonic() - tick_start
+                self._check_heartbeat()
+                continue
             slept_since_duties += wait_sleep
             wait_sleep = min(wait_sleep * 2, self.WAIT_TICK_MAX)
             self._check_heartbeat()
@@ -1536,7 +1565,9 @@ class WorkerProcess:
             write_all(pool.job_fd, payload)
         logger.info(f"Sent job {job.id} to prefork child PID {pool.pid}")
         try:
-            return self._await_child(job, pool.pid, lambda: self._poll_pool_child(pool))
+            return self._await_child(
+                job, pool.pid, lambda: self._poll_pool_child(pool), wait_fd=pool.result_fd
+            )
         finally:
             if pool.recycling or not self._pool_child_alive(pool):
                 self._stop_pool_child()
