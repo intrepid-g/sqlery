@@ -275,11 +275,6 @@ wp = WorkerProcess(queues=["default"], backend=backend)
 
 # Bound the run to exactly one election pass without any real wall-clock sleep.
 worker_module.time.sleep = lambda *a, **k: None
-# django IS installed in dev, so worker_module.close_old_connections is the real
-# Django fn; with no DJANGO_SETTINGS_MODULE it raises ImproperlyConfigured and the
-# worker's broad except would spin forever. The bare standalone worker has no
-# Django connections to prune, so no-op it (mirrors _run_one_election_cycle).
-worker_module.close_old_connections = None
 _real_claim_job = backend.claim_job
 def _claim_then_stop(queues, worker_id):
     _real_claim_job(queues, worker_id)
