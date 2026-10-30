@@ -44,6 +44,7 @@ from .pool import (
     encode_frame,
     load_pool_settings,
     max_rss_kib,
+    ping_db_connections,
     read_frame,
     refresh_db_connections,
     should_recycle,
@@ -59,10 +60,9 @@ from sqlery.core.db_resilience import (
 )
 
 try:
-    from django.db import connections, close_old_connections
+    from django.db import connections
 except ImportError:
     connections = None
-    close_old_connections = None
 
 # Phase 18: guard-import psycopg3 for LISTEN/NOTIFY wake-up (PG-only, opt-in).
 # psycopg is already a declared dependency; this guard is for environments
@@ -1006,13 +1006,9 @@ class WorkerProcess:
                 if max_jobs and self.jobs_processed >= max_jobs:
                     break
                 try:
-                    # Prune connections that exceeded CONN_MAX_AGE (like Django request cycle)
-                    # from django.db import close_old_connections  # moved to top-level (try/except)
-                    if close_old_connections is not None:
-                        try:
-                            close_old_connections()
-                        except Exception:
-                            pass
+                    # Keep the connection between iterations whatever CONN_MAX_AGE says
+                    # (#169); only a broken one is dropped.
+                    refresh_db_connections(force=False)
 
                     self._last_loop_time = time.monotonic()
                     self._check_heartbeat()
@@ -1635,8 +1631,9 @@ class WorkerProcess:
             job = read_frame(job_fd)
             if job is None:
                 return 0  # the parent closed the pipe: shutdown
-            # Like Celery's task_prerun: drop a connection that went stale while idle.
-            refresh_db_connections(force=False)
+            # Like Celery's task_prerun: drop a connection that went stale while idle (#169:
+            # probed, not aged out by CONN_MAX_AGE).
+            ping_db_connections()
             exit_code = self.executor.run_job_in_child(job)
             jobs_done += 1
             # Like Celery: the job always completes, then the limits decide.
