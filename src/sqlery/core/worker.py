@@ -5,6 +5,7 @@ import contextvars
 import inspect
 import json
 import logging
+import random
 import re
 import socket
 import sys
@@ -1010,6 +1011,11 @@ class WorkerProcess:
         # Old: self._fork_ctx.register_post_fork_parent(self._open_listen_conn)
         self._fork_ctx.register_post_fork_child(self._orphan_listen_conn)
 
+        # #171: an empty claim right after work (a job just ran, or a NOTIFY woke us) may
+        # only mean siblings hold the ready entries (SKIP LOCKED) or won the race; retry a
+        # few times at once before waiting. A worker that was idle gets no retries.
+        claim_hot = False
+        quick_retries = 0
         try:
             while not self.shutdown_requested:
                 if max_jobs and self.jobs_processed >= max_jobs:
@@ -1057,6 +1063,20 @@ class WorkerProcess:
                     if claim_error is not None:
                         raise claim_error
 
+                    if not job and claim_hot and quick_retries < self._CLAIM_RETRIES:
+                        # Retry only if due ready entries remain (lost race, SKIP LOCKED
+                        # skips, a page of stale entries, #167). The probe is a plain read
+                        # and runs only right after work, never on the idle path.
+                        if self._ready_work_remains():
+                            quick_retries += 1
+                            # Note: no _check_heartbeat() here; the retries last ~300 ms at
+                            # most, far below the heartbeat interval.
+                            time.sleep(self._claim_retry_delay(quick_retries))
+                            continue
+
+                    quick_retries = 0
+                    claim_hot = False
+
                     if not job:
                         if self._idle_dirty and not ticked:
                             # A job just ran: flip the heartbeat back to idle and refresh
@@ -1091,7 +1111,7 @@ class WorkerProcess:
                         #     time.sleep(1)
                         #     elapsed += 1
                         #     self._check_heartbeat()
-                        self._wait_for_notify()
+                        claim_hot = bool(self._wait_for_notify())
                         continue
 
                     # Fork and execute
@@ -1119,6 +1139,7 @@ class WorkerProcess:
                         self.current_job = None
                         self.child_pid = None
                         self._idle_dirty = True
+                        claim_hot = True
 
                     # Don't heartbeat idle between jobs — the next loop iteration
                     # will either claim a new job immediately or heartbeat idle
@@ -1853,8 +1874,8 @@ class WorkerProcess:
             return False
         return True
 
-    def _wait_for_notify(self) -> None:
-        """Block up to poll_interval for a NOTIFY, in <=1s slices.
+    def _wait_for_notify(self) -> bool:
+        """Block up to poll_interval for a NOTIFY, in <=1s slices; True if one arrived.
 
         Falls back to plain time.sleep slices if no LISTEN connection is open
         (flag-off path, SQLite, or after a LISTEN connection error). Heartbeat
@@ -1869,38 +1890,54 @@ class WorkerProcess:
         if self._listen_conn is None and self._lazy_open_listen_conn():
             # Just subscribed: return so the loop re-claims. A job enqueued before the
             # LISTEN took effect is found by that claim; one after it is NOTIFYed.
-            return
+            return False
         if self._listen_conn is None:
             # Flag-off / SQLite / no connection — original 1s-slice sleep loop
             end = time.monotonic() + timeout
             while not self.shutdown_requested:
                 remaining = end - time.monotonic()
                 if remaining <= 0:
-                    return
+                    return False
                 time.sleep(min(1.0, remaining))
                 self._check_heartbeat()
-            return
+            return False
         # Flag-on + PG: wait for NOTIFY with the idle timeout, in 1s slices
         end = time.monotonic() + timeout
         while not self.shutdown_requested:
             remaining = end - time.monotonic()
             if remaining <= 0:
-                return
+                return False
             try:
                 for _ in self._listen_conn.notifies(
                     timeout=min(remaining, 1.0), stop_after=1
                 ):
-                    return  # NOTIFY received — wake up to claim immediately
+                    return True  # NOTIFY received — wake up to claim immediately
             except Exception as e:
                 logger.warning(
                     f"Worker {self.worker_id}: LISTEN connection error: {e}; "
                     f"closing, falling back to polling"
                 )
                 self._close_listen_conn()
-                return
+                return False
             self._check_heartbeat()
             if self.shutdown_requested:
-                return
+                return False
+        return False
+
+    # #171: quick claim retries after an empty claim that follows work.
+    _CLAIM_RETRIES = 4
+    _CLAIM_RETRY_BASE = 0.01
+
+    def _ready_work_remains(self) -> bool:
+        try:
+            return bool(self.backend.has_claimable_ready(self.queues))
+        except Exception as e:
+            logger.debug(f"Worker {self.worker_id}: ready probe failed: {e}")
+            return False
+
+    def _claim_retry_delay(self, attempt: int) -> float:
+        """Jittered, doubling pause (10-20 ms, 20-40 ms, ...) before re-claiming."""
+        return self._CLAIM_RETRY_BASE * (2 ** (attempt - 1)) * random.uniform(1.0, 2.0)
 
     def _idle_timeout(self) -> float:
         """poll_interval, shortened to the earliest queued job that is not due yet.

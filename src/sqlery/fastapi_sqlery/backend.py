@@ -414,6 +414,14 @@ class SQLAlchemyBackend(DatabaseBackend):
             nxt = nxt.replace(tzinfo=UTC)
         return (nxt - now).total_seconds()
 
+    def has_claimable_ready(self, queues: list[str]) -> bool:
+        now = datetime.now(UTC)
+        with self._get_session() as session:
+            return (
+                session.exec(ready_sql.next_entry_stmt(queues, now, None, lock=False)).first()
+                is not None
+            )
+
     def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
         with self._get_session() as session:
             nxt = session.exec(

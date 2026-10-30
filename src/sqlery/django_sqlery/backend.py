@@ -333,6 +333,14 @@ class DjangoBackend(DatabaseBackend):
         )["m"]
         return None if nxt is None else (nxt - now).total_seconds()
 
+    def has_claimable_ready(self, queues: list[str]) -> bool:
+        now = timezone.now()
+        return (
+            JobReady.objects.filter(queue_name__in=queues)
+            .filter(db_models.Q(scheduled_at__isnull=True) | db_models.Q(scheduled_at__lte=now))
+            .exists()
+        )
+
     def next_scheduled_run_at(self, queue_names: list[str]) -> datetime | None:
         return self.ScheduledTask.objects.filter(
             enabled=True, next_run_at__isnull=False, queue_name__in=queue_names
