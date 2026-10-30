@@ -118,6 +118,15 @@ class DatabaseBackend(ABC):
 
         return nullcontext()
 
+    def has_claimable_ready(self, queues: list[str]) -> bool:
+        """True if a due ready entry exists in ``queues`` (a plain read, no locks).
+
+        Asked only after an empty claim that followed work: ready entries then mean the
+        claim lost a race or skipped locked/stale entries, so retrying at once is right.
+        The default answers True (retry); backends narrow it.
+        """
+        return True
+
     @abstractmethod
     def claim_job(self, queues: list[str], worker_id: str):
         """Atomically claim next available job from specified queues.
