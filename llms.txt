@@ -1,0 +1,188 @@
+# sqlery
+
+> Database-backed Python job queue and cron scheduler (PostgreSQL or SQLite, no broker) with a Celery/RQ-like API, for Django and for standalone code (FastAPI, Flask, scripts).
+
+Version 0.28.0, Python >= 3.13 (pyproject `requires-python`). The database is the queue, the result store and the scheduler. Two integration modes share one job API: Django (ORM, management commands) and standalone (SQLAlchemy/SQLModel, `sqlery-worker` CLI). Many prose docs are stale (see "Stale docs" below). When docs and source disagree, source wins: start at `src/sqlery/__init__.py`.
+
+Every snippet below was run against SQLite on sqlery 0.28.0 unless marked UNVERIFIED.
+
+## Install
+
+Extras: `postgres` (psycopg), `django` (Django >= 5.2), `standalone` (SQLModel, FastAPI, uvicorn, Typer, Alembic), `cli` (Typer + Rich only).
+
+```
+pip install "sqlery[standalone]"          # standalone mode
+pip install "sqlery[django,postgres]"     # Django mode
+uv pip install -e ".[standalone]"         # from a checkout
+```
+
+Gotcha: the Django migrations import `django.contrib.postgres`, which needs an importable psycopg even when you run on SQLite. The `postgres` extra is plain `psycopg`, which needs the system libpq. Without libpq, use `psycopg[binary]`.
+
+## Job API (same in both modes)
+
+```python
+from sqlery import job            # works in both modes, even with Django not installed
+
+@job(queue="default", max_retries=2, timeout=30)
+def add(x, y):
+    return x + y
+
+add.enqueue(x=1, y=2)             # returns the job row (QueuedJob in Django); positional args also work
+add.delay(3, 4)                   # alias of enqueue (the docstring says it returns a dict; it returns the job row)
+r = add.apply_async(args=(7, 8), countdown=0, queue="default")   # returns AsyncResult
+```
+
+Result and control (verified: `get` returned the value after a worker ran the job):
+
+```python
+from sqlery import AsyncResult, revoke, chain, group, chord
+r.state            # PENDING / STARTED / SUCCESS / FAILURE / REVOKED ...
+r.get(timeout=30)  # blocks; raises TimeoutError, or TaskFailedError if the job failed
+revoke(job_id)                       # queued or scheduled job: cancelled (returns True)
+revoke(job_id, terminate=True)       # running job: the owning worker kills it (needs sqlery-worker or daemon)
+res = (add.s(2, 3) | add.s(10)).apply_async()      # chain; res.get() -> 60. `.s` passes upstream result first
+# group(add.s(i, i) for i in range(5)).apply_async();  chord(group(...), total.s()).apply_async()  (group/chord UNVERIFIED here)
+```
+
+Scheduling a single run: `add.enqueue_at(datetime.now(UTC) + timedelta(hours=1), 5, 6)` (verified). Also `apply_async(countdown=, eta=, expires=)`.
+
+Low-level, no decorator: `from sqlery import enqueue, enqueue_at, get_queue` and `enqueue("myapp.tasks.add", x=1, y=2)` (dotted path string; verified in standalone). `get_queue("name", priority=..., max_retries=...)` returns a `Queue`.
+
+### Job options
+
+| Option | Meaning |
+|---|---|
+| `queue` | Queue name. Default `DEFAULT_QUEUE` = `"default"`. Workers only claim from queues they listen on. |
+| `priority` | Higher runs first (override per call with `priority=`). |
+| `max_retries`, `retry_backoff` | Default 0 retries, backoff multiplier 1.0. A retry is a NEW job row (new id); the failed row becomes `archived`. `AsyncResult` follows retries (verified: 1 retry = 2 attempts, 2 ids). |
+| `autoretry_for`, `retry_backoff_max`, `retry_jitter`, `bind=True` | Celery-style retry policy. Needs `max_retries > 0`. With `autoretry_for` set, only matching exceptions retry; unset means any exception retries. |
+| `timeout` / `timeout_seconds`, `soft_time_limit` | Hard limit (job is killed) and catchable soft limit. Django `@job` default timeout is None; `DEFAULT_TIMEOUT_SECONDS` setting exists (600). |
+| `allow_parallel` | Django-flavoured `@job` defaults to True. Set False to serialize jobs of one queue. |
+| `tags` | Used with `TAG_CONCURRENCY_LIMITS` / `TAG_RATE_LIMITS` settings. |
+
+## Standalone mode
+
+Install `sqlery[standalone]`. Call `initialize()` once per process BEFORE enqueueing, reading results or running admin code. It creates the tables. SQLite URL: `sqlite:///relative.db` or `sqlite:////abs/path.db`; Postgres: `postgresql://user:pw@host/db`.
+
+```python
+# producer.py  (verified)
+from sqlery.compat import initialize, get_backend    # NOT `from sqlery import initialize`
+initialize(database_url="sqlite:///jobs.db")
+import mytasks                                       # module-level @job functions
+mytasks.add.enqueue(x=20, y=22)
+```
+
+Worker (verified: claimed and ran the job, `AsyncResult.get()` returned 42):
+
+```
+export SQLERY_DATABASE_URL=sqlite:///jobs.db PYTHONPATH=.      # the task module must be importable by the worker
+sqlery-worker --queues default                  # note: NO "run" subcommand; `sqlery worker ...` is equivalent
+sqlery-worker --queues default,high --max-jobs 1   # exit after N jobs (0 = unlimited)
+```
+
+Other worker flags: `--pool prefork|fork`, `--max-tasks-per-child`, `--max-memory-per-child`, `--db-reuse-max`. Env: `SQLERY_WORKER_POOL`, `SQLERY_WORKER_CONCURRENCY` and friends (docs/ENVIRONMENT_VARIABLES.md). `sqlery daemon start` exists (standalone daemon with a worker pool; UNVERIFIED here). `sqlery-web` serves the dashboard (UNVERIFIED).
+
+Standalone `@job` choice: `from sqlery import job` (positional args OK) or `from sqlery.core.job import job` (kwargs only: `.enqueue(x=1, y=2)`). Pick one per project.
+
+Standalone cron: use `get_backend().create_scheduled_task(name=, task_path=, cron_expression=, queue_name=, priority=)` after `initialize()` (signature read from source, UNVERIFIED). The `sqlery tasks ...`, `sqlery jobs ...`, `sqlery queues ...` CLI commands failed with "Database not initialized" when only `SQLERY_DATABASE_URL` was set (tried also `DATABASE_URL`). Do not rely on them; script against `get_backend()` instead.
+
+## Django mode
+
+```python
+# settings.py  (verified with SQLite)
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent       # the daemon reads BASE_DIR (pid/log under BASE_DIR/tmp); missing -> AttributeError
+INSTALLED_APPS = [..., "sqlery.django_sqlery", "myapp"]
+USE_TZ = True
+DJANGO_SQL_JOBS = {                               # sqlery settings live in this dict
+    "WORKER_QUEUES": ["default"],
+    "TRIGGER_MODE": "disabled",                   # see Run modes
+}
+```
+
+```
+python manage.py migrate                          # creates sqlery_* tables
+```
+
+Define jobs in `myapp/tasks.py` (workers preload each installed app's `tasks` module; `WORKER_PRELOAD_MODULES` overrides, `[]` disables), enqueue from anywhere (`add.enqueue(x=1, y=2)`).
+
+Management commands (all verified to exist; `python manage.py help` lists them under `[django_sqlery]`):
+
+| Command | Use |
+|---|---|
+| `daemon start [--workers N] [--once]` | Long-running worker pool plus scheduler plus maintenance. Runs in the foreground (verified: processed a job). `--no-detach` does NOT exist in Django mode. Also `stop`, `restart`, `status` (`status` said "not running" while a `start` was alive in my test; do not trust it blindly). |
+| `rqworker QUEUE... [--burst]` | django-tasks-scheduler compatible: daemon loop on the given queues; `--burst` drains and exits (UNVERIFIED that burst runs jobs: it reported 0 in a test where other jobs had been claimed already). |
+| `run_jobs [--queue Q] [--worker-only] [--scheduler-only] [--max-jobs N] [--idle-linger S]` | One-shot: enqueue due scheduled tasks and process up to N jobs (default 1). No `--once` flag (docs/MANAGEMENT_COMMANDS.md is wrong on that). Verified: `run_jobs --worker-only --max-jobs 10` processed 5 jobs. |
+| `run_scheduled_tasks [--task NAME]` | Enqueue due `ScheduledTask` rows (verified: "Executed 1 tasks" for a due cron task). |
+| `workers list|kill|cleanup|stop-all` | Inspect and stop worker processes. |
+| `cleanup_jobs auto|jobs|registries|stats|vacuum` | Retention cleanup. |
+| `sqlery_export`, `sqlery_import` | Move jobs and tasks between environments. |
+
+Cron / interval / once tasks (verified): create a `ScheduledTask`, then a daemon or `run_jobs`/`run_scheduled_tasks` enqueues it when due.
+
+```python
+from sqlery.django_sqlery.models import ScheduledTask
+ScheduledTask.objects.create(name="nightly-add", task_path="myapp.tasks.add", task_kwargs={"x": 1, "y": 1},
+                             schedule_type="cron", cron_expression="0 2 * * *", queue_name="default")
+# schedule_type: "cron" | "interval" (interval=, interval_unit=) | "once"; next_run_at is computed on save
+```
+
+Settings that matter (defaults in `src/sqlery/django_sqlery/settings.py`, `DEFAULTS` dict): `TRIGGER_MODE`, `EXECUTION_MODE`, `WORKER_QUEUES`, `MAX_WORKERS_PER_NODE` (default = CPU count), `WORKER_POOL` (`prefork` default), `WORKER_MAX_TASKS_PER_CHILD`, `WORKER_START_METHOD` (`fork`), `DEFAULT_QUEUE`, `DEFAULT_TIMEOUT_SECONDS`, `JOB_RETENTION`, `INTERNAL_SECRET`, `INTERNAL_BASE_URL`.
+
+## Run modes
+
+Workers (daemon, `sqlery-worker`, `rqworker`) are the default for production. The other modes trade throughput for "no always-on process". Mode is chosen by `TRIGGER_MODE` (`middleware`, `http`, `subprocess`, `daemon`, `eventbridge`, `disabled`) and `EXECUTION_MODE` (`auto`, `subprocess`, `thread`, `django-tasks`) in `DJANGO_SQL_JOBS`. The mapping below comes from settings.py and `examples/run_modes_lab`; I ran only daemon and `run_jobs`.
+
+- Daemon: `python manage.py daemon start` / `sqlery daemon start`. Always-on pool, scheduler, lease-based claiming. Pick this for production. (verified, Django)
+- Standalone worker: `sqlery-worker --queues ...`. Pick this for non-Django services. (verified)
+- Subprocess: `TRIGGER_MODE="subprocess"` spawns `run_jobs` children (`MAX_SUBPROCESS_WORKERS`, `SUBPROCESS_JOBS_PER_PROCESS`). Pick when no daemon can run. (UNVERIFIED)
+- Thread / middleware: `TRIGGER_MODE="middleware"` (default) with `EXECUTION_MODE="thread"` runs jobs inside the web process. Dev only; blocks requests. (UNVERIFIED)
+- HTTP trigger: `TRIGGER_MODE="http"` plus `INTERNAL_BASE_URL`, `INTERNAL_SECRET`; HMAC-signed POST to `_internal/trigger` starts one worker. For ASGI or serverless hosts. (UNVERIFIED)
+- Lambda / EventBridge: `TRIGGER_MODE="eventbridge"` plus `EVENTBRIDGE_LAMBDA_ARN`; handler is `sqlery.lambda_handler.handler`. The code logs that this mode is EXPERIMENTAL and not production-ready. (UNVERIFIED)
+- Async: `@async_job` plus `AsyncQueue` and `AsyncWorker` (`sqlery.core.async_worker`), or django-tasks `db_worker` (`EXECUTION_MODE="django-tasks"`). In my test `await hello.enqueue(...)` failed twice: first "No default backend configured. Call AsyncQueue.configure(backend)", then, with `AsyncQueue.configure(DjangoAsyncBackend())`, `'DjangoAsyncBackend' object has no attribute 'create_job'`. Treat async enqueue as broken or unverified; read `tests/test_async_worker*.py` before use.
+
+## Rules and gotchas for agents
+
+1. Jobs are stored by dotted path `module.qualname` and imported by the worker. Define jobs at module level in an importable module, not in `__main__`, a lambda, a closure or a method. The worker process needs that module on `PYTHONPATH` (standalone) or in an installed app (Django, `tasks` module).
+2. Arguments go through JSON. Standalone rejected `datetime`, `set` and `Decimal` at enqueue (`TypeError ... not JSON serializable`). Django accepted `datetime` at enqueue (stored as JSON, so the job most likely receives a string, not a datetime; UNVERIFIED) and rejected `set`. Pass ids and ISO strings, and load objects inside the job.
+3. Delivery is at-least-once: a job on a crashed or stalled worker is reclaimed and runs again (see `JobFencingError` in `src/sqlery/compat/__init__.py`, and `retry_pending` recovery in CHANGELOG). Make jobs idempotent. Retries also re-run the job.
+4. Never use `sqlery.backends.BackendFactory` (removed in v0.13). Use `sqlery.compat.initialize()` and `get_backend()`. `initialize()` raises in Django mode; it is standalone only.
+5. `from sqlery import initialize` fails: it is not exported. Import from `sqlery.compat`.
+6. Run workers as separate processes. Workers use a prefork child that runs many jobs, so module-level state and memory persist across jobs until `WORKER_MAX_TASKS_PER_CHILD`. After a deploy, restart the daemon (it runs preloaded code). The daemon forks workers; do not hold DB connections or open sockets at import time of task modules, because the launcher imports them before forking.
+7. SQLite suits dev, tests and a single node. Use PostgreSQL for several workers or hosts: partitioned tables, `FOR UPDATE SKIP LOCKED` claiming and LISTEN/NOTIFY wake-ups (`SQLERY_PG_NOTIFY`) are PostgreSQL features. Do not point tests at a shared database.
+8. After upgrading, migrate first, and stop workers before migrating (see CHANGELOG upgrade notes: 0.27.0 changed a running job's live row to `status='queued'`; use `JobAll` or `sqlery_job_all` to see `running`).
+9. A running job can only be revoked with `terminate=True` and only if a `WorkerProcess` runs it (daemon or `sqlery-worker`).
+10. Default concurrency is the CPU count, about 75 MiB per worker plus its job child. Set `MAX_WORKERS_PER_NODE`, `SQLERY_WORKER_CONCURRENCY` or `--concurrency` on small hosts.
+
+## Docs
+
+Accurate as of the 0.28 source (spot-checked; confirm a setting name in `settings.py` before relying on it):
+
+- [CHANGELOG.md](CHANGELOG.md): the most current statement of semantics (claims, retries, worker pool, upgrade notes). Read the top sections first.
+- [docs/CELERY_PARITY.md](docs/CELERY_PARITY.md): `apply_async`, `AsyncResult`, retries, canvas, revoke, signals, time limits, solar schedules.
+- [docs/ENVIRONMENT_VARIABLES.md](docs/ENVIRONMENT_VARIABLES.md): `SQLERY_*` variables (the worker-pool section is current; check the rest).
+- [docs/design/queue-robustness.md](docs/design/queue-robustness.md): claiming, ready queue, partitions, recovery.
+- [docs/guides/scheduled-tasks-vs-tick-loop.md](docs/guides/scheduled-tasks-vs-tick-loop.md): when to use `ScheduledTask` instead of a custom polling loop.
+- [examples/run_modes_lab](examples/run_modes_lab/README.md): per-mode services and a verifier (see its stale commands below).
+- [src/sqlery/django_sqlery/settings.py](src/sqlery/django_sqlery/settings.py): the `DEFAULTS` dict is the list of Django settings.
+- [pyproject.toml](pyproject.toml): extras and console scripts (`sqlery`, `sqlery-worker`, `sqlery-web`, `sqlery-daemon`, `sqlery-jobs`, `sqlery-tasks`, `sqlery-migrate`, `sqlery-cleanup`).
+
+## Optional
+
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md): worker-pool and tuning sections are current; the database-connection examples use `BackendFactory` and are stale.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): large; some parts predate v0.13. Verify against source.
+- [docs/MIGRATION_FROM_CELERY.md](docs/MIGRATION_FROM_CELERY.md), [docs/MIGRATION_FROM_RQ.md](docs/MIGRATION_FROM_RQ.md), [docs/MIGRATION_FROM_DJANGO_TASKS_SCHEDULER.md](docs/MIGRATION_FROM_DJANGO_TASKS_SCHEDULER.md): concept mapping; code samples unchecked.
+- [docs/SECURITY.md](docs/SECURITY.md), [docs/TESTING.md](docs/TESTING.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): background reading, unchecked.
+- [tests/](tests/): behaviour reference (for example `test_canvas.py`, `test_async_worker.py`, `test_async_result.py`).
+
+## Stale docs, verify against source
+
+Do not copy code from these:
+
+- README.md and docs/getting-started.md: use `sqlery.backends.BackendFactory` (removed in v0.13).
+- docs/CONFIGURATION.md database sections and examples/basic_sync, examples/basic_async: `BackendFactory`.
+- examples/standalone_queue_example.py: `from sqlery import initialize` (not exported; use `sqlery.compat`).
+- docs/MANAGEMENT_COMMANDS.md and docs/ARCHITECTURE.md: mention `run_jobs --once` (no such flag).
+- examples/run_modes_lab: `compose.yml` runs `sqlery-worker run ...` (no `run` subcommand; the worker rejects it) and `manage.py daemon start --no-detach` (no such flag in Django mode). Its README repeats the daemon command.
+- CLAUDE.md "Technology Stack" says Python 3.10+; pyproject requires >= 3.13.
+- Docstring of `JobFunction.delay` says it returns a dict; it returns the job row.

@@ -1,3 +1,7 @@
+## Using sqlery from an agent
+
+If you write code that USES sqlery (enqueue jobs, run workers), read [llms.txt](llms.txt) first. It lists the current API, worker commands and gotchas, and marks stale docs (README.md and docs/getting-started.md still show the removed `BackendFactory`). Source wins over prose docs.
+
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project
 
