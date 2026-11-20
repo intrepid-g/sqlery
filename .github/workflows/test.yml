@@ -175,6 +175,26 @@ jobs:
         path: htmlcov/
         retention-days: 14
 
+  libsql:
+    # EXPERIMENTAL libsql backend: real enqueue and worker run on a libsql file.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        django-version: ['5.2', '6.1']
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v5
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - run: |
+        uv venv
+        uv pip install -e ".[dev,libsql]" "django==${{ matrix.django-version }}.*"
+    - name: Run libsql tests (fail if skipped)
+      run: |
+        uv run pytest tests/test_libsql_backend.py -v --timeout=120 | tee out.txt
+        grep -q " passed" out.txt  # a skipped run (libsql missing) must fail here
+
   standalone-no-django:
     # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
     # submodules import in a fresh venv where `django` is NOT installed.
