@@ -64,7 +64,7 @@ settings.configure(
     DJANGO_SQL_JOBS={"TRIGGER_MODE": "daemon", "ENABLE_DAEMON": False,
                      "WORKER_QUEUES": ["default"], "WORKER_POLL_INTERVAL": 0.2,
                      "WORKER_HEARTBEAT_INTERVAL": 1, "SQLERY_PG_NOTIFY": False,
-                     "WORKER_POOL": "prefork"},
+                     "WORKER_POOL": os.environ.get("H172_POOL", "prefork")},
 )
 django.setup()
 if os.environ.get("H172_LOG"):
@@ -103,6 +103,16 @@ def noop():
 
 def boom():
     raise ValueError("boom")
+
+
+def own_attempt():
+    """Fail unless this job's open attempt already names the process that runs it."""
+    from django.db import connection
+
+    with connection.cursor() as cur:
+        cur.execute("SELECT child_pid FROM sqlery_job_attempt WHERE finished_at IS NULL")
+        pids = [row[0] for row in cur.fetchall()]
+    assert pids == [os.getpid()], f"open attempts name {pids}, the job runs in {os.getpid()}"
 
 
 def _pg_connect(dbname):
@@ -291,3 +301,19 @@ def test_cheaper_path_keeps_the_guarantees(db):
     # Nothing is left in the live table or the ready queue.
     assert db.query("SELECT count(*) FROM sqlery_queued_job")[0][0] == 0
     assert db.query("SELECT count(*) FROM sqlery_job_ready")[0][0] == 0
+
+
+@pytest.mark.parametrize("pool", ["prefork", "fork"])
+def test_attempt_names_the_child_before_the_job_starts(db, pool):
+    """The child PID is on the open attempt before the child runs the job, in both pools.
+
+    The completion copies it from the attempt to the history row. When the parent wrote it
+    only after the hand-over, a fast job finished first and its history row had no child PID.
+    """
+    db.env["H172_POOL"] = pool
+    db.run(_ENQUEUE, H172_JOBS="10", H172_TASK="tests.test_hot_path_statements_172.own_attempt")
+    with _Worker(db.env):
+        _wait_finished(db, 10)
+    rows = db.query("SELECT status, error, child_pid FROM sqlery_job_history")
+    assert [r[:2] for r in rows if r[0] != "success"] == []
+    assert None not in {r[2] for r in rows}
