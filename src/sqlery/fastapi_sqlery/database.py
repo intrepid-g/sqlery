@@ -517,13 +517,24 @@ def _backfill_history(engine) -> int:
 def get_engine():
     """Get the database engine.
 
+    Entry points that never call initialize() (``sqlery daemon``, the jobs/tasks/
+    queues/cleanup CLIs, the dashboard) build the engine on first use from the
+    configured DATABASE_URL (SQLERY_DATABASE_URL).
+
     Returns:
         SQLAlchemy engine instance
 
     Raises:
-        RuntimeError: If database not initialized
+        RuntimeError: If database not initialized and no DATABASE_URL is configured
     """
     if _engine is None:
+        from ..compat import get_config
+
+        database_url = get_config("DATABASE_URL")
+        if database_url:
+            init_database(database_url)
+            return _engine
+
         raise RuntimeError(
             "Database not initialized. Call init_database() first or use initialize()."
         )
