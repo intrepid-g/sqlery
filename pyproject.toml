@@ -35,7 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # PostgreSQL support (optional - not needed for SQLite)
-postgres = ["psycopg>=3.1"]
+postgres = ["psycopg[binary]>=3.1"]
 
 # CLI dependencies (typer + rich without full standalone)
 cli = ["typer>=0.9.0", "rich>=13.0.0"]
@@ -68,12 +68,12 @@ eventbridge = ["boto3>=1.34.0"]
 all-django = [
     "django>=5.2",
     "django-tasks>=0.1.0",
-    "psycopg>=3.1.0",
+    "psycopg[binary]>=3.1.0",
     "httpx>=0.24.0",
     "boto3>=1.34.0",
 ]
 all-standalone = [
-    "psycopg>=3.1.0",
+    "psycopg[binary]>=3.1.0",
     "sqlmodel>=0.0.14",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -89,7 +89,7 @@ all-standalone = [
 all = [
     "django>=5.2",
     "django-tasks>=0.1.0",
-    "psycopg>=3.1.0",
+    "psycopg[binary]>=3.1.0",
     "sqlmodel>=0.0.14",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -124,7 +124,7 @@ dev = [
     "jinja2>=3.1.0",
     "aiosqlite>=0.19.0",
     "greenlet>=3.0.0",
-    "psycopg>=3.1.0",
+    "psycopg[binary]>=3.1.0",
     "django-tasks>=0.1.0",
 ]
 
