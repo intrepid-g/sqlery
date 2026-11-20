@@ -546,6 +546,21 @@ def _backfill_history(engine) -> int:
     return _history.move_terminal_rows(run, _models.JOB_COLUMNS)
 
 
+def _init_from_config() -> None:
+    """Build the engine from the configured DATABASE_URL (SQLERY_DATABASE_URL), if any."""
+    from ..compat import get_config  # inline: compat imports this module
+
+    url = get_config("DATABASE_URL")
+    if url:
+        init_database(
+            url,
+            pool_size=get_config("POOL_SIZE", 5),
+            max_overflow=get_config("MAX_OVERFLOW", 10),
+            pool_timeout=get_config("POOL_TIMEOUT", 30),
+            pool_recycle=get_config("POOL_RECYCLE", 1800),
+        )
+
+
 def get_engine():
     """Get the database engine.
 
@@ -553,8 +568,10 @@ def get_engine():
         SQLAlchemy engine instance
 
     Raises:
-        RuntimeError: If database not initialized
+        RuntimeError: If database not initialized and no DATABASE_URL is configured
     """
+    if _engine is None:
+        _init_from_config()
     if _engine is None:
         raise RuntimeError(
             "Database not initialized. Call init_database() first or use initialize()."
