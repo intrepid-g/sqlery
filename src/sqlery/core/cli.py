@@ -1124,7 +1124,7 @@ def migrate_history():
 
 @app.command("init")
 def initialize(
-    database_url: str = typer.Option(..., "--database-url", "-d", help="PostgreSQL connection URL"),
+    database_url: str = typer.Option(..., "--database-url", "-d", help="Database URL (PostgreSQL or SQLite, e.g. sqlite:///jobs.db)"),
     max_workers: int | None = typer.Option(
         None, "--max-workers", "-w", help="Worker processes (default: number of CPUs)"
     ),
