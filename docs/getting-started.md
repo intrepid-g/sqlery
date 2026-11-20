@@ -36,7 +36,7 @@ pip install sqlery asyncpg
 
 **For PostgreSQL** (sync):
 ```bash
-pip install sqlery psycopg2-binary
+pip install "sqlery[postgres]"
 ```
 
 ---

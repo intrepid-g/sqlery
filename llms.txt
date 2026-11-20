@@ -8,7 +8,7 @@ Every snippet below was run against SQLite on sqlery 0.28.0 unless marked UNVERI
 
 ## Install
 
-Extras: `postgres` (psycopg), `django` (Django >= 5.2), `standalone` (SQLModel, FastAPI, uvicorn, Typer, Alembic), `cli` (Typer + Rich only).
+Extras: `postgres` (`psycopg[binary]`), `django` (Django >= 5.2), `standalone` (SQLModel, FastAPI, uvicorn, Typer, Alembic), `cli` (Typer + Rich only).
 
 ```
 pip install "sqlery[standalone] @ git+https://github.com/intrepid-g/sqlery.git@v0.28.0"                # standalone mode
@@ -18,7 +18,7 @@ uv pip install -e ".[standalone]"         # from a checkout
 
 sqlery is not on PyPI yet, so install from GitHub. Pin a release tag (the `@v0.28.0` above; tags are on the releases page), never `main`: it can contain unreleased schema changes.
 
-Gotcha: the Django migrations import `django.contrib.postgres`, which needs an importable psycopg even when you run on SQLite. The `postgres` extra is plain `psycopg`, which needs the system libpq. Without libpq, use `psycopg[binary]`.
+Gotcha: the Django migrations import `django.contrib.postgres`, which needs an importable psycopg even when you run on SQLite. The `postgres` extra is `psycopg[binary]`, which bundles libpq. For the system libpq, install `psycopg[c]` instead.
 
 ## Job API (same in both modes)
 
