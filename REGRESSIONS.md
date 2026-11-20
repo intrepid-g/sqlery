@@ -149,3 +149,12 @@ Use this file to:
 
 **Regression test:** `test_attempt_names_the_child_before_the_job_starts` in `tests/test_hot_path_statements_172.py` (the job itself checks that its open attempt names its own PID; both pools).
 
+## 2026-11-20 — Async job enqueue failed in both modes (#181)
+
+**What broke:** `await my_async_job.enqueue(...)` raised `No default backend configured` (standalone) or `'DjangoAsyncBackend' object has no attribute 'create_job'` (Django, after `AsyncQueue.configure(DjangoAsyncBackend())`).
+
+**Root cause:** `AsyncQueue.enqueue` called `create_job` on an async backend. The async backends (`AsyncDatabaseBackend`) are worker-only and have no `create_job`, and `AsyncJobFunction.enqueue` required `AsyncQueue.configure()` first.
+
+**Fix:** `AsyncQueue._create_job` writes the row through the sync backend (`compat.get_backend()`) off the event loop (`sync_to_async` in Django, `asyncio.to_thread` in standalone). No `configure()` needed; the call returns the job row.
+
+**Regression test:** `tests/test_async_enqueue_181.py` (enqueue then an `AsyncWorker` runs the job, both modes, SQLite).
