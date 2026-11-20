@@ -178,7 +178,6 @@ jobs:
   standalone-no-django:
     # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
     # submodules import in a fresh venv where `django` is NOT installed.
-    # See .planning/phases/01-core-unification/01-CONTEXT.md.
     runs-on: ubuntu-latest
 
     steps:

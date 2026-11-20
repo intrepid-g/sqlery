@@ -11,8 +11,6 @@ These tests lock the bug closed. If a future change reintroduces a
 duplicate CreateModel('DaemonLease') anywhere in the migration chain,
 or if pytest-django's `setup_databases` again hits "already exists",
 both tests will fail.
-
-See: .planning/phases/03-testing-ci/03-01-PLAN.md
 """
 from __future__ import annotations
 

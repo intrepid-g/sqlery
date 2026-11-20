@@ -3,8 +3,6 @@ conditional-RunPython versions. The original "Create-if-missing" logic is
 unnecessary because 0020 created the table and 0022 never deleted it
 (filename intent vs operations list mismatch).
 
-See `.planning/phases/03-testing-ci/03-01-PLAN.md` for the full root cause.
-
 Why we keep this file rather than deleting it: deployed databases may have
 already recorded `0023_restore_daemonlease` in `django_migrations`. Removing
 the file would break their migration graph. Reducing it to `operations = []`

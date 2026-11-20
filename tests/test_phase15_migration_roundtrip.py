@@ -31,9 +31,6 @@ _migration_module = importlib.import_module(
 )
 _VendorGuardedCutover = _migration_module._VendorGuardedCutover
 
-# Path to the audit artefact written by plan 15-01.
-PHASE_15_SC5_AUDIT_PATH = ".planning/milestones/v0.24.0-phases/15-schema-cutover/BLAST-RADIUS-AUDIT.md"
-
 # Shared skipif marker for all PG-only tests.
 _SKIP_NO_PG = pytest.mark.skipif(
     not os.environ.get("SQLERY_TEST_PG_URL"),
@@ -201,18 +198,16 @@ def _run_backward(conn: psycopg.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SC5 — audit file (no PG needed)
+# SC5 - audit file check, retired 2026-11-20.
+# It read an internal planning document (BLAST-RADIUS-AUDIT.md) that is no
+# longer part of the public repository, so it failed on every clean checkout.
 # ---------------------------------------------------------------------------
 
-
-def test_sc5_blast_radius_audit_zero_unaddressed():
-    """BLAST-RADIUS-AUDIT.md must declare UNADDRESSED: 0."""
-    with open(PHASE_15_SC5_AUDIT_PATH) as f:
-        content = f.read()
-    assert "UNADDRESSED: 0" in content, (
-        "BLAST-RADIUS-AUDIT.md must show UNADDRESSED: 0 — "
-        "run 15-01 Task 1 before executing 15-03"
-    )
+# def test_sc5_blast_radius_audit_zero_unaddressed():
+#     """BLAST-RADIUS-AUDIT.md must declare UNADDRESSED: 0."""
+#     with open(PHASE_15_SC5_AUDIT_PATH) as f:
+#         content = f.read()
+#     assert "UNADDRESSED: 0" in content
 
 
 # ---------------------------------------------------------------------------

@@ -3,8 +3,7 @@
 This top-level shim re-exports `TaskExecutor` for any out-of-repo importers
 during the deprecation window. Remove after 2027-05-13.
 
-Policy: comment-and-date marking per CLAUDE.md and feedback_dead_code memory.
-See .planning/phases/01-core-unification/01-CONTEXT.md.
+Policy: deprecated code is commented out and date-marked, not deleted outright.
 """
 # DEPRECATED 2026-05-13 — moved to sqlery.core.worker. Remove after 2027-05-13.
 from sqlery.core.worker import *  # noqa: F401,F403
