@@ -1,163 +1,129 @@
 # Basic Sync Example
 
-This example demonstrates the basic synchronous workflow with sqlery.
+This example shows the basic workflow of sqlery in standalone mode, with SQLite.
 
 ## Files
 
-- `setup_db.py` - Creates database tables
-- `tasks.py` - Defines background jobs
-- `enqueue.py` - Enqueues jobs to be processed
-- `worker.py` - Processes jobs from the queue
+- `setup_db.py` - Creates the database tables
+- `tasks.py` - Defines the background jobs
+- `enqueue.py` - Adds jobs to the queue
+- `worker.py` - Runs jobs from the queue
 
 ## Quick Start
 
-### 1. Install Dependencies
+Run all commands from this folder.
+
+### 1. Install
 
 ```bash
-# From project root
-pip install -e .
-pip install aiosqlite
+pip install "sqlery[standalone]"
+# or, from a copy of the repository: pip install -e ".[standalone]"
 ```
 
-### 2. Setup Database
+### 2. Create the tables
 
 ```bash
 python setup_db.py
 ```
 
-### 3. Enqueue Jobs
+### 3. Enqueue jobs
 
 ```bash
-python enqueue.py
+PYTHONPATH=. python enqueue.py
 ```
 
-You should see:
-```
-============================================================
-Enqueueing Jobs
-============================================================
+Output (job ids are different on each run):
 
+```
 1. Enqueueing email job...
-   ✓ Job 1 enqueued (queue: default)
-
+   Job 3265212802174906814 enqueued (queue: default)
 2. Enqueueing payment job (high priority)...
-   ✓ Job 2 enqueued (priority: 10)
-
+   Job 3114223427299146457 enqueued (priority: 10)
 3. Enqueueing report job...
-   ✓ Job 3 enqueued (queue: reports)
-
-============================================================
-Jobs Enqueued!
-============================================================
-
-Run 'python worker.py' to process these jobs
+   Job 3993055259416165235 enqueued (queue: reports)
 ```
 
-### 4. Run Worker
-
-In a separate terminal:
+### 4. Run the worker
 
 ```bash
-python worker.py
+PYTHONPATH=. python worker.py
 ```
 
-You should see the worker process each job:
+The worker stops after 3 jobs. Output:
+
 ```
-============================================================
-Worker Starting
-============================================================
-
-Processing queues: default, reports
-Press Ctrl+C to stop
-
-Worker worker-hostname-12345-1234567890 starting...
-Worker worker-hostname-12345-1234567890 processing job 2
-Executing tasks.process_payment with args=(), kwargs={'user_id': 12345, 'amount': 99.99}
-💳 Processing payment for user 12345
-   Amount: $99.99
-✓ Payment processed for user 12345
-Job 2 completed successfully
+[CLAIMED] Job #3114223427299146457 (tasks.process_payment)
+[SUCCESS] Job #3114223427299146457
 ...
 ```
 
+To run a worker with no limit, use the `sqlery-worker` command:
+
+```bash
+SQLERY_DATABASE_URL=sqlite:///example.db PYTHONPATH=. \
+  sqlery-worker --queues default,reports
+```
+
+Add `--max-jobs N` to stop after N jobs. `PYTHONPATH=.` lets the worker import `tasks.py`.
+
 ## How It Works
 
-### 1. Define Tasks (tasks.py)
+### 1. Define tasks (tasks.py)
 
 ```python
 from sqlery import job
 
 @job(queue='default', timeout=60)
 def send_email(to, subject, body):
-    # Your task logic here
     return f"Email sent to {to}"
 ```
 
-The `@job` decorator registers the function as a background task.
+The `@job` decorator makes the function a background task. Define tasks at module level.
 
-### 2. Configure Backend (enqueue.py)
-
-```python
-from sqlery import Queue
-from sqlery.backends import BackendFactory
-
-backend = BackendFactory.create_sync_backend('sqlite:///example.db')
-backend.connect()
-Queue.configure(backend)
-```
-
-This sets up the SQLite database connection.
-
-### 3. Enqueue Jobs (enqueue.py)
+### 2. Initialize sqlery (setup_db.py, enqueue.py, worker.py)
 
 ```python
-from tasks import send_email
+from sqlery.compat import initialize
 
-# Celery-style
-job = send_email.delay('user@example.com', 'Hello', 'Welcome!')
-
-# Or RQ-style
-job = send_email.enqueue('user@example.com', 'Hello', 'Welcome!')
+initialize(database_url="sqlite:///example.db", enable_daemon=False)
 ```
 
-Jobs are stored in the database with status='queued'.
+Call `initialize()` once in each process, before you enqueue jobs. It creates the tables if they do not exist.
 
-### 4. Process Jobs (worker.py)
+### 3. Enqueue jobs (enqueue.py)
+
+```python
+job = send_email.delay('user@example.com', 'Hello', 'Welcome!')   # Celery style
+job = send_email.enqueue('user@example.com', 'Hello', 'Welcome!') # RQ style
+print(job.id)
+```
+
+Both calls return the job row. It is an object, not a dict: use `job.id`, `job.queue_name`, `job.priority`.
+
+### 4. Process jobs (worker.py)
 
 ```python
 from sqlery import Worker
 
-worker = Worker(['default', 'reports'], backend=backend)
-worker.work()  # Runs forever, processing jobs
+worker = Worker(['default', 'reports'])
+worker.run(max_jobs=3)   # no argument = run forever
 ```
 
 The worker:
 1. Polls the database for jobs
-2. Claims jobs atomically (preventing duplicates)
-3. Executes the task function
-4. Updates the job status (success/failed)
-
-## Features Demonstrated
-
-- ✅ **Job decoration** - Using `@job` decorator
-- ✅ **Job enqueueing** - Both `.delay()` and `.enqueue()`
-- ✅ **Multiple queues** - 'default' and 'reports'
-- ✅ **Priority handling** - Payment jobs have priority=10
-- ✅ **Worker processing** - Background job execution
-- ✅ **Error handling** - Automatic capture of exceptions
+2. Claims each job so that no other worker runs it
+3. Runs the task function
+4. Saves the job status (success or failed)
 
 ## Next Steps
 
-Try modifying the example:
-
-1. **Add more tasks** - Define new functions in `tasks.py`
-2. **Change priorities** - Adjust the `priority` parameter
-3. **Add retries** - Use `max_retries` and `retry_backoff`
-4. **Multiple workers** - Run `worker.py` in multiple terminals
-5. **Scheduled jobs** - Use `queue.schedule()` for cron-style scheduling
+1. Add tasks in `tasks.py`.
+2. Change the `priority` of a task.
+3. Add retries with `max_retries` and `retry_backoff`.
+4. Run `sqlery-worker` in many terminals.
 
 ## See Also
 
-- [Async Example](../basic_async/) - Asynchronous workflow
-- [Getting Started Guide](../../docs/getting-started.md) - Detailed walkthrough
-- [Configuration Guide](../../docs/configuration.md) - All options
+- [Async Example](../basic_async/) - Async worker
+- [Getting Started Guide](../../docs/getting-started.md)
+- [Configuration Guide](../../docs/configuration.md)

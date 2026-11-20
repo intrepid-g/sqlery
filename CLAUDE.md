@@ -1,6 +1,6 @@
 ## Using sqlery from an agent
 
-If you write code that USES sqlery (enqueue jobs, run workers), read [llms.txt](llms.txt) first. It lists the current API, worker commands and gotchas, and marks stale docs (README.md and docs/getting-started.md still show the removed `BackendFactory`). Source wins over prose docs.
+If you write code that USES sqlery (enqueue jobs, run workers), read [llms.txt](llms.txt) first. It lists the current API, worker commands and gotchas, and marks stale docs (see its "Stale docs" list). Source wins over prose docs.
 
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project
@@ -95,11 +95,11 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 - Configurable `statement_timeout` and `lock_timeout` (`src/sqlery/django_sqlery/settings.py`)
 - CI tests run against PostgreSQL 15
 ## Platform Requirements
-- Python 3.10+
+- Python 3.13+ (`requires-python = ">=3.13"`)
 - uv (recommended) or pip
 - SQLite (built-in) or PostgreSQL
 - GNU Make (for `Makefile` targets)
-- Python 3.10+
+- Python 3.13+ (`requires-python = ">=3.13"`)
 - PostgreSQL 15+ (recommended) or SQLite
 - Deployment targets: bare metal, Docker, AWS Lambda (serverless mode)
 - CI: GitHub Actions with ubuntu-latest
@@ -130,7 +130,7 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 ## Code Style
 - Tool: `black` (configured in `pyproject.toml`)
 - Line length: 100 characters
-- Target Python version: 3.10+
+- Target Python version: 3.13 (`target-version` in `pyproject.toml`)
 - Tool: `ruff` (configured in `pyproject.toml`)
 - Line length: 100 characters
 - Target Python version: py310
