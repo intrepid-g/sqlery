@@ -1295,7 +1295,7 @@ def initialize(
     This is only needed in standalone mode. Django mode auto-configures from settings.
 
     Args:
-        database_url: PostgreSQL connection URL
+        database_url: Database URL (PostgreSQL or SQLite, e.g. sqlite:///jobs.db)
         max_workers: Worker processes per node (default: the number of CPUs, like Celery)
         worker_queues: List of queue names to process
         enable_daemon: Enable daemon mode
