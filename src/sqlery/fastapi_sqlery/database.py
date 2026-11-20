@@ -379,6 +379,29 @@ def _init_partitioned_pg(engine) -> None:
         conn.commit()
 
 
+# Fixed key for the first-start schema lock (ASCII "sqlery" as an integer).
+_BOOTSTRAP_LOCK_KEY = 0x73716C657279
+
+
+@contextmanager
+def _pg_bootstrap_lock(engine):
+    """Serialise schema bootstrap across processes (issue #10).
+
+    ``IF NOT EXISTS`` DDL is not safe against concurrent sessions: two can pass the check and
+    then collide on the catalog insert (UniqueViolation). A session-level advisory lock on a
+    dedicated connection makes the others wait, then see the finished schema and skip. It is
+    session-level (not ``pg_advisory_xact_lock``) because bootstrap spans several transactions.
+    """
+    with engine.connect() as conn:
+        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _BOOTSTRAP_LOCK_KEY})
+        try:
+            yield
+        finally:
+            conn.rollback()
+            conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _BOOTSTRAP_LOCK_KEY})
+            conn.commit()
+
+
 def init_database(database_url: str, **kwargs):
     """Initialize database engine and create tables.
 
@@ -418,6 +441,15 @@ def init_database(database_url: str, **kwargs):
     # Import models so SQLModel.metadata is populated before create_all
     # from ..core import models as _models  # noqa: F401  # moved to top-level
 
+    if _engine.dialect.name == "postgresql":
+        with _pg_bootstrap_lock(_engine):
+            _bootstrap_schema(database_url)
+    else:
+        _bootstrap_schema(database_url)
+
+
+def _bootstrap_schema(database_url: str) -> None:
+    """Create or upgrade the schema on the module engine (idempotent)."""
     had_ready = _has_table(_engine, _ready.READY_TABLE)
     had_history = _has_table(_engine, _history.HISTORY_TABLE)
 
