@@ -22,119 +22,37 @@ This guide will walk you through setting up sqlery and creating your first backg
 
 ### Install Sqlery
 
-Choose your database backend:
+Standalone mode (no Django) needs the `standalone` extra:
 
-**For SQLite** (easiest for getting started):
 ```bash
-pip install sqlery aiosqlite
+pip install "sqlery[standalone]"
 ```
 
-**For PostgreSQL** (async):
-```bash
-pip install sqlery asyncpg
-```
-
-**For PostgreSQL** (sync):
-```bash
-pip install "sqlery[postgres]"
-```
+For PostgreSQL, add the `postgres` extra: `pip install "sqlery[standalone,postgres]"`.
+SQLite needs nothing more.
 
 ---
 
 ## Database Setup
 
-### Create Database Tables
+Sqlery creates its tables for you. Call `initialize()` once in each process,
+before you enqueue jobs or start a worker:
 
-Sqlery needs two tables to operate:
-- `sqlery_queued_job` - Stores jobs
-- `sqlery_worker` - Tracks worker heartbeats
-- `sqlery_scheduled_task` - Stores recurring tasks (optional)
-
-**SQLite Setup**:
 ```python
-import asyncio
-from sqlery.backends import BackendFactory
+from sqlery.compat import initialize
 
-async def setup_database():
-    """Create database tables."""
-    backend = BackendFactory.create_async_backend('sqlite:///jobs.db')
-    await backend.connect()
-
-    # Create tables
-    await backend.db.execute("""
-        CREATE TABLE IF NOT EXISTS sqlery_queued_job (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_path TEXT NOT NULL,
-            kwargs TEXT DEFAULT '{}',
-            queue_name TEXT DEFAULT 'default',
-            priority INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'queued',
-            scheduled_at TIMESTAMP,
-            max_retries INTEGER DEFAULT 0,
-            retry_count INTEGER DEFAULT 0,
-            retry_backoff REAL DEFAULT 1.0,
-            allow_parallel BOOLEAN DEFAULT 0,
-            timeout_seconds INTEGER,
-            worker_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP,
-            finished_at TIMESTAMP,
-            duration_seconds REAL,
-            output TEXT DEFAULT '',
-            error TEXT DEFAULT '',
-            traceback TEXT DEFAULT '',
-            termination_reason TEXT DEFAULT '',
-            runs TEXT DEFAULT '[]',
-            worker_pid INTEGER
-        )
-    """)
-
-    await backend.db.execute("""
-        CREATE TABLE IF NOT EXISTS sqlery_worker (
-            id TEXT PRIMARY KEY,
-            node_id TEXT NOT NULL,
-            pid INTEGER NOT NULL,
-            status TEXT DEFAULT 'idle',
-            current_job_id INTEGER,
-            last_heartbeat TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            jobs_processed INTEGER DEFAULT 0
-        )
-    """)
-
-    await backend.db.execute("""
-        CREATE TABLE IF NOT EXISTS sqlery_scheduled_task (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            task_path TEXT NOT NULL,
-            cron_expression TEXT NOT NULL,
-            queue_name TEXT DEFAULT 'default',
-            priority INTEGER DEFAULT 0,
-            enabled BOOLEAN DEFAULT 1,
-            last_run_at TIMESTAMP,
-            next_run_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    await backend.disconnect()
-    print("✓ Database tables created")
-
-if __name__ == '__main__':
-    asyncio.run(setup_database())
+initialize(database_url="sqlite:///jobs.db")
 ```
 
-Save this as `setup_db.py` and run:
-```bash
-python setup_db.py
-```
+The database URL is `sqlite:///relative.db`, `sqlite:////absolute/path.db`, or
+`postgresql://user:pass@host/dbname`.
 
-**PostgreSQL Setup**:
+The `sqlery-worker` and `sqlery jobs|tasks|queues` commands read the URL from
+the `SQLERY_DATABASE_URL` (or `DATABASE_URL`) environment variable. They need no
+`initialize()` call.
 
-Use the same table definitions but with PostgreSQL-specific types:
-- Change `INTEGER PRIMARY KEY AUTOINCREMENT` to `SERIAL PRIMARY KEY`
-- Change `BOOLEAN` to use PostgreSQL's native boolean type
+The removed `sqlery.backends.BackendFactory` and hand-written `CREATE TABLE`
+statements are not needed any more.
 
 ---
 
@@ -160,29 +78,25 @@ def send_welcome_email(email, username):
     return f"Email sent to {email}"
 ```
 
-### Step 2: Configure the Backend
+### Step 2: Enqueue a Job
 
 Create a file called `app.py`:
 
 ```python
 # app.py
-from sqlery import Queue
-from sqlery.backends import BackendFactory
+from sqlery.compat import initialize
 from tasks import send_welcome_email
 
-# Configure backend
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
-backend.connect()
-Queue.configure(backend)
+initialize(database_url='sqlite:///jobs.db')
 
-# Enqueue a job
+# Enqueue a job. .delay() and .enqueue() are the same call.
 job = send_welcome_email.delay('user@example.com', 'Alice')
-# Or use RQ-style
 # job = send_welcome_email.enqueue('user@example.com', 'Alice')
 
-print(f"✓ Job {job['id']} enqueued")
-print(f"  Queue: {job['queue_name']}")
-print(f"  Status: {job['status']}")
+# The result is the job row (an object, not a dict; the id is a large number).
+print(f"Job {job.id} enqueued")
+print(f"  Queue: {job.queue_name}")
+print(f"  Status: {job.status}")
 ```
 
 Run it:
@@ -192,7 +106,7 @@ python app.py
 
 You should see:
 ```
-✓ Job 1 enqueued
+Job 1684925837740022301 enqueued
   Queue: emails
   Status: queued
 ```
@@ -201,44 +115,26 @@ You should see:
 
 ## Running the Worker
 
-Now let's process the job with a worker.
+Now let's process the job with a worker. Use the `sqlery-worker` command.
+The worker must be able to import your task module, so put the project folder on
+`PYTHONPATH`:
 
-### Step 3: Create a Worker Script
-
-Create a file called `worker.py`:
-
-```python
-# worker.py
-from sqlery import Worker
-from sqlery.backends import BackendFactory
-import tasks  # Import to register tasks
-
-# Configure backend
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
-backend.connect()
-
-# Create worker for 'emails' queue
-worker = Worker(['emails'], backend=backend)
-
-print("Worker starting... Press Ctrl+C to stop")
-worker.work()  # Runs forever
-```
-
-Run the worker in a separate terminal:
 ```bash
-python worker.py
+export SQLERY_DATABASE_URL=sqlite:///jobs.db PYTHONPATH=.
+sqlery-worker --queues emails
 ```
 
-You should see:
+Run the worker in a separate terminal. It runs until you press Ctrl+C.
+To stop after N jobs, add `--max-jobs N`.
+
+The worker prints one line per job:
+
 ```
-Worker starting... Press Ctrl+C to stop
-Worker worker-hostname-12345-1234567890 starting...
-Worker worker-hostname-12345-1234567890 processing job 1
-Executing tasks.send_welcome_email with args=('user@example.com', 'Alice'), kwargs={}
-Sending welcome email to user@example.com
-Welcome email sent to Alice!
-Job 1 completed successfully
+[CLAIMED] Job #1684925837740022301 (tasks.send_welcome_email)
+[SUCCESS] Job #1684925837740022301
 ```
+
+Check the result with `sqlery jobs list`. The job has status `success`.
 
 ---
 
@@ -296,7 +192,7 @@ Here's what just happened:
        │ reads
        ▼
 ┌──────────────┐
-│  worker.py   │
+│sqlery-worker │
 │              │
 │ Claims job,  │
 │ executes,    │
@@ -310,34 +206,16 @@ Here's what just happened:
 
 Now that you have a basic job queue working, here are some next steps:
 
-### 1. Try Async Workflows
+### 1. Use the Celery-style API
 
 ```python
-# async_tasks.py
-from sqlery import async_job
-import asyncio
+from tasks import send_welcome_email
 
-@async_job(queue='reports')
-async def generate_report(user_id):
-    print(f"Generating report for user {user_id}")
-    await asyncio.sleep(2)  # Simulate async work
-    return f"Report for user {user_id} generated"
-
-# async_worker.py
-import asyncio
-from sqlery import AsyncWorker
-from sqlery.backends import BackendFactory
-import async_tasks
-
-async def main():
-    backend = BackendFactory.create_async_backend('sqlite:///jobs.db')
-    await backend.connect()
-
-    worker = AsyncWorker(['reports'], backend=backend)
-    await worker.work()
-
-asyncio.run(main())
+result = send_welcome_email.apply_async(args=('user@example.com', 'Alice'), countdown=30)
+result.get(timeout=60)   # blocks until a worker finishes the job
 ```
+
+See [CELERY_PARITY.md](CELERY_PARITY.md) for `AsyncResult`, `chain`, `group` and `revoke`.
 
 ### 2. Add Job Priority
 
@@ -364,27 +242,25 @@ def flaky_api_call(url):
 ### 4. Schedule Recurring Jobs
 
 ```python
-from sqlery import Queue
+from sqlery.compat import initialize, get_backend
 
-queue = Queue(name='maintenance', backend=backend)
+initialize(database_url='sqlite:///jobs.db')
 
 # Run every day at 2 AM
-queue.schedule(
-    cron='0 2 * * *',
-    func=cleanup_old_data,
-    name='daily-cleanup'
+get_backend().create_scheduled_task(
+    name='daily-cleanup',
+    task_path='tasks.cleanup_old_data',
+    cron_expression='0 2 * * *',
+    queue_name='default',
+    priority=0,
 )
 ```
 
 ### 5. Multiple Queues
 
-```python
-# Process multiple queues with different priorities
-worker = Worker(
-    queues=['high-priority', 'default', 'low-priority'],
-    backend=backend
-)
-worker.work()
+```bash
+# One worker, several queues. The first queue is checked first.
+sqlery-worker --queues high-priority,default,low-priority
 ```
 
 ---
@@ -398,7 +274,6 @@ worker.work()
 your-app/
 ├── app.py          # Web application (enqueues jobs)
 ├── tasks.py        # Task definitions
-├── worker.py       # Background worker
 └── requirements.txt
 ```
 
@@ -408,31 +283,26 @@ Run separately:
 python app.py
 
 # Terminal 2: Run worker
-python worker.py
+sqlery-worker --queues emails
 ```
 
 ### Pattern 2: Burst Mode (Process and Exit)
 
 Useful for cron jobs or one-time processing:
 
-```python
-worker = Worker(['emails'], backend=backend, burst=True)
-worker.work()  # Processes all jobs then exits
+```bash
+sqlery-worker --queues emails --max-jobs 100   # exits after 100 jobs
 ```
+
+In Django mode, use `python manage.py rqworker --burst emails`. It drains the queue and exits.
 
 ### Pattern 3: Multiple Workers
 
 Scale horizontally by running multiple worker processes:
 
 ```bash
-# Terminal 1
-python worker.py
-
-# Terminal 2
-python worker.py
-
-# Terminal 3
-python worker.py
+# Terminal 1, 2, 3 (same command in each)
+sqlery-worker --queues emails
 ```
 
 Workers automatically coordinate using database locks.
@@ -443,8 +313,8 @@ Workers automatically coordinate using database locks.
 
 ### Jobs Not Processing
 
-1. **Check worker is running**: Look for "Worker starting..." message
-2. **Check queue names match**: Decorator `queue='emails'` must match `Worker(['emails'])`
+1. **Check worker is running**: Look for "Starting worker for queues: ..."
+2. **Check queue names match**: Decorator `queue='emails'` must match `sqlery-worker --queues emails`
 3. **Check database connection**: Verify connection string is correct
 4. **Check for errors**: Look in worker output for exceptions
 
@@ -452,8 +322,8 @@ Workers automatically coordinate using database locks.
 
 If you see `ImportError: Cannot import module tasks`:
 
-1. **Ensure worker imports tasks**: Add `import tasks` at top of worker.py
-2. **Check PYTHONPATH**: Worker needs to find your task modules
+1. **Check PYTHONPATH**: The worker must be able to import your task module (`PYTHONPATH=.`)
+2. **Check the task path**: The job stores a dotted path such as `tasks.send_welcome_email`
 3. **Use absolute imports**: In tasks, use `from myproject.tasks import ...`
 
 ### Jobs Stuck in 'Running'
@@ -468,7 +338,7 @@ If jobs stay in 'running' status:
 
 ## Learn More
 
-- [Configuration Guide](configuration.md) - All configuration options
+- [Configuration Guide](CONFIGURATION.md) - All configuration options
 - [Examples](../examples/) - More example projects
 - [Migration from Celery](MIGRATION_FROM_CELERY.md) - If coming from Celery
 - [Migration from RQ](MIGRATION_FROM_RQ.md) - If coming from RQ

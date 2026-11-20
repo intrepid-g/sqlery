@@ -4,7 +4,8 @@ This demonstrates how to use the Queue API in standalone/FastAPI mode
 without Django.
 """
 
-from sqlery import initialize, get_queue, job
+from sqlery import get_queue, job
+from sqlery.compat import initialize
 from datetime import datetime, timedelta
 
 # ============================================================================
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta
 # ============================================================================
 
 initialize(
-    database_url="postgresql://localhost/sqlery_jobs",
+    database_url="sqlite:///example.db",  # or "postgresql://localhost/sqlery_jobs"
     max_workers=3,
     worker_queues=['email', 'reports', 'default'],
 )

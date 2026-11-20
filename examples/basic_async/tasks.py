@@ -1,13 +1,14 @@
 """Async task definitions for basic async example."""
 
-from sqlery import async_job
+from sqlery import job
 import asyncio
-import aiohttp
 
 
-@async_job(queue='default', timeout=60)
+@job(queue='default', timeout=60)
 async def fetch_url(url):
-    """Fetch a URL asynchronously."""
+    """Fetch a URL asynchronously (needs: pip install aiohttp)."""
+    import aiohttp
+
     print(f"🌐 Fetching {url}")
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
@@ -16,7 +17,7 @@ async def fetch_url(url):
             return f"Fetched {len(data)} bytes"
 
 
-@async_job(queue='default', priority=10, timeout=120)
+@job(queue='default', priority=10, timeout=120)
 async def process_data_async(data_id, processing_time=2):
     """Process data asynchronously (simulated)."""
     print(f"⚙️  Processing data {data_id}")
@@ -25,7 +26,7 @@ async def process_data_async(data_id, processing_time=2):
     return f"Data {data_id} processed successfully"
 
 
-@async_job(queue='reports', timeout=180)
+@job(queue='reports', timeout=180)
 async def generate_async_report(report_type, user_id):
     """Generate a report asynchronously (simulated)."""
     print(f"📊 Generating {report_type} report for user {user_id}")
@@ -34,7 +35,7 @@ async def generate_async_report(report_type, user_id):
     return f"{report_type} report for user {user_id}"
 
 
-@async_job(queue='default', timeout=90)
+@job(queue='default', timeout=90)
 async def send_notifications_batch(user_ids):
     """Send notifications to multiple users concurrently."""
     print(f"📢 Sending notifications to {len(user_ids)} users")

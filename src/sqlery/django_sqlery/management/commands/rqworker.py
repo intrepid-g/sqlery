@@ -91,7 +91,8 @@ class Command(BaseCommand):
         total = 0
 
         for queue_name in queues:
-            processed = executor.run_queue_workers(queue_name=queue_name)
+            # once=True drains the queue; the default runs one job and spawns a detached worker (#182)
+            processed = executor.run_queue_workers(queue_name=queue_name, once=True)
             count = len(processed) if processed else 0
             total += count
             if count:

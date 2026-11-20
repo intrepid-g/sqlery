@@ -45,7 +45,7 @@ The lab will automatically:
 ### Daemon Mode (`daemon` service)
 
 **Service**: `daemon`  
-**Command**: `python manage.py daemon start --no-detach`  
+**Command**: `python manage.py daemon start` (runs in the foreground; the container keeps it alive)  
 **How it works**: Runs the DaemonManager process which owns a worker pool, schedules due tasks, and uses database-backed leases to coordinate job claiming. This is the "production-ready" mode for managed deployments.
 
 Watch it work:

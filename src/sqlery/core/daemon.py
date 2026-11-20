@@ -460,6 +460,10 @@ class DaemonManager:
         # from sqlery.core.db_resilience import configure_connection_resilience  # moved to top-level
         configure_connection_resilience()
 
+        # Foreground starts (`manage.py daemon start`, rqworker) have no other PID writer;
+        # without it `daemon status` says "not running" while this loop runs (#182).
+        self.write_pid(os.getpid())
+
         # Get configuration
         check_interval = get_config("DAEMON_CHECK_INTERVAL", 10)
         if max_workers is None:

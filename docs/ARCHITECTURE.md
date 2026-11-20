@@ -93,14 +93,14 @@ job = enqueue('myapp.tasks.send_email', queue='email', priority=10)
 Workers can process specific queues:
 
 ```bash
-# Process all queues
-python manage.py run_queue_workers
+# Process one job from any queue, then exit
+python manage.py run_jobs
 
-# Process specific queue
-python manage.py run_queue_workers --queue email
+# Process one job from a specific queue
+python manage.py run_jobs --queue email
 
-# Process multiple queues
-python manage.py run_queue_workers --queue default --queue email
+# Run a foreground worker for several queues
+python manage.py rqworker default email
 ```
 
 ### Priority
@@ -164,7 +164,7 @@ def send_welcome_email(request):
 
 ```bash
 # AWS Lambda triggered every minute by EventBridge
-python manage.py run_queue_workers --once
+python manage.py rqworker --burst
 
 # Processes all queued jobs, then exits
 # No always-running process
@@ -184,7 +184,7 @@ DJANGO_SQL_JOBS = {
     'USE_DJANGO_TASKS': True,
 
     # Worker settings
-    'MAX_JOBS_PER_RUN': 100,  # For --once mode
+    'MAX_JOBS_PER_RUN': 100,  # defined in settings, not read by any command
 }
 ```
 

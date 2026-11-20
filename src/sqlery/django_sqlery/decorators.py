@@ -172,7 +172,7 @@ class JobFunction:
 
         return job
 
-    def delay(self, *args: Any, queue: str | None = None, priority: int | None = None, max_retries: int | None = None, **kwargs: Any) -> dict[str, Any]:
+    def delay(self, *args: Any, queue: str | None = None, priority: int | None = None, max_retries: int | None = None, **kwargs: Any) -> Any:
         """Enqueue the job for execution (Celery-style alias).
 
         This is an alias for .enqueue() for Celery compatibility.
@@ -184,7 +184,7 @@ class JobFunction:
             **kwargs: Keyword arguments for the function
 
         Returns:
-            Job dict from backend
+            The job row from the backend (a ``QueuedJob`` in Django mode), not a dict
 
         Example:
             @job(queue='emails')
@@ -194,7 +194,7 @@ class JobFunction:
 
             # Enqueue job (Celery-style)
             job = send_email.delay('user@example.com', 'Hello', 'World')
-            print(f"Job {job['id']} enqueued")
+            print(f"Job {job.id} enqueued")
         """
         return self.enqueue(*args, queue=queue, priority=priority, max_retries=max_retries, **kwargs)
 
