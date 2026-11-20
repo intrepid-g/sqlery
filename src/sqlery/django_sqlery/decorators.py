@@ -363,13 +363,7 @@ class AsyncJobFunction:
             job = await send_email_async.enqueue('user@example.com', 'Hello', 'World')
             print(f"Job {job['id']} enqueued")
         """
-        # Get default queue instance
-        if AsyncQueue._default_backend is None:
-            raise RuntimeError(
-                "No default backend configured. Call AsyncQueue.configure(backend) first."
-            )
-
-        queue = AsyncQueue(name=self.queue_name, backend=AsyncQueue._default_backend)
+        queue = AsyncQueue(name=self.queue_name)
 
         # Enqueue with configured options
         return await queue.enqueue(

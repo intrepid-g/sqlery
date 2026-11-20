@@ -4,6 +4,7 @@ Provides high-level async API for job enqueueing and management.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from typing import Any, Callable
@@ -38,7 +39,9 @@ class AsyncQueue:
             default_timeout: Default timeout for jobs in seconds
         """
         self.name = name
-        self.backend = backend or self._get_default_backend()
+        # ponytail: the async backend is only for workers; enqueue writes through the sync
+        # backend (compat.get_backend), so no async backend is needed to enqueue (#181).
+        self.backend = backend or self._default_backend
         self.default_timeout = default_timeout
 
     @classmethod
@@ -50,16 +53,6 @@ class AsyncQueue:
         """
         cls._default_backend = backend
         logger.info("Configured default backend for AsyncQueue")
-
-    @classmethod
-    def _get_default_backend(cls) -> AsyncStorageBackend:
-        """Get default backend or raise error."""
-        if cls._default_backend is None:
-            raise RuntimeError(
-                "No backend configured. Either pass backend to AsyncQueue() "
-                "or call AsyncQueue.configure(backend) first."
-            )
-        return cls._default_backend
 
     async def enqueue(
         self,
@@ -108,7 +101,7 @@ class AsyncQueue:
         task_kwargs = self._serialize_args(args, kwargs)
 
         # Create job
-        job = await self.backend.create_job(
+        job = await self._create_job(
             task_path=task_path,
             kwargs=task_kwargs,
             queue_name=queue_options['queue'],
@@ -121,9 +114,25 @@ class AsyncQueue:
         )
 
         logger.info(
-            f"Enqueued job {job['id']} for task {task_path} on queue {queue_options['queue']}"
+            f"Enqueued job {job.id} for task {task_path} on queue {queue_options['queue']}"
         )
         return job
+
+    @staticmethod
+    async def _create_job(**fields: Any) -> Any:
+        """Create the job row via the sync backend, off the event loop (#181).
+
+        The async backends (AsyncDatabaseBackend) have no ``create_job``; the sync
+        backend for the active mode (Django or standalone) does.
+        """
+        from .compat import get_backend, is_django_mode
+
+        create = get_backend().create_job
+        if is_django_mode():
+            from asgiref.sync import sync_to_async
+
+            return await sync_to_async(create)(**fields)
+        return await asyncio.to_thread(create, **fields)
 
     async def enqueue_at(
         self,
