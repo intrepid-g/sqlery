@@ -287,3 +287,60 @@ def test_real_app_protects_routes_and_allows_healthz(monkeypatch):
     # an unauthenticated request is rejected with 401).
     r = client.get("/api/stats")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# HTTP Basic for browsers (issue #9)
+# ---------------------------------------------------------------------------
+
+def _basic_client(monkeypatch) -> TestClient:
+    monkeypatch.setenv("SQLERY_DASHBOARD_API_KEY", "secret-key")
+    app = _make_app()
+
+    @app.get("/api/ping")
+    def ping():
+        return {"ok": True}
+
+    return TestClient(app)
+
+
+def _basic(user: str, password: str) -> dict[str, str]:
+    import base64
+
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def test_basic_auth_correct_password_any_username_returns_200(monkeypatch):
+    r = _basic_client(monkeypatch).get("/protected", headers=_basic("whoever", "secret-key"))
+    assert r.status_code == 200
+
+
+def test_basic_auth_wrong_password_returns_401_with_challenge(monkeypatch):
+    r = _basic_client(monkeypatch).get("/protected", headers=_basic("u", "nope"))
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="sqlery"'
+
+
+def test_header_key_still_works_on_html_route(monkeypatch):
+    r = _basic_client(monkeypatch).get("/protected", headers={"X-Sqlery-Key": "secret-key"})
+    assert r.status_code == 200
+
+
+def test_no_credentials_on_html_route_returns_401_with_challenge(monkeypatch):
+    r = _basic_client(monkeypatch).get("/protected")
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="sqlery"'
+
+
+def test_api_route_without_credentials_keeps_json_401_without_challenge(monkeypatch):
+    r = _basic_client(monkeypatch).get("/api/ping")
+    assert r.status_code == 401
+    assert r.json() == {"detail": "unauthorized"}
+    assert "www-authenticate" not in r.headers
+
+
+def test_wrong_header_key_keeps_plain_json_401(monkeypatch):
+    r = _basic_client(monkeypatch).get("/protected", headers={"X-Sqlery-Key": "bad"})
+    assert r.status_code == 401
+    assert "www-authenticate" not in r.headers
