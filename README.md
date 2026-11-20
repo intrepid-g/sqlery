@@ -50,7 +50,7 @@ Always pin a release tag, as above. Do not track `main`: it can contain unreleas
 |---|---|
 | `standalone` | SQLModel, FastAPI, uvicorn, Typer, Alembic. Needed for standalone mode. |
 | `django` | Django 5.2+. Needed for Django mode. |
-| `postgres` | `psycopg` 3. It needs the system `libpq`. Without `libpq`, install `psycopg[binary]` instead. |
+| `postgres` | `psycopg[binary]` 3. It bundles `libpq`, so it needs no system library. For production images that use the system `libpq`, install `psycopg[c]` yourself instead. |
 | `http`, `webhooks`, `eventbridge`, `tasks` | `httpx`, `httpx`, `boto3`, `django-tasks`. For the HTTP trigger, webhooks, Lambda and django-tasks modes. |
 
 Django mode needs `psycopg` even on SQLite, because one migration imports `django.contrib.postgres`.
