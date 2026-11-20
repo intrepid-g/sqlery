@@ -1239,12 +1239,17 @@ class WorkerProcess:
 
         # The child sends an outcome it could not persist (DB connection lost) here.
         outcome_r, outcome_w = os.pipe()
+        # The child starts the job only once the parent has recorded its PID (EOF here).
+        go_r, go_w = os.pipe()
         child_pid = self._fork_ctx.fork()
 
         if child_pid == 0:
             # === CHILD PROCESS ===
             try:
                 os.close(outcome_r)
+                os.close(go_w)
+                os.read(go_r, 1)
+                os.close(go_r)
                 self.executor.outcome_fd = outcome_w
                 try:
                     os.setpgrp()
@@ -1261,6 +1266,11 @@ class WorkerProcess:
 
         # === PARENT PROCESS ===
         os.close(outcome_w)
+        os.close(go_r)
+        try:
+            self._record_child_pid(job, child_pid)
+        finally:
+            os.close(go_w)
         logger.info(f"Forked child PID {child_pid} for job {job_id}")
 
         def poll():
@@ -1308,6 +1318,19 @@ class WorkerProcess:
             return True, os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
         return False, None
 
+    def _record_child_pid(self, job, child_pid: int) -> None:
+        """Record ``child_pid`` on the job's open attempt. Never raises.
+
+        Must run before the child starts the job: the completion copies the PID from the
+        attempt to the history row, so a child that finishes first would record none.
+        """
+        try:
+            self.backend.update_job_child_pid(
+                job.id, child_pid, **attempt_kwargs(job, self.backend.update_job_child_pid)
+            )
+        except Exception as e:
+            logger.debug(f"Could not record child PID {child_pid} for job {job.id}: {e}")
+
     def _await_child(self, job, child_pid: int, poll, wait_fd: int | None = None) -> dict:
         """Wait for ``child_pid`` to finish ``job`` while heartbeating, then read the outcome.
 
@@ -1323,12 +1346,9 @@ class WorkerProcess:
         self._handed_over = None
         self._recorded = None
 
-        try:
-            self.backend.update_job_child_pid(
-                job_id, child_pid, **attempt_kwargs(job, self.backend.update_job_child_pid)
-            )
-        except Exception:
-            pass
+        # Old: update_job_child_pid() here, after the child already had the job. A child that
+        # finished first copied a NULL child_pid to history. Both pools now record it before
+        # the child starts the job (_record_child_pid).
 
         # Update heartbeat with child info. Not when the claim just wrote this worker's row
         # (busy, this job, fresh heartbeat): the wait loop below renews it (#172).
@@ -1630,12 +1650,14 @@ class WorkerProcess:
             logger.warning(f"Job {job.id} cannot be sent to the prefork child ({e}); forking it")
             return self._fork_and_execute(job)
         pool = self._ensure_pool_child()
+        self._record_child_pid(job, pool.pid)  # before the child gets the job
         try:
             write_all(pool.job_fd, payload)
         except BrokenPipeError:
             # The idle child died (e.g. killed from outside): start a fresh one, once.
             self._stop_pool_child()
             pool = self._ensure_pool_child()
+            self._record_child_pid(job, pool.pid)
             write_all(pool.job_fd, payload)
         logger.info(f"Sent job {job.id} to prefork child PID {pool.pid}")
         try:
