@@ -730,5 +730,4 @@ print(f"Stats: {stats}")
 ## See Also
 
 - [Getting Started Guide](getting-started.md) - Basic setup
-- [API Reference](api-reference.md) - Complete API docs
 - [Examples](../examples/) - Working examples

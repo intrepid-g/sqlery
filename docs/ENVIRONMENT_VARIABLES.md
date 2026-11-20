@@ -638,7 +638,6 @@ export DJANGO_SQL_JOBS_ENABLE_DAEMON=False  # Treated as truthy!
 
 - [CONFIGURATION.md](CONFIGURATION.md) - Full Django settings reference
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Common issues
-- [PACKAGE_SPLIT_MIGRATION.md](PACKAGE_SPLIT_MIGRATION.md) - Migration guide
 
 ---
 

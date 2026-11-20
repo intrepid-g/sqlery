@@ -17,7 +17,7 @@ This guide will walk you through setting up sqlery and creating your first backg
 
 ### Prerequisites
 
-- Python 3.11 or higher
+- Python 3.13 or higher
 - PostgreSQL 12+ or SQLite 3.35+
 
 ### Install Sqlery
@@ -469,10 +469,9 @@ If jobs stay in 'running' status:
 ## Learn More
 
 - [Configuration Guide](configuration.md) - All configuration options
-- [API Reference](api-reference.md) - Complete API documentation
 - [Examples](../examples/) - More example projects
-- [Migration from Celery](migration-from-celery.md) - If coming from Celery
-- [Migration from RQ](migration-from-rq.md) - If coming from RQ
+- [Migration from Celery](MIGRATION_FROM_CELERY.md) - If coming from Celery
+- [Migration from RQ](MIGRATION_FROM_RQ.md) - If coming from RQ
 
 ---
 

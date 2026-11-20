@@ -911,7 +911,6 @@ grep -r "from sqlery\.decorators import" . --include="*.py"
 # Replace: from sqlery.django_sqlery.decorators
 ```
 
-**See:** [Package Split Migration Guide](PACKAGE_SPLIT_MIGRATION.md)
 
 ---
 
@@ -1008,7 +1007,6 @@ find . -name "*.pyc" -delete
 
 ## See Also
 
-- [Package Split Migration Guide](PACKAGE_SPLIT_MIGRATION.md) - Detailed migration instructions
 - [Environment Variables](ENVIRONMENT_VARIABLES.md) - Configuration via env vars
 - [Configuration Guide](CONFIGURATION.md) - Complete settings reference
 - [Management Commands](MANAGEMENT_COMMANDS.md) - CLI reference

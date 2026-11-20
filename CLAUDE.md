@@ -13,7 +13,7 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 
 ### Constraints
 
-- **Python version**: 3.10+ minimum (uses `X | None` union syntax)
+- **Python version**: 3.13+ minimum (uses `X | None` union syntax)
 - **Database**: PostgreSQL (production) or SQLite (dev/lightweight). No other DB engines.
 - **Backward compatibility**: Public API (`@job`, `enqueue`, `Queue`) must remain stable
 - **Fork safety**: Must handle DB connection lifecycle around `os.fork()` correctly
@@ -24,12 +24,12 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 ## Technology Stack
 
 ## Languages
-- Python 3.10+ - All source code, tests, and tooling
+- Python 3.13+ - All source code, tests, and tooling
 - HTML/Jinja2 - Dashboard templates (`src/sqlery/fastapi_sqlery/templates/`, `src/sqlery/django_sqlery/templates/`)
 - CSS/JS - Dashboard static assets (`src/sqlery/django_sqlery/static/`)
 ## Runtime
-- CPython 3.10+ (minimum)
-- Tested in CI against 3.11, 3.12, 3.13
+- CPython 3.13+ (minimum)
+- Tested in CI against 3.13
 - uv (primary, used in CI and Makefile)
 - pip-compatible (standard `pyproject.toml` with hatchling build backend)
 - Lockfile: `uv.lock` present
@@ -333,24 +333,3 @@ Sqlery is a database-backed Python task queue library that supports two integrat
 No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
 <!-- GSD:skills-end -->
 
-<!-- GSD:workflow-start source:GSD defaults -->
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-
-
-<!-- GSD:profile-start -->
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->

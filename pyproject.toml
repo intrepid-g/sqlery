@@ -9,19 +9,18 @@ description = "Job queue + cron scheduling - works standalone or with Django"
 readme = "README.md"
 # requires-python = ">=3.10"
 requires-python = ">=3.13"
-license = {text = "MIT"}
+license = "MIT"
+keywords = ["task-queue", "job-queue", "scheduler", "cron", "django", "fastapi", "sqlalchemy", "postgresql", "sqlite", "background-jobs"]
 authors = [
-    {name = "Sqlery Contributors"},
+    {name = "intrepid-g"},
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Django",
-    "Framework :: Django :: 4.2",
-    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Framework :: Django :: 6.1",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     # "Programming Language :: Python :: 3.10",
     # "Programming Language :: Python :: 3.11",
@@ -132,6 +131,9 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/intrepid-g/sqlery"
 Repository = "https://github.com/intrepid-g/sqlery"
+Issues = "https://github.com/intrepid-g/sqlery/issues"
+Changelog = "https://github.com/intrepid-g/sqlery/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/intrepid-g/sqlery/tree/main/docs"
 
 [project.scripts]
 sqlery = "sqlery.core.cli:main"
@@ -195,8 +197,8 @@ exclude_lines = [
 
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ['py313']
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"

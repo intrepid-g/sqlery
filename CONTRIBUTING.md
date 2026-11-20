@@ -4,7 +4,7 @@ Thanks for your interest in contributing to Sqlery. This guide covers everything
 
 ## Development Setup
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/)
+**Requirements:** Python 3.13+, [uv](https://docs.astral.sh/uv/)
 
 ```bash
 # Clone and install
@@ -28,7 +28,7 @@ uv run pytest tests/test_core.py
 
 ## Code Style
 
-This project uses **black** for formatting and **ruff** for linting. Both are configured with a line length of 100 characters targeting Python 3.10+.
+This project uses **black** for formatting and **ruff** for linting. Both are configured with a line length of 100 characters targeting Python 3.13+.
 
 ```bash
 # Format code

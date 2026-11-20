@@ -79,3 +79,8 @@ docs/archive/
 
 # Local planning artifacts
 .planning/
+
+# Internal planning (never commit)
+.planning/
+Scratchpad.md
+ADVERSARIAL-REVIEW-*.md
