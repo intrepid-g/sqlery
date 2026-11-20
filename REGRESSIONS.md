@@ -138,3 +138,14 @@ Use this file to:
 - **Regression test:** the fixed cells themselves — `test_mode_e2e[postgres-standalone-http-trigger]`, `test_mode_e2e[postgres-standalone-subprocess]`, `test_async_e2e_standalone_pg` — now pass reliably (verified 2x back-to-back with no manual DB cleanup in between); `test_mode_e2e[postgres-django-http-trigger]` reports `SKIPPED` with a clear reason instead of failing.
 - **Inline comment:** `Issue #23` at `tests/integration/conftest.py` (`_drive_http_trigger_standalone`, `_clear_standalone_pg_queue`, `skip_django_http_trigger_pg`) and `.github/workflows/test.yml` (both postgres steps).
 - **Validation:** ran the full non-daemon postgres suite (`tests/integration/test_modes.py tests/integration/test_async_e2e.py -m postgres -k "not daemon"`) twice back-to-back against a local Postgres 15 container with no manual cleanup between runs — both runs: 6 passed, 1 skipped, 1 xfailed (pre-existing, unrelated `test_async_e2e_django_pg`), 0 failed; `ps aux` showed zero leftover `worker_runner`/subprocess processes after each run. Also confirmed no regressions on the SQLite rail: `tests/integration/ tests/unit/test_dashboard_auth.py tests/test_http_trigger.py tests/test_triggers.py -m "not postgres"` — 63 passed, 4 skipped, 0 failed. The `daemon` postgres cells were excluded from these runs — they are extremely slow/hang against this local Docker Postgres setup regardless of this fix (pre-existing, macOS-local; the issue's own text attributes this to local environment noise not reproduced on Linux CI). Separately confirmed: forcing a daemon cell to hit pytest's `--timeout` leaves zero orphan processes afterward, supporting the `--timeout` fix for the CI-cancellation symptom.
+
+## 2026-11-20 — History row without `child_pid` for a fast job
+
+**What broke:** `tests/test_hot_path_statements_172.py::test_cheaper_path_keeps_the_guarantees[sqlite]` failed at times in CI with `assert None not in child_pids`. One job in `sqlery_job_history` had no `child_pid`.
+
+**Root cause:** A product race, not a test race. The worker parent gave the job to the child first and wrote the child PID to the open attempt second (`_await_child`). The completion copies the PID from the attempt to the history row. A child that finished (or, on the Django failure path, read the attempt) before the parent's write recorded `NULL`.
+
+**Fix:** `WorkerProcess._record_child_pid` runs before the child starts the job. Prefork: before the job frame is sent. Fork-per-job: the child waits on a pipe until the parent has written the PID.
+
+**Regression test:** `test_attempt_names_the_child_before_the_job_starts` in `tests/test_hot_path_statements_172.py` (the job itself checks that its open attempt names its own PID; both pools).
+
