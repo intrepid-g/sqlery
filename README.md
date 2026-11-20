@@ -157,19 +157,37 @@ Enqueue the same way from a view or a signal. Workers preload the `tasks` module
 |---|---|---|
 | SQLite | Supported | Dev, tests, a single node. |
 | PostgreSQL | Supported. CI runs on PostgreSQL 15. | Production, several workers or hosts. |
-| libSQL / Turso | **Not supported** | See below. |
+| libSQL (embedded file) | **Experimental**, Django mode only | See below. Remote Turso is not supported. |
 | MySQL and others | Not supported | |
 
 **SQLite.** URL: `sqlite:///relative.db` or `sqlite:////abs/path.db`. Claiming uses optimistic locking.
 
 **PostgreSQL.** URL: `postgresql://user:password@host/dbname`, plus the `postgres` extra or `psycopg[binary]`. In Django, use the normal `DATABASES` setting. PostgreSQL adds `FOR UPDATE SKIP LOCKED` claiming, optional LISTEN/NOTIFY wake-ups and partitioned tables. On a new standalone database, let one process run `initialize()` before you start the others: two first starts at the same moment can collide while they create the tables.
 
-**libSQL / Turso.** sqlery 0.28 has no libSQL driver, test or CI job. The only libSQL code is a fork-safety rule: a Django connection with vendor `libsql` is closed before a worker forks. Two tests on 0.28.0 both failed:
+**libSQL (experimental).** Django mode only, with an embedded libSQL file. This is not remote Turso, and it is not standalone (SQLAlchemy) mode. The `libsql` extra pins `libsql==0.1.11`. It is new after v0.28.0, so install from GitHub and pin the latest release tag (newer than v0.28.0) from the [releases page](https://github.com/intrepid-g/sqlery/releases):
 
-- Standalone with `sqlalchemy-libsql` and a `sqlite+libsql:///` URL: `initialize()` fails while it creates the tables (`foreign key mismatch`).
-- Django 6.1 with `django-libsql` 0.1.3: the backend fails to open a cursor before sqlery runs.
+```bash
+pip install "sqlery[django,libsql] @ git+https://github.com/intrepid-g/sqlery.git@<latest-tag>" "psycopg[binary]"
+```
 
-Use SQLite or PostgreSQL.
+Then set the engine:
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "sqlery.django_sqlery.libsql_backend",
+        "NAME": "/abs/path/queue.db",
+        "OPTIONS": {"timeout": 5.0},
+    }
+}
+```
+
+The backend wraps the `libsql` module under Django's SQLite backend, so the vendor stays `sqlite` and the SQLite claiming rules apply. CI runs one real enqueue and one worker run on a libsql file, on Python 3.13 with Django 5.2 and 6.1. Both passed on libsql 0.1.11. Caveats:
+
+- Experimental. The backend is tested for the queue path only. It does not register Django's SQL functions (some date lookups will fail).
+- Use `psycopg[binary]` or install libpq: the sqlery migrations import `django.contrib.postgres`.
+- No remote Turso URL, no embedded replica, and no standalone-mode driver. `sqlalchemy-libsql` fails in `initialize()` (`foreign key mismatch`) and `django-libsql` 0.1.3 fails on Django 6.1.
+- Same limits as SQLite: not for production multi-worker setups.
 
 ## Features
 

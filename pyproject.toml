@@ -37,6 +37,9 @@ dependencies = [
 # PostgreSQL support (optional - not needed for SQLite)
 postgres = ["psycopg[binary]>=3.1"]
 
+# EXPERIMENTAL libsql file backend for Django (ENGINE sqlery.django_sqlery.libsql_backend); verified on 0.1.11
+libsql = ["libsql==0.1.11"]
+
 # CLI dependencies (typer + rich without full standalone)
 cli = ["typer>=0.9.0", "rich>=13.0.0"]
 
