@@ -1,31 +1,26 @@
-"""Async worker process example."""
+"""Async worker process example.
+
+Run it from this folder: python worker.py
+It stops after 8 jobs.
+"""
 
 import asyncio
-from sqlery import AsyncWorker
-from sqlery.backends import BackendFactory
-import tasks  # Import to register tasks
+
+from sqlery.core.async_worker import AsyncWorker
+from sqlery.fastapi_sqlery import database
+from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
+import tasks  # noqa: F401  (the worker must be able to import the tasks)
+
+ASYNC_DATABASE_URL = "sqlite+aiosqlite:///example_async.db"
 
 
 async def main():
-    """Run an async worker to process jobs."""
-    # Configure backend
-    backend = BackendFactory.create_async_backend('sqlite:///example_async.db')
-    await backend.connect()
-
-    # Create async worker for multiple queues
-    worker = AsyncWorker(['default', 'reports'], backend=backend)
-
-    print("=" * 60)
-    print("Async Worker Starting")
-    print("=" * 60)
-    print()
-    print("Processing queues: default, reports")
-    print("Press Ctrl+C to stop")
-    print()
-
-    # Start processing jobs (runs forever)
-    await worker.work()
+    """Run an async worker that processes the 'default' and 'reports' queues."""
+    database.get_async_engine(ASYNC_DATABASE_URL)
+    worker = AsyncWorker(SQLAlchemyAsyncBackend(), ["default", "reports"], concurrency=5)
+    print("Processing queues: default, reports (stops after 8 jobs)")
+    await worker.run(max_jobs=8)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

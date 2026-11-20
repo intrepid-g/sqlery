@@ -1,31 +1,21 @@
-"""Worker process example."""
+"""Worker process example.
+
+Run it from this folder: python worker.py
+It stops after 3 jobs. Use the sqlery-worker command to run without a limit.
+"""
 
 from sqlery import Worker
-from sqlery.backends import BackendFactory
-import tasks  # Import to register tasks
+from sqlery.compat import initialize
+import tasks  # noqa: F401  (the worker must be able to import the tasks)
 
 
 def main():
-    """Run a worker to process jobs."""
-    # Configure backend
-    backend = BackendFactory.create_sync_backend('sqlite:///example.db')
-    backend.connect()
-
-    # Create worker for multiple queues
-    # Processes 'default' and 'reports' queues
-    worker = Worker(['default', 'reports'], backend=backend)
-
-    print("=" * 60)
-    print("Worker Starting")
-    print("=" * 60)
-    print()
-    print("Processing queues: default, reports")
-    print("Press Ctrl+C to stop")
-    print()
-
-    # Start processing jobs (runs forever)
-    worker.work()
+    """Run a worker that processes the 'default' and 'reports' queues."""
+    initialize(database_url="sqlite:///example.db", enable_daemon=False)
+    worker = Worker(["default", "reports"])
+    print("Processing queues: default, reports (stops after 3 jobs)")
+    worker.run(max_jobs=3)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

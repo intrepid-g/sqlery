@@ -52,7 +52,7 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    command: python manage.py daemon start --no-detach
+    command: python manage.py daemon start
     environment:
       <<: *django-env
       TRIGGER_MODE: daemon
@@ -186,7 +186,7 @@ services:
         condition: service_completed_successfully
       standalone-web:
         condition: service_started
-    command: sqlery-worker run --queues standalone_queue
+    command: sqlery-worker --queues standalone_queue
     environment:
       SQLERY_DATABASE_URL: ${SQLERY_DATABASE_URL:-postgresql+psycopg://sqlery:sqlery@postgres:5432/sqlery_lab}
 

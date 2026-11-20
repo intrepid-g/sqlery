@@ -15,6 +15,10 @@ This guide covers all configuration options for sqlery.
 
 ## Backend Configuration
 
+Standalone mode picks its backend from a database URL. Call `initialize()` once per
+process. It builds the engine and creates the tables. (`sqlery.backends.BackendFactory`
+was removed in v0.13.) In Django mode, use the Django `DATABASES` setting instead.
+
 ### Connection Strings
 
 Sqlery supports PostgreSQL and SQLite via connection strings.
@@ -22,117 +26,77 @@ Sqlery supports PostgreSQL and SQLite via connection strings.
 #### SQLite
 
 ```python
-from sqlery.backends import BackendFactory
+from sqlery.compat import initialize
 
-# In-memory (testing only)
-backend = BackendFactory.create_sync_backend('sqlite:///:memory:')
-
-# File-based
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
+# File-based (relative to the working directory)
+initialize(database_url='sqlite:///jobs.db')
 
 # Absolute path
-backend = BackendFactory.create_sync_backend('sqlite:////absolute/path/to/jobs.db')
+initialize(database_url='sqlite:////absolute/path/to/jobs.db')
+
+# In-memory (one process only, testing only)
+initialize(database_url='sqlite:///:memory:')
 ```
 
 #### PostgreSQL
 
 ```python
 # Basic connection
-backend = BackendFactory.create_sync_backend('postgresql://user:pass@localhost/dbname')
+initialize(database_url='postgresql://user:pass@localhost/dbname')
 
 # With port
-backend = BackendFactory.create_sync_backend('postgresql://user:pass@localhost:5432/dbname')
+initialize(database_url='postgresql://user:pass@localhost:5432/dbname')
 
 # With additional options
-backend = BackendFactory.create_sync_backend(
-    'postgresql://user:pass@localhost/dbname?sslmode=require&connect_timeout=10'
+initialize(
+    database_url='postgresql://user:pass@localhost/dbname?sslmode=require&connect_timeout=10'
 )
 ```
 
-### Sync vs Async Backends
+Pool tuning: `initialize(..., pool_size=5, max_overflow=10, pool_timeout=30, pool_recycle=1800)`.
 
-**Sync Backend** (blocking):
-```python
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
-backend.connect()  # Blocking
-# Use with Queue and Worker
-backend.disconnect()
+### Environment Variable
+
+The `sqlery` and `sqlery-worker` commands read `SQLERY_DATABASE_URL`
+(or `DATABASE_URL`). They initialize the database themselves:
+
+```bash
+export SQLERY_DATABASE_URL=sqlite:///jobs.db
+sqlery-worker --queues default
+sqlery jobs list
 ```
 
-**Async Backend** (non-blocking):
-```python
-backend = BackendFactory.create_async_backend('sqlite:///jobs.db')
-await backend.connect()  # Non-blocking
-# Use with AsyncQueue and AsyncWorker
-await backend.disconnect()
-```
+### Sync vs Async
+
+`get_backend()` returns the sync backend that `@job`, `enqueue()` and the worker use.
+For async code, use `sqlery.fastapi_sqlery.database.get_async_engine(url)`.
 
 ### Database Initialization
 
-**Using schema module** (recommended):
+`initialize()` creates all tables. No extra step is needed:
+
 ```python
-from sqlery import create_tables_sync, create_tables_async
-from sqlery.backends import BackendFactory
+from sqlery.compat import initialize, get_backend
 
-# Sync
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
-backend.connect()
-create_tables_sync(backend)
-backend.disconnect()
-
-# Async
-import asyncio
-
-async def setup():
-    backend = BackendFactory.create_async_backend('sqlite:///jobs.db')
-    await backend.connect()
-    await create_tables_async(backend)
-    await backend.disconnect()
-
-asyncio.run(setup())
+initialize(database_url='sqlite:///jobs.db')
+backend = get_backend()
 ```
 
-**Manual SQL** (if needed):
-```python
-# See src/sqlery/schema.py for complete SQL definitions
-await backend.db.execute("""
-    CREATE TABLE IF NOT EXISTS sqlery_queued_job (
-        id SERIAL PRIMARY KEY,
-        task_path TEXT NOT NULL,
-        ...
-    )
-""")
-```
+For schema changes on PostgreSQL, use `sqlery migrate upgrade` (Alembic).
 
 ---
 
 ## Queue Configuration
 
-### Default Backend
+### Backend
 
-Configure a default backend for all queues:
-
-```python
-from sqlery import Queue
-from sqlery.backends import BackendFactory
-
-backend = BackendFactory.create_sync_backend('sqlite:///jobs.db')
-backend.connect()
-
-# Set default
-Queue.configure(backend)
-
-# Now all queues use this backend
-queue1 = Queue(name='emails')
-queue2 = Queue(name='reports')
-```
-
-### Explicit Backend
-
-Pass backend explicitly:
+Queues use the backend that `initialize()` set up. No `Queue.configure()` call is needed:
 
 ```python
-queue = Queue(name='emails', backend=backend)
+from sqlery import get_queue
+
+queue1 = get_queue('emails')
+queue2 = get_queue('reports')
 ```
 
 ### Queue Naming
@@ -140,10 +104,10 @@ queue = Queue(name='emails', backend=backend)
 Choose descriptive queue names:
 
 ```python
-Queue(name='emails')        # Email sending tasks
-Queue(name='reports')       # Report generation
-Queue(name='high-priority') # Urgent tasks
-Queue(name='low-priority')  # Background cleanup
+get_queue('emails')        # Email sending tasks
+get_queue('reports')       # Report generation
+get_queue('high-priority') # Urgent tasks
+get_queue('low-priority')  # Background cleanup
 ```
 
 ### Default Timeout
@@ -492,13 +456,12 @@ def critical_task():
 
 ```python
 # Bad
-backend = BackendFactory.create_sync_backend('postgresql://admin:secret123@localhost/db')
+initialize(database_url='postgresql://admin:secret123@localhost/db')
 
 # Good - Use environment variables
 import os
 
-DATABASE_URL = os.environ['DATABASE_URL']
-backend = BackendFactory.create_sync_backend(DATABASE_URL)
+initialize(database_url=os.environ['DATABASE_URL'])
 ```
 
 ### Environment Variables
@@ -519,7 +482,7 @@ import os
 
 load_dotenv()
 
-backend = BackendFactory.create_sync_backend(os.environ['DATABASE_URL'])
+initialize(database_url=os.environ['DATABASE_URL'])
 ```
 
 ### Database Permissions
@@ -634,56 +597,26 @@ For truly massive enqueueing, consider batching SQL inserts (advanced).
 
 ### Development
 
-```python
+```bash
 # Simple SQLite, single worker
-from sqlery import Queue, Worker
-from sqlery.backends import BackendFactory
-
-backend = BackendFactory.create_sync_backend('sqlite:///dev.db')
-backend.connect()
-Queue.configure(backend)
-
-worker = Worker(['default'], backend=backend, poll_interval=1.0)
-worker.work()
+export SQLERY_DATABASE_URL=sqlite:///dev.db PYTHONPATH=.
+sqlery-worker --queues default
 ```
 
 ### Production
 
-```python
-# PostgreSQL with environment variables
-import os
-from sqlery import Queue, Worker
-from sqlery.backends import BackendFactory
-
-DATABASE_URL = os.environ['DATABASE_URL']
-backend = BackendFactory.create_sync_backend(DATABASE_URL)
-backend.connect()
-Queue.configure(backend)
-
-# Multiple queues with priorities
-worker = Worker(
-    queues=['critical', 'high', 'default', 'low'],
-    backend=backend,
-    poll_interval=2.0,
-    worker_id=f"worker-{os.getpid()}"
-)
-worker.work()
+```bash
+# PostgreSQL with environment variables, several queues
+export SQLERY_DATABASE_URL=postgresql://user:pass@host/dbname
+sqlery-worker --queues critical,high,default,low
 ```
 
 ### Testing
 
-```python
-# In-memory SQLite, burst mode
-from sqlery import Queue, Worker
-from sqlery.backends import BackendFactory
-
-backend = BackendFactory.create_sync_backend('sqlite:///:memory:')
-backend.connect()
-Queue.configure(backend)
-
-# Process all jobs then exit
-worker = Worker(['default'], backend=backend, burst=True)
-worker.work()
+```bash
+# Process queued jobs, then exit
+export SQLERY_DATABASE_URL=sqlite:///test.db PYTHONPATH=.
+sqlery-worker --queues default --max-jobs 10
 ```
 
 ---

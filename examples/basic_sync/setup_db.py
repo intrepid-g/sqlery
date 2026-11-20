@@ -1,22 +1,9 @@
-"""Setup database tables for the example."""
+"""Create the database tables for the example."""
 
-import asyncio
-from sqlery.backends import BackendFactory
-from sqlery.schema import create_tables_async
+from sqlery.compat import initialize
 
+DATABASE_URL = "sqlite:///example.db"
 
-async def setup():
-    """Create required database tables."""
-    print("Creating database tables...")
-
-    backend = BackendFactory.create_async_backend('sqlite:///example.db')
-    await backend.connect()
-
-    await create_tables_async(backend)
-
-    await backend.disconnect()
-    print("✓ Database tables created successfully")
-
-
-if __name__ == '__main__':
-    asyncio.run(setup())
+if __name__ == "__main__":
+    initialize(database_url=DATABASE_URL, enable_daemon=False)  # creates the tables
+    print("Database tables created in example.db")

@@ -17,24 +17,23 @@ Complete reference for all management commands in sqlery.
 Process jobs from the queue.
 
 ```bash
-# Process all pending jobs once (serverless mode)
-python manage.py run_jobs --once
-
-# Process specific queue
-python manage.py run_jobs --queue email --once
-
-# Limit number of jobs processed
-python manage.py run_jobs --max-jobs 100 --once
-
-# Continuous processing (blocks)
+# Process one job and exit (the default)
 python manage.py run_jobs
 
+# Process specific queue
+python manage.py run_jobs --queue email
+
+# Limit number of jobs processed per process
+python manage.py run_jobs --max-jobs 100
+
 # Verbose output
-python manage.py run_jobs --once -v 2
+python manage.py run_jobs -v 2
 ```
 
+`run_jobs` has no `--once` flag. To drain the queue and exit (serverless, cron), use
+`rqworker --burst` (see [rqworker](#rqworker)).
+
 **Options:**
-- `--once` - Process pending jobs once and exit (for serverless)
 - `--queue QUEUE` - Process jobs from specific queue only
 - `--max-jobs N` - Jobs this process runs before exiting (default: 1; a fresh process is spawned if more are queued)
 - `--idle-linger S` - Once the queue is empty and fewer than `--max-jobs` have run, wait up to S seconds for new jobs (default: 0). The subprocess trigger passes both through from the `SUBPROCESS_JOBS_PER_PROCESS` (default 1) and `SUBPROCESS_IDLE_LINGER_S` (default 0) settings.
@@ -42,21 +41,33 @@ python manage.py run_jobs --once -v 2
 - `-v {0,1,2,3}` - Verbosity level
 
 **Use cases:**
-- **AWS Lambda**: Run with `--once` on schedule (EventBridge)
-- **Cloud Run**: Run with `--once` on Cloud Scheduler trigger
-- **Cron job**: Run with `--once` every minute
-- **Testing**: Run with `--once` to process specific queue
+- **AWS Lambda**: Run `rqworker --burst` on schedule (EventBridge)
+- **Cloud Run**: Run `rqworker --burst` on Cloud Scheduler trigger
+- **Cron job**: Run `run_jobs` or `rqworker --burst` every minute
+- **Testing**: Run `rqworker --burst QUEUE` to process one queue
 
 **Example Lambda handler:**
 
 ```python
 def handler(event, context):
     from django.core.management import call_command
-    call_command('run_jobs', '--once', '--max-jobs', '100')
+    call_command('rqworker', '--burst')
     return {'statusCode': 200}
 ```
 
 ## Worker Management
+
+### rqworker
+
+Drop-in for `django-tasks-scheduler`'s `rqworker`. Without `--burst`, it runs the daemon loop
+in the foreground. With `--burst`, it drains the named queues (default: the `WORKER_QUEUES`
+setting) in this process and exits.
+
+```bash
+python manage.py rqworker --burst              # drain the default queues, then exit
+python manage.py rqworker --burst email        # drain one queue, then exit
+python manage.py rqworker email default        # run until stopped
+```
 
 ### workers list
 
@@ -583,7 +594,7 @@ spec:
 ```bash
 # /etc/cron.d/sqlery
 # Run jobs every minute
-* * * * * www-data cd /opt/myapp && python manage.py run_jobs --once >> /var/log/django-jobs.log 2>&1
+* * * * * www-data cd /opt/myapp && python manage.py rqworker --burst >> /var/log/django-jobs.log 2>&1
 
 # Cleanup daily at 2 AM
 0 2 * * * www-data cd /opt/myapp && python manage.py cleanup_jobs auto >> /var/log/django-cleanup.log 2>&1
