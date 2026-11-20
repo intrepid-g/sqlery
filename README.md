@@ -274,6 +274,8 @@ uvicorn.run(app, host="127.0.0.1", port=8000)
 
 Pages: `/`, `/jobs`, `/scheduled-tasks`, `/workers`, `/registries`. A JSON API is under `/api/`. Every request except `/healthz` needs the header `X-Sqlery-Key`. The key comes from `SQLERY_DASHBOARD_API_KEY`, or is generated in `.sqlery/dashboard.key` on first start. When you mount the app inside your own ASGI app, it trusts your app's authentication (`SQLERY_DASHBOARD_AUTH=inherit`). `SQLERY_DASHBOARD_AUTH=disabled` turns the check off; use that only on a trusted network.
 
+To open the dashboard in a browser, enter any user name and the dashboard key as the password in the login prompt (HTTP Basic). Use HTTPS, because the key travels with every request.
+
 ## How it compares
 
 The sqlery column is checked against the source. The other columns come from each project's public documentation. They were not tested for this table, so check the current docs of each project.
