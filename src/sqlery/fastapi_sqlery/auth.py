@@ -1,7 +1,8 @@
 """Dashboard authentication middleware for the FastAPI standalone app (SEC-01).
 
 Three modes:
-- standalone (default): require ``X-Sqlery-Key`` header; reject otherwise with 401.
+- standalone (default): require ``X-Sqlery-Key`` header or HTTP Basic (password = key, user name
+  ignored); reject otherwise with 401. Non-``/api/`` 401s add ``WWW-Authenticate: Basic``.
 - disabled: opt-out via ``SQLERY_DASHBOARD_AUTH=disabled``; pass-through; one WARNING at install.
 - inherit: trust parent app's auth. Explicit via ``SQLERY_DASHBOARD_AUTH=inherit`` or auto-detected
   when the app is mounted under another ASGI app (Starlette's ``Mount`` sets ``scope['app_root_path']``).
@@ -14,6 +15,8 @@ Explicit env value always wins over auto-detection.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import logging
 import os
@@ -120,11 +123,37 @@ class DashboardAuthMiddleware(BaseHTTPMiddleware):
         if mode in ("disabled", "inherit"):
             return await call_next(request)
 
-        # Standalone: require X-Sqlery-Key.
-        provided = request.headers.get("x-sqlery-key", "")
-        if not hmac.compare_digest(provided.encode("utf-8"), self._expected_key.encode("utf-8")):
+        # Standalone: X-Sqlery-Key header, or HTTP Basic (password = key) for browsers.
+        header_key = request.headers.get("x-sqlery-key")
+        if header_key is not None:
+            if self._key_matches(header_key):
+                return await call_next(request)
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        return await call_next(request)
+
+        basic = _basic_password(request.headers.get("authorization", ""))
+        if basic is not None and self._key_matches(basic):
+            return await call_next(request)
+
+        headers = {}
+        if not request.url.path.startswith("/api/"):
+            # Browser pages: ask for a login. Same body as before, so nothing leaks.
+            headers["WWW-Authenticate"] = 'Basic realm="sqlery"'
+        return JSONResponse({"detail": "unauthorized"}, status_code=401, headers=headers)
+
+    def _key_matches(self, provided: str) -> bool:
+        return hmac.compare_digest(provided.encode("utf-8"), self._expected_key.encode("utf-8"))
+
+
+def _basic_password(authorization: str) -> str | None:
+    """Return the password of an ``Authorization: Basic`` value (user name ignored), else None."""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "basic":
+        return None
+    try:
+        decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    return decoded.partition(":")[2]
 
 
 def install(app, *, key_path: pathlib.Path | None = None) -> None:

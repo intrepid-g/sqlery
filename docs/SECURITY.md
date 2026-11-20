@@ -90,6 +90,16 @@ X-Sqlery-Key: <your-api-key>
 The header is case-insensitive (Sqlery uses Starlette's normalized header
 accessor). Comparison uses `hmac.compare_digest` for constant-time equality.
 
+### Browser Access (HTTP Basic)
+
+A browser cannot send `X-Sqlery-Key`. Sqlery also accepts
+`Authorization: Basic`, where the **password** is the dashboard key and the
+user name is ignored. HTML pages answer a missing or wrong credential with
+`401` and `WWW-Authenticate: Basic realm="sqlery"`, so the browser shows its
+login prompt. `/api/*` paths and requests with a wrong `X-Sqlery-Key` keep the
+plain JSON `401` without that header. The key is never read from the URL or a
+cookie. Basic sends the key on every request: use HTTPS.
+
 ### Unauthenticated Endpoint
 
 `GET /healthz` is **always reachable**, in every mode, regardless of the
