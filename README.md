@@ -300,7 +300,7 @@ Migration guides: [from Celery](docs/MIGRATION_FROM_CELERY.md), [from RQ](docs/M
 
 ## Agents / LLM
 
-If you are a coding agent, or you use one, read [llms.txt](llms.txt) first. It is the short, verified API summary: install, job API, worker commands, run modes, gotchas, and the list of stale docs. It marks each item it did not run as UNVERIFIED. Its install lines show a plain `pip install`; use the pinned GitHub commands from [Install](#install) until the PyPI release.
+If you are a coding agent, or you use one, read [llms.txt](llms.txt) first. It is the short, verified API summary: install, job API, worker commands, run modes, gotchas, and the list of stale docs. It marks each item it did not run as UNVERIFIED. Its install lines use the same pinned GitHub commands as [Install](#install).
 
 Rules for generated code:
 
