@@ -328,6 +328,10 @@ class TestForkLifecycle:
         monkeypatch.setattr(os, "WIFEXITED", lambda s: True)
         monkeypatch.setattr(os, "WEXITSTATUS", lambda s: 0)
         monkeypatch.setattr("sqlery.core.worker.time.sleep", lambda *_a, **_k: None)
+        # Where os.pidfd_open exists (Linux) the fake pid 4242 fails it and the wait
+        # falls back to plain ticks. macOS has no pidfd and would block on the real
+        # result pipe, whose closed write end reads as EOF: force the tick path.
+        monkeypatch.setattr("sqlery.core.worker._wait_readable", lambda *_a, **_k: False)
 
         wp._fork_and_execute(job)
 

@@ -79,8 +79,9 @@ def wait_for(predicate, timeout=20.0):
 
 
 def parent_of(pid):
-    with open(f"/proc/{pid}/stat") as f:
-        return int(f.read().rsplit(")", 1)[1].split()[1])
+    # ps works on Linux and macOS; /proc exists on Linux only.
+    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+    return int(out.stdout)
 
 
 # --- settings -----------------------------------------------------------------------------
