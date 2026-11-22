@@ -36,6 +36,7 @@ from .retry import (
 from .signals import task_retry
 from .result import REVOKED_ERROR
 from .scheduler import Scheduler
+from . import maintenance
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
 from .pool import (
@@ -913,6 +914,7 @@ class WorkerProcess:
         self._last_tick: float | None = None
         self._last_lease_renew = 0.0
         self._sched_next_check = 0.0
+        self._last_maintenance: datetime | None = None  # #35
         self._idle_delay: float | None = None
         self._idle_delay_at = 0.0
         self._idle_dirty = False
@@ -1074,6 +1076,8 @@ class WorkerProcess:
                         setattr(self, attr, value)
                     if "_owned_queues" in pending:
                         owned_queues = self._owned_queues
+                    # #35: outside the idle transaction, partition DDL manages its own.
+                    self._maybe_run_maintenance()
                     if claim_error is not None:
                         raise claim_error
 
@@ -2082,6 +2086,19 @@ class WorkerProcess:
         except Exception as e:
             logger.error(f"Scheduler-election error: {e}", exc_info=True)
         self._idle_housekeeping()
+
+    def _maybe_run_maintenance(self) -> None:
+        """Lease holder only: the daemon's zombie, dead-worker and partition sweeps (#35).
+
+        The first poll after the worker wins a lease runs it at once, so a worker that
+        restarts after a crash clears the zombies its earlier run left behind.
+        """
+        now = maintenance.now_utc()
+        interval = get_config("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 5)
+        if not self._owned_queues or not maintenance.is_due(self._last_maintenance, interval, now):
+            return
+        self._last_maintenance = now  # set first: a failing sweep must not retry every poll
+        maintenance.maintenance_tick(self.backend, sorted(self._owned_queues))
 
     def _scheduler_election_step(self, scheduler, lease_secs: float, pending: dict) -> None:
         """Renew/claim scheduler leases and fire due cron tasks for held queues.
