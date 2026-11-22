@@ -37,7 +37,7 @@ jobs:
           - 5432:5432
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install uv
       uses: astral-sh/setup-uv@v7
@@ -182,7 +182,7 @@ jobs:
       matrix:
         django-version: ['5.2', '6.1']
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: astral-sh/setup-uv@v7
     - uses: actions/setup-python@v5
       with:
@@ -201,7 +201,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install uv
       uses: astral-sh/setup-uv@v7
