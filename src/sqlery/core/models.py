@@ -32,7 +32,7 @@ from sqlalchemy.orm import registry as _sa_registry
 from sqlery.core import history as _history
 from sqlery.core.utils import reject_unawaited_coroutine
 from sqlery.core.sqltypes import UTCDateTime
-from sqlery.core.worker_admin import is_worker_beating
+from sqlery.contract.database import is_beating
 from sqlery.compat import get_config
 from sqlery.tables import JOB_ALL
 
@@ -445,7 +445,8 @@ class Worker(SQLModel, table=True):
         """Check if worker is alive based on heartbeat (see is_worker_beating)."""
         if timeout_seconds is None:
             timeout_seconds = get_config("WORKER_ALIVE_TIMEOUT", 30)
-        return is_worker_beating(
+        # Old: is_worker_beating(...)  (now clause DB-1)
+        return is_beating(
             self.status, self.last_heartbeat, datetime.now(UTC), timeout_seconds
         )
 

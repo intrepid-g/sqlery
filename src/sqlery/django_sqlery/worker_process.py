@@ -18,6 +18,7 @@ from django.utils import timezone
 from sqlery.core.worker import TaskExecutor
 from sqlery.core.claiming import claim_next_job_with_queue_priority, release_job
 from sqlery.compat import get_backend
+from sqlery.contract import worker as worker_contract
 from .worker_registry import register_worker, unregister_worker, update_heartbeat
 from .settings import get_setting
 from .deadlines import write_deadline, clear_deadline
@@ -70,7 +71,8 @@ def run_worker():
     try:
         while not shutdown_requested:
             # Send heartbeat if interval elapsed
-            if time.time() - last_heartbeat >= heartbeat_interval:
+            # Old: time.time() - last_heartbeat >= heartbeat_interval  (clause WRK-2)
+            if worker_contract.beat_owed(time.time() - last_heartbeat, heartbeat_interval):
                 update_heartbeat(worker)
                 last_heartbeat = time.time()
 

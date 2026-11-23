@@ -17,6 +17,7 @@ from django.db import connection, IntegrityError, models as db_models, transacti
 from django.db.models import Q, Count
 from django.utils import timezone
 
+from sqlery.contract import database as db_contract
 from sqlery.core.db_resilience import retry_on_db_error
 
 from sqlery.core import history as history_core
@@ -1508,7 +1509,8 @@ class DjangoBackend(DatabaseBackend):
         requeued, since the sweep looked) is left alone and False is returned.
         """
         job = self.QueuedJob.objects.filter(id=job_id).first()
-        if job is None or job.status != "queued":
+        # Old: job.status != "queued"  (clause DB-2)
+        if job is None or not db_contract.can_be_running(job.status):
             return False
         attempt = job.open_attempt()
         if attempt is None:
@@ -1517,7 +1519,8 @@ class DjangoBackend(DatabaseBackend):
         with transaction.atomic():
             # Closing the open attempt is the arbiter between recovery, a completion and a
             # requeue (each closes it exactly once): lose that race and there is nothing to do.
-            if JobAttempt.close_open(job_id, OUTCOME_ABANDONED) < 1:
+            # Old: close_open(...) < 1  (clause DB-3)
+            if not db_contract.closed_the_attempt(JobAttempt.close_open(job_id, OUTCOME_ABANDONED)):
                 return False
             job.mark_failed(error=reason, termination_reason="zombie_job")
         return True

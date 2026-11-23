@@ -8,8 +8,13 @@ the decision logic in ``daemon._fail_zombie_running_jobs`` never touches an ORM.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+
+from sqlery.contract.config import misconfiguration
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,3 +45,13 @@ class RunningJobLiveness:
     worker_last_heartbeat: datetime | None
     worker_friendly_name: str | None
     has_worker: bool
+
+
+def check_liveness_config(heartbeat_interval: float, alive_timeout: float) -> None:
+    """Edge: warn once at startup when the heartbeat cannot keep a worker alive (CFG-1).
+
+    A warning, not an error: a deploy that runs today must keep running.
+    """
+    problem = misconfiguration(heartbeat_interval, alive_timeout)
+    if problem:
+        logger.warning(problem)

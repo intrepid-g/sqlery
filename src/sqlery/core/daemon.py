@@ -17,6 +17,8 @@ from pathlib import Path
 
 from ..compat import get_backend, get_config, is_django_mode
 from . import history as history_core
+from sqlery.contract import dead_worker_reaper, zombie_sweep
+from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT
 from .cleanup import CleanupManager
 # Old: from . import partitioning as _partitioning
 try:
@@ -891,14 +893,8 @@ class DaemonManager:
                 skipped), and a job without a worker is only a zombie once it has been
                 running longer than ``WORKER_ALIVE_TIMEOUT`` (claim→register window).
         """
-        # Heartbeat stale threshold: the daemon sends SIGUSR1 every cycle
-        # (~DAEMON_CHECK_INTERVAL seconds). If the worker can't respond for
-        # this many seconds, something is wrong.
-        alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", 30)
-        # Use 3x alive_timeout as the stale threshold to allow for timing
-        # jitter between daemon cycles and worker signal handling.
-        stale_threshold = alive_timeout * 3
-
+        # Old: five inline checks here; they are clauses ZS-1..ZS-5 in contract/zombie_sweep.py
+        alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", ALIVE_TIMEOUT_DEFAULT)
         current_node = os.environ.get("NODE_ID", socket.gethostname())
         now = datetime.now(timezone.utc)
 
@@ -906,64 +902,14 @@ class DaemonManager:
         failed_count = 0
 
         for rec in records:
-            reason = None
-
-            # Check 1: worker_pid doesn't exist on this machine
-            if rec.worker_pid:
-                if rec.worker_node_id == current_node:
-                    try:
-                        os.kill(rec.worker_pid, 0)
-                    except PermissionError:
-                        pass  # the process exists but belongs to another user: it is alive
-                    except OSError:
-                        reason = f"Worker PID {rec.worker_pid} no longer exists on {current_node}"
-                # Remote nodes: rely on heartbeat staleness (Check 5)
-
-            # Check 2: running job has no worker assigned
-            if not reason and not rec.has_worker:
-                if concurrent_workers and rec.started_at and rec.started_at >= now - timedelta(
-                    seconds=alive_timeout
-                ):
-                    continue
-                reason = "Running job has no worker assigned"
-
-            # Check 3: assigned worker is marked dead
-            if not reason and rec.has_worker and rec.worker_status == "dead":
-                reason = f"Assigned worker {rec.worker_friendly_name} is dead"
-
-            # Check 4: worker moved on to a different job or is idle (this job is abandoned)
-            if (
-                not reason
-                and rec.has_worker
-                and not concurrent_workers
-                and rec.worker_current_job_id != rec.job_id
-            ):
-                if rec.worker_current_job_id:
-                    reason = (
-                        f"Worker {rec.worker_friendly_name} moved on to job "
-                        f"#{rec.worker_current_job_id} — this job was abandoned"
-                    )
-                # Worker is idle (current_job_id=None) but job still running.
-                # Grace period: only flag if running longer than alive_timeout
-                # to avoid false positives during the brief claim→heartbeat window.
-                elif rec.started_at and rec.started_at < now - timedelta(seconds=alive_timeout):
-                    age = int((now - rec.started_at).total_seconds())
-                    reason = (
-                        f"Worker {rec.worker_friendly_name} is idle but job has been "
-                        f"running for {age}s — zombie"
-                    )
-
-            # Check 5: assigned worker heartbeat is stale
-            if not reason and rec.has_worker:
-                if rec.worker_last_heartbeat and rec.worker_last_heartbeat < now - timedelta(
-                    seconds=stale_threshold
-                ):
-                    age = int((now - rec.worker_last_heartbeat).total_seconds())
-                    reason = (
-                        f"Worker {rec.worker_friendly_name} heartbeat stale "
-                        f"({age}s old, threshold {stale_threshold}s)"
-                    )
-
+            pid_alive = DaemonManager._probe_pid(rec, current_node)
+            reason = zombie_sweep.zombie_verdict(
+                rec,
+                now=now,
+                alive_timeout=alive_timeout,
+                pid_alive=pid_alive,
+                concurrent_workers=concurrent_workers,
+            )
             if reason:
                 # fail_zombie_job closes the open attempt as 'abandoned' in the same
                 # transaction as the failure, so a late completion from the dead worker's
@@ -978,6 +924,19 @@ class DaemonManager:
         if failed_count > 0:
             logger.info(f"Cleaned up {failed_count} zombie running jobs")
         return failed_count
+
+    @staticmethod
+    def _probe_pid(rec, current_node) -> bool | None:
+        """Edge: is the job's worker PID alive? None when it cannot be probed from here."""
+        if not zombie_sweep.pid_probe_applies(rec.worker_pid, rec.worker_node_id, current_node):
+            return None
+        try:
+            os.kill(rec.worker_pid, 0)
+        except PermissionError:
+            return True  # the process exists but belongs to another user: it is alive
+        except OSError:
+            return False
+        return True
 
     @staticmethod
     def _running_jobs_of_worker(worker_id) -> list:
@@ -1042,7 +1001,7 @@ class DaemonManager:
         are restarted and get new hostnames, leaving old worker records orphaned.
 
         Workers are considered stale if:
-        - Their heartbeat is older than 1 hour
+        - Their heartbeat is older than WORKER_ALIVE_TIMEOUT
         - They're marked as idle/busy (not dead)
 
         Args:
@@ -1058,7 +1017,7 @@ class DaemonManager:
             # Use configured alive timeout (default 30s)
             # from ..compat import get_config  # moved to top-level
             alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", 30)
-            threshold = datetime.now(timezone.utc) - timedelta(seconds=alive_timeout)
+            now = datetime.now(timezone.utc)
             cleaned = 0
 
             for worker in workers:
@@ -1085,8 +1044,11 @@ class DaemonManager:
                 if worker_status == "dead":
                     continue
 
-                # Check if heartbeat is too old
-                if last_heartbeat and last_heartbeat < threshold:
+                # Old: if last_heartbeat and last_heartbeat < threshold:  (clause DWR-1)
+                worker_pid = worker.get("pid") if isinstance(worker, dict) else worker.pid
+                if dead_worker_reaper.is_silent_past(
+                    worker_status, worker_pid, last_heartbeat, now, alive_timeout
+                ):
                     # Fail any running jobs assigned to this worker
                     try:
                         # from ..django_sqlery.models import QueuedJob  # moved to top-level (try/except)

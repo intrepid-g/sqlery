@@ -21,8 +21,8 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from sqlery.contract.database import is_beating
 from sqlery.core.worker_admin import (
-    is_worker_beating,
     is_worker_deletable,
     worker_delete_staleness_threshold_seconds,
 )
@@ -122,7 +122,8 @@ def _serialize_worker(worker, now) -> dict:
         worker_data['is_stalled'] = True
 
     # Single source of truth for "alive" — heartbeat-based, not the status column.
-    worker_data['is_alive'] = is_worker_beating(
+    # Old: is_worker_beating(...)  (now clause DB-1)
+    worker_data['is_alive'] = is_beating(
         worker.status, worker.last_heartbeat, now, worker_alive_timeout_seconds()
     )
 

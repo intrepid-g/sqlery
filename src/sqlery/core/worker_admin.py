@@ -5,6 +5,8 @@ No IO, no Django/SQLAlchemy imports — safe to unit-test in isolation.
 
 from datetime import datetime
 
+from sqlery.contract.database import is_beating
+
 
 # Gray area: how stale must a worker be before the user is allowed to delete it?
 # Decision: 5 minutes (300s) without a heartbeat — well past any normal poll cycle.
@@ -48,13 +50,5 @@ def is_worker_deletable(
 #   so it is correct with or without a reaper running.
 # Forced by: heartbeats are written by the worker itself on every waitpid tick
 #   (core/worker.py lease renewal), so a busy long-job worker still beats.
-def is_worker_beating(
-    status: str | None,
-    last_heartbeat: datetime | None,
-    now: datetime,
-    timeout_seconds: int,
-) -> bool:
-    """Return True when the worker is genuinely alive (heartbeat within timeout)."""
-    if status == "dead" or last_heartbeat is None:
-        return False
-    return (now - last_heartbeat).total_seconds() < timeout_seconds
+# Old: the body lived here; it is clause DB-1 in sqlery.contract.database. Kept as a shim.
+is_worker_beating = is_beating

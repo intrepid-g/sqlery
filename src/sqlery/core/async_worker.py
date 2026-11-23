@@ -36,6 +36,9 @@ import traceback as tb_module
 from typing import Any, Awaitable, Callable
 
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
+from sqlery.contract import worker as worker_contract
+from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT, HEARTBEAT_INTERVAL_DEFAULT
+from sqlery.core.liveness import check_liveness_config
 
 from .attempts import MISSING_TABLE_MESSAGE, AttemptTableMissingError, attempt_kwargs, attempt_of
 from .history import MISSING_TABLE_MESSAGE as HISTORY_MISSING_TABLE_MESSAGE
@@ -235,6 +238,7 @@ class AsyncWorker:
         last_sweep = time.monotonic()
         last_heartbeat = float("-inf")
         sweep_interval = self._orphan_sweep_interval()
+        self._check_liveness_config()
         jobs_started = 0
         polls = 0
         running: set[asyncio.Task] = set()
@@ -248,7 +252,10 @@ class AsyncWorker:
                 if time.monotonic() - last_sweep >= sweep_interval:
                     last_sweep = time.monotonic()
                     await self._recover_orphans()
-                if time.monotonic() - last_heartbeat >= self._heartbeat_interval():
+                # Old: time.monotonic() - last_heartbeat >= self._heartbeat_interval()  (clause WRK-2)
+                if worker_contract.beat_owed(
+                    time.monotonic() - last_heartbeat, self._heartbeat_interval()
+                ):
                     last_heartbeat = time.monotonic()
                     try:
                         await self.backend.aupdate_heartbeat(self.worker_id)
@@ -299,6 +306,15 @@ class AsyncWorker:
 
     # ------------------------------------------------------------- idle wait
 
+    @staticmethod
+    def _check_liveness_config() -> None:
+        from sqlery.compat import get_config
+
+        check_liveness_config(
+            float(get_config("WORKER_HEARTBEAT_INTERVAL", HEARTBEAT_INTERVAL_DEFAULT)),
+            float(get_config("WORKER_ALIVE_TIMEOUT", ALIVE_TIMEOUT_DEFAULT)),
+        )
+
     def _heartbeat_interval(self) -> float:
         """Minimum seconds between heartbeats: the configured interval, capped at
         (roughly) one poll interval so a normal poll cycle still beats once, while
@@ -309,7 +325,8 @@ class AsyncWorker:
             interval = float(get_config("WORKER_HEARTBEAT_INTERVAL", 5))
         except Exception:
             interval = 5.0
-        return max(min(interval, self.poll_interval * 0.9), 0.0)
+        # Old: max(min(interval, self.poll_interval * 0.9), 0.0)  (clause WRK-4)
+        return worker_contract.async_beat_interval(interval, self.poll_interval)
 
     async def _idle_timeout(self) -> float:
         """poll_interval, shortened to the earliest queued job that is not due yet."""

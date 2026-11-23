@@ -30,7 +30,8 @@ from sqlery.core.attempts import (
     new_token,
 )
 from sqlery.core.utils import reject_unawaited_coroutine
-from sqlery.core.worker_admin import is_worker_beating
+from sqlery.contract import database as db_contract
+from sqlery.contract import worker as worker_contract
 
 from .db_compat import is_sqlite
 
@@ -506,7 +507,8 @@ class QueuedJobQuerySet(models.QuerySet):
 
 # What a finished job leaves on its worker row. last_heartbeat is deliberately absent
 # (RELEASE_KEEPS_HEARTBEAT, #37).
-RELEASED_WORKER_FIELDS = {"status": "idle", "current_job_id": None}
+# Old: RELEASED_WORKER_FIELDS = {"status": "idle", "current_job_id": None}  (clause WRK-1)
+RELEASED_WORKER_FIELDS = worker_contract.release_fields()
 
 
 class QueuedJob(models.Model):
@@ -1314,7 +1316,7 @@ class QueuedJob(models.Model):
             # Old (#35, +1 UPDATE per job): a second filter marked workers with a stale beat
             # dead, then released with last_heartbeat=now.
             Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
-                **RELEASED_WORKER_FIELDS
+                **worker_contract.release_fields()
             )
         # Old: except Exception: pass  (a failed release left the worker busy, unseen; #37)
         except Exception:
@@ -1663,7 +1665,8 @@ class Worker(models.Model):
         """Check if worker is alive based on heartbeat (see is_worker_beating)."""
         if timeout_seconds is None:
             timeout_seconds = get_setting("WORKER_ALIVE_TIMEOUT", 30)
-        return is_worker_beating(
+        # Old: is_worker_beating(...)  (now clause DB-1)
+        return db_contract.is_beating(
             self.status, self.last_heartbeat, timezone.now(), timeout_seconds
         )
 

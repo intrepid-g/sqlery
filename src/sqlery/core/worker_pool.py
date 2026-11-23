@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from sqlery.contract import dead_worker_reaper, zombie_sweep
+from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT
+
 from ..compat import get_backend, get_config, is_django_mode
 from .launcher import START_FORK, WorkerLauncher, load_start_method
 from .log_config import is_debug_mode
@@ -196,6 +199,15 @@ class WorkerPoolManager:
                 logger.debug(f"Reaped worker process PID {proc.pid} (exit code {ret})")
         self._child_processes = still_alive
 
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        """Edge: signal 0 checks existence only. Any OSError (even EPERM) counts as gone."""
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
     def cleanup_dead_workers(self) -> int:
         """Remove dead workers from database.
 
@@ -211,7 +223,6 @@ class WorkerPoolManager:
 
         workers = self.backend.get_worker_heartbeats(active_only=False)
         now = datetime.now(timezone.utc)
-        heartbeat_threshold = now - timedelta(seconds=60)
 
         cleaned = 0
         for worker in workers:
@@ -240,30 +251,12 @@ class WorkerPoolManager:
             else:
                 continue
 
-            # Skip daemon processes (PID=0)
-            if pid == 0:
-                continue
-
-            # Skip workers already marked as dead
-            if status == 'dead':
-                continue
-
-            # Check 1: Heartbeat age (primary indicator - applies to ALL nodes)
-            is_dead = False
-            reason = None
-
-            if last_heartbeat and last_heartbeat < heartbeat_threshold:
-                is_dead = True
-                age_seconds = int((now - last_heartbeat).total_seconds())
-                reason = f"heartbeat too old ({age_seconds}s > 60s threshold)"
-
-            # Check 2: Process existence (secondary check, ONLY for workers on this node with recent heartbeat)
-            elif on_this_node and last_heartbeat and last_heartbeat >= heartbeat_threshold:
-                try:
-                    os.kill(pid, 0)  # Signal 0 = check existence only
-                except OSError:
-                    is_dead = True
-                    reason = "process not found on this node"
+            # Old: inline heartbeat-age and PID checks (clauses DWR-1 and reap_verdict)
+            pid_exists = self._pid_exists(pid) if on_this_node else None
+            reason = dead_worker_reaper.reap_verdict(
+                status=status, pid=pid, last_heartbeat=last_heartbeat, now=now, pid_exists=pid_exists
+            )
+            is_dead = reason is not None
 
             # Mark as dead if either check failed
             if is_dead:
@@ -649,8 +642,9 @@ class WorkerPoolManager:
         # Only check: workers whose heartbeat is stale despite SIGUSR1.
         # The daemon sends SIGUSR1 every cycle (~10s). If a worker can't
         # respond for WORKER_ALIVE_TIMEOUT * 3, it's truly stuck.
-        alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', 30)
-        stale_threshold = alive_timeout * 3
+        alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', ALIVE_TIMEOUT_DEFAULT)
+        # Old: stale_threshold = alive_timeout * 3  (clause ZS-0)
+        stale_threshold = zombie_sweep.stale_threshold(alive_timeout)
 
         for worker in node_workers:
             if hasattr(worker, 'last_heartbeat'):
@@ -665,19 +659,17 @@ class WorkerPoolManager:
                 continue
 
             heartbeat_age = (now - last_heartbeat).total_seconds()
-            if heartbeat_age <= stale_threshold:
-                continue
-
             pid = worker.pid if hasattr(worker, 'pid') else worker.get('pid')
             worker_id = str(worker.id) if hasattr(worker, 'id') else str(worker.get('id'))
 
-            try:
-                os.kill(pid, 0)
-                process_exists = True
-            except OSError:
-                process_exists = False
+            # Old: if heartbeat_age <= stale_threshold: continue; then an inline os.kill probe
+            action = dead_worker_reaper.safety_net_action(
+                heartbeat_age, stale_threshold, self._pid_exists(pid)
+            )
+            if action == "keep":
+                continue
 
-            if not process_exists:
+            if action == "mark_dead":
                 self.backend.update_worker_heartbeat(
                     worker_id=worker_id, status='dead', current_job_id=None
                 )

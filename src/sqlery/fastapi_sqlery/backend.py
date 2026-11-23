@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, func, delete
 
 from ..compat import DatabaseBackend, JobFencingError, get_config
+from ..contract import database as db_contract
 from ..core.attempts import (
     OUTCOME_ABANDONED,
     OUTCOME_FAILED,
@@ -2433,7 +2434,8 @@ class SQLAlchemyBackend(DatabaseBackend):
         """
         with self._get_session() as session:
             job = session.exec(select(QueuedJob).where(QueuedJob.id == job_id)).first()
-            if job is None or job.status != "queued":
+            # Old: job.status != "queued"  (clause DB-2)
+            if job is None or not db_contract.can_be_running(job.status):
                 return False
             attempts = self._open_attempts_in(session, [job_id])
             if job_id not in attempts:
@@ -2441,7 +2443,8 @@ class SQLAlchemyBackend(DatabaseBackend):
             closed = session.exec(
                 attempt_sql.close_unfenced_stmt(job_id, OUTCOME_ABANDONED, datetime.now(UTC))
             ).rowcount
-            if closed < 1:
+            # Old: if closed < 1  (clause DB-3)
+            if not db_contract.closed_the_attempt(closed):
                 session.rollback()
                 return False
             # Detach before mutating: the in-memory mark_failed only computes the outcome

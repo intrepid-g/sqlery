@@ -37,6 +37,9 @@ from .signals import task_retry
 from .result import REVOKED_ERROR
 from .scheduler import Scheduler
 from . import maintenance
+from sqlery.contract import lease_holder, worker as worker_contract
+from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT, HEARTBEAT_INTERVAL_DEFAULT
+from .liveness import check_liveness_config
 from .security import check_task_module_allowed, warn_if_unconfigured
 from .fork_safety import ForkSafeExecutor
 from .pool import (
@@ -906,7 +909,8 @@ class WorkerProcess:
 
         # from ..compat import get_config  # moved to top-level
         self.poll_interval = get_config('WORKER_POLL_INTERVAL', 5)
-        self.heartbeat_interval = get_config('WORKER_HEARTBEAT_INTERVAL', 5)
+        self.heartbeat_interval = get_config('WORKER_HEARTBEAT_INTERVAL', HEARTBEAT_INTERVAL_DEFAULT)
+        check_liveness_config(self.heartbeat_interval, get_config('WORKER_ALIVE_TIMEOUT', ALIVE_TIMEOUT_DEFAULT))
         # Phase 18: dedicated psycopg3 AUTOCOMMIT connection for LISTEN/NOTIFY
         # wake-up. None when SQLERY_PG_NOTIFY is False (default) or on SQLite.
         self._listen_conn = None
@@ -1481,7 +1485,8 @@ class WorkerProcess:
             # heartbeat cadence instead of expiring on a fixed poll_interval*3
             # window unrelated to how long the job runs.
             now = time.monotonic()
-            if now - last_lease_heartbeat >= self.heartbeat_interval:
+            # Old: if now - last_lease_heartbeat >= self.heartbeat_interval  (clause WRK-2)
+            if worker_contract.beat_owed(now - last_lease_heartbeat, self.heartbeat_interval):
                 self._heartbeat('busy', job_id=job_id)
                 last_lease_heartbeat = now
             # WR-01: keep scheduler leadership alive across long jobs. The main
@@ -2048,10 +2053,8 @@ class WorkerProcess:
         least every half lease TTL and at least every WORKER_HEARTBEAT_INTERVAL (both
         far below the WORKER_ALIVE_TIMEOUT / 60s staleness thresholds).
         """
-        interval = lease_secs / 2
-        if self.heartbeat_interval and self.heartbeat_interval > 0:
-            interval = min(interval, self.heartbeat_interval)
-        return max(interval, 0.1)
+        # Old: inline min(lease_secs / 2, heartbeat_interval), floor 0.1  (clause WRK-3)
+        return worker_contract.idle_tick_interval(lease_secs, self.heartbeat_interval)
 
     def _tick_due(self, tick_interval: float) -> bool:
         if self._last_tick is None:
@@ -2095,8 +2098,9 @@ class WorkerProcess:
         restarts after a crash clears the zombies its earlier run left behind.
         """
         now = maintenance.now_utc()
-        interval = get_config("PARTITION_MAINTENANCE_INTERVAL_MINUTES", 5)
-        if not self._owned_queues or not maintenance.is_due(self._last_maintenance, interval, now):
+        interval = get_config("PARTITION_MAINTENANCE_INTERVAL_MINUTES", lease_holder.MAINTENANCE_INTERVAL_DEFAULT_MINUTES)
+        # Old: not self._owned_queues or not maintenance.is_due(...)  (clause LH-2)
+        if not lease_holder.sweep_due(self._owned_queues, self._last_maintenance, interval, now):
             return
         self._last_maintenance = now  # set first: a failing sweep must not retry every poll
         maintenance.maintenance_tick(self.backend, sorted(self._owned_queues))

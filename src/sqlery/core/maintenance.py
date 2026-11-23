@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..compat import get_config
+from ..contract import lease_holder
 from . import history as history_core
 from .daemon import DaemonManager, _nullable_cursor_cm, _partitioning
 from .worker_pool import WorkerPoolManager
@@ -17,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 def is_due(last_run: datetime | None, interval_minutes: float, now: datetime) -> bool:
     """True on the first run, then once ``interval_minutes`` have passed."""
-    return last_run is None or (now - last_run).total_seconds() >= interval_minutes * 60
+    # Old: inline check, now clause LH-1 (kept as a shim for callers)
+    return lease_holder.interval_elapsed(last_run, interval_minutes, now)
 
 
 def _raw_cursor(backend):
@@ -52,7 +54,7 @@ def partition_tick(backend) -> tuple[int, int] | None:
 def maintenance_tick(backend, queues) -> dict:
     """Fail zombie jobs, mark dead workers, keep partitions. Each step is best-effort."""
     result: dict = {}
-    steps = {
+    steps = {  # keyed by the clause names in lease_holder.SWEEP_STEPS
         # concurrent_workers=True: a worker with a thread pool runs several jobs at once.
         "zombies_failed": lambda: DaemonManager._fail_zombie_running_jobs(
             backend, queue_names=queues, concurrent_workers=True
@@ -60,7 +62,8 @@ def maintenance_tick(backend, queues) -> dict:
         "dead_workers": lambda: WorkerPoolManager(0, list(queues or []), backend).cleanup_dead_workers(),
         "partitions": lambda: partition_tick(backend),
     }
-    for name, step in steps.items():
+    for name in lease_holder.SWEEP_STEPS:
+        step = steps[name]
         try:
             result[name] = step()
         except Exception as e:
