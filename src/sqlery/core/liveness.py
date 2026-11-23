@@ -9,10 +9,12 @@ the decision logic in ``daemon._fail_zombie_running_jobs`` never touches an ORM.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlery.contract.config import misconfiguration
+from sqlery.contract.dead_worker_reaper import probe_found_process
 
 logger = logging.getLogger(__name__)
 
@@ -55,3 +57,12 @@ def check_liveness_config(heartbeat_interval: float, alive_timeout: float) -> No
     problem = misconfiguration(heartbeat_interval, alive_timeout)
     if problem:
         logger.warning(problem)
+
+
+def pid_exists(pid: int) -> bool:
+    """Edge: probe a PID with signal 0 and let clause DWR-3 read the outcome."""
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return probe_found_process(e)
+    return True

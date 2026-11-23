@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..compat import get_backend, get_config, is_django_mode
 from . import history as history_core
+from . import liveness
 from sqlery.contract import dead_worker_reaper, zombie_sweep
 from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT
 from .cleanup import CleanupManager
@@ -237,12 +238,9 @@ class DaemonManager:
         """
         if not pid or pid <= 0:
             return False  # os.kill(0 or -n, 0) would test a process group, not a process
-        try:
-            # Send signal 0 - doesn't kill, just checks if process exists
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        # Old: os.kill(pid, 0) with `except OSError: return False` read another user's live
+        # process (EPERM) as gone, so the heartbeat cycle marked its worker dead (#40).
+        return liveness.pid_exists(pid)
 
     def is_running(self) -> bool:
         """Check if daemon is currently running.
@@ -930,13 +928,8 @@ class DaemonManager:
         """Edge: is the job's worker PID alive? None when it cannot be probed from here."""
         if not zombie_sweep.pid_probe_applies(rec.worker_pid, rec.worker_node_id, current_node):
             return None
-        try:
-            os.kill(rec.worker_pid, 0)
-        except PermissionError:
-            return True  # the process exists but belongs to another user: it is alive
-        except OSError:
-            return False
-        return True
+        # Old: os.kill probe; PermissionError -> True, any other OSError -> False (now DWR-3)
+        return liveness.pid_exists(rec.worker_pid)
 
     @staticmethod
     def _running_jobs_of_worker(worker_id) -> list:

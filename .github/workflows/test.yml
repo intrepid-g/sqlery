@@ -98,7 +98,7 @@ jobs:
         # Old: ... --timeout=30 || echo "PostgreSQL-specific tests completed"
         # (the `|| echo` hid every failure; without SQLERY_TEST_PG_URL the PG cells skipped; #37)
         uv run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v -rs --timeout=30 | tee pg_out.txt
-        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL not set|requires SQLERY_TEST_PG_URL|needs PostgreSQL|is not PostgreSQL in this run)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     - name: Run @pytest.mark.postgres suite
       env:
@@ -126,7 +126,7 @@ jobs:
       run: |
         uv run pytest -m postgres -v -rs --tb=short --timeout=90 | tee pg_out.txt
         # A postgres-marked test that skipped for a missing/wrong database is a silent hole (#37).
-        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL not set|requires SQLERY_TEST_PG_URL|needs PostgreSQL|is not PostgreSQL in this run)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     # Phase 11 (PARITY-05): the standalone x Postgres parity cells are NOT
     # exercised by the step above (pytest-django resolves the Django backend)
@@ -184,7 +184,7 @@ jobs:
           tests/test_parity_scheduler.py \
           tests/test_core_standalone.py \
           tests/chaos/test_lease_zombie.py | tee pg_out.txt
-        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL not set|requires SQLERY_TEST_PG_URL|needs PostgreSQL|is not PostgreSQL in this run)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     - name: Run tests with coverage
       env:

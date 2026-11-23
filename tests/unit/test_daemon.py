@@ -77,7 +77,7 @@ class TestProcessLiveness:
 
     def test_is_process_running_false_when_kill_raises(self, dm, monkeypatch):
         def boom(pid, sig):
-            raise OSError("no such process")
+            raise ProcessLookupError("no such process")
 
         monkeypatch.setattr(os, "kill", boom)
         assert dm.is_process_running(123) is False
@@ -301,7 +301,7 @@ class TestStop:
     def test_stop_returns_false_when_process_already_gone(self, dm, monkeypatch):
         dm.write_pid(99999)
         # kill(0) raises → not running.
-        monkeypatch.setattr(os, "kill", mock.MagicMock(side_effect=OSError("gone")))
+        monkeypatch.setattr(os, "kill", mock.MagicMock(side_effect=ProcessLookupError("gone")))
         assert dm.stop() is False
 
     def test_stop_sends_sigterm_then_returns_true(self, dm, monkeypatch):
@@ -320,7 +320,7 @@ class TestStop:
                 if sig != 0:
                     calls.append((pid, sig))
                 return
-            raise OSError("dead")
+            raise ProcessLookupError("dead")
 
         monkeypatch.setattr(os, "kill", fake_kill)
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
@@ -346,7 +346,7 @@ class TestCleanupStale:
     def test_cleanup_stale_removes_files_when_process_dead(self, dm, monkeypatch):
         dm.write_pid(99999)
         dm.heartbeat_file.write_text("1")
-        monkeypatch.setattr(os, "kill", mock.MagicMock(side_effect=OSError("dead")))
+        monkeypatch.setattr(os, "kill", mock.MagicMock(side_effect=ProcessLookupError("dead")))
         assert dm.cleanup_stale() is True
         assert not dm.pid_file.exists()
         assert not dm.heartbeat_file.exists()

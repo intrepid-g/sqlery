@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.29.3] - 2026-11-23
+
+### Changed
+
+- **Another user's process counts as alive (#40).** `WorkerPoolManager._pid_exists` treated `PermissionError` (a live process of another OS user on the same node) as gone, so the reaper could mark that worker dead and the safety net could kill it. Only `ProcessLookupError` now means gone, in the pool, in the daemon's zombie-job probe and in `DaemonManager.is_process_running` (which marked such a worker dead every heartbeat cycle, and a live daemon of another user as stopped), through one clause (`DWR-3`) and one edge, `core.liveness.pid_exists`. Any other `OSError` from the probe now counts as alive too (the daemon used to read it as gone).
+- **One rule for a dead worker (#40).** `WORKER_ALIVE_TIMEOUT` is now the only silence limit. `WorkerPoolManager.cleanup_dead_workers` (the reaper a bare worker runs) used a fixed 60s (`REAP_SILENCE_SECONDS`, removed) and ignored the setting; it now marks a worker dead after `WORKER_ALIVE_TIMEOUT` (default 30s), as `is_beating` and the daemon startup reaper already did. A beat exactly `WORKER_ALIVE_TIMEOUT` old now counts as dead in all three. The 3 x timeout limit stays for the kill of an unresponsive process and for the zombie-job sweep. Clause `DWR-1`.
+
 ## [0.29.2] - 2026-11-22
 
 ### Fixed

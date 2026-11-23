@@ -2,7 +2,7 @@
 
 > Database-backed Python job queue and cron scheduler (PostgreSQL or SQLite, no broker) with a Celery/RQ-like API, for Django and for standalone code (FastAPI, Flask, scripts).
 
-Version 0.29.2, Python >= 3.13 (pyproject `requires-python`). The database is the queue, the result store and the scheduler. Two integration modes share one job API: Django (ORM, management commands) and standalone (SQLAlchemy/SQLModel, `sqlery-worker` CLI). Many prose docs are stale (see "Stale docs" below). When docs and source disagree, source wins: start at `src/sqlery/__init__.py`.
+Version 0.29.3, Python >= 3.13 (pyproject `requires-python`). The database is the queue, the result store and the scheduler. Two integration modes share one job API: Django (ORM, management commands) and standalone (SQLAlchemy/SQLModel, `sqlery-worker` CLI). Many prose docs are stale (see "Stale docs" below). When docs and source disagree, source wins: start at `src/sqlery/__init__.py`.
 
 Every snippet below was run against SQLite on sqlery 0.28.0 unless marked UNVERIFIED.
 
@@ -11,12 +11,12 @@ Every snippet below was run against SQLite on sqlery 0.28.0 unless marked UNVERI
 Extras: `postgres` (`psycopg[binary]`), `django` (Django >= 5.2), `standalone` (SQLModel, FastAPI, uvicorn, Typer, Alembic), `cli` (Typer + Rich only).
 
 ```
-pip install "sqlery[standalone] @ git+https://github.com/intrepid-g/sqlery.git@v0.29.2"                # standalone mode
-pip install "sqlery[django,postgres] @ git+https://github.com/intrepid-g/sqlery.git@v0.29.2"           # Django mode
+pip install "sqlery[standalone] @ git+https://github.com/intrepid-g/sqlery.git@v0.29.3"                # standalone mode
+pip install "sqlery[django,postgres] @ git+https://github.com/intrepid-g/sqlery.git@v0.29.3"           # Django mode
 uv pip install -e ".[standalone]"         # from a checkout
 ```
 
-sqlery is not on PyPI yet, so install from GitHub. Pin a release tag (the `@v0.29.2` above; tags are on the releases page), never `main`: it can contain unreleased schema changes.
+sqlery is not on PyPI yet, so install from GitHub. Pin a release tag (the `@v0.29.3` above; tags are on the releases page), never `main`: it can contain unreleased schema changes.
 
 Gotcha: the Django migrations import `django.contrib.postgres`, which needs an importable psycopg even when you run on SQLite. The `postgres` extra is `psycopg[binary]`, which bundles libpq. For the system libpq, install `psycopg[c]` instead.
 

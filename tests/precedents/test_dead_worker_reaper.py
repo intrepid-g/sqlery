@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
+from sqlery.contract import database
 from sqlery.contract import dead_worker_reaper as reaper
 
 NOW = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
@@ -12,21 +13,45 @@ def ago(seconds):
 
 
 def verdict(**kw):
-    base = {"status": "idle", "pid": 10, "last_heartbeat": ago(1), "now": NOW, "pid_exists": None}
+    base = {
+        "status": "idle",
+        "pid": 10,
+        "last_heartbeat": ago(1),
+        "now": NOW,
+        "pid_exists": None,
+        "alive_timeout": 30,
+    }
     return reaper.reap_verdict(**{**base, **kw})
 
 
-def test_worker_silent_61_seconds_is_reaped_with_its_age_in_the_reason():
-    assert verdict(last_heartbeat=ago(61)) == "heartbeat too old (61s > 60s threshold)"
+def test_worker_silent_31_seconds_is_reaped_with_its_age_in_the_reason():
+    assert verdict(last_heartbeat=ago(31)) == "heartbeat too old (31s > 30s threshold)"
 
 
-def test_worker_silent_45_seconds_is_spared_even_though_it_is_past_the_alive_timeout():
-    # Reaper limit (60s) is deliberately not the 30s alive timeout: a documented disagreement.
-    assert verdict(last_heartbeat=ago(45)) is None
+def test_worker_silent_29_seconds_is_spared():
+    assert verdict(last_heartbeat=ago(29)) is None
 
 
-def test_worker_silent_exactly_60_seconds_is_spared():
-    assert verdict(last_heartbeat=ago(60)) is None
+def test_worker_silent_exactly_the_alive_timeout_is_reaped_as_the_database_calls_it_dead():
+    assert verdict(last_heartbeat=ago(30)) == "heartbeat too old (30s > 30s threshold)"
+
+
+def test_worker_silent_45_seconds_is_reaped_under_the_default_timeout_not_a_hidden_60():
+    assert verdict(last_heartbeat=ago(45)) == "heartbeat too old (45s > 30s threshold)"
+
+
+def test_a_raised_alive_timeout_spares_a_worker_the_old_limit_would_have_reaped():
+    assert verdict(last_heartbeat=ago(61), alive_timeout=120) is None
+    assert verdict(last_heartbeat=ago(121), alive_timeout=120) == (
+        "heartbeat too old (121s > 120s threshold)"
+    )
+
+
+def test_reaper_and_database_agree_on_the_boundary():
+    for age in (29, 30, 31):
+        beat = ago(age)
+        reaped = verdict(last_heartbeat=beat) is not None
+        assert reaped == (not database.is_beating("idle", beat, NOW, 30))
 
 
 def test_local_worker_whose_process_vanished_is_reaped_despite_a_fresh_beat():
@@ -77,3 +102,15 @@ def test_vanished_process_counts_as_gone_only_for_a_live_looking_local_worker():
     assert reaper.process_gone_on_this_node("busy", 4242, beat, None) is False
     assert reaper.process_gone_on_this_node("dead", 4242, beat, False) is False
     assert reaper.process_gone_on_this_node("busy", 4242, None, False) is False
+
+
+def test_probe_denied_by_permission_means_the_process_is_alive_under_another_user():
+    assert reaper.probe_found_process(PermissionError()) is True
+
+
+def test_probe_with_no_such_process_means_gone():
+    assert reaper.probe_found_process(ProcessLookupError()) is False
+
+
+def test_probe_that_raised_nothing_means_the_process_exists():
+    assert reaper.probe_found_process(None) is True

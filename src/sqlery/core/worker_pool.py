@@ -19,6 +19,7 @@ from sqlery.contract import dead_worker_reaper, zombie_sweep
 from sqlery.contract.config import ALIVE_TIMEOUT_DEFAULT
 
 from ..compat import get_backend, get_config, is_django_mode
+from . import liveness
 from .launcher import START_FORK, WorkerLauncher, load_start_method
 from .log_config import is_debug_mode
 
@@ -201,19 +202,16 @@ class WorkerPoolManager:
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
-        """Edge: signal 0 checks existence only. Any OSError (even EPERM) counts as gone."""
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
+        """Edge: does the PID exist? Delegates to clause DWR-3 (EPERM counts as alive, #40)."""
+        # Old: except OSError: return False  (EPERM, a live process of another user, read as gone)
+        return liveness.pid_exists(pid)
 
     def cleanup_dead_workers(self) -> int:
         """Remove dead workers from database.
 
         Uses heartbeat timestamp as primary indicator of worker health.
         Workers are considered dead if:
-        1. Heartbeat is older than 60 seconds (worker not responding)
+        1. Heartbeat is older than WORKER_ALIVE_TIMEOUT (worker not responding)
         2. OR process PID check fails (worker crashed on same node)
 
         Returns:
@@ -223,6 +221,7 @@ class WorkerPoolManager:
 
         workers = self.backend.get_worker_heartbeats(active_only=False)
         now = datetime.now(timezone.utc)
+        alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', ALIVE_TIMEOUT_DEFAULT)
 
         cleaned = 0
         for worker in workers:
@@ -254,7 +253,8 @@ class WorkerPoolManager:
             # Old: inline heartbeat-age and PID checks (clauses DWR-1 and reap_verdict)
             pid_exists = self._pid_exists(pid) if on_this_node else None
             reason = dead_worker_reaper.reap_verdict(
-                status=status, pid=pid, last_heartbeat=last_heartbeat, now=now, pid_exists=pid_exists
+                status=status, pid=pid, last_heartbeat=last_heartbeat, now=now,
+                pid_exists=pid_exists, alive_timeout=alive_timeout,
             )
             is_dead = reason is not None
 
