@@ -31,6 +31,14 @@ from tests.pg_url import sqlalchemy_pg_url
 
 pytestmark = pytest.mark.timeout(60)
 
+# #37: these cases build a running job as a queued row with status="running" and worker columns
+# on it. Since #157 a claim writes nothing to the job row (the open attempt says who runs it), so
+# they fail on current code. Their rules are pinned elsewhere: the five zombie checks in
+# tests/unit/test_daemon.py::TestZombieDetection, the sweep end to end in
+# tests/test_worker_maintenance_35.py, and late-completion fencing in
+# tests/test_attempt_fencing_138.py. The `|| echo` in CI hid these failures. Code kept below.
+OBSOLETE_SINCE_157 = pytest.mark.skip(reason="builds a pre-#157 running row; see comment above")
+
 CHAOS_SETTINGS = settings(
     max_examples=10,
     deadline=None,
@@ -84,6 +92,7 @@ def _build_running_job(worker_kwargs: dict | None = None, job_kwargs: dict | Non
 # ---------------------------------------------------------------------------
 
 
+@OBSOLETE_SINCE_157
 @pytest.mark.django_db(transaction=True)
 class TestZombie5CheckSequence:
     """One parametrised test per zombie-detection branch (CLAUDE.md
@@ -486,6 +495,7 @@ class TestStandaloneLeaseFailoverPostgres:
 # ---------------------------------------------------------------------------
 
 
+@OBSOLETE_SINCE_157
 @pytest.mark.django_db(transaction=True)
 class TestFencedCompletionAfterReclaim:
     """Race: a job's original worker goes heartbeat-stale mid-execution, the
@@ -622,6 +632,7 @@ class TestStandaloneFencedCompletionAfterReclaim:
     fencing check is no longer a silent no-op in SQLAlchemy/standalone mode.
     """
 
+    @OBSOLETE_SINCE_157
     def test_stale_worker_completion_is_rejected_after_zombie_reclaim(
         self, standalone_zombie_backend
     ):

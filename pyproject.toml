@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlery"
-version = "0.29.1"
+version = "0.29.2"
 description = "Job queue + cron scheduling - works standalone or with Django"
 readme = "README.md"
 # requires-python = ">=3.10"
@@ -51,6 +51,11 @@ django = [
 # Standalone mode dependencies
 standalone = [
     "sqlmodel>=0.0.14",
+    # Imported directly (pre-1.0 sqlmodel only pulls them in transitively); v2 APIs are used (#37)
+    "sqlalchemy>=2.0",
+    "pydantic>=2.0",
+    # TemplateResponse(request, name, ...) exists since 0.29; app.py uses only that form (#37)
+    "starlette>=0.29.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "jinja2>=3.1.0",
@@ -139,15 +144,18 @@ Changelog = "https://github.com/intrepid-g/sqlery/blob/main/CHANGELOG.md"
 Documentation = "https://github.com/intrepid-g/sqlery/tree/main/docs"
 
 [project.scripts]
-sqlery = "sqlery.core.cli:main"
-sqlery-worker = "sqlery.fastapi_sqlery.cli:worker_main"
-sqlery-web = "sqlery.fastapi_sqlery.cli:web_main"
-sqlery-daemon = "sqlery.core.cli:daemon_main"
-sqlery-jobs = "sqlery.core.cli:jobs_main"
-sqlery-cleanup = "sqlery.core.cli:cleanup_main"
-sqlery-migrate = "sqlery.core.cli:migrate_main"
-sqlery-tasks = "sqlery.core.cli:tasks_main"
-sqlery-queues = "sqlery.core.cli:queues_main"
+# All scripts go through sqlery._cli, which prints an install hint when a CLI extra is missing (#37).
+# Old: sqlery = "sqlery.core.cli:main"  (and the same for each script: a bare install crashed on
+# `import typer`)
+sqlery = "sqlery._cli:main"
+sqlery-worker = "sqlery._cli:worker_main"
+sqlery-web = "sqlery._cli:web_main"
+sqlery-daemon = "sqlery._cli:daemon_main"
+sqlery-jobs = "sqlery._cli:jobs_main"
+sqlery-cleanup = "sqlery._cli:cleanup_main"
+sqlery-migrate = "sqlery._cli:migrate_main"
+sqlery-tasks = "sqlery._cli:tasks_main"
+sqlery-queues = "sqlery._cli:queues_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlery"]
@@ -155,6 +163,9 @@ packages = ["src/sqlery"]
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
+# auto: async tests run without a mark, so sync tests in the same module need no per-module
+# pytestmark = pytest.mark.asyncio (which warned on every sync test; #37)
+asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [

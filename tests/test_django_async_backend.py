@@ -12,7 +12,7 @@ import uuid
 import pytest
 from django.utils import timezone
 
-pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.asyncio]
+pytestmark = pytest.mark.django_db(transaction=True)  # asyncio_mode=auto (pyproject)
 
 
 @pytest.fixture(autouse=True)

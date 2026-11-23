@@ -6,11 +6,12 @@ to ensure consistency with Django models.
 
 import os
 from datetime import datetime, UTC
-# from typing import Optional  # Replaced with X | None (Python 3.10+)
-# Needed for SQLModel forward-reference string annotations in Relationship() — union syntax ("X | None")
-# is not supported by SQLAlchemy's string resolver, so Optional["X"] must be used instead.
-from typing import Optional
+# Old: from typing import Optional  (used as Optional["Worker"] because SQLAlchemy's string resolver
+# cannot read "Worker | None"; tried → InvalidRequestError "failed to locate a name 'Worker | None'".
+# Fix: the Worker relationship passes sa_relationship=relationship("Worker", ...), so the annotation
+# is never resolved; #37)
 from uuid import UUID
+from sqlalchemy.orm import relationship
 from uuid6 import uuid7
 from sqlmodel import Field, SQLModel, Column, JSON, Relationship
 from sqlalchemy import (
@@ -67,12 +68,15 @@ class ScheduledTask(SQLModel, table=True):
     # Relationships
     jobs: list["QueuedJob"] = Relationship(back_populates="scheduled_task")
 
-    class Config:
-        """SQLModel configuration."""
-        table = True
-        indexes = [
-            ("enabled", "next_run_at"),
-        ]
+    # Old (#37): class Config is deprecated in Pydantic V2 and removed in V3. `table = True` repeats
+    # the class keyword. `indexes` was never a SQLModel option: no such index exists in the schema
+    # (checked against the generated DDL). Real composite indexes need an Alembic migration.
+    # class Config:
+    #     """SQLModel configuration."""
+    #     table = True
+    #     indexes = [
+    #         ("enabled", "next_run_at"),
+    #     ]
 
 
 class QueuedJob(SQLModel, table=True):
@@ -190,20 +194,23 @@ class QueuedJob(SQLModel, table=True):
 
     # Relationships
     scheduled_task: ScheduledTask | None = Relationship(back_populates="jobs")
-    # "Worker | None" string is not resolvable by SQLAlchemy's class registry; use Optional["Worker"]
+    # With sa_relationship the annotation is not resolved by SQLAlchemy, so "Worker | None" is safe
+    # (as a bare relationship annotation it fails: see the import note at the top)
     # foreign_keys required because QueuedJob<->Worker has two FK paths (worker_id and current_job_id)
-    worker: Optional["Worker"] = Relationship(
-        back_populates="assigned_jobs",
-        sa_relationship_kwargs={"foreign_keys": "[QueuedJob.worker_id]"},
+    worker: "Worker | None" = Relationship(
+        sa_relationship=relationship(
+            "Worker", back_populates="assigned_jobs", foreign_keys="[QueuedJob.worker_id]"
+        ),
     )
     registry_entries: list["JobRegistry"] = Relationship(back_populates="job", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
-    class Config:
-        """SQLModel configuration."""
-        table = True
-        indexes = [
-            ("queue_name", "status", "priority", "created_at"),
-        ]
+    # Old (#37): class Config removed, see ScheduledTask.
+    # class Config:
+    #     """SQLModel configuration."""
+    #     table = True
+    #     indexes = [
+    #         ("queue_name", "status", "priority", "created_at"),
+    #     ]
 
     def mark_running(self):
         """Mark job as running (the worker PID is recorded on the execution attempt)."""
@@ -342,10 +349,11 @@ class ScheduledJob(SQLModel, table=True):
         description="Maximum number of retry attempts (0 = no retries)",
     )
 
-    class Config:
-        """SQLModel configuration."""
-
-        table = True
+    # Old (#37): class Config removed, see ScheduledTask.
+    # class Config:
+    #     """SQLModel configuration."""
+    #
+    #     table = True
 
 
 class JobRegistry(SQLModel, table=True):
@@ -376,14 +384,15 @@ class JobRegistry(SQLModel, table=True):
     # Relationships
     job: QueuedJob = Relationship(back_populates="registry_entries")
 
-    class Config:
-        """SQLModel configuration."""
-        table = True
-        indexes = [
-            ("registry_type", "entered_at"),
-            ("job_id", "registry_type"),
-            ("registry_type", "exited_at"),
-        ]
+    # Old (#37): class Config removed, see ScheduledTask.
+    # class Config:
+    #     """SQLModel configuration."""
+    #     table = True
+    #     indexes = [
+    #         ("registry_type", "entered_at"),
+    #         ("job_id", "registry_type"),
+    #         ("registry_type", "exited_at"),
+    #     ]
 
 
 class Worker(SQLModel, table=True):
@@ -423,13 +432,14 @@ class Worker(SQLModel, table=True):
         sa_relationship_kwargs={"foreign_keys": "[QueuedJob.worker_id]"},
     )
 
-    class Config:
-        """SQLModel configuration."""
-        table = True
-        indexes = [
-            ("node_id", "status"),
-            ("status", "last_heartbeat"),
-        ]
+    # Old (#37): class Config removed, see ScheduledTask.
+    # class Config:
+    #     """SQLModel configuration."""
+    #     table = True
+    #     indexes = [
+    #         ("node_id", "status"),
+    #         ("status", "last_heartbeat"),
+    #     ]
 
     def is_alive(self, timeout_seconds: int | None = None) -> bool:
         """Check if worker is alive based on heartbeat (see is_worker_beating)."""

@@ -12,18 +12,36 @@ on:
   pull_request:
     branches: [ main ]
 
+defaults:
+  run:
+    shell: bash  # bash -eo pipefail: `pytest | tee` must fail when pytest fails
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Old: runs-on: ubuntu-latest  (the image moves under us; pinned in #37)
+    runs-on: ubuntu-24.04
+    # 3.15 is a pre-release: it may fail without failing the workflow.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
+      fail-fast: false
       matrix:
-        # python-version: ['3.11', '3.12', '3.13']
-        python-version: ['3.13']
-        django-version: ['5.2', '6.1']  # Supported floor plus current Django 6.x.
+        # Old: python-version: ['3.13']; django-version: ['5.2', '6.1']
+        python-version: ['3.13', '3.14']
+        django-version: ['5.2', '6.0', '6.1']  # Supported floor, then every Django 6.x we claim.
+        postgres: ['15']
+        include:
+          # Newest Python and Django also run against the newest PostgreSQL.
+          - python-version: '3.14'
+            django-version: '6.1'
+            postgres: '18'
+          - python-version: '3.15'
+            django-version: '6.1'
+            postgres: '15'
+            experimental: true
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -39,15 +57,17 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
+    # setup-uv publishes no major tags since v8: pin the exact release. uv itself is pinned too.
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@v10.4.0
       with:
-        version: "latest"
+        version: "0.13.9"
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
+        allow-prereleases: true
 
     - name: Install dependencies
       run: |
@@ -65,14 +85,20 @@ jobs:
       env:
         PYTHONPATH: .
       run: |
-        uv run pytest tests/chaos/ -v --timeout=60 -m "not postgres" || echo "Chaos tests completed (some may be skipped)"
+        # Old: ... -m "not postgres" || echo "Chaos tests completed (some may be skipped)"
+        # (the `|| echo` made this step pass whatever happened; #37)
+        uv run pytest tests/chaos/ -v --timeout=60 -m "not postgres"
 
     - name: Run tests with PostgreSQL
       env:
         PYTHONPATH: .
+        SQLERY_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sqlery_test
       run: |
-        uv run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v --timeout=30 || echo "PostgreSQL-specific tests completed"
+        # Old: ... --timeout=30 || echo "PostgreSQL-specific tests completed"
+        # (the `|| echo` hid every failure; without SQLERY_TEST_PG_URL the PG cells skipped; #37)
+        uv run pytest tests/test_atomic_claiming.py tests/test_atomic_scheduler.py -v -rs --timeout=30 | tee pg_out.txt
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     - name: Run @pytest.mark.postgres suite
       env:
@@ -97,7 +123,10 @@ jobs:
       # canceled" plus orphaned uv/pytest/python3 processes. A pytest-level
       # timeout raises a catchable exception inside the hanging test instead,
       # so that cleanup runs and the failure reports cleanly.
-      run: uv run pytest -m postgres -v --tb=short --timeout=90
+      run: |
+        uv run pytest -m postgres -v -rs --tb=short --timeout=90 | tee pg_out.txt
+        # A postgres-marked test that skipped for a missing/wrong database is a silent hole (#37).
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     # Phase 11 (PARITY-05): the standalone x Postgres parity cells are NOT
     # exercised by the step above (pytest-django resolves the Django backend)
@@ -151,10 +180,11 @@ jobs:
         # Issue #23: add --timeout so a hang here fails cleanly through pytest's
         # own catchable timeout instead of the job needing external cancellation
         # (see the matching comment on the "Run @pytest.mark.postgres suite" step).
-        uv run pytest -m "postgres and standalone_pg" -v --tb=short --timeout=90 \
+        uv run pytest -m "postgres and standalone_pg" -v -rs --tb=short --timeout=90 \
           tests/test_parity_scheduler.py \
           tests/test_core_standalone.py \
-          tests/chaos/test_lease_zombie.py
+          tests/chaos/test_lease_zombie.py | tee pg_out.txt
+        if grep -E "^SKIPPED.*(SQLERY_TEST_PG_URL|PostgreSQL)" pg_out.txt; then echo "FAIL: PG tests skipped on the PG rail"; exit 1; fi
 
     - name: Run tests with coverage
       env:
@@ -171,19 +201,22 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: coverage-html-py${{ matrix.python-version }}
+        # one name per cell: upload-artifact v4+ rejects a duplicate name
+        name: coverage-html-py${{ matrix.python-version }}-dj${{ matrix.django-version }}-pg${{ matrix.postgres }}
         path: htmlcov/
         retention-days: 14
 
   libsql:
     # EXPERIMENTAL libsql backend: real enqueue and worker run on a libsql file.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        django-version: ['5.2', '6.1']
+        django-version: ['5.2', '6.0', '6.1']
     steps:
     - uses: actions/checkout@v7
-    - uses: astral-sh/setup-uv@v7
+    - uses: astral-sh/setup-uv@v10.4.0
+      with:
+        version: "0.13.9"
     - uses: actions/setup-python@v7
       with:
         python-version: '3.13'
@@ -198,15 +231,15 @@ jobs:
   standalone-no-django:
     # Regression guard for UNIF-04/05/06: verifies `sqlery.core` and all its
     # submodules import in a fresh venv where `django` is NOT installed.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v7
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@v10.4.0
       with:
-        version: "latest"
+        version: "0.13.9"
 
     # - name: Set up Python 3.10
     - name: Set up Python 3.13

@@ -4,10 +4,10 @@ Provides web UI and REST API for job queue management.
 """
 
 import asyncio
-import inspect
 from datetime import UTC, datetime
 from pathlib import Path
 
+import jinja2  # noqa: F401  (missing jinja2 must be an ImportError, not starlette's AssertionError)
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -55,16 +55,15 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 # Builtins the templates call directly; Jinja does not expose them by default.
 templates.env.globals.update(min=min, max=max, str=str)
 
-_REQUEST_FIRST = next(iter(inspect.signature(templates.TemplateResponse).parameters)) == "request"
+# Old: _REQUEST_FIRST = next(iter(inspect.signature(templates.TemplateResponse).parameters)) == "request"
+# and a legacy TemplateResponse(name, context) branch. On starlette 0.48 the signature is wrapped,
+# so the check read "args" and picked the legacy form, which starlette 1.0 removes (#37).
+# The request-first form exists since starlette 0.29, which the standalone extra requires.
 
 
 def _render(name: str, context: dict, status_code: int = 200):
-    """Render a template using the request-first (starlette 1.x) or legacy TemplateResponse form."""
-    if _REQUEST_FIRST:
-        return templates.TemplateResponse(
-            context["request"], name, context, status_code=status_code
-        )
-    return templates.TemplateResponse(name, context, status_code=status_code)
+    """Render a template with the request-first TemplateResponse form (starlette >= 0.29)."""
+    return templates.TemplateResponse(context["request"], name, context, status_code=status_code)
 
 
 # Mount static files (if directory exists and has content)

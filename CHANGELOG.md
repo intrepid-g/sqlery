@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-11-22
+
+### Fixed
+
+- **Releasing a worker costs no extra statement (#37).** The 0.29.1 fix for #35 added a second UPDATE to every job completion. Release now writes status and current job only, in one UPDATE (no heartbeat, no extra statement per job): a silent worker keeps its stale heartbeat and `cleanup_dead_workers` marks it `dead`; a live worker beats on its own every few seconds.
+- **`sqlery.fastapi_sqlery` exports real names (#37).** It re-exported `create_app` and `FastAPIBackend`, which do not exist, and a bare `except Exception` turned the error into an `ImportWarning`, so only the async backend was exported. It now exports `default_app`, `SQLAlchemyBackend`, `cli_app` and `SQLAlchemyAsyncBackend`, and catches only `ImportError`. `docs/TROUBLESHOOTING.md` names the real classes.
+- **A bare install no longer crashes the CLIs with a traceback (#37).** Console scripts now start in `sqlery._cli` and, when `typer`, `rich`, `uvicorn` or the web stack is missing, exit with `pip install "sqlery[cli]"` (or `[standalone]`).
+- **Swallowed errors are logged (#37).** `mark_job_failed` after a timeout kill (worker), `QueuedJob.force_stop` and `QueuedJob._release_worker` ended in `except Exception: pass`. Each now calls `logger.exception`; none raises.
+- **The dashboard always renders templates request-first (#37).** The check that chose the `TemplateResponse` form misread the signature on starlette 0.48 and used the legacy form that starlette 1.0 removes. The standalone extra now requires `starlette>=0.29`.
+- **CI fails when it should (#37).** The chaos and PostgreSQL-claiming steps ended in `|| echo`, so they never failed. That hid 9 chaos tests that had failed since #157 (they build a running job the pre-#157 way); they are skipped with the reason beside them, and their rules are pinned in `tests/unit/test_daemon.py`, `tests/test_worker_maintenance_35.py` and `tests/test_attempt_fencing_138.py`. PostgreSQL steps now fail when a PG test skipped for a missing or wrong database.
+
+### Added
+
+- **Log of threads alive at fork (#37).** `ForkSafeExecutor.fork` logs a warning with the thread names when more than one thread is alive (Python 3.12+ also warns, without names).
+
+### Changed
+
+- **Pause is documented as Django-only (#37).** `SQLAlchemyBackend.is_worker_paused` always returns `False`: the standalone worker table has no `paused_until` column and nothing sets one.
+- **The standalone extra declares `sqlalchemy>=2.0`, `pydantic>=2.0` and `starlette>=0.29.0` (#37).** The code imports them directly; they were only transitive through the pre-1.0 `sqlmodel`.
+- **Pydantic V3 readiness (#37).** The `class Config` blocks in `sqlery.core.models` are gone (`indexes` was never a SQLModel option; the generated DDL is identical on SQLite and PostgreSQL), and so is `typing.Optional`. pytest runs with `asyncio_mode = "auto"`.
+- **CI matrix (#37).** Python 3.13 and 3.14 (3.15 may fail), Django 5.2, 6.0 and 6.1, PostgreSQL 15 on every cell and 18 on the newest, `ubuntu-24.04`, `astral-sh/setup-uv@v10.4.0` (no major tags since v8) with uv pinned.
+
 ## [0.29.1] - 2026-11-22
 
 ### Fixed

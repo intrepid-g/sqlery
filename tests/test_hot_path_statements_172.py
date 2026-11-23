@@ -265,7 +265,10 @@ def test_noop_jobs_cost_few_statements_and_commits(db):
     # Commits are read once the worker has exited (its statistics are then all reported) and
     # cover its whole life, start-up and shutdown included, spread over all the jobs.
     commits = db.commits() - commits0 if db.kind == "pg" else None
-    assert jobs >= JOBS - WARMUP_JOBS - 5
+    # #37: a faster worker has done more than WARMUP_JOBS by the time the warm-up poll reads the
+    # count, so the measured window shrinks. The average is still valid; require half the stream.
+    # Old: assert jobs >= JOBS - WARMUP_JOBS - 5  (failed when the worker got faster)
+    assert jobs >= JOBS // 2
     per_job = statements / jobs
     assert per_job <= MAX_STATEMENTS_PER_JOB, f"{per_job:.1f} statements per job"
     if commits is not None:

@@ -1390,6 +1390,15 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             return list(session.exec(stmt).all())
 
+    def is_worker_paused(self, worker_id: str) -> bool:
+        """Always False: pausing a worker is a Django-mode feature (#37).
+
+        The standalone ``Worker`` table has no ``paused_until`` column and no endpoint sets one,
+        so there is nothing to read. Upgrade path: an Alembic column plus a pause endpoint in
+        ``fastapi_sqlery/app.py``, then read the column here as ``DjangoBackend`` does.
+        """
+        return False
+
     def update_worker_heartbeat(
         self,
         worker_id: str,

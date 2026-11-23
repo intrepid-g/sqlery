@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from sqlery.core import maintenance
 from tests.test_ready_queue_139 import DjangoMode, StandaloneMode, mode  # noqa: F401
 
@@ -26,19 +28,22 @@ def test_a_tick_fails_the_job_a_dead_worker_left_running(mode):
     assert mode.backend.get_running_jobs() == []
 
 
-def test_failing_a_zombie_job_leaves_its_silent_worker_dead(mode):
+def test_failing_a_zombie_job_leaves_its_silent_worker_for_cleanup_to_reap(mode):
     if not isinstance(mode, DjangoMode):
-        return
+        pytest.skip("Django worker rows only")
     from django.utils import timezone
 
     from sqlery.django_sqlery.models import Worker
+    from sqlery.django_sqlery.worker_registry import cleanup_dead_workers
 
     worker = "worker_deadhost_888888"
     mode.backend.update_worker_heartbeat(worker, "busy")
     job = mode.new_job()
     assert mode.backend.claim_job(["default"], worker).id == job.id
-    Worker.objects.filter(node_id="deadhost", pid=888888).update(last_heartbeat=timezone.now() - timedelta(hours=8))
+    stale = timezone.now() - timedelta(hours=8)
+    Worker.objects.filter(node_id="deadhost", pid=888888).update(last_heartbeat=stale)
     assert mode.backend.fail_zombie_job(job.id, "zombie")
     row = Worker.objects.get(node_id="deadhost", pid=888888)
-    assert row.status == "dead"
-    assert row.last_heartbeat < timezone.now() - timedelta(hours=7)
+    assert row.last_heartbeat <= stale + timedelta(seconds=1)  # release did not refresh it
+    cleanup_dead_workers()
+    assert Worker.objects.get(node_id="deadhost", pid=888888).status == "dead"

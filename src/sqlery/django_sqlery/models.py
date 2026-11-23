@@ -504,6 +504,11 @@ class QueuedJobQuerySet(models.QuerySet):
         return count
 
 
+# What a finished job leaves on its worker row. last_heartbeat is deliberately absent
+# (RELEASE_KEEPS_HEARTBEAT, #37).
+RELEASED_WORKER_FIELDS = {"status": "idle", "current_job_id": None}
+
+
 class QueuedJob(models.Model):
     """A job in the queue, waiting to be executed or already processed.
 
@@ -1277,8 +1282,9 @@ class QueuedJob(models.Model):
             self.mark_failed(
                 error="Displaced by newer job with same name", termination_reason="displaced"
             )
+        # Old: except Exception: pass  (a failed mark_failed left the job stuck, unseen; #37)
         except Exception:
-            pass
+            logger.exception(f"force_stop: could not mark job {self.id} failed")
 
         # Reset worker state so it shows idle immediately on the dashboard
         # Old: worker = Worker.objects.filter(current_job=self, status="busy").first()
@@ -1301,23 +1307,18 @@ class QueuedJob(models.Model):
         if not self.worker_id:
             return
         try:
-            # from django.apps import apps  # moved to top-level
-
             Worker = apps.get_model("sqlery", "Worker")
-            now = timezone.now()
-            fresh = now - timedelta(seconds=get_setting("WORKER_ALIVE_TIMEOUT", 30))
-            held = Worker.objects.filter(id=self.worker_id, current_job_id=self.id)
-            # A silent worker (e.g. its job failed as a zombie) is dead: a fresh heartbeat
-            # here would hide it from cleanup_dead_workers (#35).
-            held.filter(last_heartbeat__lt=fresh).update(status="dead", current_job_id=None)
-            held.update(
-                status="idle",
-                # Old: current_job=None,
-                current_job_id=None,
-                last_heartbeat=now,
+            # Clause RELEASE_KEEPS_HEARTBEAT (#35, #37): one UPDATE, no heartbeat write. A
+            # silent worker keeps its stale beat, so cleanup_dead_workers reaps it; a live
+            # one beats on its own every few seconds.
+            # Old (#35, +1 UPDATE per job): a second filter marked workers with a stale beat
+            # dead, then released with last_heartbeat=now.
+            Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
+                **RELEASED_WORKER_FIELDS
             )
+        # Old: except Exception: pass  (a failed release left the worker busy, unseen; #37)
         except Exception:
-            pass
+            logger.exception(f"Could not release worker {self.worker_id} from job {self.id}")
 
     def _record_run(self, status, output="", error=""):
         """Record execution attempt in runs history.

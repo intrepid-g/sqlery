@@ -24,7 +24,7 @@ from sqlery.core.models import QueuedJob, Worker, JobAll
 from sqlery.core.async_worker import AsyncWorker
 
 
-pytestmark = pytest.mark.asyncio
+# Old: pytestmark = pytest.mark.asyncio  (warned on each sync test; asyncio_mode=auto now, #37)
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ from sqlery.fastapi_sqlery import database as _db_mod
 from sqlery.core.models import JobRegistry, QueuedJob, ScheduledTask, Worker, JobAll
 
 
-pytestmark = pytest.mark.asyncio
+# Old: pytestmark = pytest.mark.asyncio  (warned on each sync test; asyncio_mode=auto now, #37)
 
 
 @pytest_asyncio.fixture

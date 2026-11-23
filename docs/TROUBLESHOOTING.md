@@ -892,8 +892,8 @@ from sqlery.django_sqlery.decorators import job
 from sqlery.django_sqlery.queue import enqueue
 
 # NEW (v0.8+) - FastAPI
-from sqlery.fastapi_sqlery import create_app
-from sqlery.fastapi_sqlery.backend import FastAPIBackend
+from sqlery.fastapi_sqlery import default_app  # the FastAPI app
+from sqlery.fastapi_sqlery.backend import SQLAlchemyBackend
 ```
 
 **Quick Find & Replace:**

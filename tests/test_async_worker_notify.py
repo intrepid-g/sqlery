@@ -18,7 +18,7 @@ from sqlery.fastapi_sqlery import async_backend as _ab  # noqa: F401
 from sqlery.fastapi_sqlery import database as _db_mod
 from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
 
-pytestmark = pytest.mark.asyncio
+# Old: pytestmark = pytest.mark.asyncio  (warned on each sync test; asyncio_mode=auto now, #37)
 
 _ran: list[int] = []
 

@@ -27,7 +27,7 @@ from sqlery.core.models import QueuedJob, JobAll
 from sqlery.core.async_worker import AsyncWorker, SHUTDOWN_TIMEOUT_ERROR
 
 
-pytestmark = pytest.mark.asyncio
+# Old: pytestmark = pytest.mark.asyncio  (warned on each sync test; asyncio_mode=auto now, #37)
 
 
 # Top-level job callables (importable by task_path).

@@ -6,6 +6,7 @@ system that makes it impossible to fork with open DB connections.
 
 import logging
 import os
+import threading
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,18 @@ def verify_no_open_connections(
 # ---------------------------------------------------------------------------
 
 
+def threaded_fork_warning(thread_names: list[str]) -> str | None:
+    """Clause FORK_NEEDS_ONE_THREAD: a fork with other threads alive can deadlock the child.
+
+    Python 3.12+ also warns about it. Returns the log line naming the threads, or None when
+    the process is single-threaded. Workers start no thread of their own, so a name here
+    is a leak (often a test thread that was never joined).
+    """
+    if len(thread_names) <= 1:
+        return None
+    return f"fork_safety: forking with {len(thread_names)} threads alive: {', '.join(thread_names)}"
+
+
 class ForkSafeExecutor:
     """Wraps os.fork() with guaranteed DB connection lifecycle hooks.
 
@@ -167,6 +180,7 @@ class ForkSafeExecutor:
                 logger.warning(f"pre_fork hook {hook.__name__} failed: {e}")
 
         self._verify_pre_fork()
+        self._warn_if_threaded()
 
         pid = os.fork()
 
@@ -184,6 +198,12 @@ class ForkSafeExecutor:
                     logger.warning(f"post_fork_parent hook {hook.__name__} failed: {e}")
 
         return pid
+
+    @staticmethod
+    def _warn_if_threaded() -> None:
+        warning = threaded_fork_warning([t.name for t in threading.enumerate()])
+        if warning:
+            logger.warning(warning)
 
     def _verify_pre_fork(self) -> None:
         """Log warnings for any connections that survived pre-fork cleanup."""

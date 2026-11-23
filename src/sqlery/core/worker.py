@@ -1416,8 +1416,9 @@ class WorkerProcess:
                         traceback=f"Parent killed child PID {child_pid} after {int(elapsed)}s",
                         **attempt_kwargs(job, self.backend.mark_job_failed),
                     )
+                # Old: except Exception: pass  (a job could stay "running" with no trace, #37)
                 except Exception:
-                    pass
+                    logger.exception(f"Could not mark job {job_id} failed after killing its child")
                 return {'success': False, 'error': f'Timeout after {int(elapsed)}s'}
 
             # Sleep briefly so parent stays responsive to signals

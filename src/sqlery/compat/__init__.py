@@ -177,7 +177,10 @@ class DatabaseBackend(ABC):
         raise NotImplementedError
 
     def is_worker_paused(self, worker_id: str) -> bool:
-        """Check if worker is currently paused (paused_until is in the future)."""
+        """Check if worker is currently paused (paused_until is in the future).
+
+        Django mode only: the standalone backend has no pause and always returns False.
+        """
         return False
 
     def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
