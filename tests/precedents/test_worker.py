@@ -51,6 +51,18 @@ def test_async_worker_beats_at_the_configured_interval_when_polls_are_slow():
     assert worker.async_beat_interval(heartbeat_interval=5, poll_interval=60) == 5
 
 
+def test_heartbeat_restores_idle_status_by_default():
+    assert worker.heartbeat_fields() == {"status": "idle"}
+
+
+def test_heartbeat_restores_custom_status():
+    assert worker.heartbeat_fields("busy") == {"status": "busy"}
+
+
+def test_heartbeat_fields_does_not_contain_timestamp():
+    assert "last_heartbeat" not in worker.heartbeat_fields()
+
+
 # --- #35 guard: the real release, against a real database -------------------------------
 
 
@@ -73,3 +85,22 @@ def test_releasing_a_worker_issues_one_statement_and_never_writes_last_heartbeat
     after = Worker.objects.get(id=row.id)
     assert (after.status, after.current_job_id) == ("idle", None)
     assert after.last_heartbeat == stale  # a silent worker keeps its stale beat
+
+
+# --- #41 guard: async heartbeat restores a worker marked dead -------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_heartbeat_restores_a_worker_marked_dead():
+    import asyncio
+
+    from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
+    from sqlery.django_sqlery.models import Worker
+
+    row = Worker.objects.create(node_id="n", pid=4242, status="dead", queues=["default"])
+    backend = DjangoAsyncBackend()
+    asyncio.run(backend.aupdate_heartbeat(row.id))
+
+    after = Worker.objects.get(id=row.id)
+    assert after.status == "idle"
+

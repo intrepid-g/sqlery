@@ -31,3 +31,13 @@ def idle_tick_interval(lease_secs: float, heartbeat_interval: float) -> float:
 def async_beat_interval(heartbeat_interval: float, poll_interval: float) -> float:
     """Clause WRK-4 (obligation): an async worker beats once per poll cycle at most."""
     return max(min(heartbeat_interval, poll_interval * 0.9), 0.0)
+
+
+# A heartbeat writes a fresh beat and restores the worker's status (#41):
+HEARTBEAT_FIELDS = {"status": "idle"}
+
+
+def heartbeat_fields(status: str = "idle") -> dict:
+    """Clause WRK-5: the non-timestamp columns a heartbeat restores so a dead marker clears."""
+    return {"status": status}
+

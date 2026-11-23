@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Async worker recovers after a missed heartbeat (#41).** `aupdate_heartbeat` now restores `status` (clause WRK-5), matching the sync heartbeat. An async worker marked `dead` after blocking the event loop recovers on its next beat instead of staying dead forever.
+
 ## [0.29.2] - 2026-11-22
 
 ### Fixed

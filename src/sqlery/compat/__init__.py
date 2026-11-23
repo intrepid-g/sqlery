@@ -1039,8 +1039,8 @@ class AsyncDatabaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def aupdate_heartbeat(self, worker_id) -> None:
-        """Async analog of DatabaseBackend.refresh_worker_heartbeat."""
+    async def aupdate_heartbeat(self, worker_id, status: str = "idle") -> None:
+        """Async analog of DatabaseBackend.refresh_worker_heartbeat (with status recovery)."""
         pass
 
     @abstractmethod

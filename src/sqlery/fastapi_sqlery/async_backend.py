@@ -30,6 +30,7 @@ from sqlalchemy import delete, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
+from sqlery.contract import worker as worker_contract
 from sqlery.core.attempts import (
     OUTCOME_ABANDONED,
     OUTCOME_FAILED,
@@ -623,12 +624,14 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
 
     # ----- worker registry -------------------------------------------------
 
-    async def aupdate_heartbeat(self, worker_id) -> None:
+    async def aupdate_heartbeat(self, worker_id, status: str = "idle") -> None:
         now = _utcnow()
         factory = get_async_session_factory()
         async with factory() as session:
             await session.execute(
-                update(Worker).where(Worker.id == worker_id).values(last_heartbeat=now)
+                update(Worker)
+                .where(Worker.id == worker_id)
+                .values(last_heartbeat=now, **worker_contract.heartbeat_fields(status))
             )
             await session.commit()
 

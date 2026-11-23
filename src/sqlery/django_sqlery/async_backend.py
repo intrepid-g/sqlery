@@ -19,6 +19,7 @@ from django.db import connection
 from django.utils import timezone
 
 from sqlery.compat import AsyncDatabaseBackend
+from sqlery.contract import worker as worker_contract
 from sqlery.core.attempts import OUTCOME_ABANDONED, OUTCOME_FAILED, OUTCOME_SUCCESS
 from sqlery.core.utils import reject_unawaited_coroutine
 
@@ -350,9 +351,11 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
 
     # ----- worker registry -------------------------------------------------
 
-    async def aupdate_heartbeat(self, worker_id) -> None:
+    async def aupdate_heartbeat(self, worker_id, status: str = "idle") -> None:
         now = timezone.now()  # capture BEFORE await
-        await Worker.objects.filter(pk=worker_id).aupdate(last_heartbeat=now)
+        await Worker.objects.filter(pk=worker_id).aupdate(
+            last_heartbeat=now, **worker_contract.heartbeat_fields(status)
+        )
 
     async def aregister_worker(self, worker_id, metadata: dict) -> None:
         defaults: dict[str, Any] = {

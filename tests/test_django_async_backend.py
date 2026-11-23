@@ -269,6 +269,19 @@ async def test_aupdate_heartbeat(backend):
     assert after >= before
 
 
+async def test_aupdate_heartbeat_restores_dead_status(backend):
+    from sqlery.django_sqlery.models import Worker
+
+    wid = uuid.uuid4()
+    await backend.aregister_worker(
+        wid, {"node_id": "node-1", "pid": 1234, "queues": ["default"]}
+    )
+    await Worker.objects.filter(pk=wid).aupdate(status="dead")
+    await backend.aupdate_heartbeat(wid)
+    after = await Worker.objects.aget(pk=wid)
+    assert after.status == "idle"
+
+
 # ----- lease ops ------------------------------------------------------------
 
 

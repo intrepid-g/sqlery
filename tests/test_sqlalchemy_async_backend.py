@@ -252,6 +252,28 @@ async def test_aupdate_heartbeat(backend, session_factory):
     assert a >= b
 
 
+async def test_aupdate_heartbeat_restores_dead_status(backend, session_factory):
+    wid = uuid.uuid4()
+    await backend.aregister_worker(
+        wid, {"node_id": "node-1", "pid": 1234, "queues": ["default"]}
+    )
+    async with session_factory() as s:
+        from sqlalchemy import update
+
+        await s.execute(update(Worker).where(Worker.id == wid).values(status="dead"))
+        await s.commit()
+
+    await backend.aupdate_heartbeat(wid)
+
+    async with session_factory() as s:
+        from sqlalchemy import select
+
+        row = (
+            await s.execute(select(Worker).where(Worker.id == wid))
+        ).scalars().first()
+        assert row.status == "idle"
+
+
 # ----- lease ops ------------------------------------------------------------
 
 
