@@ -75,8 +75,12 @@ def run_worker():
             if worker_contract.beat_owed(time.time() - last_heartbeat, heartbeat_interval):
                 update_heartbeat(worker)
                 last_heartbeat = time.time()
+                worker.refresh_from_db(fields=["paused_until"])  # WRK-6: per heartbeat
 
-            # Try to claim a job
+            # Try to claim a job (not while paused, WRK-6)
+            if not worker_contract.may_claim(worker.paused_until, timezone.now()):
+                time.sleep(1)
+                continue
             job = claim_next_job_with_queue_priority(worker, backend, queues)
 
             if job:

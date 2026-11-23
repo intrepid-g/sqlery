@@ -24,6 +24,8 @@ from sqlery.contract import worker as worker_contract
 from sqlery.core.attempts import OUTCOME_ABANDONED, OUTCOME_FAILED, OUTCOME_SUCCESS
 from sqlery.core.utils import reject_unawaited_coroutine
 
+from .backend import aware_or_none
+
 from .models import (
     DaemonLease,
     JobAll,
@@ -362,6 +364,11 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
                 default=F("status"),
             ),
         )
+
+    async def aget_paused_until(self, worker_id):
+        # Old: returned the raw value; naive under USE_TZ=False, crashing the async worker's compare.
+        value = await Worker.objects.filter(pk=worker_id).values_list("paused_until", flat=True).afirst()
+        return aware_or_none(value)
 
     async def aregister_worker(self, worker_id, metadata: dict) -> None:
         defaults: dict[str, Any] = {

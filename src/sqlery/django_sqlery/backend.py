@@ -76,6 +76,13 @@ FINISHED_STATUSES = ("success", "failed", "archived")
 _EPHEMERAL_CLAIMER_PREFIXES = ("lambda-", "trigger-")
 
 
+def aware_or_none(value):
+    """Make a naive datetime aware (USE_TZ=False stores naive values); keep None."""
+    if value is not None and timezone.is_naive(value):
+        return timezone.make_aware(value)
+    return value
+
+
 class DjangoBackend(DatabaseBackend):
     """Django ORM implementation of DatabaseBackend.
 
@@ -636,6 +643,11 @@ class DjangoBackend(DatabaseBackend):
             logger.info(f"Auto-registered worker {worker_id} on-demand")
 
         return worker
+
+    def get_worker_paused_until(self, worker_id: str):
+        """Read ``paused_until`` without writing (unlike ``is_worker_paused``, which clears it)."""
+        worker = self._resolve_worker(worker_id)
+        return aware_or_none(worker.paused_until if worker else None)
 
     def is_worker_paused(self, worker_id: str) -> bool:
         """Check if worker is currently paused."""

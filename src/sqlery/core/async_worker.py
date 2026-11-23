@@ -33,6 +33,7 @@ import signal
 import socket
 import time
 import traceback as tb_module
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
@@ -237,6 +238,7 @@ class AsyncWorker:
         self._start_listener()
         last_sweep = time.monotonic()
         last_heartbeat = float("-inf")
+        paused_until = None  # WRK-6: re-read with each heartbeat, never per job
         sweep_interval = self._orphan_sweep_interval()
         self._check_liveness_config()
         jobs_started = 0
@@ -259,8 +261,13 @@ class AsyncWorker:
                     last_heartbeat = time.monotonic()
                     try:
                         await self.backend.aupdate_heartbeat(self.worker_id)
+                        paused_until = await self.backend.aget_paused_until(self.worker_id)
                     except Exception as e:  # pragma: no cover - heartbeat is best-effort
                         logger.warning(f"Heartbeat update failed: {e}")
+
+                if not worker_contract.may_claim(paused_until, datetime.now(timezone.utc)):
+                    await self._idle_wait(self.poll_interval)
+                    continue
 
                 if len(running) >= self.concurrency:
                     # At capacity: wait for a slot (or the next heartbeat tick).

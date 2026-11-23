@@ -378,3 +378,16 @@ async def test_anext_due_delay_none_then_future(backend, make_job):
     delay = await backend.anext_due_delay(["default"])
     assert delay is not None and 0 < delay <= 3
     assert await backend.anext_due_delay(["other"]) is None
+
+
+async def test_paused_until_is_aware_even_when_stored_naive(backend, settings):
+    from datetime import UTC, datetime
+
+    from sqlery.django_sqlery.models import Worker
+
+    settings.USE_TZ = False
+    naive = datetime(2030, 1, 1, 12, 0)
+    w = await Worker.objects.acreate(node_id="tz", pid=4321, status="idle", paused_until=naive)
+    value = await backend.aget_paused_until(w.pk)
+    assert value is not None and value.tzinfo is not None
+    assert value > datetime.now(UTC)  # the async worker compares with an aware now

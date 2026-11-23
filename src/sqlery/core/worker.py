@@ -922,6 +922,9 @@ class WorkerProcess:
         self._idle_delay: float | None = None
         self._idle_delay_at = 0.0
         self._idle_dirty = False
+        # WRK-6: paused_until, re-read once per heartbeat interval (never per job)
+        self._paused_until: datetime | None = None
+        self._pause_read_at = float("-inf")
 
     def run(self, max_jobs: int | None = None):
         """Run worker loop: claim jobs, fork children, monitor, heartbeat.
@@ -1068,9 +1071,11 @@ class WorkerProcess:
                         # renewal and heartbeat above; it is re-raised after the commit.
                         claim_error = None
                         job = None
+                        may_claim = self._may_claim()
                         try:
                             with self.backend.idle_transaction():
-                                job = self.backend.claim_job(self.queues, self.worker_id)
+                                if may_claim:
+                                    job = self.backend.claim_job(self.queues, self.worker_id)
                         except Exception as e:
                             claim_error = e
                     # Bookkeeping that says "the lease was renewed / the check ran" is applied
@@ -2158,6 +2163,18 @@ class WorkerProcess:
             return max(float(get_config("SCHEDULER_RECHECK_INTERVAL", 10)), 0.0)
         except (TypeError, ValueError):
             return 10.0
+
+    def _may_claim(self) -> bool:
+        """Clause WRK-6 at the edge: re-read ``paused_until`` per heartbeat interval, then decide."""
+        now = time.monotonic()
+        if worker_contract.beat_owed(now - self._pause_read_at, max(self.heartbeat_interval, 1.0)):
+            self._pause_read_at = now
+            try:
+                with self.backend.idle_transaction():  # own savepoint, see _heartbeat
+                    self._paused_until = self.backend.get_worker_paused_until(self.worker_id)
+            except Exception as e:
+                logger.warning(f"Pause read failed (keeping the last value): {e}")
+        return worker_contract.may_claim(self._paused_until, datetime.now(timezone.utc))
 
     def _check_heartbeat(self):
         """Process deferred heartbeat from SIGUSR1 signal handler (signal-safe)."""

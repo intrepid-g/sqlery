@@ -1,5 +1,7 @@
 """Precedents for the Worker party."""
 
+from datetime import timedelta
+
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
@@ -82,3 +84,18 @@ def test_a_beat_lifts_a_dead_worker_to_idle():
 def test_a_beat_leaves_a_busy_or_idle_worker_as_it_is():
     assert worker.status_after_beat("busy") == "busy"
     assert worker.status_after_beat("idle") == "idle"
+
+
+def test_an_unpaused_worker_may_claim():
+    assert worker.may_claim(None, timezone.now())
+
+
+def test_a_worker_paused_into_the_future_may_not_claim():
+    now = timezone.now()
+    assert not worker.may_claim(now + timedelta(seconds=1), now)
+
+
+def test_a_worker_may_claim_exactly_when_the_pause_passes():
+    now = timezone.now()
+    assert worker.may_claim(now, now)
+    assert worker.may_claim(now - timedelta(seconds=1), now)

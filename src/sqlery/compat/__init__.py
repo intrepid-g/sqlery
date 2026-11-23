@@ -183,6 +183,13 @@ class DatabaseBackend(ABC):
         """
         return False
 
+    def get_worker_paused_until(self, worker_id: str):
+        """The worker's ``paused_until`` (aware datetime) or ``None``; a plain read, no write.
+
+        Django mode only: the standalone backend has no pause column and returns ``None``.
+        """
+        return None
+
     def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
         """Store the forked child PID on the job's open execution attempt.
 
@@ -1042,6 +1049,10 @@ class AsyncDatabaseBackend(ABC):
     async def aupdate_heartbeat(self, worker_id) -> None:
         """Async analog of DatabaseBackend.refresh_worker_heartbeat."""
         pass
+
+    async def aget_paused_until(self, worker_id):
+        """Async analog of ``DatabaseBackend.get_worker_paused_until``; ``None`` = not paused."""
+        return None
 
     @abstractmethod
     async def aregister_worker(self, worker_id, metadata: dict) -> None:

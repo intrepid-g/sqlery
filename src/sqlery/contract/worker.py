@@ -41,3 +41,14 @@ def async_beat_interval(heartbeat_interval: float, poll_interval: float) -> floa
 def status_after_beat(status: str) -> str:
     """Clause WRK-5: a beat restores the worker's status (idle or busy), never leaves it dead."""
     return REVIVED_STATUS if status == DEAD_STATUS else status
+
+
+def may_claim(paused_until, now) -> bool:
+    """Clause WRK-6 (decision): a paused worker claims no new job until ``paused_until`` passes.
+
+    ``paused_until`` is ``None`` (never paused) or an aware datetime; ``now`` is aware too. A job
+    already running is not touched. The worker reads ``paused_until`` from the database once per
+    heartbeat interval (WRK-2) and keeps it, so a pause or an unpause takes effect within one
+    heartbeat interval, and a pause that runs out ends at ``paused_until`` with no read.
+    """
+    return paused_until is None or now >= paused_until
