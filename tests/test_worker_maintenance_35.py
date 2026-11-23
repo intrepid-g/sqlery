@@ -24,3 +24,21 @@ def test_a_tick_fails_the_job_a_dead_worker_left_running(mode):
     result = maintenance.maintenance_tick(mode.backend, None)
     assert result["zombies_failed"] == 1
     assert mode.backend.get_running_jobs() == []
+
+
+def test_failing_a_zombie_job_leaves_its_silent_worker_dead(mode):
+    if not isinstance(mode, DjangoMode):
+        return
+    from django.utils import timezone
+
+    from sqlery.django_sqlery.models import Worker
+
+    worker = "worker_deadhost_888888"
+    mode.backend.update_worker_heartbeat(worker, "busy")
+    job = mode.new_job()
+    assert mode.backend.claim_job(["default"], worker).id == job.id
+    Worker.objects.filter(node_id="deadhost", pid=888888).update(last_heartbeat=timezone.now() - timedelta(hours=8))
+    assert mode.backend.fail_zombie_job(job.id, "zombie")
+    row = Worker.objects.get(node_id="deadhost", pid=888888)
+    assert row.status == "dead"
+    assert row.last_heartbeat < timezone.now() - timedelta(hours=7)

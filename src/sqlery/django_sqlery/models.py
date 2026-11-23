@@ -1304,11 +1304,17 @@ class QueuedJob(models.Model):
             # from django.apps import apps  # moved to top-level
 
             Worker = apps.get_model("sqlery", "Worker")
-            Worker.objects.filter(id=self.worker_id, current_job_id=self.id).update(
+            now = timezone.now()
+            fresh = now - timedelta(seconds=get_setting("WORKER_ALIVE_TIMEOUT", 30))
+            held = Worker.objects.filter(id=self.worker_id, current_job_id=self.id)
+            # A silent worker (e.g. its job failed as a zombie) is dead: a fresh heartbeat
+            # here would hide it from cleanup_dead_workers (#35).
+            held.filter(last_heartbeat__lt=fresh).update(status="dead", current_job_id=None)
+            held.update(
                 status="idle",
                 # Old: current_job=None,
                 current_job_id=None,
-                last_heartbeat=timezone.now(),
+                last_heartbeat=now,
             )
         except Exception:
             pass
