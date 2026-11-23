@@ -16,9 +16,11 @@ from datetime import timedelta
 from typing import Any
 
 from django.db import connection
+from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
 from sqlery.compat import AsyncDatabaseBackend
+from sqlery.contract import worker as worker_contract
 from sqlery.core.attempts import OUTCOME_ABANDONED, OUTCOME_FAILED, OUTCOME_SUCCESS
 from sqlery.core.utils import reject_unawaited_coroutine
 
@@ -352,7 +354,14 @@ class DjangoAsyncBackend(AsyncDatabaseBackend):
 
     async def aupdate_heartbeat(self, worker_id) -> None:
         now = timezone.now()  # capture BEFORE await
-        await Worker.objects.filter(pk=worker_id).aupdate(last_heartbeat=now)
+        # Old: aupdate(last_heartbeat=now)  (left a dead-marked worker dead; #41, WRK-5)
+        await Worker.objects.filter(pk=worker_id).aupdate(
+            last_heartbeat=now,
+            status=Case(
+                When(status=worker_contract.DEAD_STATUS, then=Value(worker_contract.REVIVED_STATUS)),
+                default=F("status"),
+            ),
+        )
 
     async def aregister_worker(self, worker_id, metadata: dict) -> None:
         defaults: dict[str, Any] = {

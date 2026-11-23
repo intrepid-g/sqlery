@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import case, delete, select, text, update
 from sqlmodel import Field, SQLModel
 
 from sqlery.compat import AsyncDatabaseBackend, JobFencingError
@@ -40,6 +40,7 @@ from sqlery.core.attempts import (
     claim_verdict,
     decide_close,
 )
+from sqlery.contract import worker as worker_contract
 from sqlery.core import history as history_core
 from sqlery.core import ready as ready_core
 from sqlery.core import ready_sql
@@ -628,7 +629,17 @@ class SQLAlchemyAsyncBackend(AsyncDatabaseBackend):
         factory = get_async_session_factory()
         async with factory() as session:
             await session.execute(
-                update(Worker).where(Worker.id == worker_id).values(last_heartbeat=now)
+                update(Worker)
+                .where(Worker.id == worker_id)
+                # Old: .values(last_heartbeat=now)  (left a dead-marked worker dead; #41, WRK-5)
+                .values(
+                    last_heartbeat=now,
+                    status=case(
+                        (Worker.status == worker_contract.DEAD_STATUS,
+                         worker_contract.REVIVED_STATUS),
+                        else_=Worker.status,
+                    ),
+                )
             )
             await session.commit()
 

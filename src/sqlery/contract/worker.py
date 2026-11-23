@@ -5,6 +5,11 @@
 RELEASE_FIELDS = {"status": "idle", "current_job_id": None}
 RELEASE_STATEMENTS = 1
 
+# A beat is proof of life, so it takes a worker out of ``dead`` (#41). The async backends
+# write this as one CASE in their single heartbeat UPDATE, from these two constants.
+DEAD_STATUS = "dead"
+REVIVED_STATUS = "idle"
+
 
 def release_fields() -> dict:
     """Clause WRK-1: the columns a worker writes to itself when a job finishes."""
@@ -31,3 +36,8 @@ def idle_tick_interval(lease_secs: float, heartbeat_interval: float) -> float:
 def async_beat_interval(heartbeat_interval: float, poll_interval: float) -> float:
     """Clause WRK-4 (obligation): an async worker beats once per poll cycle at most."""
     return max(min(heartbeat_interval, poll_interval * 0.9), 0.0)
+
+
+def status_after_beat(status: str) -> str:
+    """Clause WRK-5: a beat restores the worker's status (idle or busy), never leaves it dead."""
+    return REVIVED_STATUS if status == DEAD_STATUS else status

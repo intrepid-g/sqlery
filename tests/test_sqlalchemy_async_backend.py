@@ -225,6 +225,19 @@ async def test_aregister_and_aunregister_worker(backend, session_factory):
         assert res.scalars().first() is None
 
 
+async def test_aupdate_heartbeat_lifts_a_dead_worker_to_idle_and_keeps_busy(
+    backend, session_factory
+):
+    dead, busy = uuid.uuid4(), uuid.uuid4()
+    for pid, (wid, status) in enumerate(((dead, "dead"), (busy, "busy")), start=1):
+        await backend.aregister_worker(wid, {"pid": pid, "status": status})
+    await backend.aupdate_heartbeat(dead)
+    await backend.aupdate_heartbeat(busy)
+    async with session_factory() as s:
+        assert (await s.get(Worker, dead)).status == "idle"
+        assert (await s.get(Worker, busy)).status == "busy"
+
+
 async def test_aupdate_heartbeat(backend, session_factory):
     wid = uuid.uuid4()
     await backend.aregister_worker(

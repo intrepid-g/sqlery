@@ -2186,7 +2186,8 @@ class WorkerProcess:
             with self.backend.idle_transaction():
                 self.backend.update_worker_heartbeat(
                     worker_id=self.worker_id,
-                    status=status,
+                    # Old: status=status  (a beat never wrote dead; clause WRK-5 now states it)
+                    status=worker_contract.status_after_beat(status),
                     current_job_id=job_id,
                     jobs_processed=self.jobs_processed,
                     total_busy_seconds=self.total_busy_seconds,

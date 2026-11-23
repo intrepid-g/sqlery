@@ -73,3 +73,12 @@ def test_releasing_a_worker_issues_one_statement_and_never_writes_last_heartbeat
     after = Worker.objects.get(id=row.id)
     assert (after.status, after.current_job_id) == ("idle", None)
     assert after.last_heartbeat == stale  # a silent worker keeps its stale beat
+
+
+def test_a_beat_lifts_a_dead_worker_to_idle():
+    assert worker.status_after_beat("dead") == "idle"
+
+
+def test_a_beat_leaves_a_busy_or_idle_worker_as_it_is():
+    assert worker.status_after_beat("busy") == "busy"
+    assert worker.status_after_beat("idle") == "idle"
