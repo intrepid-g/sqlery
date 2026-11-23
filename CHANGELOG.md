@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-11-22
+
+### Fixed
+
+- **A bare worker runs the daemon's housekeeping (#35).** A deploy that runs only `WorkerProcess` never failed zombie jobs, marked dead workers or dropped drained live partitions. After a host reboot, one zombie attempt blocked a queue for 8 hours. The worker that holds the scheduler lease now runs these sweeps when it wins the lease and then every `PARTITION_MAINTENANCE_INTERVAL_MINUTES`.
+- **Failing a zombie job no longer brings its dead worker back (#35).** The Django `_release_worker` set the worker to `idle` with a fresh heartbeat, so `cleanup_dead_workers` skipped it. A worker whose heartbeat is older than `WORKER_ALIVE_TIMEOUT` is now marked `dead`.
+
 ## [0.29.0] - 2026-11-22
 
 ### Added
