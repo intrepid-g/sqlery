@@ -583,6 +583,7 @@ class SQLAlchemyBackend(DatabaseBackend):
             lock = determine_claim_strategy(dialect) == "skip_locked"
             attempt_worker = self._attempt_worker_id(worker_id)
             cursor = None
+            queue_locks: dict = {}  # queue -> holds a live non-parallel lock, per claim scan
             while True:
                 entry = session.exec(
                     ready_sql.next_entry_stmt(queues, now, cursor, lock=lock)
@@ -625,6 +626,9 @@ class SQLAlchemyBackend(DatabaseBackend):
                     continue
                 if self._tag_limited(session, job, now):
                     session.commit()  # release the entry lock; the job stays ready
+                    continue
+                if self._queue_locked(session, job, queue_locks):
+                    session.commit()  # a live non-parallel holder (QL-2): the job stays ready
                     continue
 
                 # Claim: deleting the entry is the mutex (a lost race deletes nothing). The job
@@ -767,6 +771,26 @@ class SQLAlchemyBackend(DatabaseBackend):
             return session.exec(history_sql.latest_retry_stmt(job_id)).first()
 
         return ready_core.judge_dependencies(deps, rows.get, latest_retry, is_retry_pending)
+
+    def _queue_locked(self, session, job, cache: dict) -> bool:
+        """True if non-parallel ``job`` must wait for a live holder of its queue (QL-2)."""
+        from sqlery.core.claiming import QUEUE_LOCK_PREFIX, queue_locked
+
+        if getattr(job, "allow_parallel", True):
+            return False
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            # Serialize the check with the claim per queue until this transaction ends; a busy
+            # lock means another worker is claiming from this queue: skip, never wait.
+            # ponytail: SQLite takes no lock (as with tag limits); see core/claiming.py.
+            key = QUEUE_LOCK_PREFIX + job.queue_name
+            got = session.exec(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:t))").bindparams(t=key)
+            ).scalar()
+            if not got:
+                return True
+        return queue_locked(
+            job, lambda q: self._queue_lock_holders(session, q), cache
+        )
 
     def _tag_limited(self, session, job, now) -> bool:
         """True if claiming ``job`` now would exceed a tag concurrency/rate limit."""
@@ -2486,6 +2510,39 @@ class SQLAlchemyBackend(DatabaseBackend):
 
             count = session.exec(stmt).one()
             return count > 0
+
+    def queue_lock_holders(self, queue_name: str, exclude_job_id: int | None = None) -> list:
+        """The running jobs of a queue with their worker's liveness (clause QL-1)."""
+        with self._get_session() as session:
+            return self._queue_lock_holders(session, queue_name, exclude_job_id)
+
+    @staticmethod
+    def _queue_lock_holders(session, queue_name: str, exclude_job_id: int | None = None) -> list:
+        from sqlery.contract.queue_lock import Holder
+
+        def aware(dt):
+            return dt if dt is None or dt.tzinfo else dt.replace(tzinfo=UTC)
+
+        stmt = (
+            select(
+                QueuedJob.timeout_seconds,
+                JobAttempt.claimed_at,
+                Worker.status,
+                Worker.last_heartbeat,
+            )
+            .join(JobAttempt, and_(
+                JobAttempt.job_id == QueuedJob.id, JobAttempt.finished_at.is_(None)
+            ))
+            .outerjoin(Worker, Worker.id == JobAttempt.worker_id)
+            .where(QueuedJob.queue_name == queue_name, QueuedJob.status == "queued")
+        )
+        if exclude_job_id:
+            stmt = stmt.where(QueuedJob.id != exclude_job_id)
+        default_timeout = get_config("DEFAULT_TIMEOUT_SECONDS", 600)
+        return [
+            Holder(status, aware(beat), aware(claimed), timeout or default_timeout)
+            for timeout, claimed, status, beat in session.exec(stmt).all()
+        ]
 
     def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
         """Store the forked child PID on the job's open attempt.

@@ -316,8 +316,11 @@ for job in QueuedJob.objects.filter(status='pending')[:10]:
 python manage.py shell -c "
 from sqlery.models import QueuedJob
 
-# Check for blocking jobs
-running = QueuedJob.objects.filter(status='running', allow_parallel=False)
+# Check for blocking jobs: any running job in the queue blocks a non-parallel job, until
+# its worker is dead or silent for 3 x WORKER_ALIVE_TIMEOUT (#35).
+# Old: QueuedJob.objects.filter(status='running', allow_parallel=False) matched nothing:
+# a running job is a queued row with an open attempt (#157).
+running = QueuedJob.objects.running()
 print(f'Blocking jobs: {running.count()}')
 for job in running:
     print(f'  Queue: {job.queue_name}, Job: {job.id}')

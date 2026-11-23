@@ -1546,6 +1546,36 @@ class DjangoBackend(DatabaseBackend):
 
         return query.exists()
 
+    def queue_lock_holders(self, queue_name: str, exclude_job_id: int | None = None) -> list:
+        """The running jobs of a queue with their worker's liveness (clause QL-1)."""
+        from sqlery.contract.queue_lock import Holder
+
+        jobs = self.QueuedJob.objects.running().filter(queue_name=queue_name)
+        if exclude_job_id:
+            jobs = jobs.exclude(id=exclude_job_id)
+        timeouts = dict(jobs.values_list("id", "timeout_seconds"))
+        if not timeouts:
+            return []
+        attempts = list(
+            JobAttempt.objects.filter(job_id__in=list(timeouts), finished_at__isnull=True)
+            .values_list("job_id", "worker_id", "claimed_at")
+        )
+        workers = {
+            w.id: w
+            for w in self.Worker.objects.filter(id__in={a[1] for a in attempts if a[1]})
+        }
+        default_timeout = get_setting("DEFAULT_TIMEOUT_SECONDS", 600)
+        holders = []
+        for job_id, worker_id, claimed_at in attempts:
+            worker = workers.get(worker_id)
+            holders.append(Holder(
+                worker.status if worker else None,
+                worker.last_heartbeat if worker else None,
+                claimed_at,
+                timeouts.get(job_id) or default_timeout,
+            ))
+        return holders
+
     def update_job_child_pid(self, job_id: int, child_pid: int, created_at=None, attempt=None):
         """Store the forked child PID on the job's open attempt.
 

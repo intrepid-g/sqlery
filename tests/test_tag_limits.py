@@ -23,7 +23,7 @@ def backend(tmp_path, monkeypatch):
 def _mk(b, **kw):
     base = dict(
         task_path="os.getcwd", kwargs={}, queue_name="default", priority=0,
-        scheduled_at=None, max_retries=0, retry_backoff=1.0, allow_parallel=False,
+        scheduled_at=None, max_retries=0, retry_backoff=1.0, allow_parallel=True,
         timeout_seconds=None,
     )
     base.update(kw)

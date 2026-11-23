@@ -63,7 +63,7 @@ def _mk(backend, **kw):
         scheduled_at=None,
         max_retries=0,
         retry_backoff=1.0,
-        allow_parallel=False,
+        allow_parallel=True,  # the claim enforces allow_parallel=False (#35)
         timeout_seconds=None,
     )
     base.update(kw)
@@ -131,6 +131,7 @@ def _dj_job(**kw):
     kw.setdefault("task_path", "tests.tasks.dummy_task")
     kw.setdefault("queue_name", "default")
     kw.setdefault("status", "queued")
+    kw.setdefault("allow_parallel", True)  # the claim enforces allow_parallel=False (#35)
     if kw["status"] == "running":  # running = a queued row with an open attempt (#157)
         from tests.running_jobs import django_running_job
 

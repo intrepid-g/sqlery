@@ -10,6 +10,7 @@ def _job(**kw):
     kw.setdefault("task_path", "tests.tasks.dummy_task")
     kw.setdefault("queue_name", "default")
     kw.setdefault("status", "queued")
+    kw.setdefault("allow_parallel", True)  # the claim enforces allow_parallel=False (#35)
     return QueuedJob.objects.create(**kw)
 
 

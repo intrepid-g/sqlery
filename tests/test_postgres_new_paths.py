@@ -70,7 +70,7 @@ def pg_backend(monkeypatch):
 def _mk(backend, **kw):
     base = dict(task_path="operator.add", kwargs={"_args": [1, 2]}, queue_name="default",
                 priority=0, scheduled_at=None, max_retries=0, retry_backoff=1.0,
-                allow_parallel=False, timeout_seconds=None)
+                allow_parallel=True, timeout_seconds=None)  # #35: claim enforces False
     base.update(kw)
     return backend.create_job(**base)
 
@@ -195,6 +195,7 @@ def _dj_job(**kw):
     kw.setdefault("task_path", "tests.tasks.dummy_task")
     kw.setdefault("queue_name", "default")
     kw.setdefault("status", "queued")
+    kw.setdefault("allow_parallel", True)  # the claim enforces allow_parallel=False (#35)
     return QueuedJob.objects.create(**kw)
 
 

@@ -56,6 +56,38 @@ def _config_limits(name: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+QUEUE_LOCK_PREFIX = "__queue__:"  # tag-lock key that serializes a queue's lock check + claim
+
+
+def _alive_timeout() -> float:
+    try:
+        from sqlery.compat import get_config
+
+        return float(get_config("WORKER_ALIVE_TIMEOUT", 30))
+    except Exception:
+        return 30.0
+
+
+def queue_locked(job, holders_of, cache: dict | None = None) -> bool:
+    """True if ``job`` must wait for a live holder of its queue's lock (clause QL-2).
+
+    ``holders_of(queue_name)`` returns the queue's ``Holder`` rows; ``cache`` keeps one
+    answer per queue for one claim scan (most jobs are non-parallel: one query per queue,
+    not per candidate).
+    """
+    from sqlery.contract.queue_lock import must_wait
+
+    if getattr(job, "allow_parallel", True):
+        return False
+    queue = job.queue_name
+    if cache is not None and queue in cache:
+        return cache[queue]
+    locked = must_wait(False, holders_of(queue), datetime.now(timezone.utc), _alive_timeout())
+    if cache is not None:
+        cache[queue] = locked
+    return locked
+
+
 def check_tag_concurrency_limits(job, tag_limits: dict, backend) -> bool:
     """Check if job's tags would exceed configured concurrency limits.
 
@@ -286,6 +318,7 @@ def claim_next_job_with_queue_priority(
     # inspected-and-skipped id is excluded from the next page, so blocked jobs (unmet
     # dependencies, tag limits) at the head of the queue can never hide runnable work.
     seen: list = []
+    queue_locks: dict = {}  # queue -> holds a live non-parallel lock (QL-2), per claim scan
     while True:
         candidates = backend.get_claimable_jobs(
             queues=queues,
@@ -304,13 +337,15 @@ def claim_next_job_with_queue_priority(
             tag_concurrency_limits,
             tag_rate_limits,
             enable_registries,
+            queue_locks,
         )
         if job is not None:
             return job
 
 
 def _claim_from_candidates(
-    candidates, worker, backend, tag_concurrency_limits, tag_rate_limits, enable_registries
+    candidates, worker, backend, tag_concurrency_limits, tag_rate_limits, enable_registries,
+    queue_locks: dict | None = None,
 ):
     """Try each candidate in order; return the first one that passes every check and claims."""
     for job in candidates:
@@ -345,6 +380,16 @@ def _claim_from_candidates(
             continue
         if state != "met":
             continue
+
+        # Non-parallel job: skip it (it stays ready) while its queue has a live holder.
+        # The queue's tag lock serializes this check with the claim on PostgreSQL.
+        # ponytail: SQLite takes no lock here (as with tag limits), so two workers can claim
+        # two non-parallel jobs of one queue at once; a per-queue CAS row would close it.
+        if not getattr(job, "allow_parallel", True):
+            if backend.acquire_tag_locks([QUEUE_LOCK_PREFIX + job.queue_name]) is False:
+                continue
+            if queue_locked(job, backend.queue_lock_holders, queue_locks):
+                continue
 
         # All checks passed — atomically claim
         if not backend.atomic_claim_job(job, worker):

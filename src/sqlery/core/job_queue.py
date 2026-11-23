@@ -194,7 +194,7 @@ def enqueue(
         retry_backoff = get_config("DEFAULT_RETRY_BACKOFF", 1.0)
 
     if allow_parallel is None:
-        allow_parallel = False
+        allow_parallel = bool(get_config("DEFAULT_ALLOW_PARALLEL", False))
 
     # Use backend to create job
     backend = get_backend()
@@ -279,7 +279,7 @@ def enqueue_at(
         retry_backoff = get_config("DEFAULT_RETRY_BACKOFF", 1.0)
 
     if allow_parallel is None:
-        allow_parallel = False
+        allow_parallel = bool(get_config("DEFAULT_ALLOW_PARALLEL", False))
 
     # Ensure timezone-aware
     if run_at.tzinfo is None:

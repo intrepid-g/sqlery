@@ -33,7 +33,9 @@ def _spec(**kw):
         scheduled_at=None,
         max_retries=0,
         retry_backoff=1.0,
-        allow_parallel=False,
+        # Old: allow_parallel=False; the claim now enforces it (#35), so scenarios that claim
+        # several jobs of one queue use parallel jobs unless they test the lock.
+        allow_parallel=True,
         timeout_seconds=None,
     )
     base.update(TASK)

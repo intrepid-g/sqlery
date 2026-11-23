@@ -137,6 +137,7 @@ DEFAULTS = {
     # Retry settings
     "DEFAULT_MAX_RETRIES": 0,  # Default number of retries for failed jobs
     "DEFAULT_RETRY_BACKOFF": 1.0,  # Default backoff multiplier for retries
+    "DEFAULT_ALLOW_PARALLEL": False,  # enqueue() default; False serializes a queue (#35)
 
     # Tag-based concurrency limits
     "TAG_CONCURRENCY_LIMITS": {},  # e.g., {"acme-api": 1, "legacy-db": 2, "image-processing": 5}

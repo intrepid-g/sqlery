@@ -919,6 +919,21 @@ class DatabaseBackend(ABC):
         """
         pass
 
+    def queue_lock_holders(self, queue_name: str, exclude_job_id: int | None = None) -> list:
+        """The running jobs of a queue as ``contract.queue_lock.Holder`` rows (clause QL-1).
+
+        Default for backends that do not report holder liveness: every running job is a
+        live holder (the old queue-wide behavior; a dead holder blocks until a sweep).
+        """
+        from datetime import UTC, datetime
+
+        from sqlery.contract.queue_lock import Holder
+
+        if not self.has_running_jobs_in_queue(queue_name, exclude_job_id=exclude_job_id):
+            return []
+        now = datetime.now(UTC)
+        return [Holder("busy", now, now, 0)]
+
     @abstractmethod
     def release_job(self, job_id: int):
         """Release a claimed job back to queued status.

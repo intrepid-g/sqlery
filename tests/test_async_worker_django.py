@@ -54,7 +54,8 @@ async def _run(**limits) -> None:
 
 async def _enqueue(name: str, **kwargs) -> QueuedJob:
     return await QueuedJob.objects.acreate(
-        task_path=f"{__name__}.{name}", kwargs=kwargs, queue_name="default", status="queued"
+        task_path=f"{__name__}.{name}", kwargs=kwargs, queue_name="default", status="queued",
+        allow_parallel=True,  # the claim enforces allow_parallel=False (#35)
     )
 
 

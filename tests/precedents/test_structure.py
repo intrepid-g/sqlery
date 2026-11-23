@@ -33,12 +33,13 @@ def called_names(files) -> set[str]:
     return names
 
 
-def test_the_contract_has_the_six_parties():
+def test_the_contract_has_the_seven_parties():
     assert PARTIES == [
         "config",
         "database",
         "dead_worker_reaper",
         "lease_holder",
+        "queue_lock",
         "worker",
         "zombie_sweep",
     ]

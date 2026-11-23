@@ -59,7 +59,7 @@ Low-level, no decorator: `from sqlery import enqueue, enqueue_at, get_queue` and
 | `max_retries`, `retry_backoff` | Default 0 retries, backoff multiplier 1.0. A retry is a NEW job row (new id); the failed row becomes `archived`. `AsyncResult` follows retries (verified: 1 retry = 2 attempts, 2 ids). |
 | `autoretry_for`, `retry_backoff_max`, `retry_jitter`, `bind=True` | Celery-style retry policy. Needs `max_retries > 0`. With `autoretry_for` set, only matching exceptions retry; unset means any exception retries. |
 | `timeout` / `timeout_seconds`, `soft_time_limit` | Hard limit (job is killed) and catchable soft limit. Django `@job` default timeout is None; `DEFAULT_TIMEOUT_SECONDS` setting exists (600). |
-| `allow_parallel` | Django-flavoured `@job` defaults to True. Set False to serialize jobs of one queue. |
+| `allow_parallel` | Django-flavoured `@job` defaults to True; `enqueue()` defaults to `DEFAULT_ALLOW_PARALLEL` (False). False serializes jobs of one queue on every claim path (workers, async worker, Lambda, HTTP trigger). A holder whose worker is silent for 3 x `WORKER_ALIVE_TIMEOUT` stops blocking. |
 | `tags` | Used with `TAG_CONCURRENCY_LIMITS` / `TAG_RATE_LIMITS` settings. |
 
 ## Standalone mode

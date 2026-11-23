@@ -253,14 +253,13 @@ def test_allow_parallel_false_queue_serializes(mode):
     from sqlery.core.worker import JobExecutor
 
     executor = JobExecutor(backend=mode.backend)
-    first = mode.new_job()
-    second = mode.new_job()
+    first = mode.new_job(allow_parallel=False)
+    second = mode.new_job(allow_parallel=False)
     a = mode.claim()
     assert a.id == first.id and executor.can_execute_job(a)
-    b = mode.claim()  # the claim itself does not serialize ...
-    assert b.id == second.id
-    assert not executor.can_execute_job(b)  # ... the worker's check does, from the attempts
-    mode.backend.release_job(b.id)  # so it puts the job back
+    # Old: the claim returned ``second`` and only the worker's check refused it, so the worker
+    # released and re-claimed it in a loop (#35). The claim now skips it; it stays ready.
+    assert mode.claim() is None
     assert mode.ready() == {second.id}
     assert mode.backend.has_running_jobs_in_queue("default", exclude_job_id=second.id)
     mode.finish(a, ok=True)

@@ -415,6 +415,18 @@ def parallel_task():
     pass
 ```
 
+A non-parallel job waits while any job of its queue is running. The wait is a skip at
+claim time: later jobs, and jobs of other queues, still run. Every claim path enforces it:
+fork and prefork workers, the async worker, Lambda and the HTTP trigger.
+
+A running job stops blocking when its worker is marked dead or has been silent for
+3 x `WORKER_ALIVE_TIMEOUT` (90 s by default). A job with no registered worker (Lambda,
+trigger) stops blocking after its timeout plus 60 s. No zombie sweep is needed.
+
+`enqueue()` uses `DEFAULT_ALLOW_PARALLEL` (default `False`) when `allow_parallel` is not
+given. To keep jobs in one queue running at the same time on the async worker or a
+serverless path, set `DEFAULT_ALLOW_PARALLEL = True` or pass `allow_parallel=True`.
+
 ### Queue Routing
 
 Route job to specific queue:

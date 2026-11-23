@@ -80,7 +80,7 @@ def enqueue(task_path, queue=None, priority=None, max_retries=None, retry_backof
         retry_backoff = get_setting("DEFAULT_RETRY_BACKOFF", 1.0)
 
     if allow_parallel is None:
-        allow_parallel = False
+        allow_parallel = bool(get_setting("DEFAULT_ALLOW_PARALLEL", False))
 
     if tags is None:
         tags = []
@@ -166,7 +166,7 @@ def enqueue_at(task_path, run_at, queue=None, priority=None, max_retries=None, r
         retry_backoff = get_setting("DEFAULT_RETRY_BACKOFF", 1.0)
 
     if allow_parallel is None:
-        allow_parallel = False
+        allow_parallel = bool(get_setting("DEFAULT_ALLOW_PARALLEL", False))
 
     if tags is None:
         tags = []

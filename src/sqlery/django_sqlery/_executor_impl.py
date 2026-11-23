@@ -296,15 +296,15 @@ class TaskExecutor:
         if job.allow_parallel:
             return True
 
-        # Check for other running jobs in the SAME QUEUE (not task_path!)
-        has_running_in_queue = (
-            QueuedJob.objects.running()
-            .filter(queue_name=job.queue_name)  # Queue-level check
-            .exclude(id=job.id)
-            .exists()
-        )
+        # Old: any running job in the queue blocked, a dead holder too (#35); only a live
+        # holder blocks now (clause QL-2).
+        from sqlery.compat import get_backend
+        from sqlery.core.claiming import queue_locked
 
-        return not has_running_in_queue
+        backend = get_backend()
+        return not queue_locked(
+            job, lambda q: backend.queue_lock_holders(q, exclude_job_id=job.id)
+        )
 
     def execute_job(self, job):
         """Execute a single queued job.

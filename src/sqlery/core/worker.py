@@ -806,15 +806,13 @@ class JobExecutor:
 
     def can_execute_job(self, job) -> bool:
         """Check if job can be executed based on queue-level concurrency."""
-        if job.allow_parallel:
-            return True
+        # Old: has_running_jobs_in_queue, which counted a dead holder too (#35); only a
+        # live holder blocks now (clause QL-2).
+        from .claiming import queue_locked
 
-        has_running_in_queue = self.backend.has_running_jobs_in_queue(
-            job.queue_name,
-            exclude_job_id=job.id
+        return not queue_locked(
+            job, lambda q: self.backend.queue_lock_holders(q, exclude_job_id=job.id)
         )
-
-        return not has_running_in_queue
 
 
 @dataclass
