@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-23
+
 ### Fixed
 
 - **An async worker marked dead recovers on its next beat (#41).** `aupdate_heartbeat` wrote only `last_heartbeat`, so an async worker marked `dead` (for example after an `async def` job blocked the event loop for `WORKER_ALIVE_TIMEOUT`) kept beating and stayed dead, while a sync worker recovered. Both async backends now restore `dead` to `idle` in the same single UPDATE (no extra statement), and the sync worker heartbeat states the same rule. Clause `WRK-5`.
