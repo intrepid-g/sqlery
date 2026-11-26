@@ -20,6 +20,7 @@ from sqlery.core.attempts import (
     AttemptHandle,
     new_token,
 )
+from sqlery.core.claiming import get_node_id
 from sqlery.core.models import JobAttempt, QueuedJob
 
 
@@ -138,6 +139,7 @@ def new_attempt(job_id, worker_id, now: datetime) -> JobAttempt:
         token=new_token(),
         worker_id=worker_id,
         worker_pid=os.getpid(),
+        node_id=get_node_id(),
         claimed_at=now,
     )
 

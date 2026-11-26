@@ -36,6 +36,8 @@ from sqlery.core.retry import (
     retry_countdown,
     shape_retry_delay,
 )
+from sqlery.contract.zombie_sweep import pid_probe_applies
+from sqlery.core.claiming import get_node_id
 from sqlery.core.ready import SLOTS
 from sqlery.core.signals import task_retry
 from sqlery.core.utils import describe_task_args
@@ -663,11 +665,16 @@ class TaskExecutor:
 
         In the run_jobs model the claiming process IS the executing process, so a
         dead PID proves nobody is executing the job. Scoped to rows with no worker
-        row (worker_id IS NULL) because that is by construction the single-container
-        path — a PID is meaningless across nodes, where the time threshold in
+        row (worker_id IS NULL), and only to attempts claimed on this node (clause
+        ZS-1a): a PID is meaningless across nodes, where the time threshold in
         _cleanup_stale_jobs remains the correct fallback. Jobs already past that
         threshold are left to the existing path so its kill-the-hung-process
         behaviour is preserved.
+
+        # Old: assumed worker_id IS NULL meant a single container and probed every
+        # such PID locally. With 2+ web containers on one PostgreSQL, container B
+        # found container A's PID missing in its own PID namespace, failed A's live
+        # job and ran the retry alongside it (#47).
         """
         now = timezone.now()
         # Running jobs whose attempt names no worker row: the claimer is a bare process. When it
@@ -682,12 +689,13 @@ class TaskExecutor:
             job.show_running(open_attempts[job.id])
             for job in QueuedJob.objects.running().filter(id__in=list(open_attempts))
         ]
-        pids = {job_id: a.worker_pid for job_id, a in open_attempts.items()}
+        current_node = get_node_id()
 
         for job in candidates:
-            pid = pids.get(job.id)
-            if not pid:
-                continue
+            attempt = open_attempts[job.id]
+            pid = attempt.worker_pid
+            if not pid_probe_applies(pid, attempt.node_id, current_node):
+                continue  # claimed on another node (or before nodes were recorded)
             threshold_seconds = job.timeout_seconds * 2 if job.timeout_seconds else 3600
             if (now - job.started_at).total_seconds() > threshold_seconds:
                 continue  # already stale — the existing path handles (and kills) it
@@ -800,10 +808,18 @@ class TaskExecutor:
             running_duration = (now - job.started_at).total_seconds()
 
             if running_duration > threshold_seconds:
-                # Try to kill the worker process if PID is stored and process exists
+                # Try to kill the worker process if PID is stored and process exists.
+                # Only on the node that claimed the job (clause ZS-1a): elsewhere the PID
+                # names an unrelated local process. Never this process itself.
+                # Old: killed JobAttempt.process_ids(job)[0] on any node (#47).
                 kill_method = None
-                worker_pid, _child_pid = JobAttempt.process_ids(job)
-                if worker_pid:
+                attempt = open_attempts.get(job.id)
+                worker_pid = attempt.worker_pid if attempt is not None else None
+                if (
+                    attempt is not None
+                    and pid_probe_applies(worker_pid, attempt.node_id, get_node_id())
+                    and worker_pid != os.getpid()
+                ):
                     kill_method = self._kill_worker_process(worker_pid)
                     if kill_method:
                         logger.warning(

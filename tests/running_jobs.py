@@ -15,11 +15,18 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def django_make_running(job, started_at=None, worker=None, worker_pid=None, child_pid=None):
+_THIS_NODE = object()
+
+
+def django_make_running(
+    job, started_at=None, worker=None, worker_pid=None, child_pid=None, node_id=_THIS_NODE
+):
     """Make an existing Django ``QueuedJob`` running (no ready entry, one open attempt).
 
-    ``worker`` is a Worker row (or None); returns the job reloaded (shown running).
+    ``worker`` is a Worker row (or None); ``node_id`` defaults to this node, as a claim
+    writes it (#47). Returns the job reloaded (shown running).
     """
+    from sqlery.core.claiming import get_node_id
     from sqlery.django_sqlery import ready
     from sqlery.django_sqlery.models import JobAttempt
 
@@ -31,6 +38,7 @@ def django_make_running(job, started_at=None, worker=None, worker_pid=None, chil
         worker_pid=worker_pid,
         child_pid=child_pid,
         claimed_at=started_at or _now(),
+        node_id=get_node_id() if node_id is _THIS_NODE else node_id,
     )
     job.refresh_from_db()
     return job
@@ -43,7 +51,9 @@ def django_running_job(**fields):
     from sqlery.django_sqlery.models import QueuedJob
 
     attempt = {
-        k: fields.pop(k) for k in ("started_at", "worker", "worker_pid", "child_pid") if k in fields
+        k: fields.pop(k)
+        for k in ("started_at", "worker", "worker_pid", "child_pid", "node_id")
+        if k in fields
     }
     fields.pop("status", None)
     job = QueuedJob.objects.create(status="queued", **fields)

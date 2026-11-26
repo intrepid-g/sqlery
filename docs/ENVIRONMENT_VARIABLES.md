@@ -224,6 +224,26 @@ DJANGO_SQL_JOBS = {
 
 ---
 
+#### `NODE_ID`
+
+**Purpose:** Name of this machine or container in the job tables (both modes)
+
+**Type:** String
+
+**Example:**
+```bash
+export NODE_ID=web-2
+```
+
+**Default:** the hostname
+
+**Notes:**
+- Every claim records its node, and workers and daemons register under it.
+- A PID is only probed or signalled on the node that recorded it, so one container never reaps or kills another container's job (#47).
+- Each container or machine needs its own value. The hostname is unique per container on Kubernetes, ECS and plain Docker, but replicas that share one (host networking, a fixed `hostname:` in Compose, the same `NODE_ID` in a shared env file) must set `NODE_ID` to a distinct value per replica.
+
+---
+
 ### Trigger Mode Configuration
 
 #### `DJANGO_SQL_JOBS_TRIGGER_MODE`

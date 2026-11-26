@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A web container no longer reaps or kills another container's job (#47).** With `ENABLE_DAEMON=False` and 2+ containers on one PostgreSQL, `run_jobs` in container B probed the PID of a job running in container A, found it missing in its own PID namespace, failed the live job and ran the retry alongside it. Its stale-job pass could also SIGTERM/SIGKILL an unrelated local process that reused the PID. Each attempt now records the claiming node (`sqlery_job_attempt.node_id`, Django migration `0043`, Alembic `20261126_0024`), and the orphan probe and the stale kill run only for attempts claimed on the current node (clause `ZS-1a`). A job of another node, or claimed before the upgrade, still fails at the time threshold, without a signal. Replicas that share a hostname must set a distinct `NODE_ID`.
+
 ## [0.30.0] - 2026-11-23
 
 ### Fixed
