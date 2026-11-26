@@ -58,6 +58,35 @@ async def test_standalone_enqueue_then_worker_runs_job(standalone):
     assert (await backend.aget_job(job.id)).output == "5"
 
 
+@pytest.mark.parametrize("use_async_backend", [False, True])
+async def test_standalone_async_queue_reads_jobs(standalone, use_async_backend, monkeypatch):
+    from sqlery.async_queue import AsyncQueue
+    from sqlery.fastapi_sqlery.async_backend import SQLAlchemyAsyncBackend
+
+    monkeypatch.setattr(AsyncQueue, "_default_backend", None)
+    backend = SQLAlchemyAsyncBackend() if use_async_backend else None
+    queue = AsyncQueue(backend=backend)
+    job = await queue.enqueue(add_181, 2, b=3)
+
+    assert (await queue.get_job(job.id)).status == "queued"
+    assert await queue.get_job(job.id + 1) is None
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("use_async_backend", [False, True])
+async def test_django_async_queue_reads_jobs(monkeypatch, use_async_backend):
+    from sqlery.async_queue import AsyncQueue
+    from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
+
+    monkeypatch.setattr(AsyncQueue, "_default_backend", None)
+    backend = DjangoAsyncBackend() if use_async_backend else None
+    queue = AsyncQueue(backend=backend)
+    job = await queue.enqueue(add_181, 2, b=3)
+
+    assert (await queue.get_job(job.id)).status == "queued"
+    assert await queue.get_job(job.id + 1) is None
+
+
 @pytest.mark.django_db(transaction=True)
 async def test_django_enqueue_then_worker_runs_job():
     from sqlery.django_sqlery.async_backend import DjangoAsyncBackend
