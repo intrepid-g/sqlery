@@ -36,6 +36,27 @@ def process_gone_on_this_node(
     )
 
 
+def silence_since(last_heartbeat: datetime | None, watched_since: datetime | None):
+    """Clause DWR-4: silence counts only while the watcher could reach the database.
+
+    A worker cannot beat while the database is down, so after an outage every beat looks old.
+    The watcher (the daemon) passes when it last regained the database; a beat older than
+    that counts from then. ``watched_since`` None means no outage is known (bare workers).
+    """
+    if last_heartbeat is None or watched_since is None:
+        return last_heartbeat
+    return max(last_heartbeat, watched_since)
+
+
+def left_to_safety_net(pid_exists: bool | None, started_by_pool: bool) -> bool:
+    """Clause DWR-1c: a live process this pool started is not just marked dead on silence.
+
+    Marking it dead would fail its job (clause ZS-3) while the process, and its job child,
+    keep running. The safety net kills it first (clause DWR-2), then marks it dead (#48).
+    """
+    return bool(pid_exists) and started_by_pool
+
+
 def reap_verdict(
     *,
     status: str | None,
@@ -44,13 +65,19 @@ def reap_verdict(
     now: datetime,
     pid_exists: bool | None,
     alive_timeout: float,
+    watched_since: datetime | None = None,
+    started_by_pool: bool = False,
 ) -> str | None:
     """Decision: why to mark this worker dead, or None to leave it.
 
     ``alive_timeout`` is WORKER_ALIVE_TIMEOUT, the one limit for dead (Clause DB-1 agrees).
     ``pid_exists`` is None unless the worker runs on this node, where a missing process is
-    proof of death even while its last beat is still recent.
+    proof of death even while its last beat is still recent. ``watched_since`` and
+    ``started_by_pool`` come from a daemon's pool (clauses DWR-4 and DWR-1c).
     """
+    if left_to_safety_net(pid_exists, started_by_pool):
+        return None
+    last_heartbeat = silence_since(last_heartbeat, watched_since)
     if is_silent_past(status, pid, last_heartbeat, now, alive_timeout):
         age = int((now - last_heartbeat).total_seconds())
         return f"heartbeat too old ({age}s > {alive_timeout:g}s threshold)"
@@ -67,8 +94,16 @@ def probe_found_process(probe_error: OSError | None) -> bool:
     return not isinstance(probe_error, ProcessLookupError)
 
 
-def safety_net_action(heartbeat_age: float, stale_after: float, process_exists: bool) -> str:
-    """Clause DWR-2: 'keep', 'mark_dead' (process gone) or 'kill' (alive but unresponsive)."""
+def safety_net_action(
+    heartbeat_age: float, stale_after: float, process_exists: bool, started_by_pool: bool = True
+) -> str:
+    """Clause DWR-2: 'keep', 'mark_dead' (process gone) or 'kill' (alive but unresponsive).
+
+    Only a process the pool started is killed: the PID of any other row may have been reused
+    by an unrelated process (#48).
+    """
     if heartbeat_age <= stale_after:
         return "keep"
-    return "kill" if process_exists else "mark_dead"
+    if not process_exists:
+        return "mark_dead"
+    return "kill" if started_by_pool else "keep"

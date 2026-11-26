@@ -135,3 +135,14 @@ def test_each_check_speaks_for_its_own_fault_when_asked_alone():
         "Worker w1 heartbeat stale"
     )
     assert zs.unassigned_job_is_zombie(rec(has_worker=False), NOW, 30, False) is not None
+
+
+def test_stale_heartbeat_counts_only_from_when_the_daemon_regained_the_database():
+    """After an outage every beat is old; the workers get a cycle to beat again (#48)."""
+    silent = rec(worker_last_heartbeat=ago(500))
+    assert zs.heartbeat_is_stale(silent, NOW, 30, watched_since=ago(10)) is None
+    assert zs.heartbeat_is_stale(silent, NOW, 30, watched_since=ago(100)) is not None
+    assert zs.zombie_verdict(
+        silent, now=NOW, alive_timeout=30, pid_alive=None, concurrent_workers=False,
+        watched_since=ago(10),
+    ) is None

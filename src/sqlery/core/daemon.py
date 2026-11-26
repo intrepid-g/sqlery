@@ -570,6 +570,10 @@ class DaemonManager:
 
         last_partition_maintenance_at: datetime | None = None
 
+        # When this daemon last regained the database (clause DWR-4): worker silence counts
+        # only from then, so a database outage does not read as every worker hanging (#48).
+        db_watched_since: datetime | None = None
+
         # Track shutdown state
         shutdown_requested = False
 
@@ -605,14 +609,19 @@ class DaemonManager:
                         owned_queues |= newly_claimed
                         logger.info(f"Acquired scheduler leases for: {sorted(newly_claimed)}")
 
-                # Update heartbeats for live worker processes.
-                # The daemon is the "always on" parent — it refreshes each
-                # worker's heartbeat as long as the worker PID is alive,
-                # so a busy worker blocked on a long job stays healthy.
+                # Ask each live local worker to beat (SIGUSR1) and mark gone PIDs dead.
+                # Workers write their own beats; a failure here means the database is out
+                # of reach, and silence stops counting until it is back (clause DWR-4).
+                # Old: "the daemon refreshes each worker's heartbeat as long as the worker
+                # PID is alive" — that kept a hung worker looking alive forever (#48).
                 try:
                     self._heartbeat_workers(backend, worker_pool)
+                    if db_watched_since is None:
+                        db_watched_since = datetime.now(timezone.utc)
                 except Exception as e:
+                    db_watched_since = None
                     logger.error(f"Worker heartbeat error: {e}", exc_info=True)
+                worker_pool.watched_since = db_watched_since
 
                 # --- Coordinator work — scoped to owned queues only ---
                 # Run scheduler (create jobs from scheduled tasks)
@@ -623,9 +632,21 @@ class DaemonManager:
                 except Exception as e:
                     logger.error(f"Scheduler error: {e}", exc_info=True)
 
+                # Kill hung local workers (and their job children) before the zombie sweep
+                # fails their jobs, so a retry never runs beside a still-running child (#48).
+                # Old: ran after ensure_workers, at the end of the cycle.
+                try:
+                    irregularities = worker_pool.detect_and_fix_irregularities()
+                    if any(irregularities.values()):
+                        logger.warning(f"Detected and fixed irregularities: {irregularities}")
+                except Exception as e:
+                    logger.error(f"Irregularity detection error: {e}", exc_info=True)
+
                 # Validate running jobs — fail any whose worker process is dead
                 try:
-                    self._fail_zombie_running_jobs(backend, queue_names=owned_queues)
+                    self._fail_zombie_running_jobs(
+                        backend, queue_names=owned_queues, watched_since=db_watched_since
+                    )
                 except Exception as e:
                     logger.error(f"Zombie job cleanup error: {e}", exc_info=True)
 
@@ -640,14 +661,6 @@ class DaemonManager:
                         logger.info(f"Cleaned up {status['cleaned_up']} dead workers")
                 except Exception as e:
                     logger.error(f"Worker pool error: {e}", exc_info=True)
-
-                # Detect and fix irregularities (stuck workers, timed out jobs, etc.)
-                try:
-                    irregularities = worker_pool.detect_and_fix_irregularities()
-                    if any(irregularities.values()):
-                        logger.warning(f"Detected and fixed irregularities: {irregularities}")
-                except Exception as e:
-                    logger.error(f"Irregularity detection error: {e}", exc_info=True)
 
                 # Purge dead worker rows after grace period
                 try:
@@ -867,7 +880,9 @@ class DaemonManager:
     # Workers now run as independent subprocesses via worker_runner.
 
     @staticmethod
-    def _fail_zombie_running_jobs(backend, queue_names=None, concurrent_workers=False):
+    def _fail_zombie_running_jobs(
+        backend, queue_names=None, concurrent_workers=False, watched_since=None
+    ):
         """Fail running jobs that are no longer being executed.
 
         Mode-agnostic: operates on ``RunningJobLiveness`` records supplied by
@@ -890,6 +905,8 @@ class DaemonManager:
                 worker's single ``current_job`` says nothing about the others (check 4 is
                 skipped), and a job without a worker is only a zombie once it has been
                 running longer than ``WORKER_ALIVE_TIMEOUT`` (claim→register window).
+            watched_since: When the calling daemon last regained the database; worker
+                silence counts from then at the earliest (clause DWR-4).
         """
         # Old: five inline checks here; they are clauses ZS-1..ZS-5 in contract/zombie_sweep.py
         alive_timeout = get_config("WORKER_ALIVE_TIMEOUT", ALIVE_TIMEOUT_DEFAULT)
@@ -907,6 +924,7 @@ class DaemonManager:
                 alive_timeout=alive_timeout,
                 pid_alive=pid_alive,
                 concurrent_workers=concurrent_workers,
+                watched_since=watched_since,
             )
             if reason:
                 # fail_zombie_job closes the open attempt as 'abandoned' in the same
@@ -1125,7 +1143,17 @@ class DaemonManager:
 
         If the PID is gone, marks the worker as dead immediately.
         """
-        workers = backend.get_worker_heartbeats(active_only=True)
+        # The active rows, plus every worker this daemon's pool started: a worker silent past
+        # WORKER_ALIVE_TIMEOUT (after a database outage, say) must still be asked to beat, or
+        # an idle one never would (it beats on SIGUSR1) and the safety net would kill it (#48).
+        # Rows of other silent workers are left alone: their PID may now be another process.
+        # Old: get_worker_heartbeats(active_only=True) only.
+        active = {
+            str(w.get("id") if isinstance(w, dict) else getattr(w, "id", None))
+            for w in backend.get_worker_heartbeats(active_only=True)
+        }
+        started = worker_pool.started_pids() if worker_pool is not None else set()
+        workers = backend.get_worker_heartbeats(active_only=False)
 
         for worker in workers:
             # Extract node_id and pid
@@ -1133,11 +1161,15 @@ class DaemonManager:
                 w_node = worker.node_id
                 w_pid = worker.pid
                 w_id = worker.id
+                w_status = getattr(worker, "status", None)
             elif isinstance(worker, dict):
                 w_node = worker.get("node_id")
                 w_pid = worker.get("pid", 0)
                 w_id = worker.get("id")
+                w_status = worker.get("status")
             else:
+                continue
+            if str(w_id) not in active and w_pid not in started:
                 continue
 
             # Only manage workers on this node (skip daemon rows and other nodes)
@@ -1169,11 +1201,13 @@ class DaemonManager:
                 #     status=current_status or 'busy',
                 #     current_job_id=current_job_id,
                 # )
-                # Bump heartbeat timestamp only — worker owns status/current_job.
-                # This keeps the worker alive even if SIGUSR1 can't be delivered
-                # (e.g. blocked in C-level call).
-                backend.refresh_worker_heartbeat(w_id)
-            else:
+                # Old: backend.refresh_worker_heartbeat(w_id) — "keeps the worker alive even
+                # if SIGUSR1 can't be delivered (e.g. blocked in C-level call)". It also kept
+                # a hung or frozen worker alive forever: its beat was always seconds old, so
+                # the safety net (DWR-2) and the zombie sweep (ZS-5) never fired (#48). The
+                # worker beats on its own: on SIGUSR1 when idle, and every heartbeat
+                # interval from the parent while a job child runs (clause WRK-2).
+            elif w_status != "dead":
                 # PID gone — mark dead and clear current_job
                 backend.update_worker_heartbeat(
                     worker_id=str(w_id),

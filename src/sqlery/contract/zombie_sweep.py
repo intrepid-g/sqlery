@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 
+from sqlery.contract.dead_worker_reaper import silence_since
 from sqlery.core.liveness import RunningJobLiveness
 
 # The heartbeat may lag the daemon's cycle by timing jitter: stale means 3 timeouts silent.
@@ -72,10 +73,19 @@ def worker_abandoned_job(
     return None
 
 
-def heartbeat_is_stale(rec: RunningJobLiveness, now: datetime, alive_timeout: float) -> str | None:
-    """Clause ZS-5: the assigned worker has been silent past ``stale_threshold``."""
+def heartbeat_is_stale(
+    rec: RunningJobLiveness,
+    now: datetime,
+    alive_timeout: float,
+    watched_since: datetime | None = None,
+) -> str | None:
+    """Clause ZS-5: the assigned worker has been silent past ``stale_threshold``.
+
+    Silence counts from ``watched_since`` at the earliest (clause DWR-4): after a database
+    outage every beat is old, and the workers need a cycle to beat again.
+    """
     threshold = stale_threshold(alive_timeout)
-    beat = rec.worker_last_heartbeat
+    beat = silence_since(rec.worker_last_heartbeat, watched_since)
     if rec.has_worker and beat and beat < now - timedelta(seconds=threshold):
         age = int((now - beat).total_seconds())
         return f"Worker {rec.worker_friendly_name} heartbeat stale ({age}s old, threshold {threshold}s)"
@@ -89,6 +99,7 @@ def zombie_verdict(
     alive_timeout: float,
     pid_alive: bool | None,
     concurrent_workers: bool,
+    watched_since: datetime | None = None,
 ) -> str | None:
     """Decision: the reason to fail this running job, or None to leave it. First check wins."""
     return (
@@ -96,5 +107,5 @@ def zombie_verdict(
         or unassigned_job_is_zombie(rec, now, alive_timeout, concurrent_workers)
         or worker_marked_dead(rec)
         or worker_abandoned_job(rec, now, alive_timeout, concurrent_workers)
-        or heartbeat_is_stale(rec, now, alive_timeout)
+        or heartbeat_is_stale(rec, now, alive_timeout, watched_since)
     )

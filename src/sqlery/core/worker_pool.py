@@ -63,6 +63,8 @@ class WorkerPoolManager:
         self.node_id = self._get_node_id()
         self._child_processes: list = []  # Popen / LaunchedWorker handles, for reaping
         self._launcher: WorkerLauncher | None = None  # started on the first forked worker
+        # When the daemon last regained the database (clause DWR-4); None outside a daemon.
+        self.watched_since: datetime | None = None
 
     def close(self) -> None:
         """Stop the worker launcher, if one was started (workers are stopped separately)."""
@@ -200,6 +202,14 @@ class WorkerPoolManager:
                 logger.debug(f"Reaped worker process PID {proc.pid} (exit code {ret})")
         self._child_processes = still_alive
 
+    def started_pids(self) -> set[int]:
+        """PIDs of the workers this pool started that are still running.
+
+        Only these may be killed for silence: the PID of any other worker row may belong to
+        an unrelated process by now (#48).
+        """
+        return {proc.pid for proc in self._child_processes if proc.poll() is None}
+
     @staticmethod
     def _pid_exists(pid: int) -> bool:
         """Edge: does the PID exist? Delegates to clause DWR-3 (EPERM counts as alive, #40)."""
@@ -223,6 +233,7 @@ class WorkerPoolManager:
         now = datetime.now(timezone.utc)
         alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', ALIVE_TIMEOUT_DEFAULT)
 
+        started = self.started_pids()
         cleaned = 0
         for worker in workers:
             # Get worker node_id
@@ -252,9 +263,13 @@ class WorkerPoolManager:
 
             # Old: inline heartbeat-age and PID checks (clauses DWR-1 and reap_verdict)
             pid_exists = self._pid_exists(pid) if on_this_node else None
+            if isinstance(last_heartbeat, str):
+                last_heartbeat = isoparse(last_heartbeat)
             reason = dead_worker_reaper.reap_verdict(
                 status=status, pid=pid, last_heartbeat=last_heartbeat, now=now,
                 pid_exists=pid_exists, alive_timeout=alive_timeout,
+                watched_since=self.watched_since,
+                started_by_pool=on_this_node and pid in started,
             )
             is_dead = reason is not None
 
@@ -547,6 +562,21 @@ class WorkerPoolManager:
             'workers': node_workers,
         }
 
+    def _process_gone(self, pid: int) -> bool:
+        """True once ``pid`` has exited, reaping it when this pool started it.
+
+        A worker started by this pool stays a zombie (``kill(pid, 0)`` succeeds) until its
+        ``Popen`` is polled, so polling is the only way to see it gone.
+        """
+        for proc in self._child_processes:
+            if proc.pid == pid:
+                return proc.poll() is not None
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        return False
+
     def _kill_worker_process(self, pid: int) -> bool:
         """Kill a worker process by PID.
 
@@ -578,10 +608,9 @@ class WorkerPoolManager:
             # Wait up to 5 seconds for graceful shutdown
             for _ in range(10):
                 time.sleep(0.5)
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    # Process terminated
+                # Old: os.kill(pid, 0) — a worker this pool started stays a zombie until its
+                # Popen is polled, so the probe saw it alive and every kill "failed" (#48).
+                if self._process_gone(pid):
                     logger.info(f"Worker process {pid} terminated gracefully")
                     return True
 
@@ -591,9 +620,7 @@ class WorkerPoolManager:
 
             # Wait briefly for SIGKILL
             time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if self._process_gone(pid):
                 logger.info(f"Worker process {pid} killed with SIGKILL")
                 return True
 
@@ -603,6 +630,38 @@ class WorkerPoolManager:
         except Exception as e:
             logger.error(f"Error killing worker process {pid}: {e}")
             return False
+
+    def _kill_job_child(self, worker_id: str, job_id) -> int | None:
+        """SIGKILL the job child of a hung worker, with its process group (#48).
+
+        The child is read from the job's open attempt, and only when that attempt belongs to
+        ``worker_id``. A forked job child leads its own process group (``os.setpgrp``), so the
+        group takes the job's own subprocesses with it. Returns the child PID, or None.
+        """
+        if not job_id:
+            return None
+        try:
+            attempt = self.backend.get_open_attempts([job_id]).get(job_id)
+        except Exception as e:
+            logger.warning(f"Safety net: could not read the attempt of job {job_id}: {e}")
+            return None
+        if attempt is None or str(attempt.worker_id) != worker_id:
+            return None
+        child = attempt.child_pid
+        if not child or child <= 0 or child == os.getpid() or child == os.getpgrp():
+            return None  # never a process group of ours
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            try:
+                os.kill(child, signal.SIGKILL)  # not a group leader: the child alone
+            except ProcessLookupError:
+                return None  # already gone
+        except PermissionError:
+            logger.warning(f"Safety net: not allowed to kill job child {child}")
+            return None
+        logger.warning(f"Safety net: killed job child {child} of hung worker {worker_id}")
+        return child
 
     def detect_and_fix_irregularities(self) -> dict:
         """Last-resort safety net for worker/job state inconsistencies.
@@ -629,47 +688,56 @@ class WorkerPoolManager:
             'details': [],
         }
 
-        # Get active workers on this node
-        workers = self.backend.get_worker_heartbeats(active_only=True)
-        node_workers = [w for w in workers if (
-            (hasattr(w, 'node_id') and w.node_id == self.node_id) or
-            (isinstance(w, dict) and w.get('node_id') == self.node_id)
-        ) and (
-            (hasattr(w, 'pid') and w.pid > 0) or
-            (isinstance(w, dict) and w.get('pid', 0) > 0)
-        )]
+        # Every worker row on this node, the dead and the silent included: a hung worker is
+        # silent, so the reaper marks it dead after WORKER_ALIVE_TIMEOUT while its process
+        # (and job child) keep running. It is the one this check is for.
+        # Old: get_worker_heartbeats(active_only=True) — that excludes every row silent for
+        # WORKER_ALIVE_TIMEOUT, so no row could ever reach the 3x stale threshold (#48).
+        workers = self.backend.get_worker_heartbeats(active_only=False)
+        started = self.started_pids()
 
-        # Only check: workers whose heartbeat is stale despite SIGUSR1.
-        # The daemon sends SIGUSR1 every cycle (~10s). If a worker can't
-        # respond for WORKER_ALIVE_TIMEOUT * 3, it's truly stuck.
+        # Workers whose heartbeat is stale despite SIGUSR1. The daemon sends SIGUSR1 every
+        # cycle (~10s) and no longer writes the beat itself (#48): a worker that cannot
+        # answer for WORKER_ALIVE_TIMEOUT * 3 is truly stuck.
         alive_timeout = get_config('WORKER_ALIVE_TIMEOUT', ALIVE_TIMEOUT_DEFAULT)
         # Old: stale_threshold = alive_timeout * 3  (clause ZS-0)
         stale_threshold = zombie_sweep.stale_threshold(alive_timeout)
 
-        for worker in node_workers:
-            if hasattr(worker, 'last_heartbeat'):
-                last_heartbeat = worker.last_heartbeat
-            elif isinstance(worker, dict):
-                # from dateutil.parser import isoparse  # moved to top-level (try/except)
-                last_heartbeat = isoparse(worker['last_heartbeat']) if worker.get('last_heartbeat') else None
-            else:
+        for worker in workers:
+            row = worker if isinstance(worker, dict) else None
+            node_id = row.get('node_id') if row is not None else getattr(worker, 'node_id', None)
+            pid = (row.get('pid') if row is not None else getattr(worker, 'pid', None)) or 0
+            worker_id = str(row.get('id') if row is not None else getattr(worker, 'id', None))
+            status = row.get('status') if row is not None else getattr(worker, 'status', None)
+            last_heartbeat = (
+                row.get('last_heartbeat') if row is not None
+                else getattr(worker, 'last_heartbeat', None)
+            )
+            current_job_id = (
+                row.get('current_job_id') if row is not None
+                else getattr(worker, 'current_job_id', None)
+            )
+            if node_id != self.node_id or pid <= 0 or pid == os.getpid():
+                continue  # another node's worker, or a daemon row
+            if worker_id.startswith('daemon_') or not last_heartbeat:
                 continue
+            if isinstance(last_heartbeat, str):
+                last_heartbeat = isoparse(last_heartbeat)
 
-            if not last_heartbeat:
-                continue
-
-            heartbeat_age = (now - last_heartbeat).total_seconds()
-            pid = worker.pid if hasattr(worker, 'pid') else worker.get('pid')
-            worker_id = str(worker.id) if hasattr(worker, 'id') else str(worker.get('id'))
-
+            # Old: heartbeat_age = (now - last_heartbeat)  (an outage made every beat stale)
+            heartbeat_age = (
+                now - dead_worker_reaper.silence_since(last_heartbeat, self.watched_since)
+            ).total_seconds()
             # Old: if heartbeat_age <= stale_threshold: continue; then an inline os.kill probe
             action = dead_worker_reaper.safety_net_action(
-                heartbeat_age, stale_threshold, self._pid_exists(pid)
+                heartbeat_age, stale_threshold, self._pid_exists(pid), pid in started
             )
             if action == "keep":
                 continue
 
             if action == "mark_dead":
+                if status == 'dead':
+                    continue  # already recorded; nothing to fix
                 self.backend.update_worker_heartbeat(
                     worker_id=worker_id, status='dead', current_job_id=None
                 )
@@ -685,6 +753,9 @@ class WorkerPoolManager:
                     f"Safety net: worker {worker_id} (PID {pid}) heartbeat stale "
                     f"({heartbeat_age:.0f}s > {stale_threshold}s) but process alive — killing"
                 )
+                # The job child runs in its own process group, so killing the worker alone
+                # left it running while the zombie sweep retried its job (#48).
+                child_killed = self._kill_job_child(worker_id, current_job_id)
                 killed = self._kill_worker_process(pid)
                 if killed:
                     self.backend.update_worker_heartbeat(
@@ -694,6 +765,7 @@ class WorkerPoolManager:
                     irregularities['details'].append({
                         'type': 'stalled_worker', 'worker_id': worker_id,
                         'pid': pid, 'heartbeat_age': heartbeat_age,
+                        'job_child_killed': child_killed,
                         'reason': f'unresponsive_to_signals_{heartbeat_age:.0f}s',
                     })
 
