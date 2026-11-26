@@ -125,14 +125,18 @@ class AsyncQueue:
         The async backends (AsyncDatabaseBackend) have no ``create_job``; the sync
         backend for the active mode (Django or standalone) does.
         """
+        return await AsyncQueue._call_sync_backend("create_job", **fields)
+
+    @staticmethod
+    async def _call_sync_backend(method: str, *args: Any, **kwargs: Any) -> Any:
         from .compat import get_backend, is_django_mode
 
-        create = get_backend().create_job
+        call = getattr(get_backend(), method)
         if is_django_mode():
             from asgiref.sync import sync_to_async
 
-            return await sync_to_async(create)(**fields)
-        return await asyncio.to_thread(create, **fields)
+            return await sync_to_async(call)(*args, **kwargs)
+        return await asyncio.to_thread(call, *args, **kwargs)
 
     async def enqueue_at(
         self,
@@ -226,15 +230,14 @@ class AsyncQueue:
 
         return task
 
-    async def get_job(self, job_id: int) -> dict[str, Any] | None:
-        """Get job by ID (async).
+    async def get_job(self, job_id: int) -> Any:
+        """Return the stored job, or None if the ID does not exist."""
+        if self.backend is None:
+            return await self._call_sync_backend("get_job_by_id", job_id)
 
-        Args:
-            job_id: Job ID
-
-        Returns:
-            Job dict or None if not found
-        """
+        read_job = getattr(self.backend, "aget_job", None)
+        if read_job is not None:
+            return await read_job(job_id)
         return await self.backend.get_job_by_id(job_id)
 
     async def cancel_job(self, job_id: int) -> bool:
