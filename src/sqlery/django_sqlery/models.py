@@ -1864,6 +1864,12 @@ class JobAttempt(models.Model):
     outcome = models.CharField(
         max_length=10, null=True, blank=True, help_text="success / failed / abandoned"
     )
+    node_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Node of the claiming process: its PIDs mean nothing on another node (#47)",
+    )
 
     class Meta:
         db_table = "sqlery_job_attempt"
@@ -1941,11 +1947,14 @@ class JobAttempt(models.Model):
         none is abandoned here. The object is shown as running (``show_running``); its row is
         not written.
         """
+        from sqlery.core.claiming import get_node_id
+
         row = cls.objects.create(
             job_id=job.id,
             token=new_token(),
             worker_id=worker_id,
             worker_pid=worker_pid,
+            node_id=get_node_id(),
         )
         attach_attempt(
             job,

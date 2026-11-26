@@ -502,6 +502,11 @@ class JobAttempt(SQLModel, table=True):
     )
     finished_at: datetime | None = Field(sa_type=UTCDateTime, default=None)
     outcome: str | None = Field(default=None, max_length=10)
+    node_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Node of the claiming process: its PIDs mean nothing on another node (#47)",
+    )
 
 
 class JobReady(SQLModel, table=True):

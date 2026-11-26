@@ -359,6 +359,7 @@ def postgres_attempt_partitioned_ddl(table: str = ATTEMPT_TABLE) -> list[str]:
             claimed_at  TIMESTAMPTZ  NOT NULL,
             finished_at TIMESTAMPTZ,
             outcome     VARCHAR(10),
+            node_id     VARCHAR(255),
             PRIMARY KEY (claimed_at, id),
             {ATTEMPT_OUTCOME_CHECK}
         ) PARTITION BY RANGE (claimed_at)
