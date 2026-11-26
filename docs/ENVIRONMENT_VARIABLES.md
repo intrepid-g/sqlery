@@ -148,6 +148,10 @@ export DJANGO_SQL_JOBS_WORKER_ALIVE_TIMEOUT=60
 **Notes:**
 - Should be > `WORKER_HEARTBEAT_INTERVAL * 2`
 - Jobs from dead workers will be reclaimed
+- Only the worker writes its own heartbeat. A worker the daemon started that stays silent
+  for 3x this timeout while its process still exists (deadlocked, frozen) is killed together
+  with its job's process group, and the job is failed. Silence is only counted while the
+  daemon can reach the database, so a database outage never gets workers killed (#48).
 
 ---
 

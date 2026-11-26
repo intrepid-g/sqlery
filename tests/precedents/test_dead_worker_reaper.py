@@ -114,3 +114,42 @@ def test_probe_with_no_such_process_means_gone():
 
 def test_probe_that_raised_nothing_means_the_process_exists():
     assert reaper.probe_found_process(None) is True
+
+
+# #48: the daemon no longer writes beats for its workers, so silence is read with care.
+
+
+def test_safety_net_never_kills_a_process_the_pool_did_not_start():
+    """The PID of a row the pool did not start may belong to an unrelated process by now."""
+    assert reaper.safety_net_action(91, 90, True, started_by_pool=False) == "keep"
+    assert reaper.safety_net_action(91, 90, False, started_by_pool=False) == "mark_dead"
+
+
+def test_silence_counts_from_when_the_watcher_regained_the_database():
+    assert reaper.silence_since(ago(500), ago(20)) == ago(20)
+
+
+def test_a_beat_after_the_watch_began_is_its_own_age():
+    assert reaper.silence_since(ago(5), ago(20)) == ago(5)
+
+
+def test_silence_without_a_watch_window_is_the_beat_itself():
+    assert reaper.silence_since(ago(500), None) == ago(500)
+    assert reaper.silence_since(None, ago(20)) is None
+
+
+def test_a_worker_silent_through_an_outage_is_spared_until_the_watch_is_old_enough():
+    assert verdict(last_heartbeat=ago(500), watched_since=ago(10)) is None
+    assert verdict(last_heartbeat=ago(500), watched_since=ago(31)) == (
+        "heartbeat too old (31s > 30s threshold)"
+    )
+
+
+def test_a_live_process_the_pool_started_is_left_to_the_safety_net():
+    """Marking it dead would fail its job while it (and its job child) still run."""
+    assert reaper.left_to_safety_net(True, True) is True
+    assert reaper.left_to_safety_net(False, True) is False
+    assert reaper.left_to_safety_net(None, True) is False
+    assert reaper.left_to_safety_net(True, False) is False
+    assert verdict(last_heartbeat=ago(500), pid_exists=True, started_by_pool=True) is None
+    assert verdict(last_heartbeat=ago(500), pid_exists=False, started_by_pool=True) is not None
