@@ -10,20 +10,20 @@ Thanks for your interest in contributing to Sqlery. This guide covers everything
 # Clone and install
 git clone https://github.com/intrepid-g/sqlery.git
 cd sqlery
-uv pip install -e ".[dev]"
+uv sync --locked --extra dev
 ```
 
 ## Running Tests
 
 ```bash
 # Run all tests
-uv run pytest
+uv run --no-sync pytest
 
 # Run with coverage
-uv run pytest --cov=sqlery
+uv run --no-sync pytest --cov=sqlery
 
 # Run a specific test file
-uv run pytest tests/test_core.py
+uv run --no-sync pytest tests/test_core_standalone.py
 ```
 
 ## Code Style
@@ -32,16 +32,16 @@ This project uses **black** for formatting and **ruff** for linting. Both are co
 
 ```bash
 # Format code
-uv run black src/ tests/
+uv run --no-sync black src/ tests/
 
 # Lint code
-uv run ruff check src/ tests/
+uv run --no-sync ruff check src/ tests/
 
 # Lint and auto-fix
-uv run ruff check --fix src/ tests/
+uv run --no-sync ruff check --fix src/ tests/
 ```
 
-Please ensure your code passes both formatters before submitting a PR.
+Please check formatting with Black and lint with Ruff before submitting a PR.
 
 ## Type Hints
 
@@ -49,7 +49,7 @@ Sqlery uses full type annotations. Use modern built-in types (`list`, `dict`, `t
 
 ## Pull Request Process
 
-1. Fork the repository and create a feature branch from `master`.
+1. Fork the repository and create a feature branch from `main`.
 2. Make your changes with clear, focused commits.
 3. Add or update tests for any new or changed behavior.
 4. Ensure all tests pass and code is formatted/linted.
